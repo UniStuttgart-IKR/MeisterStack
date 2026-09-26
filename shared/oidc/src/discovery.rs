@@ -49,13 +49,8 @@ pub fn discovery_url(issuer: &str) -> String {
     )
 }
 
-/// Check the document against the issuer it was asked for.
-///
-/// RFC 8414 section 3.3, and it is not a formality: without it a provider
-/// that has been persuaded to serve somebody else's document — or a config
-/// with a typo pointing at the wrong tenant of the same provider — hands
-/// this controller a `jwks_uri` of the attacker's choosing, and every token
-/// that key signs is then a valid token here.
+/// Match discovery issuer to configuration, ignoring trailing slashes.
+/// Reject mismatches before trusting the document's signing-key location.
 pub fn check_issuer(doc: &Discovery, expected: &str) -> Result<()> {
     if doc.issuer.trim_end_matches('/') != expected.trim_end_matches('/') {
         bail!(
@@ -95,12 +90,8 @@ pub trait KeySource: Send + Sync {
     fn describe(&self) -> String;
 }
 
-/// The real one: discovery once, then the `jwks_uri` it named.
-///
-/// Discovery is repeated only if it has never succeeded. A provider that
-/// moves its `jwks_uri` between two fetches is a provider that will be
-/// followed at the next restart, and re-reading the document on every fetch
-/// would double the traffic for a change that happens once a decade.
+/// HTTP key source caching the first successful discovery document.
+/// Subsequent refreshes reuse its JWKS URI until this source is reconstructed.
 pub struct HttpKeySource {
     issuer: String,
     ca: Option<PathBuf>,
@@ -146,15 +137,8 @@ impl KeySource for HttpKeySource {
     }
 }
 
-/// Keep a cache current: once at start-up, on every nudge, and on a timer.
-///
-/// `Weak` and not `Arc`, which is the whole of how this task ends. The nudge
-/// channel's sender lives inside the `KeyCache`, so a task holding the cache
-/// strongly would be holding the sender that tells it to stop — it would
-/// wait for a message only it could still send, forever. With a weak handle
-/// the last authenticator going away drops the cache, drops the sender,
-/// closes the channel and ends this. Nothing has to be told twice, and a
-/// controller shutting down does not leave a task behind.
+/// Refresh at startup, on a nudge and periodically. Hold the cache weakly
+/// so dropping the last authenticator also drops the sender and ends this task.
 pub async fn refresh_forever(
     cache: Weak<KeyCache>,
     source: Arc<dyn KeySource>,
@@ -171,9 +155,7 @@ pub async fn refresh_forever(
             Ok(set) => {
                 let keys = Keys::parse(&set);
                 if keys.is_empty() {
-                    // Not an error to us: the provider answered, and what it
-                    // said was "nothing usable". Loud, because every token
-                    // will now be refused and the reason is at the far end.
+                    // Warn when the provider returns no usable keys because token verification will fail.
                     warn!(
                         provider = %source.describe(),
                         "the identity provider published no usable signing keys"
@@ -243,25 +225,16 @@ mod tests {
         assert!(err.to_string().contains("elsewhere.example"), "{err}");
 
         check_issuer(&doc("https://idp.example.org"), "https://idp.example.org").unwrap();
-        // The trailing slash is the one difference that is not one.
+        // Issuer comparison ignores a trailing slash.
         check_issuer(&doc("https://idp.example.org/"), "https://idp.example.org").unwrap();
     }
 
-    /// Let the spawned refresher run up to its next wait.
-    ///
-    /// Not `yield_now`: that is one poll, and a fetch has more await points
-    /// than that. Under `start_paused` a sleep costs no wall clock and the
-    /// runtime advances to it only once every task is idle, which is exactly
-    /// the condition being waited for.
+    /// Advance the paused test runtime until the refresher reaches its next wait.
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    /// A key source that answers from a script instead of an http server.
-    ///
-    /// This is the seam, used the way the brief asks for it: everything above
-    /// `KeySource` — the cache, the rate limit, the refresher, the whole
-    /// authenticator — is exercised here without a provider existing.
+    /// Scripted key source for exercising cache, refresh and authentication without a provider.
     struct Scripted {
         answers: Mutex<Vec<Result<String, String>>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -302,9 +275,7 @@ mod tests {
         }
     }
 
-    /// The nudge from the request path reaches the fetcher, and the interval
-    /// is the only thing standing between a flood of invented key ids and a
-    /// flood of requests to somebody else's server.
+    /// Fetch initially and on refresh requests, with cache-wide throttling.
     #[tokio::test(start_paused = true)]
     async fn a_nudge_fetches_and_the_first_fetch_happens_without_one() {
         let idp = crate::testing::TestIdp::new("k1");
@@ -320,8 +291,7 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        // Nobody asked, and the keys are there: a controller that starts
-        // while nobody is logging in is ready for the first person who does.
+        // Startup fetch does not require a login request.
         settle().await;
         assert!(cache.loaded());
         assert_eq!(cache.with_keys(|k| k.len()), 1);
@@ -332,8 +302,7 @@ mod tests {
         settle().await;
         assert_eq!(source.calls(), 2);
 
-        // Every further ask inside the interval is refused by the cache
-        // before it ever becomes a request.
+        // Suppress repeated refresh requests within the minimum interval.
         for _ in 0..100 {
             assert!(!cache.request_refresh());
         }
@@ -343,9 +312,7 @@ mod tests {
         task.abort();
     }
 
-    /// A provider that is down does not cost us the keys we have. The
-    /// alternative — installing an empty set on a failed fetch — would turn
-    /// somebody else's outage into ours.
+    /// Failed refresh retains previously cached keys.
     #[tokio::test(start_paused = true)]
     async fn a_failed_fetch_keeps_the_keys_we_already_had() {
         let idp = crate::testing::TestIdp::new("k1");

@@ -30,42 +30,21 @@ pub const SYSTEM_PREFIX: &str = "system:";
 pub const GROUP_NODES: &str = "system:nodes";
 /// The same one tier up: CN `system:cluster:<cluster_name>`.
 pub const GROUP_CLUSTERS: &str = "system:clusters";
-/// And one tier up again: CN `system:cloud:<cloud_name>`.
-///
-/// The three replicas of one cloud SHARE this name, exactly as the three
-/// replicas of a cluster share theirs. It is the cloud's identity and not a
-/// replica's: what it is for is a replica asking its sibling for a console,
-/// and "which of the three am I talking to" is not a question that has an
-/// answer worth authorizing against — they are interchangeable by design.
+/// Cloud identity group, with CN `system:cloud:<cloud_name>`.
+/// Replicas share this identity for authorized sibling requests.
 pub const GROUP_CLOUDS: &str = "system:clouds";
 /// The four groups a user certificate can carry, one each.
 pub const GROUP_ADMINS: &str = "meister:admins";
 pub const GROUP_OPERATORS: &str = "meister:operators";
 pub const GROUP_MEMBERS: &str = "meister:members";
 pub const GROUP_VIEWERS: &str = "meister:viewers";
-/// Break glass. Kubernetes' own group, with Kubernetes' own meaning: a
-/// certificate carrying it is above the directory and answers to no `User`
-/// object at all.
-///
-/// It exists because the directory has a bootstrap problem — the first user
-/// has to be created by somebody, and until that somebody exists there is
-/// nobody the directory knows. `tools/meister-ca` mints exactly one of these,
-/// and the static bearer token is the other one. Both are meant to be used
-/// twice and then left alone.
+/// Privileged group for bootstrap and break-glass credentials. The static
+/// bearer identity also uses this group.
 pub const GROUP_MASTERS: &str = "system:masters";
 
-/// What a `User` may do. It is a field on the object in etcd — that is where
-/// the truth is — and the signer stamps the matching group into the
-/// certificate it issues so that a person holding one can read what it is
-/// for. Since the permission table below, that group is a LABEL: the cloud
-/// takes the role out of the directory, and the cluster refuses a user
-/// certificate outright.
-///
-/// Four, and the two new ones are the two halves the first two conflated.
-/// `Operator` is somebody who drains a node and declares a pool and has no
-/// business in the user directory; `Viewer` is somebody who may look and not
-/// touch, which is what an on-call rotation and a dashboard both want and
-/// what `Member` was being stretched to mean.
+/// Directory-backed role. Certificate role groups describe the issued
+/// credential; cloud authorization reads the current User grant. Cluster
+/// controllers reject ordinary user identities without a directory.
 #[derive(
     schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
@@ -84,12 +63,8 @@ impl Role {
     /// `rank` below, and the test nails both.
     pub const ALL: [Role; 4] = [Role::Admin, Role::Operator, Role::Member, Role::Viewer];
 
-    /// Least to most. `Viewer < Member < Operator < Admin` is the whole
-    /// policy's backbone: the table says the least role a thing needs, and
-    /// `permits` asks whether the caller is at least that.
-    ///
-    /// Written out rather than derived from the declaration order, because
-    /// deriving it would make reordering the variants a silent policy change.
+    /// Explicit Viewer < Member < Operator < Admin ordering for permission checks.
+    /// Enum reordering must not silently change policy.
     fn rank(self) -> u8 {
         match self {
             Role::Viewer => 0,
@@ -151,16 +126,8 @@ impl PartialOrd for Role {
 pub struct Identity {
     pub name: String,
     pub groups: Vec<String>,
-    // --- lane 5A: which certificate this was ---------------------------
-    /// The serial of the certificate this identity came out of, exactly as
-    /// `pki::CertInfo::serial` spells it (lowercase hex, colon separated).
-    ///
-    /// `None` for every identity that is not a certificate — a bearer token,
-    /// a token from the identity provider, a test. It is not part of WHO
-    /// somebody is (two certificates for one name are one identity, which is
-    /// what a rotation is), and it is what a revocation names: a session
-    /// that is running when its certificate is revoked has to be findable,
-    /// and the only handle on it is this.
+    /// Certificate serial in lowercase colon-separated hex for revocation lookup.
+    /// None for other credential types; one user may hold several certificates.
     pub serial: Option<String>,
     // --- end lane 5A ---------------------------------------------------
 }
@@ -192,14 +159,8 @@ impl Identity {
             || self.groups.iter().any(|g| g.starts_with(SYSTEM_PREFIX))
     }
 
-    /// The role this identity's certificate claims.
-    ///
-    /// Nothing in the authorization path reads this any more, and that is the
-    /// permission table's doing: the cloud takes the role out of the
-    /// directory, and a tier without a directory authorizes no person at all.
-    /// What the group in a certificate is now is a LABEL — so that somebody
-    /// holding one can read what it was issued for — and this is how to read
-    /// it. See `rest::grant_of`.
+    /// Read the certificate's descriptive role label.
+    /// Authorization uses the directory role instead; see `rest::grant_of`.
     pub fn claimed_role(&self) -> Option<Role> {
         Role::from_groups(&self.groups)
     }
@@ -210,24 +171,9 @@ impl Identity {
         format!("{SYSTEM_PREFIX}{kind}:{peer}")
     }
 
-    /// A session says who it is in its Hello, and its certificate says who it
-    /// is too. When the certificate is specific — `system:node:manacor` —
-    /// they have to agree, or one node's key would let it report as any
-    /// other. A certificate that only carries `O=system:nodes` under some
-    /// other CN is a shared identity: allowed, and worth exactly what sharing
-    /// a key is worth.
-    ///
-    /// The KIND is half of "specific", and leaving it out was a hole rather
-    /// than a shortcut. This used to strip `system:<kind>:` and let anything
-    /// that did not start with it through as unnamed — so `system:node:x`
-    /// asked whether it may speak for a CLUSTER did not start with
-    /// `system:cluster:`, fell into the shared-identity branch, and was
-    /// allowed to be any cluster it liked. One CA signs both tiers
-    /// (`tools/meister-ca`), and the cloud's session port trusts it, so a
-    /// node's key was a key to the cloud session of every cluster. A name
-    /// that names a peer at all therefore has to name THIS kind and THIS
-    /// peer; a name with no `system:<kind>:<peer>` shape names no peer and
-    /// keeps the shared identity it always had.
+    /// Check a Hello against its certificate identity. A named machine
+    /// identity must match both peer kind and name. A group-only credential
+    /// without a named system peer retains shared-identity behavior.
     pub fn may_speak_for(&self, kind: &str, peer: &str) -> bool {
         let Some(rest) = self.name.strip_prefix(SYSTEM_PREFIX) else {
             return true;
@@ -249,12 +195,8 @@ impl std::fmt::Display for Identity {
     }
 }
 
-/// Everything an authenticator is allowed to look at.
-///
-/// Owned and transport-free on purpose: the certificate chain arrives from
-/// rustls at the REST edge and from tonic at the session edge, and an
-/// authenticator that took either of those types would be testable only
-/// through a TLS handshake.
+/// Transport-independent authentication inputs, shared by REST and gRPC.
+/// Owned certificate and token data also permit tests without a live handshake.
 #[derive(Debug, Default)]
 pub struct AuthRequest {
     /// The peer's certificate chain, leaf first, DER. Empty = no client
@@ -278,20 +220,9 @@ pub trait Authenticator: Send + Sync {
     /// who it is. `Err` = I checked, and no — which ends the chain.
     fn authenticate(&self, req: &AuthRequest) -> anyhow::Result<Option<Identity>>;
 
-    /// Can this link authenticate anybody right now?
-    ///
-    /// The difference between CONFIGURED and READY, and D11 is what it is
-    /// for: the lab's cloud offered `auth=mtls,oidc` in its discovery
-    /// document for hours while the identity provider was unreachable and no
-    /// signing key had ever been fetched. Every token would have been
-    /// refused. A client that reads the document and believes it gets a
-    /// promise that does not hold, and the failure lands at the far end.
-    ///
-    /// `true` by default, because it is true of every link whose readiness is
-    /// its construction: an mTLS authenticator holds a CA it was given, and a
-    /// bearer link holds a token it was given. Only a link that loads
-    /// something from somewhere else has a second state, and only that link
-    /// overrides this.
+    /// Whether this authenticator currently has the material needed to
+    /// verify credentials. Local credentials are ready on construction;
+    /// remotely fetched keys may leave a configured authenticator degraded.
     fn ready(&self) -> bool {
         true
     }
@@ -321,10 +252,8 @@ impl std::fmt::Display for Rejected {
 #[derive(Default)]
 pub struct AuthChain {
     links: Vec<Box<dyn Authenticator>>,
-    /// What each link is, in order, for the discovery document: "mtls",
-    /// "oidc", "bearer". A name and not the link itself, because what a
-    /// client needs from this is which credentials the endpoint will look at
-    /// — the CA path and the token behind them are nobody else's business.
+    /// Ordered authenticator names for discovery, excluding credential material
+    /// and local configuration paths.
     names: Vec<&'static str>,
 }
 
@@ -353,24 +282,9 @@ impl AuthChain {
         Self { links, names }
     }
 
-    /// What a discovery document says under `auth`: the links, comma-joined,
-    /// or `none` when nothing is configured.
-    ///
-    /// `none` is not "unknown": it is the anonymous mode this stack has run
-    /// in since M1, and a client that reads it may say so out loud rather
-    /// than waiting for a 401 that will never come.
-    ///
-    /// A link that is configured and cannot authenticate anybody yet is named
-    /// `<name>:degraded` (D11). Named rather than dropped, and that is the
-    /// decision: dropping it would make "this deployment has no identity
-    /// provider" and "the identity provider is unreachable" the same
-    /// sentence, and they need different people. `:degraded` says the door
-    /// exists and is shut, which is what an operator has to know and what a
-    /// client has to stop relying on.
-    ///
-    /// Asked at the moment it is answered and never cached — see
-    /// `rest::discovery`. A snapshot taken when the router was built would
-    /// say `degraded` for ever, because at start-up nothing has loaded yet.
+    /// Current discovery description: comma-separated authenticators, with
+    /// `:degraded` for configured but unready links. An empty chain is `none`
+    /// (anonymous mode). Compute on demand so readiness changes remain visible.
     pub fn describe(&self) -> String {
         if self.names.is_empty() {
             return "none".to_string();
@@ -414,14 +328,9 @@ impl AuthChain {
     }
 }
 
-// --- lane 5A: revocation ---------------------------------------------------
-//
-// D11, and the one sentence it rests on: a certificate that has been taken
-// back has to stop working WITHOUT restarting anything. rustls can check a
-// list at the handshake, but only one it was handed when the `ServerConfig`
-// was built (M0 probe S10 measured that), and the session port does not go
-// through rustls at all — tonic has no CRL api. So the check that matters
-// sits here, at the one point both ports pass through, and it reloads.
+// Reloadable application-level revocation shared by REST and session auth.
+// Handshake configuration alone cannot update established sessions or reload
+// new revocations without rebuilding the server.
 
 /// How often the file is looked at again. Not how often it is READ: the
 /// mtime is looked at, and the file is read when the mtime moved.
@@ -440,10 +349,8 @@ pub struct RevocationList {
     /// system would not say — and then every check re-reads, which is the
     /// safe direction.
     pub mtime: Option<std::time::SystemTime>,
-    /// And its size, because a modification time is only as fine as the
-    /// filesystem that keeps it: two writes within one tick of it are two
-    /// different lists with one timestamp, and the second would never be
-    /// read.
+    /// File length supplements mtime when detecting changes within one filesystem
+    /// timestamp tick. Same-size replacements still require a changed mtime.
     pub size: Option<u64>,
 }
 
@@ -461,22 +368,11 @@ impl RevocationList {
     }
 }
 
-/// One spelling for a serial number, because this stack has three.
-///
-/// `x509-parser` prints `64:35:c9:…` (lowercase, colon separated) and it is
-/// what both a certificate and a CRL entry come out of here. openssl's
-/// `index.txt` and `x509 -serial` print `6435C9…` (upper case, no
-/// separators), and that is the one an operator reads off a receipt and
-/// retypes. A leading zero byte is DER's sign padding and says nothing about
-/// the number.
-///
-/// Comparing serials is the whole of revocation, so the comparison is made
-/// in exactly one function and both sides go through it.
+/// Normalize certificate serials across colon-separated X.509 text and
+/// OpenSSL uppercase hex, removing DER sign padding before comparison.
 pub fn normalise_serial(serial: &str) -> String {
-    // In `pki` and not here, because the deployment tool compares serials
-    // too (`keys issue` refuses to hand out a second certificate for a name
-    // whose first one nobody took back) and it does not depend on this
-    // crate. One function, three callers, one meaning.
+    // Use the shared PKI normalization so issuance and authentication compare
+    // certificate serials identically.
     pki::tls::normalise_serial(serial)
 }
 
@@ -492,20 +388,13 @@ pub enum Reload {
         serials: usize,
         crl_number: Option<u64>,
     },
-    /// It moved and it could not be read, or it was read but refused: an
-    /// older CRL number than the one already in force (Astra finding F14,
-    /// 2026-09-23), or the same number with different content. The list
-    /// this process holds is the OLD one, deliberately — see
-    /// [`Revocations::refresh_at`].
+    /// Reload failed, rolled back its CRL number, or reused a number with changed
+    /// content. The previously accepted list remains enforced.
     Failed(String),
 }
 
-/// The revocation list this process enforces, and the file it comes from.
-///
-/// Shared by the authenticator (which asks about every certificate) and by
-/// the session registries (which ask about the certificates that are already
-/// talking), because there must be exactly one answer to "is this serial
-/// revoked" in a process.
+/// Shared revocation state for new authentication and established sessions.
+/// Both paths must use the same accepted list.
 #[derive(Debug)]
 pub struct Revocations {
     path: PathBuf,
@@ -516,13 +405,8 @@ pub struct Revocations {
 }
 
 impl Revocations {
-    /// Read the list now, or fail.
-    ///
-    /// A configured `crl` that cannot be read is a start-up error and not a
-    /// warning: a deployment that names one believes it enforces revocation,
-    /// and the failure mode of "carry on with an empty list" is precisely a
-    /// revoked certificate that keeps working while a log line nobody reads
-    /// says why.
+    /// Load the configured CRL or fail startup. Continuing with an empty list
+    /// would silently permit credentials the deployment intended to revoke.
     pub fn load(path: &Path) -> anyhow::Result<Arc<Revocations>> {
         Self::load_at(path, Utc::now())
     }
@@ -566,13 +450,7 @@ impl Revocations {
         &self.path
     }
 
-    /// Read the list and say what it holds, without keeping it.
-    ///
-    /// What `--check-config` needs: the file a running controller would
-    /// refuse to start without is read by the same code, so that the answer
-    /// is the same answer. A summary and not a bool, because "12 revoked
-    /// serials, crl number 4" is what tells an operator whether the file
-    /// they are looking at is the one they just wrote.
+    /// Validate a CRL without retaining it and report its serial count and number.
     pub fn check(path: &Path) -> anyhow::Result<String> {
         let list = Self::read(path, Utc::now())?;
         Ok(format!(
@@ -598,13 +476,8 @@ impl Revocations {
         list.is_revoked(serial).then_some(list.crl_number)
     }
 
-    /// Look at the file again, at most every [`REVOCATION_RELOAD_SECS`].
-    ///
-    /// Cheap on purpose: one `stat` per half minute, not a parse per
-    /// request. What it must never do is turn an unreadable file into an
-    /// empty list — a CRL that cannot be read is not "nothing is revoked" —
-    /// so a failed read keeps the list this process already has and says so
-    /// once per attempt.
+    /// Check file metadata at most every `REVOCATION_RELOAD_SECS` and reload changes.
+    /// Failed reloads retain the accepted list and report the failure.
     pub fn refresh(&self) -> Reload {
         self.refresh_at(Utc::now())
     }
@@ -635,19 +508,8 @@ impl Revocations {
                     let list = self.list.read().expect("revocation list");
                     (list.crl_number, list.serials.clone())
                 };
-                // Astra finding F14, 2026-09-23: this reload is the only
-                // place a live process re-checks revocation (the TLS
-                // handshake's own CRL is read once, at startup, and never
-                // replaced — see `pki::tls::server_config`), and until here
-                // it accepted whatever mtime/size said had changed, with no
-                // check that the new list is actually newer. Restoring an
-                // earlier CRL — same file path, older or equal number —
-                // used to be accepted outright, forgetting every serial
-                // that a later list alone had revoked. A CRL number that
-                // goes backwards is refused outright; a CRL number that
-                // stays the same but the content differs is not "the same
-                // list twice" and is refused too, in either case keeping
-                // the list already in force.
+                // Keep the accepted CRL on rollback or same-number content changes.
+                // This application-level reload supplements the startup TLS CRL.
                 if let (Some(held_n), Some(fresh_n)) = (held_number, fresh.crl_number)
                     && fresh_n < held_n
                 {
@@ -705,20 +567,11 @@ impl Revocations {
 }
 // --- end lane 5A -----------------------------------------------------------
 
-/// Identity out of a client certificate: CN is the name, every O is a group.
-///
-/// rustls has already checked the chain by the time a REST handler runs, so
-/// checking it again here is belt and braces — but it is the belt and braces
-/// that make this testable from two PEM files with no socket involved, and
-/// the certificate has to be parsed for its subject anyway. One parse, both
-/// answers.
+/// Verify a client certificate and extract its CN as name and O fields as groups.
+/// This repeats transport verification and also supports direct, socket-free use.
 pub struct MtlsAuthenticator {
     cas: Vec<CertificateDer<'static>>,
-    // --- lane 5A ---
-    /// The list this authenticator refuses against, when the deployment
-    /// configured one. Shared with whoever else in the process has to know
-    /// (the session registries), and reloadable — which is the difference
-    /// between this check and rustls'.
+    /// Optional reloadable revocations, shared with active-session registries.
     revocations: Option<Arc<Revocations>>,
     // --- end lane 5A ---
 }
@@ -756,14 +609,8 @@ impl MtlsAuthenticator {
             return Ok(None);
         };
         let info = CertInfo::verified_by(leaf, &self.cas, now)?;
-        // --- lane 5A: after the chain, before the identity ---------------
-        //
-        // AFTER `verified_by` and not before it, because a serial means
-        // nothing until it is known which CA issued it: two CAs can issue
-        // the same number, and refusing on a serial alone would let anybody
-        // with a self-signed certificate pick a number that locks a node
-        // out. The order is: this CA signed it, it is in date, and it has
-        // not been taken back.
+        // Verify the chain and validity before consulting serial revocations.
+        // A serial has meaning only within its issuing CA.
         if let Some(revocations) = &self.revocations {
             revocations.refresh_at(now);
             if let Some(number) = revocations.revoked(&info.serial) {
@@ -800,14 +647,8 @@ impl Authenticator for MtlsAuthenticator {
     }
 }
 
-/// A single static token that stands for one identity.
-///
-/// This is a development path and is labelled one wherever it appears: there
-/// is no expiry, no rotation and no per-user token, so a token that leaks is
-/// a permanent credential. It exists because the CSR flow has a chicken and
-/// egg problem — the first request a new user makes is the one asking for the
-/// certificate they do not have yet — and because a lab wants a way in that
-/// does not involve a CA.
+/// Static bearer credential for development and bootstrap access.
+/// It has one identity and no built-in expiry, rotation or per-user isolation.
 pub struct BearerAuthenticator {
     token: String,
     identity: Identity,
@@ -868,19 +709,8 @@ pub struct Attempt<'a> {
     pub verb: Verb,
 }
 
-/// Classify a request from its method and path.
-///
-/// `None` means the path is not an API object route at all — /healthz and
-/// /readyz — and those are never gated: a probe that needs a certificate is a
-/// probe that cannot tell "down" from "not invited".
-///
-/// Two API paths are in that set too, and for one reason: what they answer is
-/// not an object. The discovery document falls out of the prefix (there is no
-/// segment under the group-version at all), and `/schemas` is named here —
-/// the comment over `SCHEMAS_PATH` has always said it should be let past
-/// "exactly as it lets discovery past, the shape of an object is not a
-/// secret", and the code did not do it. A build-time generator needed a
-/// credential for a document with nothing in it but field names.
+/// Classify API object routes for authorization. Health/readiness,
+/// discovery and schemas return None and are publicly readable.
 pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
     let rest = path.strip_prefix("/apis/meister.io/v1/")?;
     let rest = rest.split('?').next().unwrap_or(rest);
@@ -894,10 +724,8 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
     let resource = parts.next()?;
     let _name = parts.next();
     let subresource = parts.next();
-    // A CORS preflight carries no credentials by definition, so classifying
-    // it as a write would answer 401 to the question the browser asks BEFORE
-    // it is willing to send any. Not a permission: the router has no OPTIONS
-    // handler, so an unanswered preflight is a 405 exactly as it was.
+    // Do not classify unauthenticated CORS preflight as a write. This does not
+    // grant access or provide an OPTIONS handler.
     if method == "OPTIONS" {
         return None;
     }
@@ -913,25 +741,9 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
     })
 }
 
-/// The resources a member may write inside its own tenant. Everything else —
-/// tenants, users, clusters, nodes — stays an admin's, read-only for a member
-/// exactly as it was in M4.5.
-///
-/// `floatingips` is here and `floatingpools` and `routedsubnets` are not, and
-/// that split IS the assignment rule: what exists (the pools, the subnets) is
-/// an administrator's to decide, and taking one address out of a pool is
-/// self-service — but only as far as that pool's quota for this tenant goes,
-/// which defaults to zero on a public pool. So a member reaching this door
-/// still meets the quota behind it; the door being open is what makes a lab
-/// usable without a ticket per address.
-///
-/// `volumes` is here and `storagepools` is not, which is the same split with
-/// storage nouns and for the same reason: which disks EXIST is an
-/// administrator's decision, taking room out of one is self-service inside
-/// that pool's per-tenant ceiling. A volume is the first tenant-scoped object
-/// whose deletion can destroy something irreplaceable, which is a reason to
-/// be careful in the HANDLER (see the release finalizer) and not a reason to
-/// shut this door — a member who cannot make a disk cannot make a VM.
+/// Resources members may write within their own tenant. Infrastructure
+/// provisioning remains separate; address and volume creation still enforce
+/// pool quotas in their handlers.
 const TENANT_SCOPED: [&str; 8] = [
     Vm::RESOURCE,
     Image::RESOURCE,
@@ -940,23 +752,15 @@ const TENANT_SCOPED: [&str; 8] = [
     // A snapshot is a copy of a tenant's data and is therefore the tenant's,
     // by exactly the argument the volume it came from is.
     crate::resources::VolumeSnapshot::RESOURCE,
-    // A secret is the tenant's own bytes and nothing else is: there is no
-    // administrator's half to it the way a pool is the half of a volume.
-    // Which makes the READ half of this door the interesting one — and it is
-    // shut by the object rather than by the table, because what a read of a
-    // secret answers with is its key NAMES. See `Secret::redacted`.
+    // Secrets are tenant-owned. Read handlers return redacted key names rather
+    // than plaintext values; see `Secret::redacted`.
     crate::resources::Secret::RESOURCE,
     // A migration is a record of what happened to a tenant's VM, so it is
     // filed in that tenant and read by them. It is the one resource here
     // whose WRITE door is not the tenant's — see `Class::TenantOperated`.
     crate::resources::VmMigration::RESOURCE,
-    // A router is filed in a tenant for exactly that reason: it is that
-    // tenant's way out and nobody else's, and a member should be able to see
-    // whether theirs is up. It is the SECOND resource whose write door is not
-    // the tenant's, and the same argument makes it so — a router names the
-    // operator's provider network and takes a gateway slot on the operator's
-    // machines, which is running the estate rather than using it. See
-    // `Class::TenantOperated`.
+    // Router reads are tenant-scoped; writes require infrastructure privileges
+    // because routers consume provider networks and gateway capacity.
     crate::resources::Router::RESOURCE,
 ];
 
@@ -965,13 +769,7 @@ pub fn is_tenant_scoped(resource: &str) -> bool {
     TENANT_SCOPED.contains(&resource)
 }
 
-/// What KIND of thing a resource is, for the purposes of the table below.
-///
-/// Four classes and not fourteen resources, because the sentence an operator
-/// has to be able to say out loud is "an operator drains machines and does
-/// not touch the directory" — not a list. A resource that does not fit one of
-/// these is a resource that needs a fifth class and a paragraph, which is the
-/// point of making it an enum.
+/// Resource policy classes used by the role table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     /// Who exists and what they may do: `tenants`, `users`, and saying yes to
@@ -986,36 +784,13 @@ pub enum Class {
     /// Asking for a certificate — the renewal path. Not a privilege: the gate
     /// is the approval, which is `Directory`. K8s says the same thing.
     CsrCreate,
-    /// A tenant's object that only an OPERATOR may write: `vmmigrations` and
-    /// `routers`.
-    ///
-    /// The fifth class the comment above asked for, with its paragraph. A
-    /// live migration is filed in a tenant — it is a record of what happened
-    /// to their VM and they should be able to read it — but asking for one is
-    /// running the estate, not using it: it is how an operator gets a machine
-    /// empty, it costs a stream between two hosts, and a member who could
-    /// start them could move their own VMs around somebody else's fleet all
-    /// afternoon.
-    ///
-    /// So `Tenant` for the read half, `Infra` for the write half, which is
-    /// exactly what "a move is an operation" means. Squeezing it into either
-    /// of those two would have got one of the halves wrong.
-    ///
-    /// A `Router` is here by the same argument, one noun over: it is the
-    /// tenant's way out and their business to read, and making one names the
-    /// operator's provider network and takes a gateway slot on the operator's
-    /// machines. A member who could create routers could fill every gateway
-    /// node in the fleet an afternoon.
+    /// Tenant-scoped reads with operator-only writes, used for migrations
+    /// and routers that consume fleet or gateway capacity.
     TenantOperated,
 }
 
-/// Which class a resource falls in.
-///
-/// `certificatesigningrequests` is in two of them, and that split IS the
-/// design: creating, reading and deleting your own request is `CsrCreate` and
-/// open to anybody the directory knows, and saying yes to one is `Directory`
-/// and an admin's. `classify` only ever produces `Verb::Approve` for the
-/// `/approval` subresource, so the verb is enough to tell them apart.
+/// Classify CSR approval as directory administration; other CSR operations
+/// use CsrCreate. Only the approval subresource produces `Verb::Approve`.
 pub fn class_of(resource: &str, verb: Verb) -> Class {
     match resource {
         Tenant::RESOURCE | User::RESOURCE => Class::Directory,
@@ -1028,23 +803,14 @@ pub fn class_of(resource: &str, verb: Verb) -> Class {
             Class::TenantOperated
         }
         r if is_tenant_scoped(r) => Class::Tenant,
-        // Everything else is the estate: clusters, nodes, storage pools,
-        // floating pools, routed subnets, the provider networks a cluster
-        // gave an interface away for — and the event log, which is a read of
-        // what happened to the estate and is filtered by the handler for a
-        // caller confined to one tenant.
+        // Remaining resources use infrastructure policy. Event handlers additionally
+        // filter inventory for tenant-confined callers.
         _ => Class::Infra,
     }
 }
 
-/// The least role that may do `verb` to something in `class`.
-///
-/// `None` is "nobody but `system:masters`", and it is what the two
-/// unreachable cells of the table say: there is no approving a VM and no
-/// approving a node.
-///
-/// This function IS the policy. Everything above it decides which cell to
-/// look in and everything below it compares two roles.
+/// Minimum role for a resource class and verb.
+/// None denotes an unsupported combination, bypassed only by masters policy.
 pub fn least_role(class: Class, verb: Verb) -> Option<Role> {
     match (class, verb) {
         // Who exists, and who may say yes to a certificate. One answer.
@@ -1147,13 +913,8 @@ pub struct OwnPeer<'a> {
     pub forwarded: bool,
 }
 
-/// What a tenant-scoped object says about whose it is.
-///
-/// Both fields default to "nobody's": an object written before this milestone
-/// carries neither, and a member may neither read nor write it. That is the
-/// conservative direction of the two — the alternative, treating an unscoped
-/// object as everybody's, would have made every VM in the lab visible to the
-/// first member somebody created.
+/// Object ownership and public-read scope. Defaults provide neither tenant
+/// ownership nor public access, so members cannot access unscoped legacy objects.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Scope<'a> {
     pub tenant: Option<&'a str>,
@@ -1175,14 +936,9 @@ impl<'a> Scope<'a> {
     }
 }
 
-/// The object half of the policy: may this caller do this to THIS object.
-///
-/// Runs in the handler rather than the middleware, and it has to: the
-/// middleware sees a method and a path, and whose an object is is a fact
-/// about the object. A handler that forgets to ask is the hole this design
-/// has, which is why every one of them asks through this one function and why
-/// the list handlers filter through it too — an object a member may not read
-/// must not appear in a list either, or the name alone leaks the inventory.
+/// Check object scope after resource/verb authorization.
+/// Handlers must call this after loading ownership, and listings must filter
+/// equivalently to avoid exposing unauthorized inventory.
 pub fn permits_object(
     identity: &Identity,
     role: Option<Role>,
@@ -1193,10 +949,8 @@ pub fn permits_object(
     if identity.is_system() || role == Some(Role::Admin) {
         return true;
     }
-    // Viewer, Member and Operator are all inside the tenancy, and the whole
-    // difference between them is the VERB — which is `permits`' question,
-    // asked before this one. Here the question is only whose the object is,
-    // and it has the same answer for all three.
+    // Remaining tenant-scoped operations require a directory role and tenant;
+    // verb permissions have already been checked separately.
     let Some(role) = role else {
         return false;
     };
@@ -1205,18 +959,8 @@ pub fn permits_object(
     };
     let own = scope.tenant == Some(mine);
     match verb {
-        // An operator reads every tenant's objects and a public image is
-        // somebody else's object that everybody may boot from; neither is
-        // somebody else's object that anybody may edit.
-        //
-        // The operator half is the same line `Grant::confined_to` draws one
-        // tier up, said about ONE object rather than about a listing, and the
-        // two have to agree: a listing that hands an operator every VM in the
-        // cloud and a GET that refuses the one they clicked is an API that
-        // contradicts itself in two requests. An estate you can see the names
-        // of and not the objects of is not one you can run — and `logs` and
-        // `events` hang off the same permission, which is the half an
-        // operator actually needs at three in the morning.
+        // Operators may read across tenants; public images are also readable.
+        // Neither exception grants cross-tenant writes.
         Verb::Read => role >= Role::Operator || own || scope.public,
         // Belt and braces with `permits`, which has already refused a viewer
         // this: a viewer sees its tenant and `public`, and writes nothing.
@@ -1425,11 +1169,7 @@ mod tests {
         ));
     }
 
-    /// The assignment rule of the network half, at the verb level: what
-    /// EXISTS — the pools an operator was given, the subnets an operator
-    /// carved — is an administrator's, and taking one address out of a pool
-    /// is self-service. The quota behind that door is what bounds it, and a
-    /// public pool's quota is zero.
+    /// Members may reserve floating addresses but cannot create pools or subnets.
     #[test]
     fn a_member_takes_addresses_but_never_makes_pools_or_subnets() {
         let m = member("alice");
@@ -1562,12 +1302,7 @@ mod tests {
         ));
     }
 
-    /// The whole table, one assertion per cell.
-    ///
-    /// Written out rather than derived from `least_role`, which is the point:
-    /// a test that computed the answer the same way the code does would pass
-    /// whatever the policy said. This is the policy, spelled a second time by
-    /// hand, and a change to `least_role` has to be made here too.
+    /// Assert each permission-table cell from independent expected policy values.
     #[test]
     fn every_cell_of_the_permission_table() {
         use Role::{Admin, Member, Operator, Viewer};
@@ -1656,10 +1391,7 @@ mod tests {
             ]);
         }
 
-        // TenantOperated: read like a tenant's object, write like the estate.
-        // The two of them, and the split is the whole class — a member sees
-        // whether their router is up and cannot make one, because a router
-        // takes a gateway slot on the operator's machines.
+        // TenantOperated permits tenant reads but requires operator privileges to write.
         for resource in ["vmmigrations", "routers"] {
             by_role(&[
                 (Viewer, resource, Verb::Read, true),
@@ -1772,13 +1504,8 @@ mod tests {
         assert!(!seen(shared, Verb::Write));
     }
 
-    /// The change this table makes on purpose, and the one existing test it
-    /// breaks: a machine identity has NOTHING at REST.
-    ///
-    /// `system:nodes` and `system:clusters` speak the gRPC session, which is
-    /// the only door they need. Until now a node's key was a key to every
-    /// object of every tenant through this one, for no purpose anybody could
-    /// name.
+    /// Machine identities without an authorized sibling context have no REST access,
+    /// except through the masters override.
     #[test]
     fn a_machine_identity_has_nothing_at_rest_except_break_glass() {
         let node = Identity::new("system:node:manacor", vec![GROUP_NODES.into()]);
@@ -1855,15 +1582,8 @@ mod tests {
         );
     }
 
-    /// D2's other half: the one WRITE a sibling may pass on, and everything
-    /// it may not.
-    ///
-    /// A node patch at the cloud does not go into the shared store — it
-    /// travels down the cluster's gRPC session, and only one replica holds
-    /// it. So `node cordon` answered 503 on two of three replicas and the
-    /// client had to guess. The door this opens is exactly one route wide,
-    /// and it needs both halves: this tier's own certificate, which nothing
-    /// outside the control plane holds, AND the forward header.
+    /// Forwarded node writes require both the exact sibling credential and
+    /// the forwarding marker; other writes remain refused.
     #[test]
     fn a_sibling_may_pass_on_a_node_patch_and_nothing_else() {
         let cloud = Identity::new("system:cloud:lab", vec![GROUP_CLOUDS.into()]);
@@ -1889,12 +1609,8 @@ mod tests {
             "the header is what says a person asked for this, once"
         );
 
-        // The third route of this table, and the one the lab found missing:
-        // `vm migrate` asked at the cloud travels down the CLUSTER's session
-        // as CreateVmMigration, so it is the node patch's shape exactly. The
-        // forward was built for it and the door was not opened, so the verb
-        // worked on one replica in three and answered
-        // "system:cloud:cloud may not Write vmmigrations" on the other two.
+        // Cloud migration requests may forward to the sibling holding the cluster
+        // session, using the same restricted-write mechanism as node patches.
         let a_migration = Attempt {
             resource: crate::resources::VmMigration::RESOURCE,
             subresource: None,
@@ -1945,13 +1661,8 @@ mod tests {
         assert!(!permits(&node, None, None, &node_of_a_cluster, forwarded));
     }
 
-    /// The second forwarded write, one tier down (D-P2): a live migration is
-    /// the one object at the cluster whose commands have to reach two nodes,
-    /// and their sessions can hang off two replicas.
-    ///
-    /// The same three rules as the node patch above — this tier's own
-    /// certificate, the header, and that one route — because it is the same
-    /// door with a second entry and not a second door.
+    /// A cluster sibling may forward migration commands only with its exact identity,
+    /// the forwarded marker and the permitted route.
     #[test]
     fn a_sibling_may_pass_on_a_migration_command_and_still_nothing_else() {
         let cluster = Identity::new("system:cluster:cluster-1", vec![GROUP_CLUSTERS.into()]);
@@ -2000,10 +1711,8 @@ mod tests {
         assert_eq!(attempt.verb, Verb::Write);
     }
 
-    /// And the path really does classify the way the rule assumes. A rule
-    /// written against `resource`/`subresource` that `classify` never
-    /// produces would be a door that is open and unreachable, or shut and
-    /// believed open.
+    /// Route classification must produce the resource and verb the forwarding
+    /// authorization rule expects.
     #[test]
     fn a_node_patch_classifies_as_a_write_on_a_cluster_subresource() {
         let attempt = classify(
@@ -2048,11 +1757,7 @@ mod tests {
         }
     }
 
-    /// A public image is somebody else's object every tenant may boot from —
-    /// and nobody else's to edit. The two halves are the whole point of the
-    /// flag: without the read half every tenant needs its own catalogue entry
-    /// for the same file, and without the write half `--public` would be a
-    /// way to hand an image to anybody who asks.
+    /// Public images permit cross-tenant reads while retaining owner-only writes.
     #[test]
     fn a_public_image_is_readable_by_every_tenant_and_writable_by_its_own() {
         let alice = member("alice");
@@ -2082,15 +1787,7 @@ mod tests {
         ));
     }
 
-    /// The line an operator's job is drawn at: every object's CONTENTS, and
-    /// only its own tenant's WRITES.
-    ///
-    /// It is `Grant::confined_to`'s line, said about one object. Before this,
-    /// a listing showed an operator every VM in the cloud and the GET on any
-    /// one of them was a 403 — the API contradicting itself in two requests,
-    /// and `logs` and `events` refused along with it. Read is where an
-    /// operator's job lives; write stays where a tenant boundary is worth
-    /// something.
+    /// Operators read across tenants but write only within their own tenant.
     #[test]
     fn an_operator_reads_every_tenants_objects_and_writes_only_its_own() {
         let olivia = Identity::new("olivia", vec![GROUP_OPERATORS.into()]);
@@ -2207,11 +1904,8 @@ mod tests {
         assert!(shared.may_speak_for("node", "manacor-b"));
     }
 
-    /// The kind is half of the name. One CA signs nodes and clusters both,
-    /// and the cloud's session port trusts that CA — so a check that only
-    /// compared within a kind made every node's key a key to the cloud
-    /// session of any cluster, under a name the cloud would then log as the
-    /// cluster's.
+    /// Peer authorization includes kind as well as name, preventing a node
+    /// certificate from impersonating a cluster signed by the same CA.
     #[test]
     fn a_node_certificate_may_not_speak_for_a_cluster() {
         let node = Identity::new("system:node:manacor", vec![GROUP_NODES.into()]);
@@ -2270,11 +1964,7 @@ mod tests {
 
     // --- lane 5A: revocation ------------------------------------------
 
-    /// A CA, two leaves with serials this test chose, and a signed CRL over
-    /// whichever of them the caller names. Real DER and real signatures, for
-    /// the same reason `ca_and_leaf` is real: what is being tested is that a
-    /// revocation is READ, and a hand-built fixture would prove the parser
-    /// runs.
+    /// Generate a CA, two chosen leaf serials and a signed CRL for revocation tests.
     fn ca_leaves_and_crl(
         revoke: &[u64],
         crl_number: u64,
@@ -2505,11 +2195,7 @@ mod tests {
         assert_eq!(revocations.list().crl_number, Some(3));
     }
 
-    /// Astra finding F14, 2026-09-23: this reload used to trust whatever
-    /// mtime/size said had changed, with no check that the new list is
-    /// actually newer. Restoring an earlier CRL over the same path --
-    /// lower crl number, and it does not revoke the serial the later one
-    /// did -- used to be accepted outright, un-revoking it.
+    /// Reject CRL rollback so replacing a file cannot undo accepted revocations.
     #[test]
     fn restoring_an_older_crl_does_not_forget_a_later_revocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -2550,10 +2236,7 @@ mod tests {
         assert_eq!(revocations.list().crl_number, Some(8));
     }
 
-    /// Astra finding F14, 2026-09-23: a crl number is supposed to be unique
-    /// per list, so two files that carry the SAME number but disagree on
-    /// content are not "the same list twice" -- one of them is wrong, and
-    /// neither is trusted over what is already enforced.
+    /// Reject changed CRL content that reuses an already accepted number.
     #[test]
     fn a_repeated_crl_number_with_different_content_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -2573,10 +2256,7 @@ mod tests {
         assert_eq!(revocations.list().crl_number, Some(8));
     }
 
-    /// The order the check runs in. A serial is a number somebody else can
-    /// choose, so it means nothing until it is known which CA issued it:
-    /// refusing on the serial alone would let anybody with a self-signed
-    /// certificate pick a number and lock a node out.
+    /// Reject a foreign issuer before interpreting its serial as a local revocation.
     #[test]
     fn a_foreign_certificate_with_a_revoked_serial_is_refused_as_foreign() {
         let dir = tempfile::tempdir().unwrap();
@@ -2596,14 +2276,8 @@ mod tests {
         assert!(err.contains("no configured CA"), "{err}");
     }
 
-    /// And the OTHER half of D11, one layer down: rustls itself refuses the
-    /// handshake of a revoked client.
-    ///
-    /// The test lives here and not beside `pki::tls`, because minting a CA,
-    /// a serving certificate and a signed CRL is what `rcgen` is for and
-    /// this is the crate that has it. What it proves is the belt to the
-    /// application check's braces: a certificate on the list at start-up
-    /// does not reach an authenticator at all.
+    /// A CRL loaded into rustls rejects revoked clients at the handshake, before
+    /// application authentication. Runtime reload is tested separately.
     #[tokio::test]
     async fn rustls_refuses_the_handshake_of_a_revoked_client() {
         use rcgen::{
@@ -2688,12 +2362,8 @@ mod tests {
             }
         });
 
-        // The whole exchange and not only the connect: under TLS 1.3 the
-        // client is finished before the server has looked at its
-        // certificate, so the refusal arrives as an alert on the first read.
-        // What is asserted is therefore what a client actually gets — no
-        // bytes — which is also what the REST edge would turn into a failed
-        // request.
+        // Read after connecting: TLS 1.3 can deliver the server's client-certificate
+        // rejection as an alert on the first read rather than during client connect.
         let dial = |cert: std::path::PathBuf, key: std::path::PathBuf| {
             let ca_path = ca_path.clone();
             async move {

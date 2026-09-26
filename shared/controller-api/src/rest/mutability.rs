@@ -6,64 +6,28 @@
 
 use super::*;
 
-/// One field an update may not change, and the half-sentence that says why.
-///
-/// The rule, whole, and the reason the two kinds share a type: *a field the
-/// controller acts on exactly once — when it creates the thing — is
-/// immutable; a field a controller WRITES belongs to the server; everything
-/// else is free.* Both are refusals to a client and both name a path, so what
-/// differs between them is only the sentence, and the sentence belongs beside
-/// the field rather than in a second enum.
+/// Update restriction for a dotted field path, with a client-facing reason.
+/// The kind distinguishes immutable, server-owned and structurally mutable fields.
 #[derive(Clone, Copy, Debug)]
 pub struct Owned {
     /// A dotted path into the serialised object: `spec.vm`, `spec.nodeName`.
     pub path: &'static str,
-    /// Which of the two this is. The refusal is the same either way; a client
-    /// reading the published table needs to tell them apart, because they are
-    /// different sentences to a person: "you cannot change this, ever" and
-    /// "this is not yours to set".
+    /// Published restriction kind so clients can distinguish ownership from shape
+    /// and lifetime immutability.
     pub kind: Mutability,
     /// What follows the path in the refusal. Written to read as one sentence:
     /// `"is immutable; delete the vm and create it again"`.
     pub because: &'static str,
-    /// What is KNOWN to be coming for this field, if anything — published
-    /// beside the refusal so a client learns it from the server rather than
-    /// from a release note.
-    ///
-    /// Not a second reason and never part of the 422: a refusal is about
-    /// today, and mixing "you may not" with "you will be able to" into one
-    /// sentence would make the message longer without making it truer. It is
-    /// here because `/schemas` is what a form reads, and a form that greys a
-    /// field out can say why it is grey AND that it will not always be.
-    ///
-    /// `None` for almost every row, which is the honest default: most
-    /// immutable fields are immutable because the thing they describe was
-    /// decided once, and nothing is coming for them.
+    /// Optional schema guidance, separate from the current refusal reason.
+    /// This note does not change enforcement or the 422 response.
     pub note: Option<&'static str>,
-    /// For a [`Mutability::Structural`] row: whether a given change is one of
-    /// the changes this field allows.
-    ///
-    /// `check_owned` asks THIS instead of comparing the two values, so the
-    /// row is enforced in the same one place every other row is. That is the
-    /// whole reason it is a field and not a second check beside the table: a
-    /// structural rule enforced somewhere else is a rule the next handler
-    /// forgets to call.
-    ///
-    /// A pair and not a projection, because the two rules that need it are
-    /// different shapes. `spec.vm` freezes a PART of the document and could
-    /// be written as "project, then compare"; `spec.sizeGib` may only grow,
-    /// which no projection of one side can express — it is a fact about the
-    /// two numbers together. One signature covers both, and the projection
-    /// version is one line inside the predicate.
-    ///
-    /// A function pointer and not a closure, so the tables stay `const`.
+    /// Allowed old/new-value predicate for a Structural field. `check_owned`
+    /// uses it instead of equality, covering partial immutability and grow-only
+    /// values through one enforcement path. Function pointers keep tables const.
     pub permits: Option<fn(&serde_json::Value, &serde_json::Value) -> bool>,
 }
 
-/// Why a field may not be written.
-///
-/// Published under `/schemas` so a form can grey a field out with a reason
-/// rather than discovering it as a 422 after somebody typed.
+/// Field restriction published with schemas for client-side editing guidance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mutability {
@@ -71,14 +35,8 @@ pub enum Mutability {
     Immutable,
     /// A controller writes it.
     ServerOwned,
-    /// Immutable in its SHAPE: parts of it may change and the rest may not,
-    /// and the `because` sentence says which is which.
-    ///
-    /// The third word exists because the second one became a lie. `spec.vm`
-    /// is immutable in everything except `volumes[]` from its second entry
-    /// on — a disk plugged into a running VM is an edit of the spec, not a
-    /// verb — and a form that greyed the whole document out on the strength
-    /// of "immutable" would be greying out the one part a tenant may use.
+    /// Only selected structural changes are allowed, as defined by the predicate
+    /// and explanation; for example, referenced-disk hot-plug within a VM spec.
     Structural,
 }
 
@@ -117,15 +75,8 @@ impl Owned {
         }
     }
 
-    /// A field that is fixed in SOME way rather than in every way: `permits`
-    /// says which changes go through, and `check_owned` asks it instead of
-    /// comparing.
-    ///
-    /// One row, one enforcement point, and that is deliberate. The
-    /// alternative — leaving the field out of the table and checking it in
-    /// the two update handlers — is a rule the third handler forgets, and the
-    /// first field this exists for is `spec.vm`, where forgetting means a
-    /// client rewriting a booted VM's kernel command line.
+    /// Define a field with an allowed-change predicate, enforced by the
+    /// same `check_owned` loop as other mutability rules.
     pub const fn structural(
         path: &'static str,
         because: &'static str,
@@ -150,22 +101,9 @@ impl Owned {
     }
 }
 
-/// Refuse an update that changes a field it does not own.
-///
-/// Before this, every one of these fields was silently put back: `update_vm`
-/// at the cluster reset `spec.nodeName` to the stored value, the cloud reset
-/// `spec.clusterName` and `spec.tenant`, and a client that sent something
-/// else got 200 and an object that was not what it sent. That is the lie this
-/// removes — and for `spec.vm` it is worse than a lie, because a node takes a
-/// spec once and "delete it and make it again" is, with volumes that do not
-/// survive a VM today, somebody's data.
-///
-/// A value equal to the stored one passes. A value that DIFFERS is 422, and
-/// that includes a field left out of a PUT: a PUT already has to round-trip
-/// the object it read — that is where its `resourceVersion` comes from — so a
-/// body that dropped a field is a body that means to clear it. PATCH never
-/// meets this: the patch is merged onto the stored object first, so a field
-/// the patch does not mention is already the stored value.
+/// Reject changes to server-owned or immutable fields with 422. Equal
+/// values round-trip. Omitting a field from PUT means clearing it; PATCH
+/// merges onto the stored object before this check.
 pub fn check_owned<T: serde::Serialize>(
     current: &T,
     next: &T,
@@ -197,12 +135,8 @@ pub fn check_owned<T: serde::Serialize>(
     Ok(())
 }
 
-/// A dotted path into a document, or `Null` where nothing is.
-///
-/// Absent and `null` come out the same, deliberately: a field left out of a
-/// body and a field written as `null` are the same statement about it, and a
-/// rule that told them apart would depend on whether a struct spells its
-/// empty case `Option::None` or `skip_serializing_if`.
+/// Read a dotted JSON path, treating an absent value as null so optional-field
+/// serialization choices do not alter ownership checks.
 pub(super) fn at<'a>(document: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
     const NOTHING: &serde_json::Value = &serde_json::Value::Null;
     let mut here = document;
@@ -231,11 +165,7 @@ pub fn carry_generation<S: serde::Serialize, St>(
     Ok(())
 }
 
-/// The envelope a POST or PUT body has to wear, read off the type the handler
-/// deserialised it into. Checked at every write edge of both tiers, because a
-/// body that names another kind is a client sending the wrong document to the
-/// right URL — and the fields it does not know about would be defaulted away
-/// silently.
+/// Validate apiVersion and kind against the handler's resource type.
 pub fn check_envelope<S, St>(body: &Object<S, St>) -> std::result::Result<(), ApiError>
 where
     Object<S, St>: Resource,

@@ -81,11 +81,7 @@ impl TestIdp {
         )
     }
 
-    /// A token with whatever header the test wants, signed for real.
-    ///
-    /// The signature is genuine even when the header lies about it, which is
-    /// exactly the shape of the algorithm-confusion attack: a real signature
-    /// under a header that asks for it to be checked another way.
+    /// Sign test claims with a caller-supplied header, including deliberately mismatched algorithms.
     pub fn sign_with(&self, header: &Value, claims: &Value) -> String {
         let signing_input = format!(
             "{}.{}",
@@ -99,7 +95,7 @@ impl TestIdp {
         format!("{signing_input}.{}", b64(sig.as_ref()))
     }
 
-    /// The same token with one bit of the signature turned over.
+    /// Generate a token with one flipped signature bit.
     pub fn tampered(&self, claims: &Value) -> String {
         let token = self.token(claims);
         let (head, sig) = token.rsplit_once('.').expect("three parts");

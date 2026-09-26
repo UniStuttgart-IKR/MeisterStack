@@ -59,12 +59,11 @@ message AgentMessage {
 }
 // Interactive consoles share the command session. ConsoleOpen, data and close
 // messages use one session_id. A dropped transport ends the console. Agents
-// bound output buffering so a slow console cannot indefinitely block status.
+// use bounded output buffers.
 
 message ConsoleOpen {
   string session_id = 1;
-  // The uid at the tier below, exactly as FetchLogs and CreateInstance carry
-  // one: a name is a label people reuse.
+  // VM name on cloud-to-cluster requests; VM UID on cluster-to-agent requests.
   string vm_id = 2;
 }
 
@@ -335,8 +334,9 @@ message ControllerMessage {
 }
 
 // Complete managed VM intent sent after Hello. Entries reuse idempotent
-// CreateInstance semantics. Missing managed records enter teardown; local
-// VMs are retained. Deleting controller objects are omitted and continue
+// CreateInstance semantics. Missing managed records become Absent unless an
+// incoming attempt protects them; operation barriers still gate teardown.
+// Local VMs remain. Deleting controller objects are omitted and continue
 // through the controller finalizer/Destroy path.
 message SyncState {
   repeated CreateInstance desired = 1;
@@ -640,9 +640,8 @@ message ClusterStatus {
   // Cloud-owned volumes, including terminating objects, identified by
   // the UIDs supplied on CreateVolume.
   repeated VolumeStatusReport volumes = 8;
-  // Completeness of the cluster-owned volume inventory. Missing entries
-  // from an incomplete list do not establish deletion. Node-local absence
-  // one tier below has different ownership semantics.
+  // Completeness of cloud-managed volume objects held by this cluster.
+  // Missing entries from an incomplete list do not establish deletion.
   bool volumes_complete = 9;
   // Cluster pool observations, including driver-reported locality used
   // by cloud placement. See StoragePoolStatusReport.
@@ -659,9 +658,8 @@ message ClusterStatus {
   // are cloud UIDs. The cluster fills active node and candidate nodes so
   // gateway failover is visible at the cloud.
   repeated RouterReport routers = 14;
-  // Completeness of the cluster-owned volume inventory. Missing entries
-  // from an incomplete list do not establish deletion. Node-local absence
-  // one tier below has different ownership semantics.
+  // Completeness of cloud-managed router objects held by this cluster.
+  // Record absence does not prove node cleanup has completed.
   bool routers_complete = 15;
   // Cloud-managed secret UIDs and generations held by the cluster. The cloud
   // avoids resending unchanged copies and removes mirrors absent upstream.
@@ -744,15 +742,12 @@ message VolumeStatusReport {
   string reason = 9;
 }
 
-// One node, as the cluster sees it. Spec and status flattened into one
-// message on purpose: this is a report and not an object, and the tier above
-// keeps no Node of its own to merge it into.
+// Node intent and observations mirrored into cloud-side Node objects.
 message NodeReport {
   string name = 1;
   // The agent has a session AND its heartbeat has not expired.
   bool ready = 2;
-  // What an operator decided about it — `spec.schedulable`. False is drained:
-  // nothing new is placed here and everything already here goes on running.
+  // spec.schedulable: false cordons new placement without evicting existing VMs.
   bool schedulable = 3;
   // `spec.labels`, what a vm's nodeSelector selects against.
   map<string, string> labels = 4;
@@ -884,9 +879,8 @@ message CreateRouter {
   repeated string announced = 8;
 }
 
-// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
-// cloud removal waits for cluster absence. DropSnapshot is the separate
-// node command that removes backend data.
+// Delete the cluster router record. Node sweeps clean up remaining namespaces;
+// neither this ACK nor cluster inventory absence proves node cleanup completed.
 message DeleteRouter {
   string name = 1;
   // Same rule as CreateRouter: only the object carrying this uid is ours to
@@ -964,9 +958,8 @@ message CreateVolume {
   string tenant = 4;
 }
 
-// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
-// cloud removal waits for cluster absence. DropSnapshot is the separate
-// node command that removes backend data.
+// Set deletionTimestamp on the cluster volume. Its finalizer uses
+// DeprovisionVolume for backend cleanup; cloud removal waits for cluster absence.
 message DestroyVolume {
   string name = 1;
   // Same rule as CreateVolume: only the object carrying this uid is ours to
@@ -1064,9 +1057,8 @@ message CreateVm {
   repeated string routed_subnets = 6;
 }
 
-// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
-// cloud removal waits for cluster absence. DropSnapshot is the separate
-// node command that removes backend data.
+// Set deletionTimestamp on the cluster VM. Its finalizer uses DestroyInstance
+// for node cleanup; cloud removal waits for cluster absence.
 message DestroyVm {
   string name = 1;
   // Same rule as CreateVm: only the object carrying this uid is ours to stamp.

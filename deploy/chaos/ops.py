@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The verbs. Everything the chaos loop and the scenario catalog can do to the
-lab, and nothing that judges the result — judging is invariants.py's job.
+"""REST requests, fixture operations and fault injection for the lab harness.
 
-Blackbox on purpose: the REST tiers and a shell on the nodes, no product code.
+These helpers can mutate controller resources, services and host networking.
+Topology, credentials and cleanup limits are documented in README.md.
 """
 
 import json
@@ -29,15 +29,7 @@ class ApiError(Exception):
 
 
 def call(ip, port, method, path, body=None, timeout=20):
-    # Names travel in the path and the lab accepts names a path cannot hold
-    # verbatim; quote the last segment so the CLIENT is never the thing that
-    # fails when the server took something odd.
-    # Quote the NAME, not the query (D-H7). The name is the last path segment
-    # and the lab accepts names a path cannot hold verbatim, so it has to be
-    # quoted -- but the split used to take everything after the last slash,
-    # query string included, and turned `/routers/lab-out?tenant=lab` into
-    # `/routers/lab-out%3Ftenant%3Dlab`. That is a 404 with no hint, and every
-    # tenant-scoped GET in this harness was quietly getting one.
+    # Quote the final path segment without encoding the query delimiter.
     path, qsep, query = path.partition("?")
     head, sep, tail = path.rpartition("/")
     if sep and tail:
@@ -163,6 +155,8 @@ def wait_phase(name, want, timeout=120, where="cloud", cname="cluster-1"):
     return wait_for(lambda: (lambda o: o if phase_of(o) == want else None)(getter()), timeout)
 
 
+# The getters return None for every non-200 response, so this currently treats
+# HTTP failures as disappearance as well as 404.
 def wait_gone(name, timeout=180, where="cloud", cname="cluster-1"):
     getter = (lambda: cloud_vm(name)) if where == "cloud" else (lambda: cluster_vm(cname, name))
     return wait_for(lambda: getter() is None, timeout)
@@ -204,12 +198,10 @@ def kill_vmm(node, vm_uid):
 
 
 def partition(node, peer_ips, on=True, port=50051):
-    """Blackhole (DROP, not reject) this node's control-plane traffic.
+    """Install nft DROP rules for this node's session traffic.
 
-    nft and not iptables: the lab's agent VMs are NixOS and carry no iptables
-    at all, so the first version of this silently did nothing and reported a
-    partition that never happened. Only the session port is dropped, never a
-    whole host — the ssh this harness rides on shares the wire.
+    Uses the shared inet chaos table; no automatic expiry is installed here.
+    Inspect the returned status and remove the table after the experiment.
     """
     ips = ", ".join(peer_ips)
     if on:
@@ -257,15 +249,9 @@ def finding(fid, tag, seed, msg):
 
 
 def _mine(o, prefix):
-    """Is this object one of ours?
+    """Match object name, tenant or pool against a prefix.
 
-    By NAME where the harness chose the name, and by the tenant or the pool
-    where it did not -- which is the hole D-H2 was: a floating address is
-    named after the ADDRESS (`198.51.100.1`), so the name filter skipped every
-    one of them, the pool could then not be deleted because addresses were out
-    of it, and the tenant could not be deleted because it held them. Three
-    objects left standing, and `tenant rm` answering `409 ... still has
-    floating addresses` to whoever cleaned up by hand afterwards.
+    This is a naming convention, not proof that this run created the object.
     """
     meta, spec = o.get("metadata") or {}, o.get("spec") or {}
     for value in (meta.get("name"), spec.get("tenant"), spec.get("pool")):
@@ -275,34 +261,11 @@ def _mine(o, prefix):
 
 
 def cleanup(prefix="chaos-", passes=3, settle=15):
-    """Delete every object this harness could have created, on both tiers.
+    """Attempt prefix-based deletion across selected cloud and cluster kinds.
 
-    The ORDER is the rule and it is the reverse of how things are made: what
-    holds something is deleted after the thing it holds. A tenant with a
-    floating address, a pool with an address out of it and a storage pool with
-    a volume in it each refuse to go, correctly -- so the cluster's objects go
-    first, then the cloud's, and the tenants last.
-
-    And then again, twice: a delete refused because a finalizer had not run
-    yet succeeds on the second pass, which is cheaper than teaching this
-    function every wait in the control plane. `passes` exists so a run that
-    cleans nothing stops after one.
-
-    **With time between them, which is what "on the second pass" assumes and
-    which nothing here provided.** Three passes ran back-to-back in under two
-    seconds, and tearing a guest down takes ten to twenty — so a refusal that
-    a later pass was meant to survive met exactly the same estate each time.
-    `settle` makes the sentence above true. It is NOT offered as the
-    explanation of the one leak round 4's e2e saw: that run left
-    `chaos-ten-35` standing, empty and deletable by hand a minute later, and
-    probes at four, six and one vm — cloud tier and cluster tier — deleted
-    their tenant on the first pass every time. What that leak was is written
-    down and not closed.
-
-    Which is why the second half of this exists: **what survives is named.**
-    A cleanup that returns only what it killed reports a clean lab either
-    way, and the leftover above was found by reading `tenant ls` afterwards
-    rather than by anything here.
+    Repeat passes allow some finalizers to progress, then log survivors.
+    A recorded DELETE acceptance is not proof that an object disappeared.
+    Cloud snapshots, migration records and cluster routers are not enumerated.
     """
     killed = []
     for attempt in range(passes):
@@ -350,11 +313,10 @@ def cleanup(prefix="chaos-", passes=3, settle=15):
 
 
 def survivors(prefix="chaos-", settle=10):
-    """Everything of this harness's that is still there after a cleanup.
+    """List matching objects after a bounded settling delay.
 
-    Asked once, after the passes and after a pause long enough for a `202` to
-    become a `404`: an object on its way out is not a leak, and calling one
-    would make this line noise that nobody reads.
+    Only the enumerated kinds and successful API responses contribute results;
+    an empty result does not establish complete cleanup.
     """
     time.sleep(settle)
     left = []
@@ -375,15 +337,7 @@ def survivors(prefix="chaos-", settle=10):
 
 
 def unlabel_nodes(prefix="chaos-"):
-    """Take this harness's labels off every node of every cluster.
-
-    The other half of D-H2, and the one nothing was even trying to do:
-    `chaos-l0` and `chaos-l1` were still stuck to all five agents after the
-    run, and it was `meister-deploy check` that found them rather than the
-    harness. A label is not an object, so no delete could ever have reached
-    it -- it is a key in `spec.labels` and comes off with a patch that sets
-    it to null.
-    """
+    """Remove matching label keys from reachable cluster Node objects."""
     taken = []
     for cn in CLUSTERS:
         c, b = cluster(cn, "GET", "/nodes")
@@ -451,18 +405,10 @@ def _match(proto, side, port, peer=None):
 
 
 def shape(where, cond, seconds, matches, wire=WIRE):
-    """Put `cond` on the traffic `matches` names, and nothing else.
+    """Replace the interface root qdisc and apply filters for the requested traffic.
 
-    The self-lift is a transient systemd timer, not a backgrounded shell: the
-    first version built that timer as a nested `nohup setsid sh -c "..."` string
-    and the escaping collapsed on the way through ssh, so the `tc qdisc del`
-    inside it ran immediately instead of in three minutes. The qdisc was gone
-    before the first packet, `tc qdisc show` still said `mq`, and the shaping
-    silently did nothing. Position 1's ping proof is what caught it -- which is
-    exactly why the brief asks for two numbers before the first cell.
-
-    Raises if the qdisc or the filters are not actually on the wire afterwards.
-    A shaper that reports success it did not achieve is worse than none.
+    Validate the resulting qdisc/filter shape and request a systemd cleanup
+    timer. Timer creation is not checked. Existing qdisc state is not saved.
     """
     if cond not in CONDS:
         raise ValueError(f"unknown condition {cond}; have {sorted(CONDS)}")
@@ -500,7 +446,7 @@ def shape(where, cond, seconds, matches, wire=WIRE):
 
 
 def unshape(where, wire=WIRE):
-    """Idempotent. Safe on a node that was never shaped."""
+    """Delete the interface root qdisc and cleanup timer. Prior qdisc state is not restored."""
     unit = f"chaos-unshape-{wire}"
     return _on(where, f"systemctl stop {unit}.timer 2>/dev/null; "
                       f"systemctl reset-failed {unit}.timer {unit}.service 2>/dev/null; "
@@ -560,7 +506,10 @@ def shape_link(link, cond, seconds):
 
 
 def unshape_all(ends=None):
-    """Lift everything, everywhere. Called in every `finally` and at cleanup."""
+    """Attempt qdisc removal on the given targets or the fixed fleet.
+
+    Exceptions and remote return codes are not reflected in the returned list.
+    """
     targets = ends if ends is not None else (
         list(NODE_HOST) + list(CLOUD) + list(CLUSTER1) + list(CLUSTER2))
     lifted = []
@@ -600,14 +549,10 @@ def nft_drop(where, rules, on=True):
 
 
 def voice_holder(cname="cluster-1"):
-    """Which cluster replica currently speaks to the cloud.
+    """Return the first cluster replica with a matching established cloud connection.
 
-    `Cluster.status.sessionEndpoint` names the CLOUD end of the speaking
-    session, not the cluster end, so it cannot answer this. Asking each replica
-    whether it holds an ESTABLISHED connection to a cloud on the session port
-    can. Without this a C cell shapes a fixed replica and, four times out of
-    five, shapes one that was not speaking -- which is exactly why the first
-    run's C cells all reported `voice_moves: 0`.
+    Multiple replicas may hold such connections; this is not authoritative
+    evidence of the cloud registry's selected speaker.
     """
     peers = "|".join(CLOUD)
     for ip in CLUSTERS[cname]:
@@ -667,7 +612,7 @@ def unpartition(ends):
 
 
 def ping_rtt(frm, to, count=10):
-    """Median RTT in ms as one node sees another, or None when nothing came back."""
+    """Return the ping summary's average RTT in milliseconds, or None without a parsed reply."""
     rc, out = _on(frm, f"ping -c {count} -i 0.3 -W 3 {to} 2>/dev/null | tail -2")
     for line in out.splitlines():
         if "min/avg/max" in line or "rtt" in line:

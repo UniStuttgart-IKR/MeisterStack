@@ -1,35 +1,12 @@
 #!/usr/bin/env python3
-"""The transport, after Image 58 turned auth on.
+"""Shared urllib transport for the chaos harness.
 
-The harness was written against a lab whose REST ports were plain http. Since
-Image 58 both tiers require mTLS (`chain = ["mtls"]` at the cluster,
-`["mtls", "oidc"]` at the cloud), and every request the old transport made
-died at the first byte:
+CHAOS_CA, CHAOS_CERT and CHAOS_KEY override files under CHAOS_PKI_DIR
+(default /mnt/vmstore/MeisterStack/labpki). The default client is the root
+break-glass identity. Missing any file, or CHAOS_SCHEME=http, selects HTTP.
 
-    ApiError HTTP 0: BadStatusLine:  2
-
-That is TLS answering a client that spoke http — not a bug in the lab, and not
-something a scenario can work around. So the transport learns TLS here, in one
-place, and `ops.py` and `invariants.py` ask this module for their opener.
-
-The credential is the break-glass identity (CN=root, O=system:masters) from
-`tools/meister-ca --admin root`, the same one `cli.mtls.toml` names. It is the
-only credential that gets through both tiers: a user certificate is refused at
-the cluster, which keeps no user directory. The harness is an operator tool
-run by hand against a lab, and this is the operator's key.
-
-Everything is overridable from the environment, so a lab with its own PKI
-needs no edit here:
-
-    CHAOS_PKI_DIR   default /mnt/vmstore/MeisterStack/labpki
-    CHAOS_CA        default $CHAOS_PKI_DIR/ca.crt
-    CHAOS_CERT      default $CHAOS_PKI_DIR/root.crt
-    CHAOS_KEY       default $CHAOS_PKI_DIR/root.key
-    CHAOS_SCHEME    force "http" to talk to a lab that has auth off
-
-`verify_hostname` is off and the CA check is on, deliberately: the serving
-certificates are issued to the node names, the harness dials IP addresses, and
-weakening the CA check instead would be the wrong half to give up.
+HTTPS validates the CA chain but disables hostname verification. This trusts
+any accepted CA-issued server identity rather than authenticating the target IP.
 """
 
 import os
@@ -47,7 +24,7 @@ _opener = None
 
 
 def available():
-    """Is there TLS material to use? No = the lab still speaks http."""
+    """Whether local TLS files exist and HTTP was not forced; this does not probe the server."""
     if os.environ.get("CHAOS_SCHEME") == "http":
         return False
     return all(os.path.exists(p) for p in (CA, CERT, KEY))
@@ -63,9 +40,7 @@ def context():
     if _ctx is None:
         _ctx = ssl.create_default_context(cafile=CA)
         _ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
-        # The certificates name nodes; the harness dials IPs. Keep the CA
-        # check, drop the name check -- the other way round would be the
-        # weakening that actually matters.
+        # CA validation remains enabled; target-name verification is disabled.
         _ctx.check_hostname = False
     return _ctx
 
@@ -95,18 +70,10 @@ def describe():
 
 
 def probe(ip, port, path, scheme_="https", client_cert=True, timeout=10):
-    """One question about an edge, answered with a NUMBER.
+    """Return an HTTP status, or 0 for a transport failure.
 
-    Deliberately not `ops.call`: that one is the harness talking to a lab it
-    trusts, with the break-glass identity and a raised exception when the
-    transport fails. This is the opposite -- it asks what the edge does to a
-    caller who has less, and the transport failing IS the answer.
-
-    Returns the http status, or 0 for "nothing answered": no listener, a
-    connection refused, a handshake the edge would not do. A security
-    statement made of these three numbers is a measurement; the same
-    statement written as a constant survives the change that disproves it
-    (D-H1).
+    No listener, timeout and TLS refusal are indistinguishable at zero.
+    Certificate loading can fail before the request reaches this handler.
     """
     ctx = None
     if scheme_ == "https":

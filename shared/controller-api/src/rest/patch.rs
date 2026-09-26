@@ -59,13 +59,8 @@ where
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string())
         })?;
         let mut sent = sent.clone();
-        // `lastHeartbeat` is served, not stored (D-C7): a GET joins it in from
-        // the lease, and what etcd still holds under that key is the instant
-        // left there before the field moved out. So what a client read and
-        // what the store has never agree, and neither is the client's to
-        // send. Left in the comparison, every `node label` and every cordon
-        // was a 422 — the regression S1 and S11 found the night the lease
-        // shipped.
+        // Exclude lastHeartbeat from echoed-status comparison: GET joins it from the
+        // lease, while stored object status can contain an older value.
         for status in [&mut held, &mut sent] {
             if let Some(fields) = status.as_object_mut() {
                 fields.remove("lastHeartbeat");
@@ -91,15 +86,8 @@ where
 
 // --- the merge patch --------------------------------------------------------
 
-/// JSON Merge Patch, RFC 7386, and nothing else.
-///
-/// Object into object recursively, `null` deletes the key, everything else
-/// replaces what was there — arrays included, whole. That last clause is the
-/// format's one sharp edge and it is deliberate: there is no way to say
-/// "append", so a patch that means to change one element of a list sends the
-/// list. JSON Patch (RFC 6902) is the format that can, and it costs a client
-/// a document nobody can read; Strategic Merge is the one Kubernetes grew
-/// afterwards, and it costs a SERVER a merge key per field.
+/// JSON merge patch: recursively merge objects, delete null-valued
+/// members, and replace scalars or whole arrays. There is no append operation.
 pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     let serde_json::Value::Object(fields) = patch else {
         *target = patch.clone();
@@ -164,22 +152,12 @@ where
     })
 }
 
-/// How many times an unconditional PATCH reads, merges and writes before it
-/// gives the client the conflict.
-///
-/// Three, and the number is a budget rather than a guess: each pass costs one
-/// read and one write, the writer being lost to is the heartbeat and it
-/// touches an object every three seconds, and a client that has already
-/// failed twice in the microseconds between a read and a write is looking at
-/// something other than a race. An unbounded retry would be a handler that
-/// never returns while a hot object stays hot.
+/// Bounded read/merge/CAS attempts for a PATCH without resourceVersion.
+/// Return conflict when concurrent writes exhaust the budget.
 pub const PATCH_ATTEMPTS: u32 = 3;
 
-/// Did the client state the version it means to patch against?
-///
-/// `null` counts as not stating one: in a merge patch `null` REMOVES a key,
-/// so a body that says `"resourceVersion": null` has asked for the version to
-/// be dropped, which is the unconditional case spelled out loud.
+/// Whether the patch supplies a non-null resourceVersion condition.
+/// Null removes that field under merge-patch semantics and is unconditional.
 pub(super) fn patch_states_version(patch: &serde_json::Value) -> bool {
     patch
         .get("metadata")

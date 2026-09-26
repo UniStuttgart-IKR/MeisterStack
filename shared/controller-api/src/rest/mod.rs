@@ -44,20 +44,13 @@ pub use patch::*;
 pub use schemas::*;
 pub use status::*;
 
-/// The peer's certificate chain, leaf first, DER.
-///
-/// Put on the request by the accept loop below and read by the authenticator
-/// chain. Absent means plain HTTP, or TLS where the peer sent no certificate
-/// — to an authenticator those are the same thing, and the difference is not
-/// worth a second variant.
+/// DER peer certificate chain, leaf first, attached by the listener.
+/// Absence means either plaintext or TLS without a presented client certificate.
 #[derive(Clone, Debug, Default)]
 pub struct PeerCerts(pub Vec<Vec<u8>>);
 
-/// Serve the API on `listener`, terminating TLS if there is a config for it.
-///
-/// The plain path is the same `axum::serve` call this has always been. The
-/// TLS path is a hand-rolled accept loop for one reason only: it is the only
-/// way to get the peer's certificate onto the request.
+/// Serve HTTP or TLS. The TLS accept loop additionally attaches peer
+/// certificates for request authentication.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
@@ -79,12 +72,7 @@ pub async fn serve(
                 continue;
             }
         };
-        // Measured, not assumed: without this a plain-http request on
-        // loopback answers in 0.4ms and a TLS one in 43ms. The handshake
-        // itself costs under 3ms — the other 40 are one delayed ACK, because
-        // Nagle holds the small record that completes the exchange until the
-        // peer acknowledges the previous one. axum::serve leaves this to the
-        // caller (its `tap_io`), and this loop IS the caller.
+        // Disable Nagle to avoid delayed-ACK latency for small TLS records.
         if let Err(e) = stream.set_nodelay(true) {
             debug!(%peer, error = format!("{e:#}"), "could not set TCP_NODELAY");
         }
@@ -141,32 +129,17 @@ fn deny(
         "reason": reason,
         "message": message,
     });
-    // `details` carries exactly one thing today and is left out when it has
-    // nothing: an empty object in every error body would be a field a client
-    // learns to ignore. It is K8s' extension point and it is not being
-    // filled in ahead of a use.
+    // Omit details unless there is a structured field path to report.
     if let Some(field) = field {
         body["details"] = serde_json::json!({ "field": field });
     }
     (status, axum::Json(body)).into_response()
 }
 
-/// `axum::Json`, with this API's refusal instead of axum's plain text.
-///
-/// A drop-in: it extracts and it renders, so a handler writes `Json` and
-/// means both, exactly as before. The only difference is the third of the
-/// three refusals above — a body that does not parse, or that parses into
-/// something this route does not read.
-///
-/// 400 `BadRequest` for both, deliberately, where axum splits them into 400
-/// and 422. 422 in THIS API means "the request is well-formed and cannot be
-/// carried out" — the mutability table, a quota, a name rule — and it is
-/// answered by a handler that read the object. A body that never became an
-/// object was not understood at all, and giving it the same word as a quota
-/// refusal would put two very different things under one code.
-///
-/// The serde sentence travels as-is. It names the field and the offset, which
-/// is the one piece of information the client cannot work out for itself.
+/// JSON extractor/response using the shared Status error envelope.
+/// Malformed JSON and deserialization failures are 400 BadRequest;
+/// handlers reserve 422 for understood but invalid requests. Preserve
+/// the serde error details.
 pub struct Json<T>(pub T);
 
 impl<T, S> axum::extract::FromRequest<S> for Json<T>
@@ -194,28 +167,15 @@ impl<T: serde::Serialize> IntoResponse for Json<T> {
     }
 }
 
-/// What a handler answers with when it cannot answer with the object: the
-/// status, the K8s-style machine-readable `reason`, and the sentence a person
-/// reads. Both tiers serve the same API shape, so an error from one has to
-/// look like an error from the other — down to the body, which is the one
-/// `deny` above already writes for the refusals the guard makes.
-///
-/// The fields are private on purpose: the constructors below are the whole
-/// vocabulary, and a status paired with a reason nobody else uses is how two
-/// endpoints start answering the same problem differently.
-///
-/// `Debug` so that a test — and a `?` in a log line — can see WHICH refusal
-/// this is. It prints the fields; the constructors stay the only way to make
-/// one.
+/// Shared handler error: HTTP status, stable reason and readable message.
+/// Private fields keep status/reason combinations behind named constructors.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     reason: &'static str,
     message: String,
-    /// The path this refusal is about, where it is about one — `details.field`
-    /// in the body. Set by `invalid_field` and by nothing else: a client that
-    /// wants to point at the input that was wrong needs the path in a form it
-    /// did not have to parse out of a sentence.
+    /// Optional structured input path, emitted as details.field without requiring
+    /// clients to parse the message.
     field: Option<String>,
 }
 
@@ -229,10 +189,7 @@ impl ApiError {
         }
     }
 
-    /// The sentence a person reads, for the one caller that is not an HTTP
-    /// handler: the cluster's session, which has to put this refusal into a
-    /// `CommandResult` so that it comes out of the cloud's REST edge as the
-    /// cluster's own words rather than as "the command failed".
+    /// Message reused when a REST refusal travels through a session CommandResult.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -241,10 +198,7 @@ impl ApiError {
         self.status
     }
 
-    /// The path this refusal is about, where it is about one. `details.field`
-    /// as a caller inside the process sees it — `vm_spec`'s tests, which have
-    /// to say that a serde sentence arrived with an address and not only with
-    /// prose.
+    /// Structured field path for in-process callers and validation tests.
     pub fn field(&self) -> Option<&str> {
         self.field.as_deref()
     }
@@ -372,14 +326,8 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for DryRun {
     }
 }
 
-/// The `dryRun` value out of a raw query string, percent-decoding nothing:
-/// the only value that means anything is an ASCII word, and a value that
-/// needed decoding is a value that is wrong.
-///
-/// Written by hand rather than through a typed `Query`, because a typed one
-/// would have to be a struct per route — every list route already has its own
-/// — and `serde_urlencoded` refuses a query with keys the struct does not
-/// name.
+/// Extract the first literal dryRun query value without percent-decoding.
+/// Only the expected ASCII spelling is accepted.
 fn dry_run_value(query: &str) -> Option<&str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -389,13 +337,8 @@ fn dry_run_value(query: &str) -> Option<&str> {
 
 // --- narrowing a listing ----------------------------------------------------
 
-/// The two things a client may ask a list route to narrow by.
-///
-/// Both are FILTERS and neither is a permission: a listing hands out what the
-/// caller may see and these say which part of it to render. A member asking
-/// for another tenant's objects gets an empty list rather than a 403, because
-/// "there is nothing here for you" is what a filter says and the refusal was
-/// already made, once, by `permits_object`.
+/// Additional list filters applied within authorized inventory.
+/// A confined caller filtering for another tenant receives an empty list.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ListQuery {
     /// `labelSelector=k=v,k2=v2`, matched against `metadata.labels`.
@@ -406,14 +349,8 @@ pub struct ListQuery {
     pub tenant: Option<String>,
 }
 
-/// Equality selectors, comma-separated, and deliberately nothing else.
-///
-/// Kubernetes' set-based half (`in`, `notin`, `!k`) is not here and is not
-/// missing: it is a second grammar to parse, a second thing to document and a
-/// second thing to get subtly wrong, and every use this control plane has for
-/// a selector — a nodeSelector, a clusterSelector, `node ls -l zone=lab` — is
-/// an equality. When something needs the other half it can be added; until
-/// then a selector is a thing an operator can read at a glance.
+/// Comma-separated equality selectors. Set membership and negation syntax
+/// are unsupported.
 #[derive(Debug, Default)]
 pub struct Selector(Vec<(String, String)>);
 
@@ -459,11 +396,7 @@ impl Selector {
 
 // --- cors -------------------------------------------------------------------
 
-/// The REST edge's own configuration table (`[api]`).
-///
-/// One key today. Its own table rather than two more top-level keys because
-/// what belongs to the HTTP edge and what belongs to the control plane are
-/// different things to reason about, and `[auth]` set the shape.
+/// HTTP-edge configuration under the shared `[api]` table.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
@@ -476,10 +409,8 @@ pub struct ApiConfig {
 /// What a request's `Origin` is allowed to be answered with, if anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Allow {
-    /// The configured `*`. Answered as `*`, and deliberately without
-    /// `Allow-Credentials` — the standard forbids the pair, and a browser
-    /// that saw both would drop the response, so sending them would be a
-    /// wildcard that silently works for nothing.
+    /// Wildcard origin response without Allow-Credentials, which cannot be combined
+    /// with wildcard Access-Control-Allow-Origin.
     Any,
     /// The caller's exact origin, echoed. Never the configured LIST: a
     /// browser matches one value against its own origin, and a list is a
@@ -487,11 +418,8 @@ enum Allow {
     Exact(String),
 }
 
-/// Decide, from the configured list and the request's `Origin`.
-///
-/// Exact string equality and nothing else. Origins are already a normalised
-/// form — scheme, host, optional port — and a matcher with wildcards or
-/// suffix rules is how `https://ui.lab.example.attacker.com` gets let in.
+/// Allow an exact configured Origin or the explicit wildcard entry.
+/// Do not interpret suffixes or partial host patterns.
 fn allow_origin(configured: &[String], origin: Option<&str>) -> Option<Allow> {
     let origin = origin?;
     if configured.iter().any(|o| o == "*") {
@@ -512,35 +440,19 @@ impl Allow {
     }
 }
 
-/// The methods this API answers on an object route. Written out rather than
-/// read off the router: a preflight is a promise about what a browser may
-/// send next, and it should say what this API serves and not what one path
-/// happens to have registered.
+/// Methods advertised by API CORS preflight; individual route support may vary.
 const CORS_METHODS: &str = "GET, POST, PUT, PATCH, DELETE";
 
-/// What a browser is allowed to send. `Content-Type` is on the list because
-/// `application/merge-patch+json` is not one of the three values a browser
-/// sends without asking — which is exactly why a PATCH triggers a preflight
-/// at all.
+/// Allowed browser request headers. Merge-patch JSON requires Content-Type
+/// permission during preflight.
 const CORS_HEADERS: &str = "Authorization, Content-Type";
 
 /// How long a browser may remember a preflight, in seconds.
 const CORS_MAX_AGE: &str = "600";
 
-/// Put the CORS layer in front of a router — and in front of its GUARD.
-///
-/// The ordering is the whole of why this is written by hand rather than
-/// layered on afterwards: a preflight carries no `Authorization` header by
-/// definition, so anything that authenticates before it is answered turns
-/// every browser request into a 401 that the browser reports as a CORS
-/// failure. So this goes outermost, and the caller wraps `guard`'s result.
-///
-/// An empty list is the default and means no CORS headers anywhere,
-/// preflights included: a browser then gets nothing, which is what an API
-/// with no web interface in front of it should give it. An origin that is not
-/// on the list is answered exactly as one that sent no `Origin` at all — the
-/// browser blocks the answer, and the server has not lied about who may read
-/// it.
+/// Wrap the authentication guard with CORS so unauthenticated browser
+/// preflights can be answered. Empty allowed origins emits no CORS
+/// headers; unlisted origins receive no browser access grant.
 pub fn cors(router: Router, origins: Vec<String>) -> Router {
     router.layer(axum::middleware::from_fn_with_state(
         Arc::new(origins),
@@ -553,10 +465,7 @@ async fn cors_layer(
     req: Request,
     next: Next,
 ) -> Response {
-    // The API and nothing else. `/healthz` and `/readyz` are a load
-    // balancer's and a probe's, not a page's — and leaving them entirely
-    // untouched is what keeps "is this replica up" an answer with no
-    // negotiation in it.
+    // Apply CORS only to API routes, leaving health and readiness probes unchanged.
     if !req.uri().path().starts_with("/apis/") {
         return next.run(req).await;
     }
@@ -599,16 +508,9 @@ async fn cors_layer(
     response
 }
 
-/// Build the server TLS config, if the operator asked for one.
-///
-/// `None` back means plain HTTP, which is the default and the shape the lab
-/// runs in today. Half a config — a certificate without its key — is an
-/// error rather than a silent downgrade to plain: that is precisely the
-/// mistake that would leave an API server open while its operator believes
-/// otherwise.
-/// `crl` (lane 5A) is the revocation list rustls checks a client certificate
-/// against during the handshake. It is read here, once: what reloads while
-/// the process runs is `auth::Revocations`, which both ports consult.
+/// Build optional REST TLS. No configuration selects HTTP; a partial
+/// certificate/key pair is an error. TLS loads its CRL at startup;
+/// application revocation checks reload separately.
 pub fn server_tls(
     cert: Option<&std::path::Path>,
     key: Option<&std::path::Path>,

@@ -12,23 +12,14 @@
 use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhaseKind};
 use crate::scheduler::Capacity;
 
-/// The fence every write that makes `tenant` hold more goes through — VMs
-/// and storage alike, one door per tenant. See [`crate::store::Fence`].
-///
-/// Everything below here answers "would this tenant be inside its ceiling";
-/// the fence is what makes that answer still true at the moment of the write.
-/// Without it the check was a check-then-act, and two admissions that both
-/// looked before either wrote both got in (F03).
+/// Per-tenant admission fence shared by VM and storage writes.
+/// Callers read it before usage and compare it during writes to detect races.
 pub fn fence(tenant: &str) -> String {
     format!("quota/{tenant}")
 }
 
-/// What a tenant holds, and what it would hold.
-///
-/// One type for both, because the check is the same question either way:
-/// take the usage, put the change into it, and ask whether the result is
-/// inside the ceiling. A create is "plus this VM", an update is "minus the
-/// old size, plus the new one", and neither needs a rule of its own.
+/// Existing or prospective VM usage. Updates subtract the old VM and add its
+/// replacement; creates only add the new demand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub vms: u32,
@@ -36,12 +27,8 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// What this tenant holds, out of the whole VM listing.
-    ///
-    /// `except` is the VM being changed, by name, and it is what makes an
-    /// update one rule rather than two: the object as it stands is taken out
-    /// of the sum and put back at its new size by the caller. `None` for a
-    /// create, which is taking nothing out.
+    /// Sum tenant VM usage, excluding the named current VM during an update.
+    /// The caller adds the replacement size; creates pass no exclusion.
     pub fn of(tenant: &str, vms: &[Vm], except: Option<&str>) -> Self {
         vms.iter()
             .filter(|v| v.spec.tenant.as_deref() == Some(tenant))
@@ -67,14 +54,8 @@ impl Usage {
     }
 }
 
-/// Would this usage be inside the ceiling? The sentence names WHICH limit.
-///
-/// An unset limit is unlimited, checked field by field, so a tenant with a VM
-/// count and no memory ceiling is a perfectly ordinary thing to configure.
-///
-/// The message says the number that was hit and the number that stands, both,
-/// because "quota exceeded" sends an operator to look up what their quota
-/// actually is and a sentence that says it does not.
+/// Check each configured limit and name the requested total and exceeded ceiling.
+/// Unset limits are independent and unlimited.
 pub fn check(quota: &TenantQuota, tenant: &str, after: Usage) -> Result<(), String> {
     let over = |what: &str, want: u64, limit: u64| {
         format!("tenant {tenant} would hold {want} {what}, and its quota is {limit}")
@@ -97,12 +78,7 @@ pub fn check(quota: &TenantQuota, tenant: &str, after: Usage) -> Result<(), Stri
     Ok(())
 }
 
-/// How much storage a tenant holds in ONE pool, and what it would hold.
-///
-/// Per pool and not per tenant, because that is where the number an
-/// administrator wrote lives: a tenant with a hundred GiB on the fast NVMe
-/// pool and a terabyte on the spinning one is an ordinary thing to configure,
-/// and one tenant-wide ceiling could not say it.
+/// Tenant storage usage within one pool, matching per-pool quota configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageUsage {
     pub volumes: u32,
@@ -110,16 +86,9 @@ pub struct StorageUsage {
 }
 
 impl StorageUsage {
-    /// What this tenant holds in this pool, out of the whole volume listing.
-    ///
-    /// `except` is the volume being changed, by name — the same seam
-    /// [`Usage::of`] has, so that resizing one is measured exactly like
-    /// creating one that size.
-    ///
-    /// Every phase counts, `Releasing` included: the bytes are on a disk
-    /// until the deprovision finishes, and a tenant that could delete a
-    /// volume and immediately create its replacement would hold twice its
-    /// quota for as long as the release took.
+    /// Count this tenant's volumes in the pool, excluding the named volume
+    /// being replaced or resized. All phases count, including Releasing,
+    /// until deprovisioning removes the resource.
     pub fn of(tenant: &str, pool: &str, volumes: &[Volume], except: Option<&str>) -> Self {
         volumes
             .iter()
@@ -137,17 +106,9 @@ impl StorageUsage {
     }
 }
 
-/// Would this usage be inside the pool's ceiling for this tenant?
-///
-/// The ceiling comes from [`StoragePool::quota_for`] and is never optional:
-/// unlike a tenant quota, a storage pool always has a number, because it is a
-/// finite disk and "unlimited" would be a claim about hardware. Zero is a
-/// perfectly ordinary value and means "an admin hands these out one at a
-/// time" — the same door `DEFAULT_QUOTA_PUBLIC` closes on the address side.
-///
-/// The message says the number that was hit and the number that stands, both,
-/// exactly as [`check`] does: "quota exceeded" sends an operator to look up
-/// what their quota is, and a sentence that says it does not.
+/// Check the pool's per-tenant ceiling and report limit plus requested
+/// usage. Pool ceilings are numeric, including zero; tenant-wide optional
+/// quotas use the separate `check` path.
 pub fn check_storage(pool: &StoragePool, tenant: &str, after: StorageUsage) -> Result<(), String> {
     let limit = pool.spec.quota_for(tenant);
     if after.gib > limit {
@@ -160,12 +121,8 @@ pub fn check_storage(pool: &StoragePool, tenant: &str, after: StorageUsage) -> R
     Ok(())
 }
 
-/// Whether this volume still holds room on a backend.
-///
-/// Every phase does, and the function exists to say so in one place rather
-/// than to filter: a `Failed` volume may have got half-way, a `Releasing` one
-/// is definitely still there, and a `Pending` one is what the tenant asked
-/// for. If a phase ever stops counting, it stops counting here.
+/// All volume phases reserve quota, including Pending, Failed and Releasing.
+/// Only object removal releases that accounting.
 pub fn holds_room(phase: VolumePhaseKind) -> bool {
     match phase {
         VolumePhaseKind::Pending
@@ -281,10 +238,7 @@ mod tests {
         assert!(check(&quota(None, None, Some(1_000_000)), "acme", after).is_ok());
     }
 
-    /// The update rule, which is the one that gets forgotten: raising an
-    /// existing VM's vCPUs is the same act as creating one that size, and it
-    /// goes through the same arithmetic — the object as it stands comes out
-    /// of the sum, and its new size goes back in.
+    /// Updates count replacement VM capacity through the same arithmetic as creates.
     #[test]
     fn growing_a_vm_is_measured_the_same_way_as_creating_one() {
         let vms = fleet();
@@ -382,10 +336,8 @@ mod tests {
         assert!(err.contains("storage pool fast"), "{err}");
     }
 
-    /// A tenant nobody named gets the default, and it is not zero: disk is
-    /// something the machine has, unlike a routable address, which somebody
-    /// gave the operator. An admin who wants a ticket per volume writes a
-    /// zero, and then nothing gets through.
+    /// Tenants without an explicit pool entry receive its default quota;
+    /// an explicit zero denies allocation.
     #[test]
     fn an_unnamed_tenant_gets_the_default_and_a_zero_closes_the_door() {
         let open = pool("fast", &[]);
@@ -401,12 +353,7 @@ mod tests {
         assert!(err.contains("quota there is 0 GiB"), "{err}");
     }
 
-    /// D-P11: the hundred GiB stops being a number only the source knows.
-    ///
-    /// `storagepool ls` showed `QUOTA -` while a create was refused with "its
-    /// quota there is 100 GiB", and there was nowhere to look the number up
-    /// or change it for a tenant nobody had named yet. The `*` row is both:
-    /// what the pool applies, written down, and the thing to patch.
+    /// The wildcard quota row exposes and configures the pool default.
     #[test]
     fn the_ceiling_for_everybody_nobody_named_is_a_row_like_any_other() {
         use crate::resources::StoragePoolSpec;
@@ -455,10 +402,7 @@ mod tests {
         assert_eq!(shut.spec.quota_for("newcomer"), 0);
     }
 
-    /// Growing an existing volume is measured exactly like creating one that
-    /// size — the object as it stands comes out of the sum, and its new size
-    /// goes back in. The same rule the VM half has, and the one that gets
-    /// forgotten.
+    /// Volume growth replaces old size in usage rather than counting both copies.
     #[test]
     fn growing_a_volume_is_measured_the_same_way_as_creating_one() {
         let fast = pool("fast", &[("acme", 200)]);
@@ -474,10 +418,7 @@ mod tests {
         assert!(check_storage(&fast, "acme", over).is_err());
     }
 
-    /// Every phase holds room, `Releasing` included. Without that a tenant
-    /// deletes a volume, creates its replacement in the same second, and
-    /// holds twice its quota for as long as the release takes — which is
-    /// exactly as long as somebody's VM keeps running.
+    /// Deleting volumes continue consuming quota until their objects are removed.
     #[test]
     fn a_volume_on_its_way_out_still_holds_its_room() {
         for phase in VolumePhaseKind::ALL {

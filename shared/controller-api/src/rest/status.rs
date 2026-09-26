@@ -6,40 +6,19 @@
 
 use super::*;
 
-/// The `kind` every refusal of this API wears.
-///
-/// Kubernetes' own, and here for Kubernetes' reason: every OTHER answer this
-/// API gives is an object with a `kind`, so a client that switches on `kind`
-/// had one special case — the errors, which were
-/// `{"error": ..., "reason": ...}` and nothing else. Now there is no special
-/// case, and "read `kind`" is the whole of what a client has to know.
+/// Kind used by the shared error envelope.
 pub const KIND_STATUS: &str = "Status";
 
-/// The three refusals that come from axum and not from a handler, given the
-/// same body as every other one.
-///
-/// A client that switches on `body.kind` had a special case left after
-/// `KIND_STATUS` landed, and it was the whole first row of an API: a path
-/// nobody serves, a method a path does not have, and a body that is not JSON
-/// are all answered BEFORE any handler runs, and axum answers them in plain
-/// text. So the one thing a client must know — read `kind` — stopped being
-/// true exactly where a client is most likely to be wrong.
-///
-/// Both tiers wrap their router in this, and it is the last thing wrapped so
-/// that it sees the whole route table. The `Json` extractor below is the
-/// third of the three; it cannot live here because it is a type a handler
-/// names.
+/// Use the shared Status envelope for unknown routes and unsupported
+/// methods. Wrap the complete router; malformed bodies are handled by
+/// the separate Json extractor.
 pub fn statuses(router: Router) -> Router {
     router
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)
 }
 
-/// 404 for a path this endpoint does not serve, naming the method and the
-/// path. Not the bare "no route": which endpoint a client is talking to is
-/// half the answer here — the two tiers serve DIFFERENT resource sets on the
-/// same paths, and "no route for GET /apis/meister.io/v1/tenants" against a
-/// cluster is a complete diagnosis where "404" is a puzzle.
+/// Return a Status 404 naming the unsupported method and path.
 pub(super) async fn no_route(method: axum::http::Method, uri: axum::http::Uri) -> Response {
     deny(
         StatusCode::NOT_FOUND,
@@ -49,12 +28,8 @@ pub(super) async fn no_route(method: axum::http::Method, uri: axum::http::Uri) -
     )
 }
 
-/// 405 for a path that exists without this method.
-///
-/// The `Allow` header is axum's: it knows the methods the route has and adds
-/// the header to whatever this returns, as long as this does not set one
-/// itself. So the header is right by construction rather than by a second
-/// list here that could disagree with the routes.
+/// Return a Status 405. Axum supplies Allow from registered route methods;
+/// this response deliberately does not override it.
 pub(super) async fn wrong_method(method: axum::http::Method, uri: axum::http::Uri) -> Response {
     deny(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -69,28 +44,12 @@ pub(super) async fn wrong_method(method: axum::http::Method, uri: axum::http::Ur
 
 // --- readiness --------------------------------------------------------------
 
-/// How long `/readyz` waits for the store before it calls itself not ready.
-///
-/// One second, and it is a SECOND bound inside the store's own five: the
-/// store's timeout is a liveness bound for work that has to finish, and this
-/// is a probe a load balancer asks every few seconds. A probe that took five
-/// seconds to say "not ready" is a probe that keeps sending traffic to a
-/// replica that cannot serve it for as long as it takes to notice.
+/// Readiness probe deadline, shorter than ordinary store-operation timeouts.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// What `/readyz` answers, at both tiers.
-///
-/// `/healthz` stays "the process is alive" and this is "the process can
-/// serve", which are different questions and used to have the same answer:
-/// both routes were the same handler, so a replica whose etcd was gone
-/// answered `ok` to readiness and 500 to every real request — and kept
-/// getting traffic from the load balancer in front of it.
-///
-/// Ready means "can read and write", and the store is the whole of that. A
-/// session to the cloud or to a node is deliberately NOT part of it: a
-/// replica with no session serves every REST request correctly, and a
-/// readiness that included sessions would take a whole tier out of rotation
-/// because one gRPC stream was reconnecting.
+/// Read/write readiness against etcd. Peer sessions are excluded: their
+/// normal reconnects do not make the REST process unusable. `/healthz`
+/// checks process liveness separately.
 pub async fn readiness(store: &EtcdStore) -> Response {
     match tokio::time::timeout(READY_TIMEOUT, store.probe()).await {
         Ok(Ok(())) => (StatusCode::OK, "ok").into_response(),
@@ -114,12 +73,7 @@ pub(super) fn not_ready(why: &str) -> Response {
     )
 }
 
-/// Is the thing gone, or going?
-///
-/// The one difference a client has to act on, and the only reason a DELETE
-/// needs two codes: a resource whose teardown is somebody else's work is
-/// still readable after the request, and a client that polled for its
-/// disappearance would otherwise never learn whether to.
+/// Whether DELETE completed immediately or started asynchronous teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
     /// It is not there any more. `200`.
@@ -129,19 +83,8 @@ pub enum Removal {
     Going,
 }
 
-/// The one body a DELETE answers with, whatever the resource.
-///
-/// Before this there were four shapes behind one verb: the object itself, a
-/// `{"deleted": name}`, the same with an extra key, and a
-/// `{"releasing": …, "attachedTo": …}`. A client had to know, per resource,
-/// which one it was about to get — which is exactly the thing a
-/// machine-readable envelope exists to prevent, and what the tofu provider
-/// wrote down as its own workaround.
-///
-/// It is K8s' `Status`, and it is the SAME envelope every refusal already
-/// wears (see `deny`): `kind`, `code`, `reason`, `message`, and `details` for
-/// whatever this particular resource has to add. So the rule a client learns
-/// once — read `kind` — holds for the whole verb.
+/// Shared DELETE Status envelope. Immediate deletion returns 200;
+/// accepted cleanup with remaining finalizers returns 202.
 pub struct Removed {
     removal: Removal,
     message: String,

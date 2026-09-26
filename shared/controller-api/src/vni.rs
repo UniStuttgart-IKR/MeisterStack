@@ -15,28 +15,16 @@ use crate::store::{EtcdStore, Result, StoreError};
 /// The counter object's name. `<prefix>/registry/counters/vni`.
 pub const COUNTER_VNI: &str = "vni";
 
-/// Where allocation starts when a config names no floor.
-///
-/// Ten thousand rather than one: a lab that also runs somebody else's VXLAN
-/// deployment collides less if the two do not both start at the bottom, and a
-/// VNI an operator sees in a `tcpdump` is easier to recognise as ours when it
-/// is not `1`.
+/// Default configurable VNI allocation floor. It does not coordinate with
+/// independent VXLAN deployments.
 pub const DEFAULT_VNI_BASE: u32 = 10_000;
 
-/// A VNI is 24 bits (RFC 7348 §5). Zero is excluded here rather than in the
-/// kernel: `id 0` is a legal VXLAN device and a terrible tenant, because
-/// "unset" and "tenant zero" would be the same number in every JSON document
-/// this stack writes.
+/// Maximum 24-bit VNI. The allocator excludes zero so it cannot be confused
+/// with an unset network identifier.
 pub const VNI_MAX: u32 = 0x00FF_FFFF;
 
-/// The arithmetic half, with no store in it: what a counter standing at
-/// `current` hands out under floor `base`, and what it is left standing at.
-///
-/// The floor is applied on every allocation and not only on the first, so
-/// raising `vni_base` in a config moves the allocator forward instead of
-/// being a setting that quietly did nothing after the first tenant. Lowering
-/// it does nothing at all, which is the honest behaviour: the numbers below
-/// have already been handed out.
+/// Choose the next VNI at or above both the counter and configured floor.
+/// Raising the floor advances allocation; lowering it cannot reuse earlier IDs.
 pub fn next_vni(current: Option<u32>, base: u32) -> Result<(u32, u32)> {
     let base = base.max(1);
     let issued = current.unwrap_or(base).max(base);
@@ -117,16 +105,8 @@ pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
     touched
 }
 
-/// Does this NIC name a provider network rather than an overlay?
-///
-/// A non-empty string, so that `"physnet": ""` and `"physnet": null` both read
-/// as "said nothing" — a client that clears the field must not end up with a
-/// NIC on no network at all, which is what an emptiness-blind check would
-/// produce.
-///
-/// Here rather than at the call site because two readers ask it: the
-/// injection above, and `scheduler::resource_requests`, which turns the same
-/// field into the demand for a node that actually holds that interface.
+/// Whether the NIC selects a nonempty provider physnet. Empty or null
+/// means no provider selection for both VNI injection and scheduling.
 pub fn on_a_provider_network(nic: &serde_json::Map<String, serde_json::Value>) -> bool {
     physnet_of(nic).is_some()
 }
@@ -203,11 +183,7 @@ mod tests {
         assert_eq!(spec["nics"][1]["vxlan_id"], 10_007);
     }
 
-    /// 6k's third decision, and the gap it closes: a NIC that names a
-    /// provider network hangs on the provider bridge, so the tenant's VNI
-    /// must not be written into it. Before this, every NIC without a
-    /// `vxlan_id` of its own got one, and there was no way to say "outside"
-    /// at all.
+    /// Provider NICs must not receive the tenant overlay VNI.
     #[test]
     fn a_nic_on_a_provider_network_never_gets_the_tenants_vni() {
         let mut spec = serde_json::json!({

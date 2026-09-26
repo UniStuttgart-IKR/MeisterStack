@@ -15,29 +15,11 @@ use crate::object::Resource;
 use crate::resources::{Event, EventSpec, EventType};
 use crate::store::{EtcdStore, StoreError};
 
-/// How long an event stays readable.
-///
-/// One hour, and the number is a trade between two failures. Too short and
-/// the record is gone before anybody looks at it — the whole point is being
-/// able to ask afterwards why a VM failed three times. Too long and `count`
-/// stops meaning anything: an object that has been aggregating for a week
-/// says "this happened 4000 times" about a period nobody has in mind.
-///
-/// An hour is the span an operator is actually asking about when a VM will
-/// not come up, and it bounds the store at "one object per (thing, reason)
-/// that happened in the last hour" rather than at anything that grows.
+/// Event retention from creation. Aggregation preserves this original lease.
 pub const TTL_SECS: i64 = 3600;
 
-/// The reasons, as a closed set.
-///
-/// Short CamelCase words, Kubernetes' own convention, and the rule that comes
-/// with it is the one a metric label has: a reason is what a filter matches
-/// and what an aggregation groups by, so it may never carry a number, a name
-/// or a sentence. Those go in the message.
-///
-/// Constants rather than free strings because the aggregation key is built
-/// from this: two spellings of the same reason are two objects that each
-/// count half of what happened.
+/// Stable event reason keys. Names, counts and free-form details belong
+/// in messages, since reason participates in filtering and aggregation.
 pub mod reason {
     /// A VM was bound to a node or a cluster.
     pub const SCHEDULED: &str = "Scheduled";
@@ -59,20 +41,10 @@ pub mod reason {
     /// A peer's heartbeat stopped, or came back.
     pub const PEER_LOST: &str = "PeerLost";
     pub const PEER_READY: &str = "PeerReady";
-    /// A live migration entered a phase. One event per phase, on the
-    /// migration object itself and not on the VM — a VM's history is what
-    /// happened to the guest, and the phases of a move belong to the record
-    /// of that move. The two that also matter to the guest (it arrived; it
-    /// did not) are written on the VM as `Scheduled` and as this.
+    /// Migration phase transition recorded on the migration object.
+    /// Guest-relevant outcomes may also produce VM events.
     pub const MIGRATING: &str = "Migrating";
-    /// A router's ACTIVE machine changed — the failover, as an event.
-    ///
-    /// Beside `PHASE_CHANGED` and not folded into it, because they are two
-    /// different facts and only one of them is the one somebody is paged
-    /// about: a router that goes Active→Active on a new machine has not
-    /// changed phase at all, and that is exactly the moment a tenant's
-    /// traffic moved. Without it the failover was in a log line on one
-    /// replica and nowhere an operator reads.
+    /// Router active-node change, including failover without a phase change.
     pub const ACTIVE_CHANGED: &str = "ActiveChanged";
 }
 
@@ -110,18 +82,9 @@ pub fn name_of(kind: &str, uid: &str, name: &str, reason: &str) -> String {
     )
 }
 
-/// Write it down, or say nothing and carry on.
-///
-/// Never returns an error and never propagates one, and that is deliberate
-/// rather than lazy: this is called from inside a reconcile pass and from
-/// inside an API handler that is already refusing a request, and in both
-/// places an event that could not be written must not become the reason the
-/// real work failed. A store that will not take an event is degraded, not
-/// broken — WARN, and the next occurrence tries again.
-///
-/// Create first and fall back to aggregating, rather than the other way
-/// round: the first occurrence is the common case for a given key, and
-/// `AlreadyExists` is exactly the signal that this has happened before.
+/// Best-effort event recording: log store errors without failing the
+/// primary operation. Create the first occurrence, or aggregate when the
+/// existing key reports AlreadyExists.
 pub async fn record(store: &EtcdStore, happening: Happening<'_>) {
     let now = Utc::now();
     let name = name_of(
@@ -148,16 +111,8 @@ pub async fn record(store: &EtcdStore, happening: Happening<'_>) {
 
     match store.create_with_ttl(&event, TTL_SECS).await {
         Ok(_) => {}
-        // It has happened before and the object is still inside its window:
-        // raise the count and say when, and keep the sentence current — the
-        // twentieth failure's message is the one worth reading, not the
-        // first's.
-        //
-        // Through `mutate`, so two replicas noticing the same thing at once
-        // both land. The put behind it keeps the key's lease (see
-        // `EtcdStore::update`), so aggregating an event does not make it
-        // permanent — the deadline stays the one the first occurrence set,
-        // and a thing that goes on happening gets a fresh object afterwards.
+        // Increment count and update the latest message/time through CAS retry.
+        // Preserve the original lease so repeated events do not extend retention.
         Err(StoreError::AlreadyExists(_)) => {
             let message = happening.message;
             if let Err(e) = store
@@ -175,11 +130,7 @@ pub async fn record(store: &EtcdStore, happening: Happening<'_>) {
     }
 }
 
-/// Every event about one object, newest activity first.
-///
-/// Filtered by the involved object rather than looked up by key: one object
-/// has one event per reason, and what a person asking `vm events` wants is
-/// all of them.
+/// Return all events for the object, across reasons, newest activity first.
 pub async fn about(store: &EtcdStore, kind: &str, uid: &str, name: &str) -> Vec<Event> {
     let mut all = all(store).await;
     all.retain(|e| {
@@ -193,11 +144,8 @@ pub async fn about(store: &EtcdStore, kind: &str, uid: &str, name: &str) -> Vec<
     all
 }
 
-/// Everything still inside its window, newest activity first.
-///
-/// A read that fails is an empty list and a warning rather than an error: an
-/// event log is the one resource whose absence must not stop anybody from
-/// looking at the objects it is about.
+/// List retained events, newest activity first. Store failure logs a warning
+/// and returns an empty list so event availability does not block object access.
 pub async fn all(store: &EtcdStore) -> Vec<Event> {
     let mut events = match store.list::<Event>().await {
         Ok(events) => events,
@@ -212,13 +160,7 @@ pub async fn all(store: &EtcdStore) -> Vec<Event> {
     events
 }
 
-/// What a client may ask the event log to narrow to, beside the two filters
-/// every listing has.
-///
-/// The log used to come back whole. The console filtered it in the browser
-/// and said so on screen; a `curl` had nothing. All three of these are
-/// FILTERS and none is a permission — the tenant door was already shut, once,
-/// before this narrows anything.
+/// Additional event-list filters applied after tenant authorization.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct EventQuery {
     /// `involvedName=web-1`, matched against `spec.involvedName`.
@@ -229,13 +171,8 @@ pub struct EventQuery {
     /// pedantry about a filter.
     #[serde(default)]
     pub kind: Option<String>,
-    /// `since=2026-09-09T06:00:00Z`, RFC 3339, matched against
-    /// `spec.lastSeen`.
-    ///
-    /// An absolute instant and not a duration, deliberately: "the last hour"
-    /// is a question about the CLIENT's clock, and a server that answered it
-    /// would be answering with its own. The CLI turns `--since 1h` into an
-    /// instant before it asks.
+    /// RFC 3339 lower bound for lastSeen. Clients convert relative durations
+    /// to absolute instants using their own clock before requesting.
     #[serde(default)]
     pub since: Option<String>,
 }
@@ -405,10 +342,8 @@ mod tests {
         }
     }
 
-    /// The reasons are the closed set the aggregation key is built from, so
-    /// two spellings of one reason would be two objects each counting half.
-    /// They carry no number, no name and no sentence — those go in the
-    /// message, for the reason a metric label carries none.
+    /// Aggregation reasons use stable words; variable names, counts and explanations
+    /// belong in the message so repeated occurrences share one key.
     #[test]
     fn a_reason_is_a_word_and_never_a_sentence() {
         for word in [

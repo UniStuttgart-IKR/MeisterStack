@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Shared plumbing for the chaos harness. Sourced by every other script here.
-# Nothing in this directory changes product code; it only pokes the lab.
+# Shell helpers for binary snapshot and rollback. Sourcing creates OUT and
+# loads deploy/env; commands use root SSH with host-key checking disabled.
 CHAOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$CHAOS_DIR/../.." && pwd)"
 OUT="${CHAOS_OUT:-$CHAOS_DIR/out}"

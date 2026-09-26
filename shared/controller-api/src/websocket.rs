@@ -16,14 +16,7 @@ const ACCEPT_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// The one frame this stack sends: a whole binary message.
 const OP_BINARY: u8 = 0x2;
 
-/// The value of `Sec-WebSocket-Accept` for a client's `Sec-WebSocket-Key`.
-///
-/// The whole of the handshake's proof: it says "I read your key and I speak
-/// this protocol", which is what tells a browser it is not talking to a
-/// server that happened to answer 101 to something else. Which is exactly
-/// what this API did before — the upgrade token was never looked at, so a
-/// WebSocket handshake got a 101 with `Upgrade: meister-console` and no
-/// accept header, and the browser threw the connection away.
+/// Compute Sec-WebSocket-Accept from the client key and RFC handshake constant.
 pub fn accept_key(key: &str) -> String {
     let digest = ring::digest::digest(
         &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
@@ -32,12 +25,8 @@ pub fn accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
 }
 
-/// Is this request a WebSocket handshake, and what does it have to be
-/// answered with?
-///
-/// `None` is every other upgrade, the raw console included — this is the one
-/// place the two are told apart, and it is a header and not a route on
-/// purpose: one URL, one set of bytes, two framings.
+/// Detect a WebSocket upgrade and compute its accept header.
+/// None leaves the caller on its raw or unsupported-upgrade path.
 pub fn handshake(headers: &axum::http::HeaderMap) -> Option<String> {
     let upgrade = headers
         .get(axum::http::header::UPGRADE)?
@@ -61,10 +50,7 @@ pub fn handshake(headers: &axum::http::HeaderMap) -> Option<String> {
     Some(accept_key(key))
 }
 
-/// One whole binary message, framed for a client.
-///
-/// Never masked: masking is the client's half of the protocol and a server
-/// that masked would be one no browser reads.
+/// Encode one unmasked server-to-client binary message.
 pub fn binary_frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 10);
     out.push(0x80 | OP_BINARY);
@@ -102,12 +88,9 @@ pub enum Incoming {
     Close,
 }
 
-/// Read one whole message from a client, following continuation frames.
-///
-/// Cancel-UNSAFE by nature — half a frame read is a stream out of step — so
-/// it is called from a task of its own that owns the reader, and the pump
-/// selects on the channel that task feeds. That is the same reason the raw
-/// console can use `read()` inside a `select!` and this cannot.
+/// Read a complete client message, including continuation frames.
+/// Cancellation after a partial frame corrupts framing state. A dedicated reader
+/// task owns this operation; callers select on its output channel instead.
 pub async fn read_message<R>(reader: &mut R, limit: usize) -> std::io::Result<Incoming>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -201,18 +184,9 @@ pub fn pong_frame(payload: &[u8]) -> Vec<u8> {
 /// will refuse.
 pub const MAX_MESSAGE: usize = 4096;
 
-/// Turn a framed client into a raw one.
-///
-/// This is the whole of what the rest of the stack has to know about
-/// WebSockets: nothing. What comes back is an ordinary duplex stream, so the
-/// console pump that has always spoken raw bytes goes on speaking raw bytes,
-/// and so does the socket splice that forwards a console to a sibling
-/// replica. One adapter, one place that knows what a frame is, and no second
-/// copy of the hardest loop in this tree.
-///
-/// Two tasks rather than one `select!`, and that is not a preference:
-/// `read_message` is cancel-unsafe — half a frame read is a stream out of
-/// step — so the reader has to own its half for the whole of its life.
+/// Adapt WebSocket frames to a raw duplex stream for console consumers.
+/// Use separate reader/writer tasks: cancelling read_message midway
+/// through a frame would lose framing state.
 pub fn adapt<S>(ws: S) -> tokio::io::DuplexStream
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -393,10 +367,7 @@ mod tests {
         );
     }
 
-    /// The adapter, end to end: a browser's masked frame comes out as bytes,
-    /// and bytes go back as a frame. Everything above this sees a raw
-    /// console and cannot tell which kind of client it is talking to, which
-    /// is the entire point.
+    /// The adapter decodes client frames to raw bytes and frames bytes sent back.
     #[tokio::test]
     async fn a_framed_client_looks_like_a_raw_one_from_above() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

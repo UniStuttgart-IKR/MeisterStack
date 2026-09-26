@@ -9,22 +9,12 @@
 
 use chrono::{DateTime, Utc};
 
-/// How long a peer may stay silent before it counts as gone.
-///
-/// Both tiers report every 10s, so this tolerates two missed reports; with the
-/// 5s reconcile tick a killed peer shows up as down within ~35s. One constant
-/// because it is one SLA — the number that changes here is the number that has
-/// to change at both tiers.
+/// Shared peer-silence threshold. Reconciliation detects expiry on its next
+/// pass, so detection latency also includes the reconciliation interval.
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
-/// A peer that has not reported within the timeout is down, whatever its
-/// session looks like.
-///
-/// No heartbeat at all counts as expired, and that is the case worth naming:
-/// the object exists because somebody said Hello once, not because anybody is
-/// running now. After a controller restart every peer is in exactly that
-/// state, and treating it as alive would schedule onto nodes nobody has heard
-/// from since before the restart.
+/// Treat absent or expired heartbeat evidence as disconnected, regardless of
+/// whether a transport session still appears open.
 pub fn expired(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     match last {
         Some(hb) => now.signed_duration_since(hb).num_seconds() > HEARTBEAT_TIMEOUT_SECS,
@@ -53,10 +43,8 @@ mod tests {
         assert!(expired(None, at(0)));
     }
 
-    /// `signed_duration_since` goes negative rather than wrapping, so a clock
-    /// that went backwards makes a peer look newer, not infinitely old. The
-    /// alternative — an unsigned subtraction — would expire every peer on the
-    /// node at once the first time NTP stepped the clock back.
+    /// Signed elapsed time prevents a backward clock step from wrapping into an
+    /// extremely old heartbeat.
     #[test]
     fn a_clock_that_went_backwards_does_not_expire_a_peer() {
         assert!(!expired(Some(at(60)), at(0)));

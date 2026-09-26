@@ -20,13 +20,8 @@ use rustls_pki_types::CertificateDer;
 
 use crate::cert::CertInfo;
 
-/// The subject the API server decided this certificate gets.
-///
-/// One organisation, not a list, because that is what rcgen's distinguished
-/// name can hold — and it is enough: the group a certificate carries is the
-/// role, and a name has one of those. Reading is the general case (a peer may
-/// present several O values and all of them count as groups); issuing is the
-/// narrow one.
+/// Server-approved certificate subject. Issuance supports one organization;
+/// peer identity parsing can read multiple organization values as groups.
 #[derive(Clone, Debug)]
 pub struct Subject {
     pub common_name: String,
@@ -48,9 +43,7 @@ pub struct Ca {
 }
 
 impl Ca {
-    /// Load the CA from the two paths the config names. Both are paths and
-    /// never inline PEM: a key that can be pasted into a TOML file is a key
-    /// that ends up in a git history.
+    /// Load CA certificate and private key from configured PEM files.
     pub fn load(cert: &Path, key: &Path) -> Result<Self> {
         let cert_pem = std::fs::read_to_string(cert)
             .with_context(|| format!("reading the CA certificate {}", cert.display()))?;
@@ -82,12 +75,8 @@ impl Ca {
         &self.roots
     }
 
-    /// Sign a CSR as a client certificate for `subject`, valid for `ttl` from
-    /// `now`.
-    ///
-    /// Client authentication only, and never a CA: a certificate this server
-    /// issues must not be able to issue certificates of its own, whatever the
-    /// request asked for.
+    /// Sign the approved subject as a client-authentication certificate, valid
+    /// for ttl from now. Request-supplied CA permissions are not retained.
     pub fn sign_csr(
         &self,
         csr_pem: &str,
@@ -116,8 +105,7 @@ impl Ca {
         // A client certificate is identified by its subject, and a SAN a
         // client put in its own request would be a name it chose for itself.
         request.params.subject_alt_names.clear();
-        // A minute of slack, because the clock that checks this certificate is
-        // not the clock that issued it.
+        // Backdate validity by one minute for clock skew.
         request.params.not_before = offset(now - Duration::minutes(1))?;
         request.params.not_after = offset(now + ttl)?;
 
@@ -140,9 +128,7 @@ mod tests {
     use super::*;
     use crate::csr::generate_key_and_csr;
 
-    /// A CA in memory, written to two files, because that is the only way
-    /// `Ca::load` takes one — and the test is worth more for going through
-    /// the real entry point than for being quick.
+    /// Write a generated CA fixture to disk and load it through the public entry point.
     pub(crate) fn ca_in(dir: &Path, name: &str) -> Ca {
         let key = KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
@@ -166,9 +152,7 @@ mod tests {
         dir
     }
 
-    /// The subject in the request is thrown away. This is the whole security
-    /// property of the CSR flow: anybody may ask, nobody gets to say who they
-    /// are while asking.
+    /// Replace CSR-provided subject claims with the approved identity.
     #[test]
     fn what_the_request_claims_about_itself_is_discarded() {
         let dir = scratch("claims");
@@ -226,7 +210,7 @@ mod tests {
             CertInfo::verified_by(&der[0], theirs.roots(), now).is_err(),
             "foreign CA"
         );
-        // and it is not valid for ever
+        // Verify expiry after the requested lifetime.
         let later = now + Duration::days(2);
         let err = CertInfo::verified_by(&der[0], ours.roots(), later).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");

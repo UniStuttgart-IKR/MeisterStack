@@ -20,16 +20,9 @@ pub enum Lifecycle {
     Resume,
 }
 
-/// The command a VM's declared runStrategy and its observed phase call for.
-/// Level-triggered and without memory: no "last sent" state anywhere, so a
-/// controller three seconds old decides exactly what one that has been up
-/// for a week decides, and a lost command is simply re-derived next pass.
-///
-/// Only the three stable phases take part. Pending and Provisioning mean a
-/// pass is already in flight and a command would race it; Failed is the
-/// agent's own backoff doing its job; Quarantined exists precisely so that
-/// nothing automatic touches the VM. All four converge to a stable phase or
-/// to a human, and the drift is decided then.
+/// Derive a lifecycle command from desired strategy and stable observed
+/// phase, without a last-sent cache. Pending/Provisioning, Failed,
+/// Quarantined and Unknown do not authorize ordinary lifecycle commands.
 pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhaseKind) -> Option<Lifecycle> {
     Some(match (strategy, phase) {
         (RunStrategy::Running, VmPhaseKind::Stopped) => Lifecycle::Start,
@@ -60,13 +53,7 @@ pub fn stopped_enough(strategy: RunStrategy, phase: VmPhaseKind) -> bool {
         )
 }
 
-/// Why not, in the words the two halves need to be told apart.
-///
-/// The old sentence said "phase Running; stop it first" to somebody who had
-/// just stopped it — during the thirty-second grace `vm ls` already shows
-/// `RUN Stopped` while the phase is still `Running`, and being told to do
-/// what you have done is how an operator concludes the API is broken. The two
-/// cases are different waits: one is on a person, the other is on a guest.
+/// Distinguish a missing stop request from a stop still awaiting observation.
 pub fn not_stopped_enough(strategy: RunStrategy, phase: VmPhaseKind) -> String {
     match strategy {
         RunStrategy::Stopped => format!(
@@ -128,11 +115,7 @@ pub fn unknown_needs_its_holder(
     ))
 }
 
-/// The event a released `Unknown` binding leaves behind.
-///
-/// Part of the rule and not decoration: this is the one call in the API that
-/// lets a person assert something the control plane cannot see, so the object
-/// carries the record that it was asserted, and by which phase it was covered.
+/// Warning message for an explicit binding release while the phase was Unknown.
 pub fn released_while_unknown(holder: Holder, name: &str) -> String {
     format!(
         "the binding to {} {name} was let go while the phase was Unknown; {name} was reporting at the time, so the guest was asked to stop before the vm was placed again",
@@ -177,13 +160,8 @@ mod tests {
         }
     }
 
-    /// Silas' rule: `Unknown` is stopped enough only while the holder is
-    /// there to be asked.
-    ///
-    /// The phase says nobody knows what the guest is doing. Letting the
-    /// binding go on that alone is an assertion no one can back — and if it
-    /// is wrong, it is two VMMs on one disk. A current heartbeat is the
-    /// evidence: the holder is talking, so the ordinary stop runs first.
+    /// Unknown binding release requires a recent holder heartbeat; silence alone
+    /// cannot authorize replacement of a possibly running guest.
     #[test]
     fn an_unknown_binding_needs_its_holder_to_be_talking() {
         let at = |secs: i64| DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
@@ -299,10 +277,7 @@ mod tests {
         }
     }
 
-    /// The two tables above are the whole cross product, and this is what
-    /// says so: 3 x 7 cells, each decided, none of them twice and none of
-    /// them missing. The tables stay as they are — they carry the reasoning
-    /// for the interesting rows — and this closes the space around them.
+    /// Verify the decision tables cover each intent/phase pair exactly once.
     #[test]
     fn the_two_tables_together_are_the_whole_cross_product() {
         let mut cells = 0usize;
@@ -325,13 +300,8 @@ mod tests {
         assert_eq!(commanded, 6);
     }
 
-    /// The invariant behind the whole level-triggered design, stated over all
-    /// 21 cells rather than read off the tables: a command is only ever
-    /// issued against a phase that has come to rest, and it never asks for
-    /// the state the phase already reports. A command that argued with a
-    /// phase in flight would race the pass that is producing it; one that
-    /// restated a phase already reached would be sent forever, because the
-    /// derivation is level-triggered and has no memory to stop it.
+    /// Across all intent/phase pairs, commands neither race transitional phases
+    /// nor repeat a state already reported, preserving convergence.
     #[test]
     fn a_command_is_never_a_race_and_never_a_no_op() {
         for strategy in RunStrategy::ALL {

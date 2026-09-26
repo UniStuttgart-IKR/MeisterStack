@@ -14,32 +14,17 @@ use proto::VmStatusReport;
 
 use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhase, VmPhaseKind, VmReason};
 
-/// Is a peer's report younger than everything this tier has already done?
-/// Only then does it describe the thing as it is now.
-///
-/// The floor is whichever is later of "we asked for it to be deleted" and
-/// "we last recorded an observation", because those are the two things this
-/// tier did. A report built before either describes the world from before it,
-/// and reading it as current would have us repeat a command that already took
-/// — or, worse, accept a "gone" that answered an older question and delete an
-/// object whose bytes were just made.
-///
-/// Loose over the two `Option`s and total, because both are genuinely absent
-/// on a thing nobody has touched yet.
-///
-/// Here rather than beside either caller because both tiers ask it now, of
-/// two different objects: the cloud of a `Vm` and the cluster of a `Volume`.
-/// One rule, one place — the same argument the rest of this module makes.
+/// Check report freshness against deletion request and last observation.
+/// Reject evidence older than either floor; stale absence cannot authorize
+/// cleanup. An unset floor imposes no timestamp constraint.
 pub fn is_current(
     deletion: Option<chrono::DateTime<chrono::Utc>>,
     observed: Option<chrono::DateTime<chrono::Utc>>,
     reported_at: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     match deletion.max(observed) {
-        // Not-older rather than strictly-younger: a status this tier already
-        // wrote from carries exactly that instant, and it is evidence about
-        // itself. Two different instants never compare equal here in
-        // practice — this only readmits the status that set the floor.
+        // Accept equality with the evidence floor so the report that established
+        // that floor remains usable. This does not distinguish equal-timestamp reports.
         Some(floor) => reported_at >= floor,
         None => true,
     }
@@ -74,10 +59,8 @@ pub fn addresses_with(current: &[VmAddress], reported: &[proto::NicReport]) -> V
     out
 }
 
-/// What one line of a peer's report means for the VM it names. Everything
-/// here is a case the caller has to answer for its own tier; the case that
-/// needs no answer — a report that says exactly what is already stored — is
-/// not in the list, because `observe` drops it.
+/// Changed or unmatched peer observations requiring a tier-specific response.
+/// Unchanged reports are omitted by `observe`.
 #[derive(Debug)]
 pub enum Observation<'a> {
     /// No stored VM carries this uid. Whether that is remarkable depends on
@@ -90,28 +73,14 @@ pub enum Observation<'a> {
     /// The peer named a phase this control plane does not have. Rejected
     /// rather than defaulted: a drifting peer should be visible.
     BadPhase(&'a Vm),
-    /// The report says something new about this VM: the phase the peer
-    /// observed, the WORD it gave for why, and the sentence that came with it
-    /// (absent when the peer sent none).
-    ///
-    /// The reason is the peer's own — `VmmGone`, `Backoff`, `BackendGone` —
-    /// and not a word for the road it came down. It is read through
-    /// `VmReason::read`, so a word this binary does not know arrives as
-    /// `Unrecorded` with the word kept at the front of the sentence rather
-    /// than dropped.
+    /// Changed phase and peer reason/message. Unknown reason strings are
+    /// retained in the message by `VmReason::read` for older readers.
     Changed(&'a Vm, VmPhaseKind, VmReason, Option<String>),
 }
 
-/// Match a peer's report against the VMs this tier stores, one line at a time.
-///
-/// `speaks_for` is the binding question, and it is the caller's because the
-/// two tiers bind differently — `spec.clusterName` one floor up,
-/// `spec.nodeName` one floor down — and because how strict that question is
-/// is a statement about the tier, not about mirroring.
-///
-/// A report that changes nothing yields nothing. Peers report every 10s, and
-/// a write per report would churn etcd revisions — and wake the vm watch —
-/// while nothing about the VM actually happened.
+/// Match reports to stored VMs using the caller's binding predicate.
+/// Yield only meaningful changes to avoid an etcd write and watch wakeup
+/// for each unchanged heartbeat.
 pub fn observe<'a>(
     known: &'a [Vm],
     reported: &'a [VmStatusReport],
@@ -130,15 +99,9 @@ pub fn observe<'a>(
         };
         let message = (!line.message.is_empty()).then(|| line.message.clone());
         let (reason, message) = VmReason::read(&line.reason, message);
-        // Compared against the phase this report WOULD leave behind, not
-        // against its three parts one by one, and that is not a flourish: a
-        // resting word has no slot for a reason, so `Running` + `Working`
-        // stores as `Running` with no reason at all. Held against the parts,
-        // the stored value would differ from the report for ever and every
-        // heartbeat of every running VM would be an etcd revision — D-C7, at
-        // a second field. `since` is taken from the stored phase so that the
-        // comparison is about the word, the reason and the sentence, which
-        // are the three things a report carries.
+        // Compare the settled phase shape while retaining its existing since
+        // time. Resting phases discard reasons; comparing raw report parts
+        // would therefore rewrite an unchanged Running VM on every heartbeat.
         let candidate = VmPhase::new(phase, reason, message.clone(), vm.status.phase().since());
         if *vm.status.phase() == candidate {
             return None;
@@ -329,10 +292,8 @@ mod tests {
         }
     }
 
-    /// The whole point of the field, and the half that is a rule rather than
-    /// a copy: what a peer reports REPLACES the MAC lines, so a tap that has
-    /// gone away drops out on its own report, and it leaves everything else
-    /// exactly where it was, because the other lines have another writer.
+    /// A nonempty MAC report replaces prior MAC entries while preserving addresses
+    /// owned by other writers.
     #[test]
     fn the_reported_taps_replace_the_mac_lines_and_leave_the_rest() {
         let current = [
@@ -353,10 +314,8 @@ mod tests {
         assert_eq!(out[0].kind, VmAddressKind::Mac);
     }
 
-    /// A peer that names no tap is a peer from before the field — an old
-    /// agent to a cluster, an old cluster to a cloud — and it says NOTHING
-    /// about addresses. Not "none": nothing. Reading it the other way would
-    /// blank a working VM's list the moment an old binary reconnected.
+    /// Empty tap reports preserve addresses for compatibility with older peers;
+    /// they cannot distinguish an empty current inventory from an omitted field.
     #[test]
     fn a_peer_that_reports_no_tap_leaves_the_addresses_exactly_as_they_were() {
         let current = [mac("nics[0]", "52:54:00:00:00:01"), floating("192.0.2.7")];
@@ -386,14 +345,8 @@ mod tests {
         );
     }
 
-    /// The node's own word arrives on the object, and a word this tier does
-    /// not know arrives too — at the front of the sentence.
-    ///
-    /// The whole of decision 1 as it reaches a VM: the phase used to come up
-    /// with "Reported" beside it, which said which ROAD it came down and
-    /// never what had happened. `VmmGone` and `BackendGone` are two different
-    /// problems — the requeue curve repairs the first and must not touch the
-    /// second — and they were the same value.
+    /// Preserve known peer reason codes and include unknown codes in the message
+    /// so runtime causes remain distinguishable across version skew.
     #[test]
     fn the_word_the_peer_gave_is_the_word_on_the_observation() {
         let known = [vm("web-1", "uid-a", Some("manacor"))];
@@ -421,14 +374,8 @@ mod tests {
         ));
     }
 
-    /// The churn guard, held against the case that would break it: a running
-    /// VM whose node sends `Working` on every heartbeat.
-    ///
-    /// A resting word has no slot for a reason, so the stored phase carries
-    /// none — and a guard that compared the report's reason against the
-    /// stored one would find them different for ever. That is an etcd
-    /// revision per VM per ten seconds to record that nothing happened, which
-    /// is the defect this round fixes one field over (D-C7).
+    /// Ignore reason differences that cannot be represented by a resting phase,
+    /// avoiding unchanged VM rewrites on every heartbeat.
     #[test]
     fn a_reason_on_a_resting_word_does_not_make_a_report_news() {
         let known = [said_to_be(

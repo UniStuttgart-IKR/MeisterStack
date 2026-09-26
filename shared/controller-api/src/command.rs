@@ -16,16 +16,9 @@ use anyhow::bail;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-/// What came back from the peer. `Rejected` is the peer's own answer and
-/// therefore a fact about the VM; every other failure is a fact about the
-/// session, and a session that broke says nothing about any VM.
-///
-/// `Acked` carries the peer's payload, which is empty for every command that
-/// only changes something and says "done". One command asks a question
-/// instead — the console fetch — and its answer comes back here rather than
-/// through a second channel: the session is already the only direction that
-/// works (the node dialled us), and `Pending` already matches a request to
-/// the result that carries its id.
+/// Correlated peer response or session failure. Rejected carries a peer
+/// answer; transport failure does not establish VM state. Acked payloads
+/// include replies such as console data and migration endpoint information.
 #[derive(Debug)]
 pub enum Ack {
     Acked(Vec<u8>),
@@ -40,25 +33,11 @@ pub struct Peer<'a> {
     pub name: &'a str,
 }
 
-/// The commands of one session registry that are still out, by request_id.
-///
-/// Owns the ack timeout as well, because a registry that could be asked to
-/// wait a different length of time per call is a registry whose patience is
-/// an accident of the call site rather than a property of the tier.
-/// What one waiting caller is handed: the peer's payload, or the peer's own
-/// refusal. Named because the map below is otherwise four nested generics
-/// deep and says nothing at a glance.
+/// A pending command's peer payload or structured refusal.
 type Answer = Result<Vec<u8>, Refusal>;
 
-/// A peer's "no", with the word that says what kind of no it is.
-///
-/// It used to be a bare `String`, and that is what lost the distinction: the
-/// tier above could not tell "this node has no record of that VM" from "no
-/// replica of this cluster could be reached", so it called both a conflict.
-/// The `reason` is one of the REST edge's own (`Unavailable`, `NotFound`,
-/// `Conflict`, ...), and it is empty from a peer that predates the field —
-/// which is why the caller must have an answer for empty rather than a
-/// `match` that assumes one.
+/// Typed peer refusal using REST reason names. Legacy peers may send an
+/// empty reason, so callers must retain a conservative fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub message: String,
@@ -86,34 +65,20 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// So that a refusal can travel as an `anyhow` cause instead of being
-/// flattened into a string on its way out of `send_command`.
-///
-/// The reason has to survive that hop: a caller reads it to decide whether to
-/// take a binding back, and a caller reduced to matching on prose would be
-/// one whose behaviour changes when somebody rewords a message.
+/// Preserve the refusal reason through anyhow error chains so callers can
+/// choose recovery behavior without matching message prose.
 impl std::error::Error for Refusal {}
 
-/// A refusal a command HANDLER raises, carrying the word the REST edge would
-/// have used for the same failure.
-///
-/// The one channel by which a handler's meaning reaches the tier above: the
-/// session dispatcher looks for this on its way out and copies the reason
-/// into the `ErrorMsg`. A handler that raises a plain error still works and
-/// still says nothing, which is the old behaviour and the right default.
+/// Structured handler error copied into the session ErrorMsg reason.
+/// Plain handler errors retain the legacy empty reason.
 #[derive(Debug)]
 pub struct Refused {
     pub reason: &'static str,
     pub message: String,
 }
 
-/// The reason word for [`Refused::cannot_serve`]. Defined in `proto`, beside
-/// the field it is a value of, because the agent writes it and the agent
-/// deliberately does not depend on this crate.
-///
-/// Not one of the REST edge's words, and that is deliberate too: those
-/// describe what a CLIENT should be told, and this describes what a control
-/// plane should DO. No caller ever sees it.
+/// Agent-defined reason that requests placement recovery after structural refusal.
+/// It lives in proto so the agent need not depend on controller-api.
 pub use proto::CANNOT_SERVE;
 
 impl Refused {
@@ -127,17 +92,9 @@ impl Refused {
         }
     }
 
-    /// "This node cannot serve this VM at all" — a refusal about the NODE
-    /// and not about the request.
-    ///
-    /// The distinction the reschedule rests on. A create that fails after the
-    /// node has a record is a `Failed` VM with a requeue at the same place: a
-    /// boot that did not work may work next time. A create the node refuses
-    /// STRUCTURALLY — no hypervisor, a driver it does not have, a volume it
-    /// has no record of — leaves no record and will never work here, however
-    /// often it is asked. The tier above answers the second by taking the
-    /// binding back and placing the VM somewhere else, and it can only tell
-    /// the two apart if the node says which one it is.
+    /// Structural node refusal before a VM record is created. Controllers
+    /// may release the binding and place elsewhere; failures after creation
+    /// retain ownership and retry on the current node.
     pub fn cannot_serve(message: impl Into<String>) -> Self {
         Self {
             reason: CANNOT_SERVE,
@@ -175,16 +132,9 @@ impl Pending {
         }
     }
 
-    /// Put `build(request_id)` on the session and wait for the peer's result.
-    ///
-    /// The session channel is a PARAMETER and is deliberately not looked up in
-    /// here: the caller has therefore already found it by the time anything is
-    /// registered, so the "no session" path has nothing to clean up. The other
-    /// order leaks one entry per attempt, and a level-triggered pass retries
-    /// every tick for as long as a VM is bound to a peer that is gone — so the
-    /// leak is unbounded, not a one-off. Nothing can beat the registration
-    /// either way round: the result only ever comes back over the stream, and
-    /// nothing is on the stream until the send below.
+    /// Register a request, send it on the supplied session, and await its
+    /// reply. Resolve the session before calling so a missing peer creates
+    /// no pending entry. Register before sending so an immediate reply is matched.
     pub async fn send<M>(
         &self,
         peer: Peer<'_>,
@@ -200,11 +150,8 @@ impl Pending {
             .unwrap()
             .insert(request_id.clone(), ack_tx);
 
-        // Bounded like the ack, and for the same reason. A peer that is alive
-        // but stuck stops draining its stream; the buffer fills, and an
-        // unbounded write would park the one reconcile task there — no
-        // scheduling, no teardown, no heartbeat expiry, for every other peer
-        // too. Send is cancel-safe, so a timeout leaves nothing half-written.
+        // Bound enqueue time as well as ACK time. A peer that stops draining its
+        // stream must not stall unrelated reconciliation. A timed-out send is cancelled.
         match tokio::time::timeout(timeout, tx.send(Ok(build(request_id.clone())))).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
@@ -305,10 +252,8 @@ mod tests {
         assert_eq!(in_flight(&pending), 0);
     }
 
-    /// The leak this shape exists to prevent, in the two places it can start:
-    /// a session that has closed under us, and one that never answers. A pass
-    /// retries every tick for as long as a VM is bound to a peer that is
-    /// gone, so an entry left behind per attempt grows without bound.
+    /// Closed sessions and unanswered commands must remove pending entries so
+    /// repeated reconciliation cannot leak one entry per attempt.
     #[tokio::test(start_paused = true)]
     async fn a_command_that_goes_nowhere_leaves_nothing_behind() {
         let pending = pending();

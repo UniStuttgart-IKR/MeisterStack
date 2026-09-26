@@ -20,30 +20,13 @@ use crate::resources::{
 };
 use crate::scheduler::{Candidate, is_alive};
 
-/// How many machines one router is built on: the active one and one standby.
-///
-/// OVN allows up to five `gateway_chassis` per logical router port and two is
-/// what deployments actually run, for the reason decision 7 gives: the
-/// standby costs a netns, a veth pair and a ruleset on a second machine and
-/// buys exactly one failure. A third buys the case where two gateway nodes
-/// are down at once, which is a case where the cluster has other problems.
-///
-/// A router on a cluster with ONE gateway node is built on that one and says
-/// so — a standby that does not exist is not a reason to refuse the router.
+/// Desired gateway count: one active and one standby. A cluster with
+/// only one eligible gateway can still host the router.
 pub const GATEWAY_CHASSIS: usize = 2;
 
-/// Every node that could carry this router, best first.
-///
-/// The three cuts are the ones decision 4 names and nothing else: the node
-/// claims an interface for the router's provider network (`gateway:<physnet>`
-/// in its catalogue), it is up and willing and says nothing is wrong with
-/// itself, and it accepts the router's class. A node that answered "no
-/// gateway slot" is skipped as well — see `RouterStatus::refused`.
-///
-/// The ORDER is least-loaded first, ties broken by name so that every replica
-/// of a leaderless control plane computes the same list out of the same
-/// store. Load is routers already planned onto that node, which is what the
-/// caller counts out of the same listing it is walking.
+/// Eligible gateways ordered by planned router load, then name. Require
+/// the physnet capability, health, schedulability and accepted class;
+/// exclude nodes with a recorded gateway refusal.
 pub fn gateway_candidates<'a>(
     physnet: &str,
     class: &str,
@@ -65,23 +48,9 @@ pub fn gateway_candidates<'a>(
     fit
 }
 
-/// The priority list this router should be on, best first — OVN's
-/// `gateway_chassis`.
-///
-/// Stability first and load second, and the order of those two is the whole
-/// of the function. A router that is already built somewhere STAYS there as
-/// long as that machine is still a candidate: rebuilding a gateway because
-/// another node grew a little emptier would tear down a netns, drop every
-/// conntrack entry behind it and cost every established flow, to gain a
-/// number in a dashboard. So the nodes it is on keep their places, in the
-/// order they had, and the rest of the list is filled from the least loaded
-/// of what is left.
-///
-/// Anti-affinity against the active node falls out of this rather than being
-/// a rule of its own: the entries are distinct machines, so the standby is
-/// never the active one. That is the whole of what "anti-affinity against the
-/// active" can mean for an object that is deliberately built on several
-/// machines at once.
+/// Retain eligible existing placements in order, then fill remaining
+/// slots from candidates. Avoid rebalancing a working gateway merely to
+/// reduce load; rebuilding loses connection state. Each node appears once.
 pub fn plan_nodes(current: &[String], candidates: &[&Candidate]) -> Vec<String> {
     let eligible: BTreeSet<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
     let mut planned: Vec<String> = current
@@ -101,35 +70,19 @@ pub fn plan_nodes(current: &[String], candidates: &[&Candidate]) -> Vec<String> 
     planned
 }
 
-/// Which of the planned nodes is ACTIVE: the first one that is live.
-///
-/// Decision 7 in one line — HA over BGP withdraw. Every node on the list
-/// holds the whole router; the active one announces its external address and
-/// answers ARP on the overlay, and the others are silent. So a failover is
-/// not a build: the first entry stops being live, the second becomes the
-/// active one, and the only thing that changes on either machine is whether
-/// it speaks.
-///
-/// `None` when no node of the list is reachable, which is a router in
-/// `Unknown` rather than one in `Failed`: the netns on those machines is
-/// almost certainly still forwarding, and nothing here knows otherwise.
+/// Select the first live planned gateway. None means no reachable
+/// placement; it does not prove that old namespaces stopped forwarding.
 pub fn active_node<'a>(planned: &'a [String], candidates: &[&Candidate]) -> Option<&'a str> {
     planned
         .iter()
-        // `alive` and not `connected`, for the reason `gateway_candidates`
-        // gives: two replicas that answered this out of their own session
-        // maps would disagree about which machine is the active one, and
-        // then take it in turns to tell the other one to stand down.
+        // Use fleet-wide liveness so replicas with different session ownership
+        // select the same active gateway.
         .find(|n| candidates.iter().any(|c| &c.name == *n && c.alive))
         .map(String::as_str)
 }
 
-/// How many routers each node already carries, out of one listing.
-///
-/// Every router counts, whatever its phase, and the standby entries count
-/// too: a machine holding two standbys holds two netns, two veth pairs and
-/// two rulesets, and the fact that neither is speaking today does not make
-/// the third one free.
+/// Count every listed router placement, including standbys: inactive instances
+/// still consume namespaces, interfaces and rulesets.
 pub fn router_load(routers: &[Router]) -> BTreeMap<String, usize> {
     let mut load = BTreeMap::new();
     for router in routers {
@@ -140,22 +93,10 @@ pub fn router_load(routers: &[Router]) -> BTreeMap<String, usize> {
     load
 }
 
-/// The first address of `network`'s allocation that no other router holds.
-///
-/// A router keeps whatever address it already has for its whole life, so this
-/// is asked exactly once per router — see `RouterStatus::external_addr`. The
-/// answer is a pure function of the store as it stands, which is what lets
-/// several leaderless replicas reach it without agreeing on anything: two
-/// replicas placing the SAME router pick the same address and write the same
-/// thing, and two replicas placing two different routers in the same instant
-/// can pick the same address, which the caller resolves by looking again —
-/// the pattern `create_routed_subnet` uses, and for the same reason.
-///
-/// The prefix comes from `spec.cidr`, because an address on a wire has to
-/// carry the wire's mask or the router has no on-link route to its own
-/// gateway. A network with no `cidr` gets `/32`, which is the honest answer
-/// for a wire nobody described: the address is the router's and it reaches
-/// its gateway through the explicit route the driver adds.
+/// Choose the first unclaimed provider address. Concurrent routers can
+/// choose the same address, so callers must recheck after writing. Use
+/// the provider CIDR prefix, or /32 when unspecified; the driver adds
+/// an explicit gateway route when needed.
 pub fn cut_external_addr(network: &ProviderNetwork, routers: &[Router]) -> Option<String> {
     let ranges = Ipv4Ranges::parse(&network.spec.allocation).ok()?;
     let taken: BTreeSet<Ipv4Addr> = routers
@@ -191,10 +132,7 @@ pub enum AddressClaim {
     Yield,
 }
 
-/// The routers OTHER than `name` that hold the same address, by name.
-///
-/// Compared on the host part, because that is what is on the wire and what
-/// [`cut_external_addr`] counts as taken.
+/// Find other holders of the same host address, ignoring CIDR prefix differences.
 pub fn other_holders<'a>(name: &str, address: &str, routers: &'a [Router]) -> Vec<&'a str> {
     let wanted = bare_addr(address);
     if wanted.is_empty() {
@@ -239,15 +177,9 @@ pub fn claim_external_addr(
     }
 }
 
-/// [`claim_external_addr`] against the store, applied: the helper both tiers
-/// call in place of an address rule of their own.
-///
-/// At most two rounds, and the second is the point. The first writes an
-/// address if the router had none; the second looks at the listing AFTER that
-/// write, which is the only way a replica finds out that somebody else wrote
-/// the same address in the same instant. A router that already had an address
-/// is answered by the first round alone -- `Keep` or `Yield` -- which is the
-/// re-check the cluster tier used to skip and the cloud tier never made.
+/// Apply the shared claim rule in at most two rounds. After assigning a
+/// new address, reread to detect competing writes. Existing claims are
+/// also checked for keep/yield conflicts.
 pub async fn settle_external_addr(
     store: &crate::store::EtcdStore,
     router: Router,
@@ -321,14 +253,8 @@ pub fn nat_rules(router: &Router, floating: &[FloatingIp], announced: &[String])
     rules
 }
 
-/// One router, decided — everything a backend needs to make it so, and
-/// nothing about how.
-///
-/// It is the output of the planning above and the input of the trait below,
-/// and that is why it holds resolved values rather than object names: a
-/// backend that had to look a `ProviderNetwork` up would be a backend with a
-/// store in it, and two backends resolving the same names separately is how
-/// they start disagreeing about which wire a router is on.
+/// Resolved router configuration for a backend to apply without store lookups.
+/// Central resolution keeps placement and network interpretation consistent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouterPlan {
     /// The router's `metadata.uid` — what a node keys the thing by, exactly
@@ -368,53 +294,29 @@ pub struct RouterOutcome {
     /// `status.releasing`, and the only thing that takes a node off it: a
     /// destroy nobody could deliver is a debt that is still owed.
     pub released: Vec<String>,
-    /// Nodes that refused STRUCTURALLY: they claim the physnet and have no
-    /// gateway slot for it. They go on `status.refused` and the planner never
-    /// offers them this router again. See `Refused::cannot_serve`, whose
-    /// distinction this is — a node that could not be reached is not one that
-    /// said no.
+    /// Nodes with structural gateway refusal, retained in status.refused until
+    /// that evidence is cleared. Unreachable nodes are not structural refusals.
     pub refused: Vec<String>,
     pub phase: RouterPhaseKind,
-    /// The category behind `phase`, decided by the same function and at the
-    /// same moment. It is here rather than worked out again at the caller
-    /// because `verdict` is the only thing that knows WHY it answered what it
-    /// answered — a second derivation from the phase alone could not tell a
-    /// router nobody would carry from one every candidate refused.
+    /// Reason derived alongside phase; phase alone cannot distinguish missing
+    /// candidates from candidates that explicitly refused.
     pub reason: RouterReason,
     pub message: Option<String>,
 }
 
-/// The one road a backend has to the machines: one command, to one node,
-/// awaited.
-///
-/// A trait and not the session registry itself, because the registry is the
-/// cluster controller's and this crate is under it — the same reason
-/// `Scheduler` takes `Candidate`s rather than reading etcd. The cluster's
-/// `Dispatch` is the implementation that matters; a recorder is what the
-/// tests use, and a backend that talks to a database rather than to machines
-/// ignores it entirely.
+/// Await one command to one node. The cluster supplies session dispatch;
+/// tests can supply a recorder without depending on controller internals.
 #[async_trait::async_trait]
 pub trait RouterSink: Send + Sync {
-    /// Build or re-state one router on one node. Level-triggered: the same
-    /// call twice is one router.
-    ///
-    /// `Ok(())` is "the node has it". An `Err` whose cause is a
-    /// [`crate::Refused`] with `CANNOT_SERVE` is the structural refusal —
-    /// this machine has no gateway slot for that physnet — and everything
-    /// else is a fact about the session.
+    /// Idempotently ensure a router on one node. `Refused` with `CANNOT_SERVE`
+    /// denotes structural incompatibility; other errors do not establish that refusal.
     async fn ensure(&self, node: &str, router: proto::EnsureRouter) -> anyhow::Result<()>;
     /// Let go of one router on one node, by uid.
     async fn destroy(&self, node: &str, id: &str) -> anyhow::Result<()>;
 }
 
-/// How a decided router becomes a router that exists.
-///
-/// The seam an OVN backend goes behind, and the reason the objects of 6k are
-/// shaped the way they are. Everything this takes is already decided —
-/// [`RouterPlan`] — so a second implementation writes the same facts into a
-/// northbound database instead of sending commands, and nothing above it
-/// changes: not the objects, not the scheduler, not the reconciler, not the
-/// CLI.
+/// Apply a resolved RouterPlan through a network implementation.
+/// Backends receive placement and configuration rather than resolving objects.
 #[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
     /// The word in the config that chose this backend. For the log line at
@@ -426,21 +328,9 @@ pub trait NetworkBackend: Send + Sync {
     async fn realise(&self, sink: &dyn RouterSink, plan: &RouterPlan) -> RouterOutcome;
 }
 
-/// MeisterStack's own network backend: the routers are built by the agents
-/// with the `linux-network` driver.
-///
-/// One `EnsureRouter` per node of the priority list, `active` true on the
-/// first live one and false on the rest, and a `DestroyRouter` to everything
-/// that should let go. Level-triggered like everything else this control
-/// plane sends: the same plan twice is one router, so a pass that reaches a
-/// node which already has it costs one message and changes nothing.
-///
-/// The order is deliberate and it is the failover's whole correctness
-/// argument: **the standbys are told first, the active last**. Two nodes
-/// announcing one address at once is a fabric that has to choose, and it may
-/// choose the one whose conntrack does not have the flow; a moment where
-/// NOBODY announces is a moment of loss and no confusion. So a node that is
-/// giving up `active` hears about it before the node that is taking it up.
+/// Apply the gateway plan through agent EnsureRouter/DestroyRouter
+/// commands. Send standby updates before activation to reduce overlap.
+/// This order does not fence an unreachable previous active gateway.
 pub struct MeisterNetwork;
 
 #[async_trait::async_trait]
@@ -500,14 +390,8 @@ impl NetworkBackend for MeisterNetwork {
     }
 }
 
-/// What the phase IS after a pass, out of what happened rather than out of
-/// what was asked.
-///
-/// The order of the questions is the answer: a router nobody would carry is
-/// Pending, one every candidate refused is Failed, one that is built and
-/// speaking is Active, one that is built and deliberately silent is Standby,
-/// and one whose machines could not be reached is Unknown — never Failed,
-/// for the reason `VmPhaseKind::Unknown` gives.
+/// Derive router phase and reason from the plan, acknowledgements and failures.
+/// Unreachable nodes yield Unknown rather than proving the router Failed.
 fn verdict(
     plan: &RouterPlan,
     out: &RouterOutcome,
@@ -558,11 +442,8 @@ impl RouterPlan {
     }
 }
 
-/// The TOML spelling: `network = "meister"`.
-///
-/// The same shape `SchedulerConfig` has, for the same reason. Both
-/// controllers resolve their backend through here, so a second one is a new
-/// arm and a new line in a config file rather than an edit in two `main`s.
+/// Shared backend configuration, such as `network = "meister"`, resolved by
+/// both controller tiers.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NetworkConfig(pub String);
 
@@ -791,10 +672,8 @@ mod tests {
                     external_ip: "198.51.100.9".into(),
                     logical_ip: "10.42.0.9".into(),
                 },
-                // Announced and never translated: no external address, and
-                // the driver renders no rule for it. The contract has no
-                // field of its own for the announcement, so this is the road
-                // it takes — see `NatKind::Routed`.
+                // Routed entries carry announcements without address translation; logical_ip
+                // holds the prefix and external_ip remains empty.
                 NatRule {
                     kind: NatKind::Routed,
                     external_ip: String::new(),
@@ -804,10 +683,7 @@ mod tests {
             "sorted, so that two passes do not rewrite the object every tick"
         );
 
-        // A router that was told not to masquerade carries no snat rule,
-        // which is the routed-subnet deployment: the prefixes are real and a
-        // masquerade in the middle would hide them from the fabric that was
-        // told to route to them.
+        // Disabling SNAT preserves routed source addresses visible to the fabric.
         r.spec.snat = false;
         assert!(
             nat_rules(&r, &addresses, &["10.7.1.0/24".to_string()])
@@ -935,10 +811,8 @@ mod tests {
         }
     }
 
-    /// Every node of the list is told, exactly one of them with `active` —
-    /// and the standby hears first. Two machines announcing one address at
-    /// once is a fabric that has to choose; a moment where nobody announces
-    /// is a moment of loss and no confusion.
+    /// Configure standbys before the selected active node to avoid overlap during
+    /// ordered role changes.
     #[tokio::test]
     async fn the_standby_is_told_before_the_active_one() {
         let sink = Recorder::default();
@@ -955,11 +829,8 @@ mod tests {
         assert_eq!(out.built, ["gw-2", "gw-1"]);
     }
 
-    /// The distinction the whole refusal machinery exists for, one object
-    /// over: a node that says it has no gateway slot is never offered this
-    /// router again, and a node that could not be reached is not a node that
-    /// said no — the router is Unknown, and its netns is very probably still
-    /// forwarding.
+    /// Structural refusal is remembered; transport silence remains uncertainty
+    /// about a router that may still be forwarding.
     #[tokio::test]
     async fn a_structural_refusal_is_remembered_and_a_silent_node_is_not() {
         let sink = Recorder {

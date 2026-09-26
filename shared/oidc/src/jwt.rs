@@ -18,31 +18,20 @@ use serde_json::Value;
 
 use crate::jwks::{Alg, Keys, b64};
 
-/// A minute either way, which is what an unsynchronised laptop is worth. Big
-/// enough that a clock a few seconds out does not lock somebody out, small
-/// enough that it does not meaningfully extend the life of a stolen token.
+/// Default 60-second tolerance for token validity timestamps.
 pub const DEFAULT_LEEWAY: Duration = Duration::from_secs(60);
 
-/// The claim that names the person, unless an operator says otherwise.
-///
-/// `sub` and not `email`, and this is not a shrug at a default. `sub` is the
-/// one claim OIDC requires to be stable and never reassigned; an address
-/// changes when somebody marries or moves team, and a name that changes is a
-/// name that silently detaches a person from everything they own here — or,
-/// worse, reattaches them to what the previous holder of that address owned.
+/// Default username claim: the issuer's subject identifier rather than a mutable email address.
 pub const DEFAULT_USERNAME_CLAIM: &str = "sub";
 
 /// What a token has to satisfy. All of it is the operator's, none of it is
 /// the token's.
 #[derive(Clone, Debug)]
 pub struct Validation {
-    /// Exactly the `iss` the token must carry, and the same string the
-    /// discovery document was fetched under.
+    /// Required issuer claim, matching the configured discovery issuer.
     pub issuer: String,
-    /// Any one of these in `aud` is enough. Empty is a configuration error
-    /// caught when the validation is built, not here: a token with no
-    /// audience check is a token issued for some other service that this one
-    /// will happily accept.
+    /// Require at least one configured audience to match aud. Empty audience
+    /// configuration is rejected when validation is constructed.
     pub audience: Vec<String>,
     /// The pin. What the provider advertises is not what we accept.
     pub allowed: Vec<Alg>,
@@ -108,12 +97,8 @@ pub struct Verified {
     pub claims: Claims,
 }
 
-/// Why a token did not pass.
-///
-/// `UnknownKey` is its own variant for one reason: it is the only failure
-/// that a refetch could turn into a success, and the caller has to be able
-/// to tell it apart to decide whether to ask the provider again. Every other
-/// way a token can be wrong stays wrong.
+/// Verification failure. UnknownKey permits requesting fresh provider keys;
+/// other failures do not trigger that refresh path.
 #[derive(Debug)]
 pub enum VerifyError {
     UnknownKey { kid: Option<String> },
@@ -148,19 +133,9 @@ struct Header {
     crit: Option<Vec<String>>,
 }
 
-/// Whether a bearer value is a signed JWT at all.
-///
-/// This exists so that two links of the same authenticator chain can share
-/// the `Authorization: Bearer` header without fighting over it. The chain's
-/// contract is that `Err` ends the walk, so an OIDC link that refused every
-/// bearer value it could not verify would take the static development token
-/// down with it — the token would never reach the link that knows it. A JWT
-/// is recognisable by shape, so the OIDC link claims what is one and passes
-/// on what is not.
-///
-/// Deliberately a shape test and not a validity test: something that IS a
-/// JWT and is broken must be REFUSED by the OIDC link, not handed on to a
-/// weaker one. Only things that were never JWTs get passed along.
+/// Recognize JWT shape without validating it. Non-JWT bearer values may
+/// reach a later authenticator; malformed or invalid JWTs claimed by OIDC
+/// must be refused without falling back to a weaker mechanism.
 pub fn looks_like_a_jwt(token: &str) -> bool {
     let mut parts = token.split('.');
     let (Some(header), Some(payload), Some(_), None) =
@@ -191,10 +166,7 @@ pub fn verify(
         )));
     }
 
-    // Bound once, and every slice below is a slice of THIS string. The
-    // signature is checked over `header.payload` as a range of it, so a
-    // second `trim()` producing a different string would be checking a
-    // signature over bytes nobody signed.
+    // Trim once and retain the original encoded header.payload bytes for signature verification.
     let token = token.trim();
 
     // Three parts and no more. A five-part string is a JWE — encrypted, not
@@ -246,9 +218,7 @@ pub fn verify(
             kid: header.kid.clone(),
         })?;
 
-    // Over the two raw parts and the dot between them, exactly as they
-    // arrived: re-encoding the header would check a signature over bytes the
-    // provider never signed.
+    // Verify the original encoded header.payload bytes without re-encoding.
     let signed_len = raw_header.len() + 1 + raw_payload.len();
     let signed = &token.as_bytes()[..signed_len];
     let sig = b64(raw_sig).context("the signature").map_err(invalid)?;
@@ -302,12 +272,7 @@ pub fn verify(
     Ok(Verified { username, claims })
 }
 
-/// The nominated claim, as a non-empty string.
-///
-/// A top-level claim and not a path: providers put the username at the top
-/// level, a dotted path would need an escape for a claim name containing a
-/// dot, and an identity that depends on getting an escape right is worse
-/// than one that does not.
+/// Read the configured top-level username claim as a nonempty string; dotted paths are unsupported.
 fn username_of(claims: &Claims, claim: &str) -> Result<String> {
     // `sub` is a registered claim and lands in the struct, not in `rest`, so
     // the common case has to be answered from the field.
@@ -377,17 +342,7 @@ mod tests {
         assert!(matches!(err, VerifyError::Invalid(_)));
     }
 
-    /// Algorithm confusion, both halves.
-    ///
-    /// The classic form is to take the provider's PUBLIC key, present it to
-    /// an HMAC verifier as the shared secret, and sign your own tokens with
-    /// it. That needs a symmetric code path to reach, and there is none —
-    /// `HS256` does not parse into an `Alg` at all, so the attack stops at
-    /// the header rather than at a key comparison.
-    ///
-    /// The second half is the same idea between two asymmetric families: a
-    /// header naming an RSA algorithm over an EC key. That one is refused by
-    /// the key itself, in `PublicKey::verify`.
+    /// Reject HMAC algorithms and asymmetric algorithm/key-family mismatches.
     #[test]
     fn an_algorithm_the_token_picked_is_not_an_algorithm_we_will_use() {
         let idp = TestIdp::new("k1");
@@ -423,9 +378,7 @@ mod tests {
         assert!(verify(&good(&idp), &idp.keys(), &v, now()).is_ok());
     }
 
-    /// An unknown `kid` is its own answer, because it is the only one a
-    /// refetch could change. The caller uses this to decide whether to ask
-    /// the provider again — see `cache`.
+    /// Report unknown key IDs separately so callers can request refresh.
     #[test]
     fn an_unknown_key_id_is_told_apart_from_every_other_failure() {
         let idp = TestIdp::new("k1");
@@ -460,8 +413,7 @@ mod tests {
         assert!(err.to_string().contains("does not match"), "{err}");
     }
 
-    /// A tampered PAYLOAD, which is the same refusal for a different reason
-    /// and the one that matters: the claim being edited is the username.
+    /// Reject payload changes after signing, including username edits.
     #[test]
     fn a_payload_edited_after_signing_is_refused() {
         let idp = TestIdp::new("k1");
@@ -558,9 +510,7 @@ mod tests {
         assert!(err.to_string().contains("no aud"), "{err}");
     }
 
-    /// A validation with no audience would accept every token the provider
-    /// ever issued, for any service. It is refused rather than allowed to be
-    /// a very permissive setting.
+    /// Reject validation with no audience constraint.
     #[test]
     fn a_validation_with_no_audience_refuses_everything() {
         let idp = TestIdp::new("k1");
@@ -591,9 +541,7 @@ mod tests {
         assert!(err.to_string().contains("not a string"), "{err}");
     }
 
-    /// Which claim is the name is the operator's, because providers disagree
-    /// about it — and getting it wrong is not a typo, it is a different
-    /// person.
+    /// Allow an operator-selected username claim, defaulting to sub.
     #[test]
     fn the_username_claim_is_configurable_and_defaults_to_sub() {
         let idp = TestIdp::new("k1");
@@ -645,10 +593,7 @@ mod tests {
         assert!(err.to_string().contains("critical"), "{err}");
     }
 
-    /// The shape test that lets the OIDC link and the static bearer token
-    /// share one header. Anything that was never a JWT is passed on; a
-    /// broken JWT is not, because passing that on would mean a token the
-    /// OIDC link refused getting a second opinion from a weaker link.
+    /// Recognize JWT-shaped input so rejected JWTs cannot fall through to opaque-token authentication.
     #[test]
     fn a_jwt_is_recognisable_by_shape_and_an_opaque_token_is_not() {
         let idp = TestIdp::new("k1");
@@ -673,10 +618,7 @@ mod tests {
         }
     }
 
-    /// The RSA path, against RFC 7515's own worked example — key, signing
-    /// input and signature all lifted from appendix A.2. Our tests otherwise
-    /// generate EC keys, so without this the whole `RS256` branch would only
-    /// ever have been checked against itself.
+    /// Verify the independent RS256 example from RFC 7515 appendix A.2.
     #[test]
     fn the_rs256_path_verifies_the_rfc_7515_example() {
         const N: &str = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qP\
@@ -706,7 +648,7 @@ mod tests {
         )
         .expect("the rfc's own signature checks out");
 
-        // And the same key refuses the same bytes under any other algorithm.
+        // Reject the signature under other algorithms.
         for wrong in [Alg::Rs384, Alg::Rs512] {
             assert!(
                 key.verify(

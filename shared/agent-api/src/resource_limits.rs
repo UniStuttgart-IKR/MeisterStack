@@ -11,25 +11,14 @@ use std::path::PathBuf;
 pub struct ResourceLimits {
     pub memory_max: Option<u64>,
     pub cpu_quota: Option<u32>, // in percent: like OpenNebula 100 = 1 vCore, 200 = 2vCores...
-    /// Which CPUs this agent's VMs may run on at all, e.g. "0-15,32-47".
-    ///
-    /// A different KIND of limit from the two above and that is why it reads
-    /// oddly beside them: those are per-VM allowances, this is a property of
-    /// the whole agent and is written on the PARENT slice, once, where every
-    /// VM slice inherits it (cgroup v2: an empty `cpuset.cpus` on a child
-    /// means "whatever the parent has"). It is here rather than as a second
-    /// trait method because the confiner already takes a limits struct and a
-    /// second entry point for one string would be a second entry point.
-    ///
-    /// It is the enforcing half of the two-agents-per-host recipe:
-    /// `capacity_vcpus` is what the agent CLAIMS, this is what its VMs
-    /// actually get, and a claim without the pinning would be a promise the
-    /// scheduler believes and the kernel does not keep.
+    /// Allowed CPUs for all VM slices, e.g. `0-15,32-47`. Applied to the
+    /// parent cgroup and inherited by children. This enforces host partitioning;
+    /// `capacity_vcpus` separately controls advertised scheduler capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpuset: Option<String>,
 }
 
-/// Handle for an existing cgroup for example "/sys/fs/cgroup/meisterstack/<id>"
+/// Existing cgroup handle, for example `/sys/fs/cgroup/meisterstack/<id>`.
 #[derive(Clone, Debug)]
 pub struct CgroupHandle {
     pub path: PathBuf,
@@ -77,23 +66,8 @@ pub trait ResourceConfiner: Send + Sync {
     fn pids_in_slice(&self, name: &str) -> ConfinerResult<Vec<u32>>;
     fn kill_slice(&self, name: &str) -> ConfinerResult<()>;
 
-    /// The directory this confiner puts its slices under, if it uses one.
-    ///
-    /// Asked so that the agent can keep checking that the directory is still
-    /// what it has to be — a cgroup2 mount and not an ordinary directory,
-    /// which is the difference between a node that can tear a VM down and one
-    /// that cannot. The check used to run once at start-up, and a
-    /// `/sys/fs/cgroup` that was unmounted or shadowed while the agent ran was
-    /// then something nobody said anything about until the first delete hung.
-    ///
-    /// It is here rather than passed around beside the driver because the
-    /// driver is the party that KNOWS: it is the one that writes into the
-    /// directory, and a second copy of the path in the reconciler would be a
-    /// second thing to keep in step with the config.
-    ///
-    /// `None` is a confiner with no directory to look at — every fake in this
-    /// tree's tests, and any future confiner that is not cgroupfs. Nothing is
-    /// then checked and nothing is claimed, which is the honest answer.
+    /// Confiner root used for periodic cgroup2 prerequisite checks. None
+    /// means this driver has no filesystem root to inspect.
     fn root(&self) -> Option<&std::path::Path> {
         None
     }

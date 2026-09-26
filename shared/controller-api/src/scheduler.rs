@@ -15,14 +15,8 @@ use std::collections::BTreeMap;
 
 use crate::resources::{AntiAffinity, CapacityReservation, NodeSummary, StoragePool, Vm};
 
-/// What a machine has, and what a VM wants of it. Two numbers, because those
-/// are the two a node can run out of.
-///
-/// Disk is deliberately not here. A volume is provisioned by a driver that
-/// knows its own backend — thin pool, NFS export, a file on a filesystem —
-/// and the honest answer to "how much room is left" is a different question
-/// per backend. A number this control plane invented for it would be wrong on
-/// most nodes and would refuse VMs for a reason that is not true.
+/// CPU and memory supply or demand. Storage capacity is excluded because
+/// drivers and pools own backend-specific space admission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub vcpus: u32,
@@ -30,22 +24,14 @@ pub struct Capacity {
 }
 
 impl Capacity {
-    /// What one VM asks for, out of the agent's own spec.
-    ///
-    /// Absent fields are zero, and that is the conservative direction: a spec
-    /// this controller cannot read the size of asks for nothing and is
-    /// therefore never REFUSED for a reason nobody can check. The agent's
-    /// serde is the validating authority for the rest of the document, and a
-    /// spec that names no vcpus does not get past it.
+    /// Read CPU and memory demand from the agent spec.
+    /// Missing or unreadable numbers count as zero; callers rely on prior validation.
     pub fn wanted_by(vm: &Vm) -> Self {
         Self::wanted_by_spec(&vm.spec.vm)
     }
 
-    /// The same reading, of a spec that is not on an object yet. What an
-    /// admission or a quota check at a create edge has in hand is a POST
-    /// body, and it has to be measured by the same function that measures the
-    /// object afterwards — two readings of "how big is this VM" are two
-    /// readings that start disagreeing.
+    /// Read demand before object creation, using the same sizing rules as placement
+    /// and quota checks on stored VMs.
     pub fn wanted_by_spec(spec: &serde_json::Value) -> Self {
         let number = |field: &str| spec.get(field).and_then(serde_json::Value::as_u64);
         Self {
@@ -54,10 +40,7 @@ impl Capacity {
         }
     }
 
-    /// Saturating, because a node whose reported capacity shrank under the
-    /// VMs already on it is a real state — an operator lowering
-    /// `capacity_vcpus` on a running node does exactly that — and the answer
-    /// to it is "nothing is free", not an overflow.
+    /// Subtract saturating at zero when usage exceeds newly reported capacity.
     pub fn minus(self, other: Self) -> Self {
         Self {
             vcpus: self.vcpus.saturating_sub(other.vcpus),
@@ -78,20 +61,12 @@ impl Capacity {
     }
 }
 
-/// How much more than it has a machine may be asked to carry.
-///
-/// The asymmetry is the whole point and it is not a preference: overcommitting
-/// MEMORY means the OOM killer picks a VM and ends it, and overcommitting
-/// vCPU means the guests wait for each other. One is a lost VM, the other is
-/// a slow one, and a control plane that cannot tell those apart will
-/// eventually do the first while believing it did the second.
+/// Capacity multipliers for admission. CPU overcommit permits contention;
+/// memory overcommit is disallowed to avoid admitting deliberate memory excess.
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overcommit {
-    /// Guests wait for each other. Four is the usual starting point and the
-    /// only number here that is a judgement rather than a derivation; a fleet
-    /// that was relying on the unlimited placement this stack had before
-    /// admission existed raises it.
+    /// CPU admission multiplier, defaulting to four.
     #[serde(default = "Overcommit::default_vcpu")]
     pub vcpu: f64,
     /// One, and it may not become more than one by accident. See the type's
@@ -112,13 +87,8 @@ impl Overcommit {
         Self::MEMORY_DEFAULT
     }
 
-    /// Refuse a configuration that would let the OOM killer decide which VM
-    /// survives, and one that would make a factor meaningless.
-    ///
-    /// Loud at start-up rather than quietly clamped: an operator who wrote
-    /// `memory = 1.5` believes something about their fleet that this control
-    /// plane will not do, and finding that out from a VM that died at three in
-    /// the morning is the worst possible way to learn it.
+    /// Reject nonfinite or nonpositive factors and memory overcommit instead of
+    /// silently clamping an unsupported configuration.
     pub fn check(&self) -> anyhow::Result<()> {
         if !(self.memory.is_finite() && self.memory > 0.0) {
             anyhow::bail!("admission.memory must be a positive number");
@@ -156,14 +126,7 @@ impl Default for Overcommit {
     }
 }
 
-/// Which inventory a candidate came out of: a node under a cluster, or a
-/// cluster under the cloud.
-///
-/// It sits on the candidate because the selector to enforce depends on it —
-/// see `VmSpec::node_selector`. A list never mixes the two, so this is
-/// redundant in the sense that a caller always knows; it is here so that the
-/// functions reading it are total and cannot be called with the wrong tier's
-/// question.
+/// Candidate tier selecting which VM selector applies: node or cluster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateKind {
     Node,
@@ -175,13 +138,8 @@ pub enum CandidateKind {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub name: String,
-    /// A session exists ON THIS REPLICA and the candidate's heartbeat has not
-    /// expired.
-    ///
-    /// Replica-local on purpose: it is what says whether this process can
-    /// send this machine a command, and a VM belongs to the replica holding
-    /// its node's session (`may_reconcile`). See `alive` for the other
-    /// question, which is not the same one.
+    /// Unexpired peer session held by this replica, permitting direct dispatch.
+    /// Use alive for fleet-wide readiness independent of local ownership.
     pub connected: bool,
     /// Fleet-wide readiness from stored node status, independent of which replica
     /// holds its session. Router planning uses this view; Dispatch forwards commands
@@ -189,46 +147,15 @@ pub struct Candidate {
     pub alive: bool,
     /// `spec.schedulable` — an operator draining it without stopping it.
     pub schedulable: bool,
-    /// What the machine itself says is wrong with it — `status.conditions`,
-    /// by type, in the order it reported them. Empty is a healthy machine and
-    /// is what every candidate built before this field carries.
-    ///
-    /// The third half of "usable", beside connected and schedulable, and the
-    /// one neither of those can express: `connected` is a fact about a socket
-    /// and `schedulable` is a fact about an operator, and the machine that
-    /// wedged in the mini-chaos run was both. A node that cannot act on a
-    /// command is not a candidate for one, whatever its heartbeat says.
-    ///
-    /// Read as a VETO and never as a permission: an empty list is also what an
-    /// agent too old to have the field reports, so it can only ever mean
-    /// "said nothing", which is exactly how the scheduler treated every node
-    /// before this existed.
+    /// Reported node conditions used as scheduling vetoes. Empty means no
+    /// condition was reported, including by legacy agents; it is not independent
+    /// proof of health.
     pub unhealthy: Vec<String>,
-    /// What is still free here: the allowance this candidate's capacity gives
-    /// under the configured overcommit, minus everything already bound to it
-    /// — and minus what is PROMISED to a guest on its way here, which is a
-    /// live migration's destination and nothing else. See [`hold`] and
-    /// `CapacityReservationSpec`: a guest in flight is bound to the machine
-    /// it is leaving, so without that second subtraction it is a claim on
-    /// this machine that no sum over the VM objects can see.
-    ///
-    /// On the Candidate and not behind a `Scheduler` parameter, so that the
-    /// rule reaches every strategy that will ever be written. Whether a VM
-    /// FITS is not a matter of strategy — a bin-packer and a first-fit may
-    /// disagree about where to put it and must not disagree about whether the
-    /// machine can hold it.
-    ///
-    /// Derived per pass and never stored: it is capacity minus a sum over the
-    /// VM objects, both of which the controller already has in hand, and a
-    /// second copy in etcd would be a number that can be wrong.
+    /// Per-pass capacity after bound VMs and incoming migration reservations.
+    /// All strategies consume this same budget; it is derived, not persisted.
     pub free: Capacity,
-    /// The candidate's device catalogue, spelled by `common::capability`
-    /// — the same function the node's own capacity is built with, so the two
-    /// halves of the sentence cannot drift apart. Empty = no devices offered.
-    ///
-    /// Named for what it holds rather than for the field it is read from:
-    /// `NodeCapacity.capabilities` is a wire name (design §2, control.proto)
-    /// and stays, but nothing in the scheduler is about GPUs.
+    /// Offered capabilities encoded through `common::capability` to match VM
+    /// requests consistently. Empty means no advertised capabilities.
     pub catalogue: Vec<String>,
     /// Which tier's inventory this came from, and therefore which of the VM's
     /// two selectors applies.
@@ -237,53 +164,20 @@ pub struct Candidate {
     /// on this machine, and the half of a selector that lives on the
     /// inventory.
     pub labels: BTreeMap<String, String>,
-    /// The workload classes this candidate takes, `NodeSpec.accepts`. Empty
-    /// is everything, which is every machine that was never told otherwise —
-    /// see `resources::accepts_class`.
-    ///
-    /// The mirror image of a selector and beside it on purpose: a selector is
-    /// the WORKLOAD choosing machines, this is the MACHINE choosing
-    /// workloads, and a scheduler has to honour both or an operator who said
-    /// "this one is for routers" gets VMs on it anyway.
-    ///
-    /// **Always empty at the cloud tier**, and that is a gap rather than a
-    /// decision: `proto::NodeReport` carries a node's labels, conditions,
-    /// capabilities and drain, and nothing that says what it accepts. So the
-    /// cloud cannot see the refusal and the cluster is what makes it — a VM
-    /// of a class nobody there takes comes back Pending with the cluster's
-    /// own sentence. Filling this in at the cloud needs a field on that
-    /// message.
+    /// Node workload classes; empty accepts all classes. Cloud candidates
+    /// currently have no node acceptance list on the wire, so the cluster
+    /// performs the final class check.
     pub accepts: Vec<String>,
-    /// The `metadata.labels` of every VM already bound here.
-    ///
-    /// What anti-affinity is measured against, and derived per pass from the
-    /// same VM listing `free` is: two VMs are "together" exactly when one is
-    /// bound to the candidate the other is being placed on. Not stored, for
-    /// the same reason `free` is not — a second copy in etcd is a number that
-    /// can be wrong.
+    /// Labels of bound VMs for anti-affinity checks, derived with capacity usage
+    /// from each pass's VM inventory.
     pub hosted: Vec<BTreeMap<String, String>>,
-    /// What a guest's machine state would be restored INTO here, when this
-    /// candidate is a machine and has said.
-    ///
-    /// **Not a scheduling input.** Nothing in `feasible` reads it and nothing
-    /// should: where to put a NEW guest is a question about room, devices and
-    /// selectors, and a machine profile answers none of them. It is here
-    /// because the one caller that needs it — choosing a live migration's
-    /// DESTINATION — chooses from this very list, and a second list built
-    /// from Node objects beside it would be a second answer to "which
-    /// machines are there".
-    ///
-    /// `None` at the cloud tier, where a candidate is a cluster and not a
-    /// machine, and `None` from a node whose agent predates the field.
-    /// Neither is evidence: see [`crate::live_migration_refusal`].
+    /// Machine profile for live-migration compatibility, not ordinary VM
+    /// placement. None at the cloud tier or for older nodes means unavailable
+    /// evidence, not compatibility.
     pub machine: Option<crate::MachineProfile>,
 }
 
-/// Does every pair of `selector` appear in `labels`?
-///
-/// An empty selector matches everything, which is what makes "no selector"
-/// and "a selector nobody wrote" the same thing and keeps every VM written
-/// before this feature placed exactly where it was.
+/// Require every selector pair to match; an empty selector matches all labels.
 pub fn selects(selector: &BTreeMap<String, String>, labels: &BTreeMap<String, String>) -> bool {
     selector.iter().all(|(k, v)| labels.get(k) == Some(v))
 }
@@ -305,17 +199,9 @@ fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
         .any(|labels| selects(&term.selector, labels))
 }
 
-/// Every candidate this VM may be placed on at all.
-///
-/// The conjunction of every rule that is NOT a matter of strategy: up,
-/// willing, roomy, offers what is asked for, carries the labels selected, and
-/// holds nothing a required anti-affinity term forbids. A bin-packer and a
-/// first-fit may disagree about which of these to take and must not disagree
-/// about which of them are allowed — the same argument `Candidate::free`
-/// makes, extended to the rest of the question.
-///
-/// Order is preserved, so a strategy that wants "the first" gets the first in
-/// inventory order and stays deterministic.
+/// Apply hard VM constraints while preserving inventory order: health,
+/// connectivity, schedulability, capacity, capabilities, selectors and
+/// required anti-affinity. Strategies choose only within this set.
 pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
     let wanted = DevicePolicy::of(vm);
     let size = Capacity::wanted_by(vm);
@@ -334,29 +220,14 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
         .collect()
 }
 
-/// Up, willing and able — the three cuts that are about the MACHINE and about
-/// nothing that is being placed on it.
-///
-/// Its own function because there is a second thing being placed now. A
-/// volume asks for no vCPUs, carries no anti-affinity and matches no VM
-/// selector, but a node that is down, drained or wedged is no more a
-/// candidate to provision on than it is to run on. Sharing the predicate is
-/// what keeps "unusable" from meaning three different things depending on
-/// what is being scheduled — and the wedged case is exactly the one the
-/// mini-chaos run reached through the volume path, not the VM path.
+/// Local-session usability shared by VM and storage placement: connected,
+/// schedulable and without reported health vetoes.
 pub fn is_usable(c: &Candidate) -> bool {
     c.connected && c.schedulable && c.unhealthy.is_empty()
 }
 
-/// The same three cuts, asked about the FLEET rather than about this process:
-/// the machine is up, willing and able, whoever happens to be holding its
-/// session.
-///
-/// For what is placed on several machines at once, which is routers and
-/// nothing else. Every replica has to derive the same priority list out of
-/// the same store — that is what makes two replicas planning one router in
-/// the same pass harmless — and `connected` cannot do it, because it is a
-/// fact about THIS process's socket. See `Candidate::alive`.
+/// Fleet-wide usability independent of which replica holds the session.
+/// Router planners need this shared view to derive consistent placements.
 pub fn is_alive(c: &Candidate) -> bool {
     c.alive && c.schedulable && c.unhealthy.is_empty()
 }
@@ -393,10 +264,8 @@ pub struct StoragePolicy {
 }
 
 impl StoragePolicy {
-    /// From the pool a volume was reserved out of. The VOLUME contributes
-    /// nothing to the demand today — size is the pool's own admission
-    /// question and mode is the driver's — so this takes the pool alone and
-    /// says so, rather than taking a volume it would not read.
+    /// Build placement demand from pool driver and node constraints.
+    /// Volume size and access semantics are admitted separately.
     pub fn of(pool: &StoragePool) -> Self {
         Self {
             driver: pool.spec.driver.clone(),
@@ -421,18 +290,9 @@ impl StoragePolicy {
     }
 }
 
-/// Every candidate this volume may be provisioned on at all.
-///
-/// The second application of the same idea `feasible` is, and it shares the
-/// half that is about the machine (`usable`) rather than restating it. What
-/// it does NOT share is everything that is about a VM: a volume asks for no
-/// vCPUs and no memory, so `Capacity` does not appear here — how much room is
-/// left on a thin pool is the backend's own admission question, asked at
-/// `provision` time by the driver that owns the pool, and a controller
-/// second-guessing it would be a second answer that goes stale.
-///
-/// Order is preserved, so a strategy that wants "the first" stays
-/// deterministic — the same promise `feasible` makes.
+/// Filter storage provisioning candidates by node usability and driver
+/// capability. Storage operations consume no VM CPU/memory budget; backend
+/// space admission remains the provider's responsibility. Preserve order.
 pub fn feasible_for_storage<'a>(
     policy: &StoragePolicy,
     candidates: &'a [Candidate],
@@ -440,19 +300,8 @@ pub fn feasible_for_storage<'a>(
     usable(candidates).filter(|c| policy.met_by(c)).collect()
 }
 
-/// Narrow a feasible set to the candidates that already hold the data — or
-/// leave it alone, if honouring that would mean placing nothing.
-///
-/// SOFT, and never anything else. A VM whose volume lives on node A runs best
-/// on node A, and the day the storage is rebalanced — a node drained, a
-/// replica moved, a pool re-cut — a hard rule would strand every VM that had
-/// been placed by it. The fallback is the whole difference, and it is the
-/// same one `preferred` makes for anti-affinity: a preference that can strand
-/// a VM is a requirement whose author did not know they were writing one.
-///
-/// `holders` is where the data actually is, by candidate name. Empty — which
-/// is every VM whose disks are declared in its own spec rather than reserved
-/// as objects — leaves the set exactly as it was.
+/// Prefer existing data holders only when at least one remains feasible.
+/// An empty holder set or no feasible holder leaves the full set available.
 pub fn prefer_local<'a>(feasible: Vec<&'a Candidate>, holders: &[String]) -> Vec<&'a Candidate> {
     if holders.is_empty() {
         return feasible;
@@ -465,13 +314,8 @@ pub fn prefer_local<'a>(feasible: Vec<&'a Candidate>, holders: &[String]) -> Vec
     if local.is_empty() { feasible } else { local }
 }
 
-/// Why this volume found no candidate, in a sentence and a category.
-///
-/// The same two-part answer `pending_reason_of` gives a VM and for the same
-/// two reasons: an operator reads the sentence off the object, and the
-/// category is what may become a metric label. The order of the cuts is the
-/// order that sends an operator to the right machine — nobody is here, nobody
-/// is willing, nobody has the backend, nobody the pool named is here.
+/// Explain failed storage placement with a bounded category for metrics and
+/// a detailed message for the object.
 pub fn storage_pending_reason(
     policy: &StoragePolicy,
     pool: &str,
@@ -532,13 +376,8 @@ pub fn storage_pending_reason(
     )
 }
 
-/// One volume a VM names, and what it therefore demands of the node.
-///
-/// Assembled by the tier that has the objects — the volume for its node, the
-/// pool for its locality and its wiring — so that this module goes on knowing
-/// nothing about etcd. The same shape `StoragePolicy` has, one question later:
-/// that one asks where a volume may be MADE, this one asks where the VM that
-/// uses it may RUN.
+/// Referenced-volume locality constraints on VM placement, resolved by the caller
+/// so the scheduler needs no store access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeBinding {
     /// What the VM's spec called it, for the sentence.
@@ -552,18 +391,9 @@ pub struct VolumeBinding {
     pub locality: Option<Locality>,
     /// `StoragePoolSpec.nodes`. Empty = every node.
     pub pool_nodes: Vec<String>,
-    /// `StoragePoolSpec.driver` — the backend this volume came out of.
-    ///
-    /// Read for ONE locality: `networked`. A node-local or shared volume is
-    /// pinned to machines by name, and the name is the whole constraint; a
-    /// networked one is pinned to nothing by name, and what a candidate then
-    /// has to have is the DRIVER that can reach the bytes. Without this the
-    /// scheduler would place such a VM anywhere and find out at the attach —
-    /// which works, because that refusal is structural and the VM moves, but
-    /// it is placement by trial and it shows in the events.
-    ///
-    /// `None` on a binding built without one, which reads as "no claim to
-    /// insist on" and is exactly the old behaviour.
+    /// Provider driver used to constrain networked-volume access. NodeLocal
+    /// and Shared use location rules instead. None keeps the legacy behavior
+    /// of requiring no explicit driver claim.
     pub driver: Option<String>,
 }
 
@@ -583,21 +413,9 @@ impl VolumeBinding {
         }
     }
 
-    /// The catalogue entry a candidate needs to reach this volume, where
-    /// reaching it is a capability rather than a place.
-    ///
-    /// Only `networked`, and only because that is the one locality whose
-    /// answer to "where are the bytes" is "not here, and it does not matter
-    /// where here is". A `node-local` volume names its machine and a
-    /// `shared` one names its pool's; both are answered by `required` and
-    /// neither needs this. For a networked one the driver IS the constraint:
-    /// a node that cannot speak NVMe-oF cannot reach an NVMe-oF namespace,
-    /// however much room it has.
-    ///
-    /// The day `StoragePool.spec.attacher` exists this returns the ATTACHER's
-    /// claim rather than the provider's — the two are separate roles and the
-    /// catalogue says so. Today they are one driver on one machine, which is
-    /// the shape the lab proves, and this is the line that changes.
+    /// Required driver capability for Networked storage. Current provider
+    /// and attacher names are combined; NodeLocal and Shared use location
+    /// constraints rather than this claim.
     pub fn claim(&self) -> Option<String> {
         matches!(self.locality, Some(Locality::Networked))
             .then(|| self.driver.clone())
@@ -605,34 +423,16 @@ impl VolumeBinding {
             .filter(|d| !d.is_empty())
     }
 
-    /// Whether this volume is nailed to some machine OTHER than `node`.
-    ///
-    /// `required()` asked of a VM that is already placed, which is a
-    /// different question from the one the scheduler asks: the scheduler is
-    /// choosing and this is checking. It is what refuses an attach of a
-    /// node-local disk to a VM that runs somewhere else — a move is not an
-    /// attach, and the two would be told apart far too late otherwise (the
-    /// node would be handed a path that is not on it).
-    ///
-    /// `false` where nothing is known: an unplaced volume, a pool nobody has
-    /// reported a locality for, a `shared` pool that names no nodes. Same
-    /// direction as `required` — silence never pins.
+    /// Check whether a volume's hard locality excludes an already placed
+    /// node. Unknown locality or an unplaced volume does not establish a pin.
     pub fn pins_elsewhere(&self, node: &str) -> bool {
         self.required()
             .is_some_and(|allowed| !allowed.iter().any(|n| n == node))
     }
 }
 
-/// Narrow a candidate set to those every binding REQUIRES — the hard half.
-///
-/// The `feasible` of the volume question, and split from the soft half for
-/// exactly the reason those two are split one function apart: a requirement
-/// and a preference must be applied in that order and never mixed. A
-/// preference applied first can leave the requirement nothing to choose from,
-/// and its fallback would then hand back a node the requirement forbids.
-///
-/// An empty binding list — every VM whose disks are all inline — leaves the
-/// set exactly as it was.
+/// Apply all hard volume bindings before soft preferences. No bindings
+/// leaves the candidate set unchanged.
 pub fn feasible_for_volumes<'a>(
     bindings: &[VolumeBinding],
     candidates: Vec<&'a Candidate>,
@@ -652,19 +452,9 @@ pub fn feasible_for_volumes<'a>(
     allowed
 }
 
-/// Narrow to the candidates that already hold the data — or leave the set
-/// alone, if honouring that would mean placing nothing.
-///
-/// The soft half, over the bindings that have NO hard rule: a `shared` pool
-/// with no node list, and a pool whose locality nobody has reported. Both are
-/// "any node will do, and this one will do best", which is a preference and
-/// must behave like one.
-///
-/// Applied AFTER capacity, which is what makes the fallback real: a node that
-/// holds the data and has no room left has to lose to a node that has room,
-/// or the preference would be a requirement whose author did not know they
-/// were writing one. `prefer_local` is the mechanism; this is the half of the
-/// binding list it may be given.
+/// Apply soft locality preferences after capacity and hard constraints.
+/// Only bindings without a hard location rule participate; fall back to
+/// all feasible nodes when no preferred holder fits.
 pub fn preferred_for_volumes<'a>(
     bindings: &[VolumeBinding],
     feasible: Vec<&'a Candidate>,
@@ -677,11 +467,8 @@ pub fn preferred_for_volumes<'a>(
     prefer_local(feasible, &holders)
 }
 
-/// Why this VM's volumes left it nowhere to go.
-///
-/// Only reached when `feasible` found candidates and `feasible_for_volumes`
-/// left none, so the sentence is always about a volume and never about the
-/// cluster being empty — that case has its own reasons one function up.
+/// Explain volume constraints that eliminated otherwise feasible candidates.
+/// Empty-fleet and ordinary capability failures are diagnosed separately.
 pub fn volume_pending_reason(
     bindings: &[VolumeBinding],
     candidates: &[&Candidate],
@@ -739,10 +526,8 @@ pub fn volume_nodes_unusable(
     if allowed.is_empty() || allowed.iter().any(|c| is_usable(c)) {
         return None;
     }
-    // Not connected before drained before wedged: each is more fundamental
-    // than the next, and an operator who un-drains a node that is also gone
-    // has fixed nothing. The third is what the data disk case needed — the
-    // machine holding the bytes is up and willing and cannot write them.
+    // Prioritize disconnection, then scheduling exclusion, then health conditions
+    // so the message names the first obstacle to using the volume's node.
     let state = |c: &Candidate| {
         if !c.connected {
             "not connected".to_string()
@@ -777,49 +562,27 @@ pub fn volume_nodes_unusable(
     Some((PendingReason::NoNodeForVolume, sentence))
 }
 
-/// What a VM demands of the NODES inside a cluster.
-///
-/// The question the cloud tier could not ask until `ClusterStatus.nodes`
-/// existed, and the reason two findings were open at once. A cluster's
-/// capacity is a SUM and its catalogue a UNION, so a cluster could look able
-/// to serve a VM that no single node of it can: the `nodeSelector` was
-/// checked one tier down, after the binding, so a VM that no node matched
-/// went Pending on a cluster it should never have been sent to. And a VM
-/// naming a `node-local` volume had the same problem one step worse — the
-/// bytes are on one machine of one cluster, and nothing up here knew it.
-///
-/// Both are the same question and this is it, asked once, before the binding.
+/// Node-level requirements checked before cloud cluster binding.
+/// Aggregate cluster capacity/capability alone does not establish that
+/// one node can satisfy the combined request or hold node-local data.
 #[derive(Debug)]
 pub struct NodeDemand<'a> {
     /// `spec.nodeSelector` — matched against each node's own labels, which
     /// the cluster reports and the cloud mirrors.
     pub selector: &'a BTreeMap<String, String>,
-    /// The nodes that may serve this VM's volumes, or `None` for "any".
-    ///
-    /// The INTERSECTION of what every referenced volume allows: one
-    /// `node-local` volume allows exactly the node holding it, a `shared` one
-    /// allows its pool's nodes, and an unknown locality allows everything —
-    /// so an empty vector here means the volumes contradict each other and no
-    /// node anywhere can serve them.
+    /// Intersection of nodes permitted by all referenced volumes.
+    /// None means unrestricted; an empty set means no common placement exists.
     pub allowed: Option<Vec<String>>,
 }
 
 impl NodeDemand<'_> {
-    /// Whether at least one node of this cluster could actually run the VM.
-    ///
-    /// A node has to be usable — up and not drained — before its labels are
-    /// worth reading: a cluster whose only matching node is being drained is
-    /// a cluster the VM should not be sent to, which is the whole point of
-    /// asking before the binding rather than after it.
+    /// Require a usable node satisfying the selector and volume constraints before
+    /// binding a VM to this cluster.
     pub fn met_by_a_node(&self, nodes: &[NodeSummary]) -> bool {
         nodes.iter().any(|n| {
             n.ready
                 && n.schedulable
-                // The same veto `is_usable` applies one tier down. A cloud
-                // that binds a VM to a cluster whose only matching machine
-                // has a full disk has sent the VM somewhere it will sit
-                // Pending, which is exactly what asking before the binding
-                // exists to prevent.
+                // Apply the node-health veto before cloud placement, matching node scheduling.
                 && n.conditions.is_empty()
                 && selects(self.selector, &n.labels)
                 && self
@@ -830,11 +593,8 @@ impl NodeDemand<'_> {
     }
 }
 
-/// Narrow the allowed-node set by one more volume.
-///
-/// `None` narrows nothing — an unknown locality, or a `shared` pool that
-/// names no nodes, is "any node will do". Two `Some`s intersect, and an empty
-/// result is the honest answer that no node serves both.
+/// Intersect another volume's allowed nodes. None imposes no restriction;
+/// an empty intersection means no node can serve all volumes.
 pub fn narrow_allowed(
     current: Option<Vec<String>>,
     next: Option<Vec<String>>,
@@ -848,14 +608,8 @@ pub fn narrow_allowed(
     }
 }
 
-/// Narrow a feasible set to those that also honour the PREFERRED terms — or/// Narrow a feasible set to those that also honour the PREFERRED terms — or
-/// leave it alone, if honouring them would mean placing nothing./// Narrow a feasible set to those that also honour the PREFERRED terms — or
-/// leave it alone, if honouring them would mean placing nothing.
-///
-/// That fallback is the whole difference between a preference and a
-/// requirement, and it is why the two are separate flags rather than one
-/// knob: a preference that can strand a VM is a requirement whose author did
-/// not know they were writing one.
+/// Prefer candidates satisfying soft anti-affinity terms, but retain the feasible
+/// set when none satisfy them. Preferences must not prevent placement.
 pub fn preferred<'a>(vm: &Vm, feasible: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
     let soft: Vec<&AntiAffinity> = vm
         .spec
@@ -879,13 +633,8 @@ pub trait Scheduler: Send + Sync {
     fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String>;
 }
 
-/// The TOML spelling: `scheduler = "first-fit"`.
-///
-/// The same shape `retry` has for the requeue policy, and for the same
-/// reason: a plugin trait with exactly one implementation wired in by hand is
-/// not a seam, it is a comment about one. Both controllers resolve their
-/// scheduler through here, so a second strategy is a new arm and a new line in
-/// a config file rather than an edit in two `main`s.
+/// Shared scheduler configuration, such as `scheduler = "first-fit"`, resolved
+/// by both controller tiers.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SchedulerConfig(pub String);
 
@@ -949,12 +698,8 @@ fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
         ));
     }
 
-    // And the other side of the same field: a NIC that names a provider
-    // network needs a node that really holds an interface for THAT physnet,
-    // which is exactly what a gateway claim says. One request per distinct
-    // physnet, because two of them are two different wires and a node holding
-    // one is not a node holding the other — this is the one place where
-    // asking twice is not noise.
+    // Require the gateway capability for every distinct provider physnet named
+    // by NICs; access to one provider wire does not imply access to another.
     let mut physnets: Vec<&str> = array("nics")
         .iter()
         .filter_map(|n| crate::vni::physnet_of(n.as_object()?))
@@ -967,40 +712,16 @@ fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
         ));
     }
 
-    // Every VM asks for a hypervisor, whatever else it asks for.
-    //
-    // A BARE request — any hypervisor will do, and which one is the node's
-    // business. Matching the name would be sizing knowledge this tier does
-    // not have and should not learn: a VM does not care whether it is served
-    // by cloud-hypervisor or by whatever comes next, only that something
-    // serves it.
-    //
-    // Shipping this was deliberately held back until no node in the fleet ran
-    // an agent that predates the claim: such a node claims no `hypervisor/*`,
-    // and a VM requiring one would go Pending there for ever. Claiming is
-    // additive and safe during a rollout; requiring is not. The condition is
-    // met now — `manacor` was the last node still on a hand-started binary
-    // from before the claim, and the image round replaced it.
-    //
-    // What it buys: a storage-only node has room, is connected, is
-    // schedulable, and carries no hypervisor at all, so without this the
-    // first ordinary VM lands there, the agent refuses correctly, and the VM
-    // ends Failed on a machine that could never have run it. A volume may
-    // still be placed there, which is the whole point of having such a node.
+    // Require a hypervisor capability for every VM, keeping storage-only
+    // nodes out of compute placement. Agents predating this claim cannot
+    // satisfy the requirement; additive advertisement must precede rollout.
     requests.push((capability::HYPERVISOR.to_string(), None));
 
     requests
 }
 
-/// What one VM asks of the machine it lands on, derived from its spec once
-/// and then asked as often as a scheduler likes.
-///
-/// A seam, not a new rule — the derivation below is `resource_requests`
-/// unchanged. It exists so that the next scheduler can ASK what a VM needs
-/// instead of re-reading `spec.vm` to find out: the placement contract of a
-/// volume driver or a vxlan nic is a property of the spec, not of whichever
-/// strategy is looking at it, and two strategies deriving it separately is how
-/// they start disagreeing about where an lvm-thin VM may run.
+/// Capability requests derived once from the VM spec and reused by
+/// scheduling strategies.
 pub struct DevicePolicy(Vec<(String, Option<String>)>);
 
 impl DevicePolicy {
@@ -1027,12 +748,8 @@ impl DevicePolicy {
         &self.0
     }
 
-    /// The requests no usable candidate offers, spelled the way a catalogue
-    /// spells them (`nvrm/4q`, `volume/lvm-thin`, `network/vxlan`).
-    ///
-    /// Not "which candidate fell short" but "what nobody has": a VM needs ALL
-    /// of its requests on ONE candidate, so the useful answer to an operator
-    /// is the part of the ask that no single machine can serve.
+    /// Requests individually absent from all connected, schedulable candidates.
+    /// An empty result does not prove all requests coexist on one candidate.
     pub fn unmet(&self, candidates: &[Candidate]) -> Vec<String> {
         let usable: Vec<&Candidate> = candidates
             .iter()
@@ -1050,15 +767,8 @@ impl DevicePolicy {
     }
 }
 
-/// The CATEGORY of why a VM found no placement — the same question
-/// `pending_reason` answers in a sentence, in a form that can be a label.
-///
-/// The two exist together and neither replaces the other. The sentence names
-/// the capabilities nobody offers and counts the candidates it looked at, and
-/// that is what an operator reads off the object; it is also, for exactly
-/// those reasons, unbounded, and a metric label with an unbounded value range
-/// is what takes a Prometheus down. This is the closed set behind it, so that
-/// "how many VMs are pending, and why" is a time series rather than a string.
+/// Bounded pending-reason categories for metrics. Detailed object
+/// messages separately carry names, counts and requested capabilities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingReason {
     /// Nothing has ever dialled in here.
@@ -1066,30 +776,14 @@ pub enum PendingReason {
     /// Some are known; none is both connected and schedulable — everything is
     /// down, or everything is drained.
     NoneUsable,
-    /// Everything that is up and willing has said something is wrong with
-    /// itself: a full disk, a store that refuses writes, a cgroup root that
-    /// is not one.
-    ///
-    /// Its own reason and not `NoneUsable`, because the operator fix is a
-    /// different one and lives on a different machine. "Everything is
-    /// drained" sends somebody to `node uncordon`; this sends them to the
-    /// node named in the sentence, which is where the mini-chaos run's three
-    /// wasted hours went.
+    /// All otherwise usable candidates report health problems.
     NodeUnhealthy,
     /// Everything is up and willing and none of it has room. The fourth
     /// case, and without it a full cluster looks from the API exactly like a
     /// cluster where nothing is happening.
     NoCapacity,
-    /// Every machine that is up and willing takes only classes this workload
-    /// is not one of — `NodeSpec.accepts` on one side, `spec.class` on the
-    /// other.
-    ///
-    /// Its own reason, and it is asked before room, because the operator fix
-    /// is a different one and "no candidate has room" would send somebody to
-    /// buy memory for a fleet whose machines are all reserved for routers.
-    /// It is also not `SelectorUnmatched`: a selector is what the WORKLOAD
-    /// asked for and is fixed by editing the workload; this is what the
-    /// MACHINES accept and is fixed by editing a node.
+    /// Eligible machines reject this workload class. Checked before capacity
+    /// to distinguish node acceptance policy from insufficient resources.
     ClassRefused,
     /// Room enough, and nothing carries the labels the VM selects.
     SelectorUnmatched,
@@ -1105,27 +799,16 @@ pub enum PendingReason {
     /// `Unserved`, because nothing is missing: the disk is being made, and
     /// the answer is to wait rather than to change anything.
     VolumeNotReady,
-    /// The volume is Ready, and no candidate can reach it. Where a
-    /// `node-local` volume is IS where the VM has to run, so this is a hard
-    /// wall rather than a preference that was not met — the node holding the
-    /// data is down, drained, or out of room.
+    /// No usable placement can reach a Ready volume under its locality constraints.
     NoNodeForVolume,
-    /// A `Secret` this VM's cloud-init reads from cannot be opened here yet:
-    /// it has not been mirrored down, it holds no such key, or this tier has
-    /// no `secrets_key`.
-    ///
-    /// Its own word rather than `VolumeNotReady`, which is what it borrowed
-    /// while there was nothing else to say. A reason is a METRIC LABEL —
-    /// `pending_reason{reason="volume-not-ready"}` counting VMs waiting for a
-    /// secret would send whoever is reading the dashboard to the storage.
+    /// A cloud-init secret cannot yet be resolved, such as an absent mirror,
+    /// missing key or unavailable sealing key. Separate from storage readiness.
     SecretNotReady,
 }
 
 impl PendingReason {
-    /// Every variant, in declaration order — see `RunStrategy::ALL`. What a
-    /// pass walks to publish a zero for the reasons nothing is pending for,
-    /// so that a reason with no VMs stays a flat line in a dashboard rather
-    /// than a series that vanishes.
+    /// All reasons in declaration order, used to publish zero-valued metric series
+    /// for categories with no pending VMs.
     pub const ALL: [PendingReason; 12] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
@@ -1171,16 +854,9 @@ impl PendingReason {
         }
     }
 
-    /// Which of the VM's own reasons this category is, for the phase the
-    /// object now carries (`VmStatus::phase`).
-    ///
-    /// Twelve into two, and the line is drawn where it changes what somebody
-    /// DOES about it. Ten of these are a wall: a machine has to be added,
-    /// uncordoned, repaired or relabelled, or the VM has to ask for
-    /// something else. Two are a wait: a disk or a secret is being made and
-    /// the answer is to leave it alone. The twelve words themselves do not go
-    /// anywhere — they are still what `as_str` says, still the metric label,
-    /// and still in the sentence on the object.
+    /// Map detailed pending categories to the VM phase reason: a scheduling
+    /// blocker or a dependency still being prepared. Detailed metric labels
+    /// and object messages retain the specific cause.
     pub fn category(self) -> crate::resources::VmReason {
         use crate::resources::VmReason;
         match self {
@@ -1199,17 +875,8 @@ impl PendingReason {
     }
 }
 
-/// How many VMs are pending for each reason, over one reconcile pass.
-///
-/// A gauge cannot be incremented from inside the per-VM step and be right:
-/// what a dashboard needs is "how many are pending for this reason NOW", so
-/// the pass counts and publishes once at the end — including the zeros, so
-/// that a reason nothing is pending for stays a flat line rather than a
-/// series that disappears while the panel is being read.
-///
-/// Atomics rather than a `Cell`, because the pass holds this behind a shared
-/// reference across an await and the future has to stay `Send`. There is no
-/// contention: one pass, one task.
+/// Per-pass counts by pending reason, published once with explicit zeros.
+/// Atomics keep the shared reference Send across await points.
 #[derive(Debug, Default)]
 pub struct PendingTally([std::sync::atomic::AtomicI64; PendingReason::ALL.len()]);
 
@@ -1233,38 +900,20 @@ impl PendingTally {
     }
 }
 
-/// One cut the scheduler makes at the field, and what it means that nothing
-/// survived it.
-///
-/// A candidate that is not usable at all is carried past every cut untouched:
-/// the cuts are about the VM's demands, and whether anybody is usable is the
-/// first row's question and nobody else's.
+/// One ordered diagnostic constraint and its failure explanation.
+/// Unusable candidates pass later demand cuts because the initial cut diagnoses
+/// usability separately.
 struct Cut {
     /// Which candidates get past this cut.
     keep: fn(&Vm, &Capacity, &DevicePolicy, &Candidate) -> bool,
-    /// What to say when no usable candidate got past. Reads the field as it
-    /// stood BEFORE the cut, which is what these sentences have to name: the
-    /// roomiest machine, the tier the labels are about, the part of the ask
-    /// nobody serves.
+    /// Explain an exhausted constraint using candidates from before the cut,
+    /// such as available capacity or missing capabilities.
     verdict: fn(&Vm, &Capacity, &DevicePolicy, &[Candidate]) -> (PendingReason, String),
 }
 
-/// The reasons a VM can be Pending, in the order they are asked.
-///
-/// The order IS the answer and that is why it is a table: "nobody is here" and
-/// "nobody is willing" are different operator problems from "nobody can", and
-/// only the last is about the VM's own demands. Room before capability, the
-/// same order FirstFit filters in — a VM that fits nowhere is not a VM whose
-/// device request went unserved, and telling an operator to add a GPU when
-/// what is missing is memory sends them to the wrong machine. Selector before
-/// catalogue, because an unmatched selector is something the operator wrote
-/// down a moment ago and can fix by reading it again; saying "nobody offers
-/// nvrm/4q" to somebody whose typo was `zone=stutgart` sends them to the wrong
-/// problem. Anti-affinity last, because it is the subtlest of the cuts and
-/// blaming it while a GPU is also missing would be true and useless.
-///
-/// A new reason is a new row, and where it goes in the list is the whole of
-/// the decision.
+/// Ordered diagnostic cuts. The first exhausted constraint determines
+/// the pending explanation; apply basic availability and capacity checks
+/// before more specific selector, capability and anti-affinity diagnostics.
 const CUTS: [Cut; 6] = [
     // Is anybody here at all, is anybody willing, and is anybody able?
     Cut {
@@ -1276,11 +925,8 @@ const CUTS: [Cut; 6] = [
                     "no candidates are known here yet".to_string(),
                 );
             }
-            // Before the drained/down sentence, because it is the more
-            // specific answer: a machine that is up, willing and wedged would
-            // otherwise be counted into "none is connected and schedulable",
-            // which is a sentence that sends an operator to look at a cordon
-            // that is not there.
+            // Prefer a specific health veto over a generic disconnected/unschedulable
+            // message when a candidate is reachable but unhealthy.
             let wedged = wedged_sentence(field);
             if !wedged.is_empty() {
                 return (
@@ -1367,11 +1013,8 @@ const CUTS: [Cut; 6] = [
     Cut {
         keep: |_, _, wanted, c| wanted.met_by(&c.catalogue),
         verdict: |_, _, wanted, field| match wanted.unmet(field) {
-            // Every request IS served somewhere, so the ask is servable in
-            // principle and the split is what defeated it: no single candidate
-            // holds the whole set. Worth its own sentence, because the
-            // operator fix is different (put the capabilities on one machine,
-            // or ask for less on one vm).
+            // Every request exists somewhere, but no candidate offers the complete set.
+            // Report split capabilities separately from a missing capability.
             unmet if unmet.is_empty() => split(wanted),
             unmet => (
                 PendingReason::Unserved,
@@ -1416,19 +1059,9 @@ fn split(wanted: &DevicePolicy) -> (PendingReason, String) {
     )
 }
 
-/// Why a VM found no placement: the category, and one sentence an operator
-/// can act on.
-///
-/// The scheduler's `None` is the whole of what the reconciler learns, and
-/// until this existed the explanation lived only as a `debug!` line inside a
-/// controller — so a Pending VM was a dead end for anybody holding only the
-/// API. This turns the same cases into a sentence that can be stored on the
-/// object and read back with `vm inspect`, and into a category that can be a
-/// metric label.
-///
-/// One walk down `CUTS`: narrow, and the first cut that leaves nothing usable
-/// is the answer. A field that survives every cut is the `Split` case — every
-/// part of the ask is served, no one machine serves all of it.
+/// Return a bounded category and readable placement explanation. Walk
+/// the diagnostic cuts; Split means individual requirements are available
+/// but no single candidate satisfies their combination.
 pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, String) {
     let size = Capacity::wanted_by(vm);
     let wanted = DevicePolicy::of(vm);
@@ -1463,14 +1096,9 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     }
 }
 
-/// What is promised on `node` by reservations that have not been delivered.
-///
-/// Astra finding S07, 2026-09-23: the other half of what a machine is
-/// carrying. `Candidate::free` counts the VMs BOUND to a node, and a guest a
-/// live migration is moving there is bound to the SOURCE until the transfer
-/// has finished — so for the length of a migration the destination is
-/// carrying a guest that no sum over the VM objects can see. This is that
-/// guest, counted where it is going.
+/// Sum destination reservations independently of bound VM usage.
+/// Migrating VMs remain bound to their source until settlement, while their
+/// destination capacity must already be accounted for.
 pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
     held.iter()
         .filter(|r| r.spec.node == node)
@@ -1528,18 +1156,8 @@ impl Scheduler for FirstFit {
     }
 }
 
-/// The other strategy: of everything that fits, the one carrying the least.
-///
-/// The counterpart to First-Fit rather than a replacement for it. First-Fit
-/// fills a machine before it touches the next, which is what one wants when
-/// the machines cost money; this spreads, which is what one wants when the
-/// VMs are meant to survive one of them going away. Anti-affinity states that
-/// intent per VM and exactly; this is the blunt version for a whole cluster,
-/// and the two compose — `feasible` has already cut what must not be, and
-/// this only chooses among what may.
-///
-/// Ties break on the name, so two passes over the same inventory place the
-/// same way and a test can say which.
+/// Choose the feasible candidate hosting the fewest VMs, breaking ties
+/// by name. Hard constraints and anti-affinity filtering run first.
 pub struct Spread;
 
 impl Scheduler for Spread {
@@ -1561,19 +1179,14 @@ mod tests {
     use super::*;
     use crate::resources::{VmSpec, new_vm};
 
-    /// Room enough that these tests are about what they say they are about.
-    /// Admission has tests of its own; everywhere else a candidate is assumed
-    /// to have space, exactly as every one of these tests did before it
-    /// existed.
+    /// Capacity fixture large enough to isolate tests of other placement constraints.
     const ROOMY: Capacity = Capacity {
         vcpus: 64,
         mem_mib: 65536,
     };
 
-    /// What every compute node claims, and what every VM now requires. In
-    /// the helpers rather than in each test, because a candidate WITHOUT it
-    /// is a storage-only node — a real and different thing, and the tests
-    /// that mean one say so.
+    /// Hypervisor capability included by compute-node fixtures.
+    /// Tests of storage-only nodes explicitly omit it.
     const RUNS_VMS: &str = "hypervisor/cloud-hypervisor";
 
     fn candidate(name: &str, connected: bool, schedulable: bool) -> Candidate {
@@ -1668,11 +1281,7 @@ mod tests {
         )
     }
 
-    /// The machine's half of the pairing, and the whole point of it: a node
-    /// an operator reserved for routers stops being a candidate for the
-    /// ordinary class, and the sentence names the node and what it takes —
-    /// so somebody reading `vm get` is sent to the machine rather than to
-    /// the shop for more memory.
+    /// A node restricted to router workloads excludes ordinary VM classes.
     #[test]
     fn a_node_that_accepts_only_routers_takes_no_ordinary_vm() {
         let mut gateway = candidate("gw-1", true, true);
@@ -1720,10 +1329,7 @@ mod tests {
         }
     }
 
-    /// The other half of 6k's third decision: a NIC that names a provider
-    /// network is a demand for a node that really holds an interface for
-    /// THAT wire, and one physnet is not another. Without it a VM with a
-    /// `physnet` NIC lands wherever there is room and the agent refuses it.
+    /// A provider NIC requires the gateway capability for its exact physnet.
     #[test]
     fn a_nic_on_a_provider_network_asks_for_the_node_that_holds_that_wire() {
         let outside = vm_asking(serde_json::json!({
@@ -1825,10 +1431,7 @@ mod tests {
         assert_eq!(FirstFit.assign(&vm_asking(nvrm_4q()), &candidates), None);
     }
 
-    /// vfio resolves no profiles, so its capacity entry is the bare driver
-    /// name — and a bare request is content with any profile of its driver.
-    /// The rule itself lives in `common::capability` and is tested there;
-    /// what this holds is that FirstFit asks it the right question.
+    /// Scheduler capability matching supports bare and profiled driver requests.
     #[test]
     fn bare_and_profiled_requests_match_the_catalogue_spellings() {
         let bare_vfio = serde_json::json!({"devices": [{"driver": "vfio"}]});
@@ -1878,10 +1481,7 @@ mod tests {
         vm_asking(serde_json::json!({ "volumes": volumes }))
     }
 
-    /// The half this pass added, as a table. A spec's `volumes[].driver` is a
-    /// placement constraint exactly as `devices[].driver` is: an lvm-thin VM
-    /// on a node without the backend would fail at the first `lvcreate`,
-    /// after being bound and started.
+    /// Nondefault volume drivers constrain placement through the capability catalogue.
     #[test]
     fn a_volume_driver_places_the_vm_the_same_way_a_device_driver_does() {
         let plain = volume_candidate("agent-1a", &["filesystem"]);
@@ -1938,10 +1538,8 @@ mod tests {
         }
     }
 
-    /// The rollout case, and the reason the default driver produces no
-    /// request: a node running an agent from before the volume catalogue
-    /// claims no `volume/*` entries at all. A VM with a plain disk still
-    /// belongs there — it always did.
+    /// The default volume backend adds no catalogue requirement, preserving placement
+    /// on older agents that do not advertise storage capabilities.
     #[test]
     fn a_plain_disk_still_places_on_a_node_that_claims_no_storage_at_all() {
         let old = [gpu_candidate("agent-1a", &[])];
@@ -1983,10 +1581,8 @@ mod tests {
         vm_asking(serde_json::json!({ "nics": nics }))
     }
 
-    /// The third list, as a table. A tenant VM must never land on a node
-    /// without an overlay: there the agent refuses it, and the only
-    /// alternative to refusing would be the VM on the shared default bridge —
-    /// which is the one outcome tenancy exists to prevent.
+    /// VXLAN NICs require overlay capability rather than falling back to a shared
+    /// default bridge.
     #[test]
     fn a_vxlan_nic_places_the_vm_only_where_overlays_are_served() {
         let plain = overlay_candidate("agent-1a", false);
@@ -2140,15 +1736,8 @@ mod tests {
         assert!(DevicePolicy::of(&vm()).met_by(&[RUNS_VMS.to_string()]));
     }
 
-    /// The other half of the sentence, and this test is the one that changed
-    /// when it shipped.
-    ///
-    /// A node has claimed `hypervisor/<name>` since the storage split, and
-    /// requiring one was held back for exactly as long as any node ran an
-    /// agent that predates the claim — such a node claims nothing, and a VM
-    /// requiring `hypervisor/*` would go Pending there for ever. Claiming is
-    /// additive and safe during a rollout; requiring is not. The last node on
-    /// an older binary was replaced by the image round, so it ships here.
+    /// Every VM requires an advertised hypervisor capability; storage-only
+    /// nodes remain eligible for storage provisioning.
     #[test]
     fn every_vm_asks_for_a_hypervisor_and_does_not_care_which() {
         let plain = DevicePolicy::of(&vm());
@@ -2223,11 +1812,7 @@ mod tests {
         )
     }
 
-    /// The second application of `feasible`, and the point of building it as
-    /// one: a node that is down or drained is no more a candidate to
-    /// provision on than it is to run on, and that predicate is shared rather
-    /// than restated. If "drained" ever means two different things depending
-    /// on what is being placed, this test is what notices.
+    /// Storage placement shares node usability checks with VM placement.
     #[test]
     fn a_volume_is_placed_by_the_same_rules_about_the_machine() {
         let policy = StoragePolicy::of(&storage_pool("lvm-thin", &[]));
@@ -2267,10 +1852,7 @@ mod tests {
         assert_eq!(policy.wanted(), "volume/lvm-thin");
     }
 
-    /// An empty node list is every node, which is the single-machine lab and
-    /// the compatibility direction: a pool nobody restricted narrows nothing,
-    /// and the policy degenerates to the catalogue check the VM half already
-    /// does.
+    /// An unrestricted pool node list imposes no placement narrowing.
     #[test]
     fn a_pool_that_names_no_nodes_is_reachable_from_all_of_them() {
         let policy = StoragePolicy::of(&storage_pool("filesystem", &[]));
@@ -2281,14 +1863,7 @@ mod tests {
         assert_eq!(feasible_for_storage(&policy, &fleet).len(), 2);
     }
 
-    /// Locality is SOFT and never anything else.
-    ///
-    /// Among the candidates that can serve, the ones already holding the data
-    /// win. When none of them can serve — the node was drained, the pool
-    /// re-cut, the replica moved — the set is left exactly as it was, because
-    /// a hard rule would strand every VM that a previous placement had put
-    /// next to its disk. That fallback is the whole difference between a
-    /// preference and a requirement.
+    /// Holder preference falls back when no preferred candidate is feasible.
     #[test]
     fn locality_prefers_the_holder_and_never_strands_anything() {
         let fleet = vec![
@@ -2353,11 +1928,8 @@ mod tests {
         assert!(msg.contains("storage pool fast names [a]"), "{msg}");
     }
 
-    /// No `Capacity` anywhere in the storage half, and that is a decision
-    /// rather than an omission: how much room is left on a thin pool is the
-    /// backend's own admission question, asked by the driver that owns the
-    /// pool at the moment it provisions. A controller carrying a second
-    /// answer would be carrying one that goes stale between passes.
+    /// Volume placement does not consume CPU or memory. Drivers admit backend
+    /// space at provisioning time.
     #[test]
     fn a_volume_asks_for_no_vcpus_and_no_memory() {
         let policy = StoragePolicy::of(&storage_pool("lvm-thin", &[]));
@@ -2418,10 +1990,7 @@ mod tests {
         }
     }
 
-    /// The measured lab behaviour this position exists to end: three nodes
-    /// with the same catalogue took EVERY overlay VM onto whichever sorted
-    /// first, because the scheduler never asked whether it could carry them.
-    /// Now the first one fills up and the next VM goes to the second.
+    /// Skip full candidates in favor of nodes with enough remaining capacity.
     #[test]
     fn a_full_candidate_is_passed_over_for_one_that_has_room() {
         let nodes = [room("agent-1a", 0, 0), room("agent-1b", 8, 8192)];
@@ -2465,15 +2034,8 @@ mod tests {
         assert_eq!(Capacity::wanted_by(&vm()), Capacity::default());
     }
 
-    /// The DoD case, and the one an API-edge check cannot answer: two VMs
-    /// created in the same breath, each of which fits and which together do
-    /// not.
-    ///
-    /// This is what makes the binding and not the edge the authority. The
-    /// pass places them one after another and DEDUCTS as it goes, so the
-    /// second one asks a candidate that has already been spent. Both being
-    /// bound is not a race that is unlikely here — it is arithmetic that
-    /// cannot happen.
+    /// In-pass capacity booking prevents two individually fitting VMs from
+    /// spending the same remaining capacity.
     #[test]
     fn two_vms_that_together_do_not_fit_cannot_both_be_bound() {
         let mut nodes = vec![room("agent-1a", 4, 4096)];
@@ -2560,11 +2122,8 @@ mod tests {
         );
     }
 
-    /// Draining, as the whole round trip: a cordoned candidate takes nothing
-    /// new, the sentence and the category say why, and uncordoning makes it
-    /// take the VM again. Nothing here is about the VMs already on it — the
-    /// scheduler is only ever asked about UNBOUND ones, which is the whole of
-    /// why draining cannot evict anything.
+    /// Cordon excludes new placement until reenabled; scheduling eligibility alone
+    /// does not evict bound VMs.
     #[test]
     fn a_drained_candidate_takes_nothing_new_until_it_is_undrained() {
         let drained = [candidate("manacor", true, false)];
@@ -2587,10 +2146,7 @@ mod tests {
         assert_eq!(FirstFit.assign(&vm(), &mixed).as_deref(), Some("ibiza"));
     }
 
-    /// A selector is an AND over pairs, and an empty one is not a constraint.
-    /// The second half is the compatibility promise: every VM written before
-    /// this feature existed carries no selector and must place exactly where
-    /// it always did.
+    /// Selectors AND their pairs; an empty selector adds no constraint.
     #[test]
     fn a_selector_narrows_to_the_machines_that_carry_it_and_an_empty_one_narrows_nothing() {
         let inventory = [
@@ -2673,10 +2229,7 @@ mod tests {
         );
     }
 
-    /// The difference between a preference and a requirement, in one test: it
-    /// is honoured when it can be, and it is dropped rather than stranding
-    /// the VM. A preference that can leave a VM Pending is a requirement
-    /// whose author did not know they were writing one.
+    /// Soft anti-affinity yields when enforcing it would prevent placement.
     #[test]
     fn a_preferred_term_gives_way_rather_than_leaving_the_vm_pending() {
         let roomier = [
@@ -2790,11 +2343,8 @@ mod tests {
         assert!(e.contains("first-fit") && e.contains("spread"), "{e}");
     }
 
-    /// Every sentence an operator reads, checked for the artefact that has
-    /// bitten this repository before: a string literal broken over two source
-    /// lines whose continuation keeps the indentation. It compiles, it passes
-    /// every test that greps for a word, and it puts a run of spaces in the
-    /// middle of a sentence on somebody's terminal.
+    /// Diagnostic messages must not contain indentation accidentally retained by
+    /// multiline string continuation.
     #[test]
     fn no_sentence_carries_a_run_of_spaces_from_the_source_that_wrote_it() {
         let occupied = [labelled("agent-1a", &[], &[&[("app", "web")]])];
@@ -2818,15 +2368,8 @@ mod tests {
         }
     }
 
-    /// The bug the lab found, as a test: a burst of creates that ONE pass
-    /// sees together used to stack onto one node while free nodes stood
-    /// beside it. `spend` booked the room and not the occupancy, so
-    /// `collides` asked an inventory from before the pass — and five VMs that
-    /// were required to stay apart landed on one machine.
-    ///
-    /// Written against `spend` and not against a reconciler on purpose: this
-    /// is the contract a pass relies on, and both tiers rely on it the same
-    /// way.
+    /// In-pass booking updates anti-affinity occupancy as well as capacity,
+    /// so later placements see earlier decisions from the same pass.
     #[test]
     fn a_burst_of_creates_in_one_pass_does_not_stack_what_must_stay_apart() {
         let mut inv = vec![
@@ -2890,17 +2433,8 @@ mod tests {
         r
     }
 
-    /// Astra finding S07, 2026-09-23: the arithmetic everything else rests
-    /// on. What a machine can take is what it has left MINUS what is already
-    /// promised to a guest on its way there, and a guest in flight is bound
-    /// to the machine it is LEAVING — so no sum over the VM objects can see
-    /// it.
-    ///
-    /// Asked through `feasible` rather than by reading the field, because the
-    /// whole point of booking it into `free` is that every reader of the
-    /// candidate list sees it without being told: the scheduler, the pending
-    /// sentence, and the ordinary create that must not be given a slot a
-    /// migration is already flying into.
+    /// Incoming migration reservations reduce the common feasible budget,
+    /// even while the VM remains bound to its source.
     #[test]
     fn room_promised_to_a_guest_in_flight_is_not_room_a_scheduler_may_offer() {
         let guest = sized(4, 4096);
@@ -2939,15 +2473,8 @@ mod tests {
         assert_eq!(feasible(&guest, &elsewhere).len(), 1);
     }
 
-    /// The race a create-only write does not close, and the answer to it.
-    ///
-    /// Two replicas preparing two migrations onto one node in the same
-    /// millisecond each read the reservations, each saw room, and each then
-    /// wrote a key of ITS OWN: both creates succeed, because uniqueness of a
-    /// key says nothing about a sum. So after writing, a writer asks where in
-    /// the queue it is standing — and the queue is etcd's own revision order,
-    /// which is why both replicas reach the same verdict about which of them
-    /// keeps the slot.
+    /// Distinct reservation keys can oversubscribe an aggregate budget.
+    /// Post-write arbitration uses etcd revision order to select winners.
     #[test]
     fn of_two_reservations_against_one_slot_the_earlier_one_keeps_it() {
         let slot = Capacity {
@@ -3064,11 +2591,7 @@ mod tests {
         );
     }
 
-    /// The trap the lab walked into, and the reason this function has a third
-    /// case: a cloud sees a CLUSTER catalogue, which is the UNION of its
-    /// nodes'. Every part of the ask is served somewhere in that cluster and
-    /// no single machine serves all of it — so the VM binds and then sits
-    /// Pending forever, one tier down, with nothing to read.
+    /// Distinguish split capabilities from an entirely missing request.
     #[test]
     fn a_request_served_only_in_pieces_says_so_instead_of_naming_a_gap() {
         let union = [gpu_candidate("cluster-1", &["nvrm/4q", "network/vxlan"])];
@@ -3135,11 +2658,7 @@ mod tests {
         }
     }
 
-    /// The `networked` axis, spent. Until this position nothing claimed it:
-    /// `required` answered `None` and every node was a candidate, so a VM
-    /// whose disk is on a fabric could be placed on a machine that cannot
-    /// speak to it — which worked, because the attach refusal is structural
-    /// and the VM moves, but it is placement by trial.
+    /// Networked volumes require candidates advertising their volume driver.
     #[test]
     fn a_networked_volume_is_reachable_by_whoever_carries_the_driver() {
         let initiator = volume_candidate("manacor", &["nvmeof-import"]);
@@ -3174,10 +2693,8 @@ mod tests {
         assert_eq!(poolless.claim(), None);
     }
 
-    /// The axis spent, in one test. A node-local volume pins the VM to
-    /// exactly the machine that holds it; a shared one opens the pool; a pool
-    /// nobody has reported on constrains nothing hard, which is what keeps a
-    /// mixed-version cluster placing VMs at all.
+    /// Locality distinguishes hard node-local binding, shared pool reachability
+    /// and unrestricted unknown-locality fallback.
     #[test]
     fn locality_decides_whether_a_volume_pins_a_vm_or_merely_prefers_a_node() {
         let local = binding("data-1", Some("manacor"), Some(Locality::NodeLocal), &[]);
@@ -3213,10 +2730,7 @@ mod tests {
         );
     }
 
-    /// A node-local volume leaves exactly one candidate, and it is the one
-    /// that holds the data. This is the whole difference from the soft
-    /// preference: the same rule as a preference would place the VM next to
-    /// an empty directory and boot it.
+    /// Node-local storage is a hard holder constraint, not a locality preference.
     #[test]
     fn a_node_local_volume_leaves_exactly_the_node_that_holds_it() {
         let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
@@ -3255,10 +2769,7 @@ mod tests {
         assert_eq!(left, vec!["manacor".to_string(), "soller".into()]);
     }
 
-    /// Two node-local volumes on two machines is a request no single node can
-    /// serve, and it is a split in exactly the sense the existing reason
-    /// means. The sentence for a single unreachable volume names the volume,
-    /// its locality and the nodes that hold it.
+    /// Explain incompatible volume locations and identify unreachable volumes.
     #[test]
     fn a_volume_that_cuts_everything_away_says_which_one_and_why() {
         let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
@@ -3289,15 +2800,7 @@ mod tests {
         assert!(sentence.contains("all 2"), "{sentence}");
     }
 
-    /// D8, the controller half: a node that is up, uncordoned and has said
-    /// something is wrong with itself is not a candidate.
-    ///
-    /// The mini-chaos run put a machine in exactly this state — redb wedged
-    /// after one I/O error, `ready` true, session held, `check.sh` green —
-    /// and a reschedule placed a VM onto it, which then failed on the node
-    /// with the store's error. Everything the scheduler had to go on said the
-    /// machine was fine, because everything it had to go on measured the
-    /// heartbeat.
+    /// Reported health conditions veto a connected, uncordoned node.
     #[test]
     fn a_node_that_says_it_is_wedged_is_not_a_candidate() {
         let wedged = Candidate {
@@ -3386,12 +2889,8 @@ mod tests {
         assert!(sentence.contains("DiskPressure"), "{sentence}");
     }
 
-    /// A word this build has never heard of still takes the machine out of
-    /// the running, and travels into the sentence as it came.
-    ///
-    /// The controller half branches on the LIST and never on the variant,
-    /// exactly so that an agent newer than its controller is believed rather
-    /// than ignored.
+    /// Unknown reported health conditions still veto placement and remain visible
+    /// in the explanation, preserving conservative behavior across version skew.
     #[test]
     fn an_unknown_condition_still_vetoes_the_node() {
         let odd = Candidate {
@@ -3421,15 +2920,8 @@ mod tests {
         );
     }
 
-    /// The other half of the same question, and the one that was answered
-    /// about the wrong machines: the narrowing leaves a node standing, the
-    /// scheduler refuses it anyway, and the sentence has to be about THAT
-    /// node.
-    ///
-    /// Straight out of the drain scenario. `agent-1` holds the disks and is
-    /// drained; `agent-2` is fine and irrelevant, because the VM cannot go
-    /// there. Before this, the fall-through counted both and reported a
-    /// hypervisor split.
+    /// Pending diagnostics describe the candidates remaining after hard
+    /// volume locality, excluding healthy nodes that cannot hold the VM.
     #[test]
     fn a_drained_node_holding_the_disks_is_named_as_the_reason() {
         let drained = Candidate {
@@ -3580,10 +3072,7 @@ mod tests {
         n
     }
 
-    /// The finding from the image report, closed: a `nodeSelector` now cuts
-    /// CLUSTERS. Before this it was checked one tier down, after the binding,
-    /// so a VM no node matched went Pending on a cluster it should never have
-    /// been sent to.
+    /// Cloud placement requires a node satisfying the VM's node selector.
     #[test]
     fn a_cluster_with_no_matching_node_cannot_serve_the_vm() {
         let want: BTreeMap<String, String> = [("disk".to_string(), "nvme".to_string())]
@@ -3601,10 +3090,7 @@ mod tests {
         // reason to ask before the binding rather than after it.
         assert!(!demand.met_by_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
         assert!(!demand.met_by_a_node(&[summary("a", true, false, &[("disk", "nvme")])]));
-        // And neither does one that is up, uncordoned and has said it cannot
-        // act. That is D8's half at THIS tier: a cloud that binds a VM to a
-        // cluster whose only matching machine is wedged has sent it somewhere
-        // it can only sit Pending.
+        // A reachable but unhealthy matching node cannot satisfy cloud placement.
         assert!(!demand.met_by_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
         // One healthy machine beside it is enough, as it always was.
         assert!(demand.met_by_a_node(&[
@@ -3685,15 +3171,7 @@ mod tests {
         );
     }
 
-    /// The whole of what position 6 buys, in one place: the same node, the
-    /// two questions, two answers.
-    ///
-    /// A storage-only node has room, is connected and is schedulable. Before
-    /// the requirement it was indistinguishable from a compute node, so the
-    /// first ordinary VM landed there, the agent refused correctly, and the
-    /// VM ended Failed on a machine that could never have run it. Now it is
-    /// not a candidate for a VM — and still is one for a disk, which is the
-    /// reason to have such a node at all.
+    /// A storage-only node can provision disks but cannot host VMs.
     #[test]
     fn a_storage_only_node_serves_disks_and_no_longer_serves_vms() {
         let shelf = storage_candidate("shelf-1", &["lvm-thin"]);

@@ -27,55 +27,22 @@ pub type Result<T> = std::result::Result<T, NetworkError>;
 pub struct NicSpec {
     pub bridge: String,
     pub mac: MacAddr,
-    /// The tenant overlay this NIC belongs on, if any. `None` — the default
-    /// and every spec written before M5 — is the node's default bridge,
-    /// exactly as it always was.
-    ///
-    /// A number and not a tenant name on purpose: by the time a spec reaches
-    /// a node the controller has already resolved which wire this is (see
-    /// `controller_api::vni`), and an agent that had to look tenants up would
-    /// be an agent that needs the directory. Typed rather than shovelled
-    /// through `params` for the same reason the driver name is: it decides
-    /// where the tap lands, and the scheduler reads it.
+    /// Controller-resolved tenant VNI. None selects the default bridge.
+    /// The agent does not resolve tenant names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vxlan_id: Option<u32>,
-    /// The floating addresses this NIC's VM holds the reservation for.
-    ///
-    /// The one exception to the guard the driver puts on every tap: source
-    /// addresses inside the node's `guarded_ranges` are dropped everywhere,
-    /// except here. Travels the same road `vxlan_id` does and is injected in
-    /// the same place — the cloud owns the FloatingIp objects, the cluster
-    /// writes them into the NIC entries, and the agent only checks types.
-    ///
-    /// Defaults to empty, so every spec ever written is still exactly the spec
-    /// it was: no entries, no exception, and a node with no guarded ranges has
-    /// nothing to make an exception to in the first place.
+    /// Controller-resolved floating addresses permitted by the tap guard.
+    /// Defaults to no exceptions within configured guarded ranges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub floating_ips: Vec<String>,
-    /// The routed subnets of this NIC's tenant.
-    ///
-    /// What turns the tap rule from a DENY into an ALLOWLIST. A tenant whose
-    /// address space nobody wrote down can only be told "not out of the
-    /// floating pool"; a tenant whose subnets are here can be told "these,
-    /// your floating addresses, and nothing else". Empty is the first case and
-    /// the default.
+    /// Tenant routed subnets used for tap source-address allowlists. Empty
+    /// subnets retain the guard against unassigned floating-pool addresses;
+    /// nonempty subnets permit those prefixes and assigned floating addresses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
-    /// The provider network this NIC hangs on instead of an overlay.
-    ///
-    /// Festlegung 3, and the one path through the gateway slot that needs no
-    /// router at all: a tap on `meister-px-<physnet>` is a guest ON the
-    /// provider network, with whatever addressing that network hands out.
-    /// It is the lab and single-tenant mode, it is what exists today, and it
-    /// stays — the cluster writes no VNI into a NIC that names a physnet.
-    ///
-    /// A NIC with BOTH is a refusal and not a precedence rule: the two say
-    /// different things about where the tap belongs, and guessing which one
-    /// the operator meant would put a tenant's guest on a wire the tenant
-    /// does not own, or the other way round.
-    ///
-    /// `None` — every spec ever written — is the overlay-or-default-bridge
-    /// behaviour, unchanged.
+    /// Provider physnet for a direct guest connection. Mutually exclusive
+    /// with a tenant VNI; specifying both is rejected. None retains the
+    /// overlay-or-default-bridge path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physnet: Option<String>,
 }
@@ -84,25 +51,12 @@ pub struct NicSpec {
 pub struct Nic {
     pub id: NicId,
     pub tap_name: String,
-    /// What the driver set on the tap, when it set anything. Defaults, so a
-    /// record written before overlays existed loads unchanged and means what
-    /// it always meant: nobody named an MTU, so nobody tells the guest one.
+    /// MTU configured by the driver, absent when unspecified in current or legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
-    /// The hardware address this driver PUT on this tap, when it knows one.
-    ///
-    /// Not read back off the link, and that is the point: a tap device has a
-    /// random address of its own that no guest ever uses, so asking the
-    /// kernel would answer a different question with a plausible-looking
-    /// number. What a guest sends is what the driver pinned — the address in
-    /// the tap's filter chain, and the one the hypervisor hands the virtio
-    /// device — so the driver that pinned it is the one party that can say.
-    ///
-    /// `None` is "this driver does not know one", which is a real answer and
-    /// the one a liveness check gives: `get` asks whether the tap is still
-    /// there and sets nothing, exactly as it leaves `mtu` alone. A record
-    /// written before this field loads as `None` as well, and the status
-    /// report leaves such an entry out rather than inventing an address.
+    /// Guest MAC assigned by this driver, not the tap interface's own MAC.
+    /// A liveness-only lookup or legacy record may return None; reports must
+    /// not invent an address when it is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<MacAddr>,
 }
@@ -113,18 +67,8 @@ pub trait NicDriver: Send + Sync {
     async fn destroy(&self, id: &NicId) -> Result<()>;
     async fn get(&self, id: &NicId) -> Result<Nic>;
 
-    /// Throw away whatever per-tap state this driver holds outside its own
-    /// records for taps that are not in `live_taps`.
-    ///
-    /// Called once at start-up, with the taps the agent's own store still
-    /// names. A `kill -9` between "remove the tap's filter chain" and "delete
-    /// the tap" leaves the first half behind, and while that is harmless — the
-    /// device is gone — it is a rule waiting for a name nobody will reuse, and
-    /// `nft list ruleset` is something an operator reads.
-    ///
-    /// Default: nothing to reap. A driver with no host state beyond the links
-    /// it creates has nothing to do here, which is what this was before
-    /// filtering existed.
+    /// Remove stale per-tap host state, such as nftables chains, using the
+    /// agent's persisted live-tap inventory at startup. Default: no extra state.
     async fn reap(&self, _live_taps: &[String]) {}
 }
 
@@ -139,16 +83,9 @@ pub trait BridgeDriver: Send + Sync {
     ) -> Result<()>;
     async fn destroy(&self, name: &str) -> Result<()>;
 
-    /// Make sure this node can carry the overlay `vni`, and say which bridge
-    /// taps for it join.
-    ///
-    /// Its own method rather than a flag on `ensure` because it is a
-    /// different thing to ensure: a plain bridge is one link, an overlay is a
-    /// bridge plus an encapsulation device pointed at an uplink, and only
-    /// this one can be unavailable on a node. The default is that refusal —
-    /// a driver that knows nothing about overlays says so in words instead of
-    /// quietly putting the VM on the default bridge, where it would reach
-    /// every other tenant on the node.
+    /// Ensure the overlay bridge and encapsulation device for `vni`.
+    /// Unsupported drivers must refuse rather than put a tenant NIC on the
+    /// default bridge.
     async fn ensure_overlay(&self, vni: u32) -> Result<String> {
         Err(NetworkError::InvalidSpec(format!(
             "this node has no overlay networking configured, so it cannot serve vxlan {vni}"
@@ -176,22 +113,9 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Take the interface this node gave away into a provider bridge, and say
-    /// what that bridge is called.
-    ///
-    /// Festlegung 1: the interface belongs to the bridge and the HOST has no
-    /// address on it. A driver that finds one must refuse rather than build,
-    /// because an address there is somebody still using the interface — the
-    /// node did not give it away, and a router put on it would answer for a
-    /// network the host is also on.
-    ///
-    /// Called once per configured physnet at start-up and never again: it is
-    /// the node's side of the bargain, and a node whose side of it is broken
-    /// must not come up claiming `gateway:<physnet>`.
-    ///
-    /// The default is the refusal every method of this section defaults to. A
-    /// driver with no gateway slot has no provider bridge to make, and saying
-    /// so beats returning a name nothing stands behind.
+    /// Ensure a provider bridge over a dedicated host interface. Refuse an
+    /// interface with a host address. Called for configured physnets at startup;
+    /// only successfully prepared physnets may be advertised as gateway capacity.
     async fn ensure_physnet(&self, name: &str, _interface: &str) -> Result<String> {
         Err(NetworkError::InvalidSpec(format!(
             "this node's network driver has no gateway slot, so it cannot serve the provider \
@@ -199,28 +123,14 @@ pub trait BridgeDriver: Send + Sync {
         )))
     }
 
-    /// The provider networks this driver actually serves, by name.
-    ///
-    /// What the Hello turns into one `gateway:<physnet>` profile each, and
-    /// what the agent checks an `EnsureRouter` against before it reaches the
-    /// driver at all. Off the DRIVER and not off the config for the reason
-    /// `HypervisorCatalog` gives about its own name: what a node claims has
-    /// to be what it built.
-    ///
-    /// Empty is a node that is no candidate for any router, which is every
-    /// node before 6k and every node with no `[network.provider]` section.
+    /// Prepared provider physnets. These drive gateway capability reports
+    /// and router-command admission; configuration alone is insufficient.
     fn physnets(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Make this router exist here, exactly as `spec` says, and answer with
-    /// what it now is.
-    ///
-    /// Level-triggered like everything else: the same spec twice is one
-    /// router, and a spec that differs in one field — most often `active` —
-    /// converges the router that is already there rather than building a
-    /// second one. That is what makes the failover of Festlegung 7 a single
-    /// command to the standby.
+    /// Create or reconcile a router to the supplied specification. Repeated
+    /// requests are idempotent; changed fields update the existing router.
     async fn ensure_router(&self, spec: &RouterSpec) -> Result<RouterState> {
         Err(NetworkError::InvalidSpec(format!(
             "this node's network driver has no gateway slot, so it cannot build router {}",
@@ -228,18 +138,12 @@ pub trait BridgeDriver: Send + Sync {
         )))
     }
 
-    /// Let this router go, with everything this driver made for it.
-    ///
-    /// Idempotent by contract, and `Ok(())` by default for the reason
-    /// `destroy_overlay` is: a driver that never built one has nothing to take
-    /// down, and answering a teardown with a refusal would leave the tier
-    /// above retrying a removal that already happened.
+    /// Destroy router-owned resources idempotently. The default removes nothing.
     async fn destroy_router(&self, _id: &RouterId) -> Result<()> {
         Ok(())
     }
 
-    /// One router as it IS. `RouterNotFound` for one this node does not hold,
-    /// which is a real answer and the one a teardown checks.
+    /// Read observed router state; absent local routers return RouterNotFound.
     async fn router_status(&self, id: &RouterId) -> Result<RouterState> {
         Err(NetworkError::RouterNotFound(*id))
     }
@@ -250,18 +154,9 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Take down whatever this driver built for routers nothing names any
-    /// more, and say which ones went.
-    ///
-    /// The router twin of `sweep_overlays`, and it runs at the same moment
-    /// and under the same rule: ONCE, at start-up, before anything can be
-    /// asked for. A `kill -9` between "make the namespace" and "write the
-    /// record" leaves a namespace with two legs in two bridges and nobody who
-    /// knows what it is for; nothing else would ever remove it.
-    ///
-    /// No `keep` list, unlike the overlay sweep: a router is not reference
-    /// -counted from VM records — it is its own object, and this driver's own
-    /// record is the only thing that names one.
+    /// Sweep unrecorded router resources once at startup, before commands.
+    /// Router ownership comes from driver records, independently of VM
+    /// references used for overlay cleanup.
     async fn sweep_routers(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
@@ -275,32 +170,15 @@ pub trait BridgeDriver: Send + Sync {
     }
 }
 
-/// Both halves of the networking seam in one driver.
-///
-/// A blanket supertrait and nothing else: every implementation of the two
-/// above is automatically one of these, and no driver has to say so. It
-/// exists because the agent's driver TABLE registers one row per driver and
-/// hands back one `Arc` — and taps and bridges are two faces of one kernel
-/// object, made by one implementation, on one node. The two fields on
-/// `Drivers` are upcasts of the same pointer, which is what they always held;
-/// before this they were two `Arc::clone`s of a concrete type, at the one
-/// call site that still knew which type it was.
+/// Combined NIC/bridge contract for one registered driver instance.
+/// The agent upcasts the same shared instance for each capability.
 pub trait NetworkDriver: NicDriver + BridgeDriver {}
 
 impl<T: NicDriver + BridgeDriver + ?Sized> NetworkDriver for T {}
 
-/// Something that tells the outside world which addresses live on this node.
-///
-/// One implementation and one caller: the reconciler hands over the whole set
-/// of floating addresses whose VMs are running here, on every pass, and the
-/// implementation makes that true. Level-triggered by contract — the set is
-/// the truth, not a stream of changes — which is why the method takes a set
-/// and returns nothing to react to.
-///
-/// It swallows its own failures for the same reason: the next pass hands over
-/// the same set, so a failed apply is a degradation that heals itself and not
-/// something a caller could do anything about. A driver that could not
-/// announce says so in its own log line.
+/// Publish the desired prefix set for this node. Callers submit a complete
+/// set on each pass; implementations log failures and own reconciliation.
+/// Repeated calls are required to converge, but do not establish success.
 #[async_trait::async_trait]
 pub trait RouteAnnouncer: Send + Sync {
     async fn announce(&self, prefixes: std::collections::BTreeSet<String>);
@@ -310,49 +188,25 @@ pub trait RouteAnnouncer: Send + Sync {
 pub struct NicAttachment {
     pub tap_name: String,
     pub mac: MacAddr,
-    /// The MTU to TELL THE GUEST, over virtio-net's own feature bit.
-    ///
-    /// Setting it on the tap and the bridge is not enough on its own: those
-    /// bound what the host will forward, and a guest that still believes in
-    /// 1500 goes on emitting frames the overlay then drops — silently, which
-    /// is the worst way for a network to be broken. The hypervisor is the one
-    /// party that can tell the guest, so the number travels with the
-    /// attachment. `None` = say nothing, which is every VM before overlays
-    /// and every VM on the default bridge.
+    /// Guest MTU advertised through virtio-net. Host link MTUs alone do not
+    /// configure the guest. None leaves the guest setting unspecified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
 }
 
-// --- the gateway slot -------------------------------------------------------
-//
-// 6k Mini-Neutron. A tenant router is a second thing a network driver can be
-// asked for, beside taps and bridges: a box with one leg on the provider
-// network this node gave away and one on a tenant's overlay, translating
-// between them. It lives HERE, on the driver seam, and not in the linux
-// driver alone — the whole point of the OVN-shaped model is that an OVN
-// backend or a DPU offload answers the same four verbs with a logical router
-// instead of a namespace, and the agent must not be able to tell.
-//
-// Every method below has a default, exactly as `ensure_overlay` does, and the
-// default is a refusal in words: a driver that has no gateway slot says so
-// rather than quietly building nothing and reporting success.
+// Router contracts connect a provider network to a tenant overlay.
+// Implementations may use namespaces or another dataplane; unsupported
+// operations must fail explicitly.
 
-/// A tenant router, by the uid the tier above minted for it.
+/// Tenant-router UID assigned by the control plane.
 pub type RouterId = Uuid;
 
-/// OVN's two NAT kinds, and no third one.
-///
-/// Typed here rather than carried as the wire string, for the reason
-/// `Locality` is typed: the driver has to BRANCH on it — one kind is a
-/// source rewrite for a whole subnet and the other a 1:1 pair — and a match
-/// on prose is a match that silently does nothing the day somebody writes
-/// `dnat-and-snat`. Whatever a driver cannot recognise is refused at the
-/// translation, where the sentence can still name the rule.
+/// Supported NAT operations. Translation rejects unknown wire spellings
+/// before the driver can omit an unsupported rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NatKind {
-    /// The whole internal subnet leaves behind one external address. `snat`
-    /// in OVN, masquerade in nftables.
+    /// Rewrite subnet source addresses through one external address.
     Snat,
     /// One address maps to one address, both ways. A floating IP.
     DnatAndSnat,
@@ -370,20 +224,14 @@ impl NatKind {
         }
     }
 
-    /// The inverse, total. `None` is a kind this build does not know, which
-    /// the caller has to turn into a refusal naming the string — a rule
-    /// nobody can render must never be a rule silently dropped.
+    /// Parse a supported kind. Callers must reject unknown values instead of omitting the rule.
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
     }
 }
 
-/// One translation the router performs.
-///
-/// Addresses are bare, never CIDRs — a NAT rule is about addresses and not
-/// about wires. `logical_ip` is the inside, `external_ip` the outside; for
-/// [`NatKind::Snat`] an empty `logical_ip` means "the whole subnet the
-/// router's internal leg is on", which is what OVN's own empty field means.
+/// Router address translation using bare logical and external IPs. For SNAT,
+/// an empty logical IP selects the router's internal subnet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NatRule {
     pub kind: NatKind,
@@ -392,20 +240,14 @@ pub struct NatRule {
     pub logical_ip: String,
 }
 
-/// What a router should be, as the tier above states it.
-///
-/// The driver-facing twin of the session's `EnsureRouter`, translated in the
-/// agent exactly as `NicSpec` is: a driver never sees a protobuf, and the
-/// second backend does not have to learn one.
+/// Driver-facing desired router state, translated from the controller command.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RouterSpec {
     pub id: RouterId,
     /// Which of this node's provider networks the outside leg joins. A node
     /// that does not serve it is not a candidate — see [`BridgeDriver::physnets`].
     pub physnet: String,
-    /// The router's own address on the provider network, as a CIDR: the
-    /// address `snat` hides a subnet behind, and the one the fabric is asked
-    /// to send this router's traffic to while it is active.
+    /// Provider-side router address as CIDR, used for SNAT and active-router reachability.
     pub external_addr: String,
     /// Where the outside leg's default route points.
     pub external_gateway: String,
@@ -416,30 +258,16 @@ pub struct RouterSpec {
     pub internal_addr: String,
     #[serde(default)]
     pub nats: Vec<NatRule>,
-    /// The tenant prefixes this router ANNOUNCES rather than translates.
-    ///
-    /// Festlegung 5: a routed subnet gets no NAT at all — the router simply
-    /// answers for it, and the fabric learns where to send it from the
-    /// announcement. Stateless, so every active router of the subnet may
-    /// announce it and ECMP is the fabric's business.
+    /// Tenant prefixes routed and announced without NAT. Multiple active
+    /// routers may advertise them when the fabric supports ECMP.
     #[serde(default)]
     pub routed_subnets: Vec<String>,
-    /// Whether this node is the one that answers for the router right now.
-    ///
-    /// `false` is fully built and silent: the namespace, both legs, the
-    /// addresses and every rule are there, and the router answers no ARP and
-    /// is announced nowhere. That is what makes a failover a `true` on the
-    /// standby and nothing else — Festlegung 7.
+    /// Whether this router answers ARP and advertises routes. Inactive routers
+    /// retain prepared namespaces, links, addresses and rules for activation.
     pub active: bool,
 }
 
-/// What a router IS, as the driver finds it.
-///
-/// The same rule `VmStatusReport` follows: what is, not what was asked. It is
-/// what the status report carries upwards and what the announcement pass
-/// reads, which is why `announce` is on it — WHICH prefixes a router asks the
-/// world for is the driver's answer, not something the agent recomputes from
-/// a spec it would have to keep.
+/// Driver-observed router state used for reports and route announcements.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouterState {
     pub id: RouterId,
@@ -448,13 +276,7 @@ pub struct RouterState {
     /// and for the log line; nothing branches on it.
     pub location: String,
     pub phase: RouterPhase,
-    /// Why, in the one word a program may branch on. `None` for `Ready`.
-    ///
-    /// Beside `message` and not instead of it, the pairing every reason in
-    /// this stack carries (`NodeCondition`, `StayingVm`, `PendingReason`): the
-    /// word is what a program reads, the sentence is what an operator reads,
-    /// and asking a program to match on prose is asking it to break. The
-    /// driver is what fills it, because the driver is what looked.
+    /// Machine-readable observed reason, separate from the operator message; None for Ready.
     pub reason: Option<RouterReason>,
     pub message: String,
     pub active: bool,
@@ -471,28 +293,15 @@ pub enum RouterPhase {
     Failed,
 }
 
-/// Why a router is not `Ready`, in the node's own vocabulary.
-///
-/// Here rather than in the agent for the reason [`RouterPhase`] is here: the
-/// DRIVER is what finds the condition, the driver depends on this crate and
-/// on nothing above it, and a word the driver cannot name is a word that
-/// would have to be reconstructed from its own sentence one tier up.
-///
-/// Three words, one per way `state_of` can fail to find a router, and no
-/// fourth held in reserve. The one that earns the enum on its own is
-/// [`RouterReason::DriverUnreachable`]: "the namespace is gone" and "the
-/// kernel could not be asked" are the same `Failed` today, they send an
-/// operator to two different machines, and the difference was only ever in a
-/// sentence nobody could branch on.
+/// Driver-reported router failure reason. In particular, distinguish an
+/// absent namespace from an unsuccessful host probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterReason {
     /// The network namespace this node built for the router is not there.
     NetnsGone,
-    /// It is, and one of the two legs in it is not. `message` names which.
+    /// Namespace exists but a required link is absent; message identifies it.
     LegGone,
-    /// The node could not find out: `ip` did not answer, or the state
-    /// directory could not be read. What is NOT said here is that anything is
-    /// broken — this is the reason a reader may not act on.
+    /// Host probing failed, leaving router state unknown rather than proving resource absence.
     DriverUnreachable,
 }
 
@@ -538,10 +347,7 @@ impl RouterPhase {
 mod tests {
     use super::*;
 
-    /// A driver that implements nothing but the two mandatory halves. It is
-    /// the compatibility case in one type: everything the gateway slot adds
-    /// has a default, so a driver written before 6k — or a second backend
-    /// that only does taps — still compiles and still says what it cannot do.
+    /// Minimal network fixture exercising defaults for unsupported gateway operations.
     struct NoGatewaySlot;
 
     #[async_trait::async_trait]
@@ -589,9 +395,7 @@ mod tests {
         }
     }
 
-    /// The default is a refusal IN WORDS and never a success that built
-    /// nothing. A driver that answered `Ok` here would give the tier above a
-    /// router it can schedule on to and a node that has none.
+    /// Unsupported router creation must return an explanatory error.
     #[tokio::test]
     async fn a_driver_without_a_gateway_slot_says_so_instead_of_pretending() {
         let d = NoGatewaySlot;
@@ -621,10 +425,7 @@ mod tests {
         assert!(d.sweep_routers().await.unwrap().is_empty());
     }
 
-    /// The one default that is NOT a refusal, and the reason is
-    /// `destroy_overlay`'s: a teardown of something that was never built has
-    /// already happened, and refusing it would leave the tier above retrying
-    /// a removal for ever.
+    /// Default router destruction succeeds when the driver owns no router.
     #[tokio::test]
     async fn letting_go_of_a_router_that_was_never_built_is_done_and_not_refused() {
         assert!(
@@ -635,10 +436,7 @@ mod tests {
         );
     }
 
-    /// Both NAT kinds round-trip through the one spelling the session, OVN's
-    /// northbound and this driver seam share — and nothing else parses, so a
-    /// rule this build cannot render is a refusal rather than a rule quietly
-    /// left out of the ruleset.
+    /// NAT kinds round-trip through their wire spellings; unknown kinds are rejected.
     #[test]
     fn a_nat_kind_round_trips_through_ovns_own_spelling() {
         for kind in NatKind::ALL {

@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
-"""The matrix of the chaos-extrem brief: one link, one condition, one load.
+"""Run one lab matrix cell: a traffic fault plus a selected workload.
 
-    ./matrix.py --link A --cond L200 --load w1 --seed 4714
-    ./matrix.py --link A --cond D    --load w5 --seed 4715
-    ./matrix.py --link A --cond none --load w1 --seed 4713   # the control row
-
-A cell is (link, condition, load). The condition goes on the wire, the load
-runs under it, and the numbers come out as one line in `out/matrix.txt` plus a
-JSON blob in `out/matrix-<link>-<cond>-<load>-<seed>.json`.
-
-Why this does not call `chaos.py --no-faults`: the brief wants p50/p99 of
-Create -> Running with n >= 20 per cell, and chaos.py logs operations rather
-than timing them. Everything it would give us we would have to parse back out
-of a log. The loop below is the same four operations with a clock on them.
-
-Every cell lifts its own shaping in a `finally`, and `unshape_all()` runs at
-the end regardless -- a cell that dies must not leave a node behind. The
-self-lift timer inside `shape()` is the second belt.
+The result is written to matrix.txt and matrix-<link>x<cond>x<load>-<seed>.json
+under CHAOS_OUT. Qdisc cleanup runs in finally for ordinary Python unwinding;
+process termination can bypass it. DROP rules have no self-expiry timer.
+Measurements and invariant flags must be interpreted separately from exit status.
 """
 
 import argparse
@@ -105,17 +93,10 @@ def w1(seed, n, cname="cluster-1"):
 
 
 def w5_cluster(link, cond, seconds, cname="cluster-1"):
-    """Link C's half of W5: how fast does the CLOUD notice that a cluster
-    replica went quiet, and does the voice move exactly once?
+    """Observe the cloud-published endpoint and connected flag during a link fault.
 
-    `Cluster.status.sessionEndpoint` is published by the replica whose session
-    currently speaks for the cluster (cloud-controller `session::speaker`), so
-    a change in it IS the voice moving. `MUTE_AFTER_SECS` is 30 in
-    `components/cloud-controller/src/session/mod.rs:54`, which is the number
-    this cell is measured against.
-
-    Two changes instead of one is the finding worth having: a voice that flaps
-    costs every command of that cluster a retry, and nothing above would say so.
+    sessionEndpoint identifies the cloud replica endpoint. Changes of speaker
+    among cluster connections to that same cloud replica are invisible here.
     """
     def voice():
         _, o = ops.cloud("GET", f"/clusters/{cname}")
@@ -260,11 +241,10 @@ def w2(seed, n=10, pool="fabric", tenant=None):
 
 
 def w3(seed, rounds=3, tenant="lab", router="lab-out", fip="10.128.1.217"):
-    """Router failover, both halves: the control plane's new activeNode, and
-    the gap a packet from outside actually saw.
+    """Stop router agents and measure reported active-node changes plus ping reply gaps.
 
-    The reference numbers this is measured against: 52.8 s on a hard poweroff
-    (rollout-neutron), 4.4 s / 5.2 s on bare metal (blech-manacor).
+    The ping statistic omits the leading and trailing intervals without replies.
+    It does not measure established-flow preservation.
     """
     control, data, notes = [], [], []
     stopped = []          # every agent this cell put down, for the finally

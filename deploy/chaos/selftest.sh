@@ -3,31 +3,12 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# deploy/chaos/selftest.sh — does the harness still reach a control plane?
-#
-# WHY THIS EXISTS. The harness was written against a lab whose REST ports were
-# plain http. Image 58 turned mTLS on, and from that moment every request it
-# made died at the first byte:
-#
-#     ApiError HTTP 0: BadStatusLine:  2
-#
-# That is TLS answering an http client. Nothing in the harness said so — the
-# first hour of the mini-chaos run went into reading an exception. A tool
-# whose whole job is to notice things has to notice that it is talking to a
-# wall, and it has to notice it without twelve hosts.
-#
-# So: a throwaway CA, an etcd, both controller tiers on loopback with mTLS
-# exactly as the fleet runs it, and `mini.py M0` against them. M0 asks every
-# endpoint for its discovery document and judges the ANSWER — came back at
-# all, is this API's document, calls itself the tier we think it is. If the
-# transport is broken, M0 says "the harness cannot speak to this endpoint at
-# all" instead of blaming the control plane.
-#
-#     ./selftest.sh                 build, run, tear down
-#     KEEP=1 ./selftest.sh          leave the stack up to poke at
-#
-# Needs: cargo (or prebuilt binaries), etcd, openssl, python3. No root, no
-# network, no lab. Everything lives under $ROOT and is removed at the end.
+# Exercise discovery and HTTP/TLS authentication against local controller services.
+# Builds binaries if missing, creates a CA, and starts etcd plus both tiers.
+# Requires cargo/prebuilt binaries, etcd, etcdctl, OpenSSL and Python.
+# Fixed loopback ports must be free. Cargo may need network access.
+# CHAOS_SELFTEST_ROOT is recursively replaced and removed; use a disposable path.
+# KEEP=1 retains the services and files for inspection. This is not a pure unit test.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,9 +185,8 @@ wait_port "$CLUSTER_PORT" && ok "the cluster serves on $CLUSTER_PORT" || bad "th
 echo
 echo "D. the wall this test exists for: http against a tls port"
 
-# Proof that the port really is mTLS. Without it a green M0 could mean the
-# transport works OR that the tier is serving plain http and the harness
-# happens to speak it — the exact ambiguity Image 58 created.
+# Record failure of a plain HTTP request. The later successful TLS and
+# unauthenticated-request probes distinguish transport failure from authentication.
 plain="$(CHAOS_DIR="$HERE" CHAOS_SCHEME=http CHAOS_CLOUD=127.0.0.1 \
          CHAOS_CLOUD_PORT=$CLOUD_PORT CHAOS_OUT="$ROOT/out" \
          python3 - <<'PY' 2>&1

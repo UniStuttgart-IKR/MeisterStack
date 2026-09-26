@@ -22,15 +22,12 @@ use crate::jwks::Keys;
 /// costs one person one retry.
 pub const DEFAULT_MIN_REFETCH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often to refetch with nobody asking, so that a rotation is usually
-/// picked up before any request meets an unknown key at all.
+/// Default periodic refresh interval, independent of unknown-key requests.
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 struct State {
     keys: Keys,
-    /// Whether a fetch has ever succeeded. Distinguishes "the provider
-    /// publishes no keys" from "we have not asked yet", which are the same
-    /// empty set and very different answers to give a caller.
+    /// Distinguish no successful fetch from a successfully loaded empty key set.
     loaded: bool,
     last_request: Option<DateTime<Utc>>,
 }
@@ -74,7 +71,7 @@ impl KeyCache {
         f(&state.keys)
     }
 
-    /// Whether a fetch has ever landed.
+    /// Whether a key fetch has succeeded.
     pub fn loaded(&self) -> bool {
         self.state.lock().expect("see with_keys").loaded
     }
@@ -88,12 +85,8 @@ impl KeyCache {
         state.loaded = true;
     }
 
-    /// Ask for a refetch on behalf of a request that met an unknown key.
-    ///
-    /// Returns whether the ask went through, which is the whole of the rate
-    /// limit and the thing the test asserts. A `false` is not an error: it
-    /// means somebody asked recently enough that this request's answer would
-    /// not have been any different.
+    /// Request background refresh after an unknown key. Return false when
+    /// the cache-wide minimum interval suppresses the request.
     pub fn request_refresh_at(&self, now: DateTime<Utc>) -> bool {
         let mut state = self.state.lock().expect("see with_keys");
         let floor = chrono::Duration::from_std(self.min_interval)
@@ -163,8 +156,7 @@ mod tests {
         assert!(handle.rx.try_recv().is_err());
     }
 
-    /// The empty cache is not the same as a provider with no keys, and the
-    /// request path has to be able to say which it met.
+    /// An uninitialized cache is distinguishable from an empty provider key set.
     #[test]
     fn a_cache_that_has_never_fetched_says_so() {
         let (cache, _handle) = KeyCache::new(Duration::from_secs(60));

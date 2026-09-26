@@ -19,20 +19,11 @@ use crate::object::Resource;
 use crate::resources::{FloatingIp, FloatingIpSpec, FloatingPool, RoutedSubnet};
 use crate::store::{EtcdStore, Result, StoreError};
 
-/// How many lost races to accept before saying so. A liveness bound, not a
-/// correctness one — every round is one address somebody else took first, or
-/// one this caller gave back rather than go over a quota (see `within_quota`),
-/// and a caller that has lost sixteen in a row is on a cloud with bigger
-/// problems than this reservation.
+/// Bound allocation retries after address races or quota rollback.
+/// This limits liveness work; each attempt still enforces its allocation checks.
 const MAX_ROUNDS: usize = 16;
 
-/// The pool a reservation belongs to: the one it named, or the one marked
-/// default.
-///
-/// A refusal here is deliberately wordy. "No pool" is the state a cloud is in
-/// before an operator has configured any addresses at all, and the useful
-/// answer to a member who asks for a floating address on such a cloud is what
-/// the administrator has to do, not `404`.
+/// Select the named pool or the default, with actionable configuration errors.
 pub fn pick_pool<'a>(pools: &'a [FloatingPool], named: Option<&str>) -> Result<&'a FloatingPool> {
     if let Some(name) = named.filter(|n| !n.is_empty()) {
         return pools
@@ -77,13 +68,8 @@ fn addresses(ips: &[FloatingIp]) -> BTreeSet<Ipv4Addr> {
         .collect()
 }
 
-/// Every reservation, refusing to answer from a partial list.
-///
-/// `list` drops what it cannot decode, and a dropped reservation is an address
-/// this function would hand out to somebody else. The same guard `delete_tenant`
-/// applies to its membership check, for the same reason and with more at stake:
-/// there the cost is a tenant deleted too eagerly, here it is two tenants
-/// holding one address.
+/// Read reservations and reject a list/count mismatch rather than allocate
+/// from known partial inventory. List and count are separate reads.
 pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
     let ips = store.list::<FloatingIp>().await?;
     if ips.len() != store.count::<FloatingIp>().await? {
@@ -96,33 +82,17 @@ pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
     Ok(ips)
 }
 
-/// How many addresses `tenant` holds in `pool`.
-///
-/// Per tenant AND per pool, which is what makes a public pool safe to have
-/// next to a private one: a tenant's four private addresses say nothing about
-/// how many routable ones it may hold.
+/// Count reservations within both tenant and pool, keeping public and private
+/// pool quotas independent.
 fn held_by(ips: &[FloatingIp], tenant: &str, pool: &str) -> u32 {
     ips.iter()
         .filter(|ip| ip.spec.tenant == tenant && ip.spec.pool == pool)
         .count() as u32
 }
 
-/// Which address this round will try to take: the one that was asked for, or
-/// the first gap.
-///
-/// Both answers come out of the same allocatable set, and that symmetry is the
-/// whole reason this is one function. `first_free` steps over a CIDR's network
-/// and broadcast address because a guest given either of them is a guest whose
-/// neighbours answer for it — and an address a caller NAMES is exactly as
-/// unusable, for exactly that reason. The named path used to check only
-/// `contains`, which is the GUARD's set and two addresses larger per range, so
-/// `--address 10.255.0.0` out of a `/16` was handed over down a path the scan
-/// would never have taken.
-///
-/// The three refusals are kept apart on purpose: "not in this pool", "not an
-/// address that can be handed out" and "somebody already has it" are three
-/// different things to the person reading them, and only the last of the three
-/// is worth trying again later.
+/// Choose the requested address or first free allocatable address. Both
+/// paths exclude unusable network/broadcast addresses. Distinguish an
+/// out-of-pool request, an unallocatable address and an occupied address.
 fn pick_address(
     ranges: &Ipv4Ranges,
     pool: &FloatingPool,
@@ -202,10 +172,7 @@ pub async fn allocate(
 
         let held = held_by(&existing, tenant, &pool.metadata.name);
         if held >= quota {
-            // Zero reads differently from "used up", and the difference is
-            // the whole assignment rule: a public pool defaults to zero, so
-            // the answer for most tenants asking for a routable address is
-            // "nobody has given you any", not "you have spent yours".
+            // Distinguish an unassigned zero quota from a quota the tenant has exhausted.
             let name = &pool.metadata.name;
             return Err(StoreError::Invalid(if quota == 0 {
                 format!(
@@ -235,31 +202,22 @@ pub async fn allocate(
                 internal_address: pointing.internal_address.clone(),
             },
         );
-        // A preview stops here, one line short of the write, and hands back
-        // the address this round picked. That address is not a promise — the
-        // whole loop exists because somebody else may take it between now and
-        // the write — and that is exactly what a preview is worth: the quota
-        // refusal above is answered for real, and the address is the one the
-        // request would get if it went now.
+        // Preview validates quota and shows this candidate without reserving it.
+        // Another caller may claim the address before a later real request.
         if let Some(preview) = dry.preview(&object) {
             return Ok(preview);
         }
         match store.create(&object).await {
-            // The address is ours. Whether the QUOTA is, is a question the
-            // list we read before the write could not answer — see
-            // `within_quota` for why it is asked here instead, and for what
-            // this costs.
+            // After creating the address, recheck quota to detect competing allocations
+            // under different address keys.
             Ok(created) => {
                 let after = all_reservations(store).await?;
                 if within_quota(&after, tenant, &pool.metadata.name, quota) {
                     return Ok(created);
                 }
                 if let Err(e) = store.delete::<FloatingIp>(&address.to_string()).await {
-                    // Error, not warn: the reservation is over the tenant's
-                    // quota and the rollback did not land, so the pool holds
-                    // an address that is nobody's business to take back. No
-                    // pass repairs it — only a person running
-                    // `meister floatingip assign --release` does.
+                    // Failed rollback leaves an over-quota reservation requiring operator release;
+                    // no reconciler repairs it automatically.
                     error!(
                         address = %address,
                         tenant,
@@ -269,10 +227,7 @@ pub async fn allocate(
                     );
                     return Err(e);
                 }
-                // Debug, not warn: losing a quota race is a decision that did
-                // not fall, and the round that follows says out loud whichever
-                // of the two things is actually true — the quota is used up,
-                // or there was room after all.
+                // Retry after quota rollback; the next scan determines whether room remains.
                 debug!(
                     address = %address,
                     tenant,
@@ -282,11 +237,8 @@ pub async fn allocate(
                 );
                 continue;
             }
-            // Somebody took this address between the scan and the write. The
-            // NAME is the address, so the store's own create is the
-            // compare-and-swap — and an explicit request has nowhere else to
-            // go, while a scan simply reads what the winner left and tries
-            // the next gap.
+            // Creation by address key arbitrates a lost race. An explicit address fails;
+            // automatic allocation rescans for the next gap.
             Err(StoreError::AlreadyExists(_)) => {
                 if wanted.is_some() {
                     return Err(StoreError::Conflict(format!(
@@ -306,14 +258,9 @@ pub async fn allocate(
 
 // --- routed subnets ---------------------------------------------------------
 
-/// Everything a new subnet may not touch: the other routed subnets and every
-/// floating pool.
-///
-/// Floating pools are in the list for a reason worth stating: a tenant whose
-/// routed subnet contained a floating address would have that address on its
-/// allowlist by virtue of the subnet, and the pool guard — the rule that says
-/// nobody sources from a pool address without holding it — would have a hole
-/// exactly the size of that subnet.
+/// Collect ranges a subnet must avoid, including all floating pools.
+/// Overlap would authorize a tenant to source unreserved floating addresses
+/// through its routed-subnet allowlist.
 pub fn occupied(
     pools: &[FloatingPool],
     subnets: &[RoutedSubnet],
@@ -355,12 +302,8 @@ pub fn check_free(candidate: &Ipv4Range, occupied: &[(String, Ipv4Range)]) -> Re
     Ok(())
 }
 
-/// The first aligned block of `prefix_len` bits inside the super-pools that
-/// collides with nothing.
-///
-/// Aligned, because a subnet that is not on its own boundary is a subnet no
-/// router will accept as a prefix — and walking blocks rather than addresses
-/// is also what keeps this a handful of comparisons on a /16.
+/// Find the first free, prefix-aligned block inside the super-pools.
+/// Advance by whole blocks rather than individual addresses.
 pub fn cut_subnet(
     supers: &Ipv4Ranges,
     prefix_len: u32,
@@ -436,13 +379,8 @@ pub fn inject_nic_list(spec: &mut serde_json::Value, field: &str, values: &[Stri
         let Some(nic) = nic.as_object_mut() else {
             continue;
         };
-        // A NIC on a PROVIDER network is not on the tenant's wire at all —
-        // it is on the layer 2 the operator handed over — so neither the
-        // tenant's floating addresses nor its routed subnets say anything
-        // about which addresses are legitimate there. The node stopped
-        // reading them on such a tap (see the driver's `ruleset`); this is
-        // the same statement one tier up, so that the spec a person reads
-        // does not carry a list that means nothing.
+        // Provider NICs use operator-defined layer-2 networks, not the tenant overlay.
+        // Do not inject tenant floating or routed source lists that their taps ignore.
         if nic.get("physnet").is_some_and(|p| !p.is_null()) {
             continue;
         }
@@ -493,10 +431,7 @@ mod tests {
         )
     }
 
-    /// The pool a reservation lands in, and every way that question can have
-    /// no answer. Each refusal says what to do about it — a member asking for
-    /// an address on a cloud with no pools should read the sentence that
-    /// names the command their administrator has to run.
+    /// Select named/default pools and explain missing or ambiguous configuration.
     #[test]
     fn a_reservation_lands_in_the_named_pool_or_the_default_one() {
         let pools = vec![
@@ -573,11 +508,8 @@ mod tests {
         Ipv4Ranges::parse(&cidrs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
-    /// The asymmetry that was there: the scan steps over a subnet's network
-    /// and broadcast address, so a caller who NAMES one has to be refused it
-    /// too. A guest holding the broadcast address of its own subnet is a
-    /// guest whose neighbours answer for it, and the pool cannot tell the two
-    /// requests apart once the object exists.
+    /// Explicit addresses obey the scan's exclusions, including subnet network
+    /// and broadcast addresses.
     #[test]
     fn a_named_address_is_measured_against_the_same_set_the_scan_walks() {
         let lab = pool("lab", &["10.255.0.0/24"], true);
@@ -622,16 +554,9 @@ mod tests {
         assert!(pick_address(&space, &four, Some("203.0.113.7".parse().unwrap()), &none).is_ok());
     }
 
-    /// The count after the write, which is the only one that can be believed.
-    ///
-    /// Two requests for the same tenant read the same list and both see room.
-    /// etcd arbitrates the address — the name IS the address — so two scans
-    /// for the same gap collide, but two requests NAMING two addresses do
-    /// not, and the tenant ends up over its ceiling. Recounting afterwards is
-    /// what closes that, and the closing rests on one fact: reads are
-    /// linearizable and each racer reads after its own write, so the pair of
-    /// views where each misses the other cannot happen. Every pair that CAN
-    /// happen is below, and in none of them do two racers keep an address.
+    /// Model post-write quota checks for concurrent address requests. Each
+    /// linearizable reread follows its own write; both writers cannot miss
+    /// each other. Address-name uniqueness alone does not enforce tenant quota.
     #[test]
     fn a_second_writer_that_saw_the_first_one_gives_its_address_back() {
         let a = reservation("10.255.0.1", "acme", "lab");
@@ -648,10 +573,8 @@ mod tests {
         assert!(within_quota(alone, "acme", "lab", 1));
         assert!(!within_quota(&both, "acme", "lab", 1));
 
-        // Both reads after both writes: both give theirs back and the tenant
-        // is told its quota is used up although it had room. A spurious
-        // refusal the next round undoes — the over-grant it replaces, no pass
-        // ever does.
+        // Both racing allocations may roll back after observing excess quota.
+        // A later attempt can retry once that transient excess is removed.
         assert!(!within_quota(&both, "acme", "lab", 1));
 
         // Room for two is room for two: neither gives anything back.
@@ -664,10 +587,8 @@ mod tests {
         assert_eq!(held_by(&[a, b, other_tenant, other_pool], "acme", "lab"), 2);
     }
 
-    /// A floating pool is in the occupied list, and that is not tidiness: a
-    /// routed subnet containing a pool address would put that address on its
-    /// tenant's allowlist, and the pool guard would have a hole the size of
-    /// the subnet.
+    /// Subnet ranges cannot overlap floating pools, which would bypass address
+    /// reservation through the subnet source allowlist.
     #[test]
     fn a_subnet_may_not_overlap_a_pool_or_another_subnet() {
         let pools = vec![pool("lab", &["10.255.0.0/16"], true)];
@@ -779,11 +700,7 @@ mod tests {
         let mut spec = serde_json::json!({ "vcpus": 2, "nics": [{}] });
         assert_eq!(inject_nic_list(&mut spec, NIC_FLOATING_IPS, &[]), 0);
 
-        // A NIC on a provider network gets neither list: it is not on the
-        // tenant's wire, so what the tenant may source there is not this
-        // tier's statement to make. The node stopped reading them on such a
-        // tap; this keeps the spec a person reads from carrying a list that
-        // means nothing.
+        // Provider NICs receive neither tenant-overlay address list.
         let mut mixed = serde_json::json!({
             "nics": [ {}, { "physnet": "ext" } ]
         });

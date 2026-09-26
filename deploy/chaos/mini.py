@@ -1,30 +1,13 @@
 #!/usr/bin/env python3
-"""The mini-chaos scenarios: what Image 58 added, on twelve real hosts.
+"""Named transport, storage, drain and lifecycle measurements for the lab.
 
-The big loop in `chaos.py` walks a random sequence and judges it against the
-invariants. This file is the other half the mini-chaos brief asked for: a
-handful of named, repeatable measurements that each answer ONE question about
-the storage, hot-plug, drain and reschedule work of the last week, with a
-number rather than a verdict.
+Use --list to inspect the catalogue; M0 checks discovery on every configured
+controller endpoint. Other cases rely on the fixed topology and fixtures.
+Most create mc-* resources, but M4 selects an existing stopped/Failed VM
+without a prefix filter. Cleanup is best effort and not guaranteed on errors.
 
-    ./mini.py --list
-    ./mini.py M1
-    ./mini.py --all
-    ./mini.py M1 --reps 20
-
-Every object it makes is called `mc-*`, the same prefix the run's report uses,
-and every scenario tears its own down. Nothing here touches the evidence
-(`cloud-probe`, `ubuntu-probe`, `nested-1`, `fleet-*`).
-
-A scenario returns `(findings, table)`: findings are `(id, sentence)` pairs
-that land in `out/findings.txt` exactly as the rest of the harness does it,
-and the table is what gets typed into the report.
-
-WHY THE MEASUREMENTS ARE PAIRED. Several of these run the same operation twice,
-once against cluster-1 and once against cluster-2, and the pair IS the result:
-cluster-1 has three controller replicas, cluster-2 has one. A number that is
-bad on the first and clean on the second says "HA did this", which no single
-measurement can say.
+Scenario return values are findings plus measurement rows. Differences between
+cluster-1 and cluster-2 do not isolate replica count from other fleet differences.
 """
 
 import argparse
@@ -60,12 +43,7 @@ def scenario(sid, title):
 # --- small helpers -----------------------------------------------------------
 
 def pct(xs, p):
-    """The p-th percentile of a small sample, nearest-rank.
-
-    Nearest-rank and not interpolation: with ten samples an interpolated p99
-    is a statement about a value that was never measured, and these samples
-    are seconds off a lab, not a distribution anybody fitted.
-    """
+    """Select a small-sample percentile with this helper's rounded-rank formula."""
     if not xs:
         return None
     s = sorted(xs)
@@ -167,18 +145,10 @@ def drop_vm(name, limit=120):
 
 @scenario("M1", "volume provision: 3-replica cluster vs 1-replica cluster")
 def m1(reps=6):
-    """The measurement that names the HA bug.
+    """Measure Ready latency and intervening Failed phases on two configured pools.
 
-    A `Volume` created at the cloud is reconciled by EVERY cluster-controller
-    replica, but only the one holding the node's session can deliver
-    `ProvisionVolume`. The other two reach `send_command`, get "node X has no
-    active session" back from their LOCAL registry, and publish `Failed` --
-    a phase whose own requeue curve then decides how long the volume sits
-    there. Two of three passes therefore poison a provision that the third
-    would have finished in a second.
-
-    Run against cluster-2, which has one replica, the same volume is Ready
-    without ever being Failed. That pair is the finding.
+    This can expose replica-ownership failures; it does not establish their
+    cause from timing alone. The pools are persistent lab fixtures.
     """
     ensure_tenant()
     f, rows = [], []
@@ -215,29 +185,7 @@ def m1(reps=6):
 
 @scenario("M0", "transport: every tier answers this harness on the wire it speaks")
 def m0(reps=1):
-    """The cheapest measurement there is, and the one that was missing.
-
-    The harness was written against a lab whose REST ports were plain http.
-    Image 58 turned mTLS on, and every request died at the first byte with
-    `ApiError HTTP 0: BadStatusLine:  2` — TLS answering an http client. It
-    was not a scenario failing; it was the whole harness talking to a wall,
-    and nothing said so until somebody read the exception.
-
-    So: ask every endpoint for the one document that needs no objects, no
-    tenant and no state — the discovery — and judge three things about the
-    answer:
-
-      * it came back at all, over the scheme this transport chose. A
-        transport error here is THE finding, and it is the one that must not
-        be reported as "the cloud refused" or "the volume was slow";
-      * it is this API's discovery document, not a proxy's error page;
-      * the tier calls itself what the harness thinks it is, so a run that
-        has cloud and cluster the wrong way round says so on the first
-        measurement rather than on the tenth.
-
-    Every replica separately, not the first one: D2 was invisible until each
-    was asked on its own.
-    """
+    """Check transport, discovery kind and tier identity at every configured replica."""
     f, rows = [], []
     for label, addrs, port, tier in (
             [("cloud", CLOUD, ops.CLOUD_PORT, "cloud")]
@@ -283,21 +231,10 @@ def m0(reps=1):
 
 @scenario("M2", "hot-unplug: the control plane frees a disk the VMM still has open")
 def m2(reps=1):
-    """`vm detach` reports the volume free while cloud-hypervisor keeps the fd.
-    The agent calls `vm.remove-device` and the CH API acknowledges the
-    REQUEST; virtio unplug is guest-cooperative and a guest that never
-    acknowledges leaves the device -- and the open file -- in place. Nothing
-    verifies. The volume goes to `Ready / attachedTo: none`, and the next VM
-    that uses it dies on cloud-hypervisor's own write lock, which is the only
-    thing standing between this and two VMMs on one disk.
-    Judged on the node, because the control plane is exactly the thing that
-    is wrong here: `/proc/<vmm>/fd` is the only honest witness.
+    """Compare observed detach state with matching VMM file descriptors on the node.
 
-    Two volumes, and the DATA disk is the one that goes: the first entry is
-    the boot disk and the cloud refuses to take it off a vm (422, "a vm needs
-    at least one volume as boot disk"). The first version of this scenario
-    detached the only volume, never checked the PUT's status, and measured a
-    detach that had never been asked for.
+    The data disk is secondary so the boot-volume guard does not reject the
+    edit. Failed reads and unchecked prerequisites can invalidate the result.
     """
     ensure_tenant()
     f, rows = [], []
@@ -364,17 +301,11 @@ def m2(reps=1):
 
 @scenario("M3", "drain: `moved` can never report a completed drain's work")
 def m3(reps=1):
-    """`status.draining.moved` is a per-pass counter, `complete` is `moved == 0`.
+    """Compare drain progress with the two fixture VMs' observed locations.
 
-    The field says "VMs this drain has got off the machine, or is getting off
-    it", and the reconciler counts, in ONE pass, the VMs it still has to move.
-    A VM that has left is no longer among the node's VMs, so it stops being
-    counted -- and `complete = settled && moved == 0` cannot be true unless
-    `moved` is zero. The two fields are mutually exclusive by construction, so
-    a finished drain always reads `moved: 0`, whatever it did.
-
-    Set up on cluster-2 so the evidence (`nested-1`, evacuation never) is the
-    third kind of VM without being touched.
+    This edits node labels and drain state and assumes the fixed cluster-2
+    topology. Restoration sets schedulable=true rather than restoring its
+    original value, and is not protected by a finally block.
     """
     ensure_tenant()
     f, rows = [], []
@@ -472,20 +403,10 @@ def m3(reps=1):
 
 @scenario("M4", "reschedule is refused on exactly the phase that needs it")
 def m4(reps=1):
-    """`reschedule` gates on `status.phase == Stopped`.
+    """Try releasing the binding of the first stopped-intent, Failed cloud VM.
 
-    A VM whose node cannot execute commands sits at `Failed`. It will never
-    reach `Stopped`, because reaching `Stopped` is a thing that node would
-    have to do. So the one API call that would move it to a working machine
-    is refused, and the refusal tells the operator to do what they already
-    did -- `spec.runStrategy` is `Stopped` throughout.
-
-    Same gate in both tiers:
-      components/cloud-controller/src/api/vms.rs::reschedule_refusal
-      components/cluster-controller/src/api.rs::check_reschedule
-
-    This scenario does not break a node to prove it. It reads the gate against
-    a VM that is Failed for any reason, which is the condition that matters.
+    This mutates an existing VM without restricting selection to mc-* names.
+    No suitable VM produces a skipped measurement.
     """
     f, rows = [], []
     c, o = cloud("GET", "/vms")
@@ -518,19 +439,9 @@ def m4(reps=1):
 
 @scenario("M5", "liveness: READY is a heartbeat, not the ability to act")
 def m5(reps=1):
-    """The invariant the fleet had no check for.
+    """Report recent database I/O errors on nodes currently marked Ready.
 
-    An agent whose redb has taken one I/O error answers `begin write:
-    Previous I/O error occurred. Please close and re-open the database.` to
-    every command, for ever -- redb requires a reopen and the agent never does
-    one. The session keeps beating, the unit stays `active`, `node ls` says
-    READY, and `deploy/check.sh` says green, because none of those touch the
-    database.
-
-    So the scheduler keeps placing work on it, and every placement fails.
-
-    This is a check, not an injection: it reads each READY node's journal and
-    reports any that is lying about being able to work.
+    Journal history is diagnostic evidence, not a present write/read health test.
     """
     f, rows = [], []
     for cname in CLUSTERS:
@@ -565,15 +476,9 @@ def m5(reps=1):
 
 @scenario("M6", "vm create convergence, with and without a replica reboot underneath")
 def m6(reps=6):
-    """Position 4's number: does losing one of three replicas cost anything?
+    """Measure cloud VM creation under a caller-supplied experimental condition.
 
-    Measured as time from `POST /vms` to `status.phase == Running` at the
-    cloud, which is the only latency a user of this thing ever sees. The
-    reboot half is driven from `one.py` and is the caller's job to start --
-    this scenario measures, it does not reboot, because a scenario that
-    reboots a controller replica should be a deliberate keystroke.
-
-    Set MINI_UNDER='what is happening' to label the run.
+    MINI_UNDER labels the result. This function does not inject a reboot.
     """
     ensure_tenant()
     f, rows = [], []
@@ -599,13 +504,10 @@ def m6(reps=6):
 # --- cleanup -----------------------------------------------------------------
 
 def cleanup():
-    """Every mc-* VM, volume and snapshot on both tiers.
+    """Request deletion of mc-* VMs, volumes and snapshots at both tiers.
 
-    NOT the storage pools: `mc-fs` and `mc-fs2` are the lab's fixtures for M1
-    and M2 (D-L9), made once and kept, and they happen to carry the harness
-    prefix. The night this took them with it, they had to be restored byte
-    for byte from a snapshot (lab-refresh-report.md). A run makes VMs,
-    volumes and snapshots; it never makes a pool, so it never removes one.
+    Keep persistent mc-fs/mc-fs2 pool fixtures. Deletion results are not checked
+    or awaited, and the tenant and node labels are not removed here.
     """
     gone = []
     for res in ("vms", "volumes", "volumesnapshots"):

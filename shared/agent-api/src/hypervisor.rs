@@ -37,14 +37,8 @@ pub enum HypervisorError {
 
 pub type Result<T> = std::result::Result<T, HypervisorError>;
 
-/// One volume the VMM is handed, and the name it will answer to afterwards.
-///
-/// The id beside the attachment, and the reason is hot-plug: `vm.remove-device`
-/// and `vm.resize-disk` address a disk BY NAME, so a disk that may be spoken
-/// about after boot needs a name that was decided before it. The name a VMM
-/// picks for itself is positional — cloud-hypervisor counts `_disk0`,
-/// `_disk1`, … — and a positional name moves under a detach and then names
-/// the wrong disk.
+/// A VMM attachment with a stable volume-derived disk ID for later unplug
+/// and resize, independent of attachment ordering.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttachedVolume {
     /// The volume's id: one this node minted for an inline disk, the `Volume`
@@ -61,14 +55,7 @@ impl AttachedVolume {
     }
 }
 
-/// The name a VMM knows a volume's disk by, derived from the volume id.
-///
-/// A free function and not a method so that the two sides can agree without
-/// holding the same value: the driver writes it into the config at create,
-/// and the agent speaks it back months later to unplug or grow that disk.
-/// Derived and never allocated, for the reason every other name in the
-/// storage path is: a name that has to be remembered is a name that can be
-/// lost.
+/// Derive a stable disk name from the volume ID for creation and later operations.
 pub fn disk_id(volume: &crate::VolumeId) -> String {
     format!("disk-{volume}")
 }
@@ -76,26 +63,15 @@ pub fn disk_id(volume: &crate::VolumeId) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstanceSpec {
     pub boot: BootSource,
-    /// In spec order; the first block volume is the boot disk. Attachments
-    /// rather than paths since volumes learned to be served by a backend
-    /// process — and not `disks`, because a `FsShare` in this list is a
-    /// filesystem export and never appears among the VMM's disks.
+    /// Attachments in spec order; the first block volume is the boot disk.
+    /// Filesystem shares appear here but are configured separately from VMM disks.
     pub volumes: Vec<AttachedVolume>,
     pub vcpus: u32,
     pub memory_mib: u64,
     pub nics: Vec<NicAttachment>,
     pub devices: Vec<DeviceAttachment>,
-    /// A second, read-only disk holding the cloud-init NoCloud seed.
-    ///
-    /// Beside `volumes` rather than inside it, and that is the point: a
-    /// volume is something a storage driver made and will unmake, with a
-    /// lifecycle and an attachment kind. This is a file the agent wrote out
-    /// of the spec, it is always a plain path, and it is always read-only —
-    /// putting it in the list would make all three of those a special case
-    /// every storage driver had to know about.
-    ///
-    /// `None` is every VM this stack has booted so far, and its config comes
-    /// out byte for byte the same.
+    /// Read-only NoCloud seed file created by the agent. Kept outside
+    /// `volumes` because it has no storage-provider lifecycle. Defaults to None.
     #[serde(default)]
     pub cloud_init_seed: Option<std::path::PathBuf>,
 }
@@ -153,15 +129,8 @@ pub trait Migratable: Send + Sync {
     }
 }
 
-/// The address form a migration stream is named by: `tcp:<addr>:<port>`.
-///
-/// One function because two machines have to agree on it without sharing
-/// anything but the string, and because it is easy to get wrong in a way that
-/// fails late: cloud-hypervisor parses it with `strip_prefix("tcp:")`, so
-/// `tcp://` is not a URL with a redundant slash — it is a host called `` with
-/// a port of `/1.2.3.4:9000`, and it is refused. An IPv6 literal has to be
-/// bracketed, for the same reason it is everywhere else: the parser splits on
-/// the LAST colon.
+/// Format a Cloud Hypervisor migration address as `tcp:<addr>:<port>`.
+/// Use no URL slashes and bracket IPv6 literals.
 pub fn migration_url(addr: &str, port: u16) -> String {
     if addr.contains(':') && !addr.starts_with('[') {
         format!("tcp:[{addr}]:{port}")
@@ -169,26 +138,13 @@ pub fn migration_url(addr: &str, port: u16) -> String {
         format!("tcp:{addr}:{port}")
     }
 }
-/// Adding and removing a disk while the guest is running.
-///
-/// Disks only, and the narrowing is the honest part: NICs and passthrough
-/// devices are plugged by other verbs with other rules (a NIC needs a tap
-/// first, a VFIO device needs an IOMMU group free), and one trait pretending
-/// to cover all three would have three methods nobody could implement
-/// together. This one exists because `spec.vm.volumes[]` became mutable from
-/// its second entry on, and that edit has to reach a running guest.
-///
-/// Optional, through `Hypervisor::as_hotpluggable`: a VMM that cannot do it
-/// says so by returning `None`, and the agent then writes the record and lets
-/// the next start pick the disk up from the spec.
+/// Optional disk hotplug, exposed through `Hypervisor::as_hotpluggable`.
+/// The agent applies eligible referenced-volume changes after the boot disk.
+/// Without this capability, persisted changes take effect at the next start.
 #[async_trait::async_trait]
 pub trait HotPluggable: Send + Sync {
-    /// Plug a volume into a running VM. The disk is named [`disk_id`] of the
-    /// volume afterwards, which is what `remove_disk` will speak back.
-    ///
-    /// The volume is already attached — a path exists, or a backend process
-    /// is listening — because attaching is the storage driver's half and
-    /// happened before this call. What this does is tell the VMM.
+    /// Plug an already attached volume into the running VMM, naming it with
+    /// `disk_id`. The path or backend socket must be ready before this call.
     async fn add_disk(&self, id: &VmId, volume: &AttachedVolume) -> Result<()>;
 
     /// Notify the guest of a disk increase after the storage backend has grown
@@ -197,26 +153,13 @@ pub trait HotPluggable: Send + Sync {
     /// The VMM handles any required brief vCPU pause.
     async fn resize_disk(&self, id: &VmId, disk_id: &str, size_bytes: u64) -> Result<()>;
 
-    /// Unplug a disk by the name `add_disk` gave it.
-    ///
-    /// The guest has to cooperate: a disk it has mounted does not go away
-    /// because somebody asked. That is the guest's business and not this
-    /// stack's, exactly as it is with EBS — the one disk a guest can never be
-    /// asked about is the boot disk, and that entry is immutable.
+    /// Unplug by stable disk ID. Guest cooperation may be required; callers
+    /// must handle mounted filesystems and must not remove the immutable boot disk.
     async fn remove_disk(&self, id: &VmId, disk_id: &str) -> Result<()>;
 
-    /// Plug a NIC into a running VM, on a tap that already exists.
-    ///
-    /// The tap is the network driver's half and happened before this call —
-    /// it is in its bridge, it is UP, it carries its MTU and its guard chain
-    /// is in place — exactly as a volume is attached before `add_disk` tells
-    /// the VMM. What this does is tell the VMM.
-    ///
-    /// A default, and the default is a refusal in words, for the reason
-    /// `NicDriver`'s overlay methods have one: a hypervisor that cannot plug
-    /// a NIC into a live guest must SAY so, because the alternative — a
-    /// successful call that does nothing — is a record claiming a NIC and a
-    /// guest that never sees one.
+    /// Plug an already prepared tap into a running VM. The network driver
+    /// must configure its bridge, MTU and filtering first. Unsupported
+    /// hypervisors return an error rather than acknowledge an absent NIC.
     async fn add_nic(&self, id: &VmId, nic: &NicAttachment) -> Result<()> {
         let _ = nic;
         Err(HypervisorError::Backend(anyhow::anyhow!(
@@ -237,26 +180,14 @@ pub enum BootSource {
     },
 }
 
-/// The two one-way streams a guest writes before anything inside it is
-/// reachable. Named separately because they are separately useful: a
-/// direct-kernel boot puts the kernel on `console`, firmware and a bootloader
-/// put their prompts on `serial`, and "the VM printed nothing" means
-/// different things depending on which of the two is empty.
+/// Named guest and VMM output streams. Guest console and serial contents
+/// depend on the configured firmware, boot arguments and guest drivers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConsoleStream {
     Console,
     Serial,
-    /// What the VMM said about the guest, rather than what the guest said.
-    ///
-    /// The driver's own diagnostics — `diagnostic_paths`, cloud-hypervisor's
-    /// stdout and stderr. It is NOT part of the default answer, and that is
-    /// the whole reason it can exist here at all: the note on
-    /// `diagnostic_paths` refuses to fold these into the console because it
-    /// would "put hypervisor noise in front of somebody reading their guest's
-    /// boot", and that stays true. Asked for by name it is the opposite —
-    /// when a VM will not start, the reason is in here and nowhere a client
-    /// could reach, and the answer today is to go and look on the node.
+    /// VMM diagnostics, requested explicitly and excluded from default guest logs.
     Vmm,
 }
 
@@ -273,10 +204,8 @@ impl ConsoleStream {
         }
     }
 
-    /// The stream a client named, or `None` for a word this node does not
-    /// serve. Unknown is not an error at the edges: a client built against a
-    /// newer node asking for a stream this one has never heard of should get
-    /// the streams it CAN have, not a refusal.
+    /// Parse a supported stream name. Unknown names return None so callers
+    /// can ignore unsupported filters.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "console" => Some(ConsoleStream::Console),
@@ -301,50 +230,20 @@ pub trait Hypervisor: Send + Sync {
     async fn power_button(&self, id: &VmId) -> Result<()>;
     async fn get_state(&self, id: &VmId) -> Result<VmState>;
 
-    /// Where this VM's one-way output is kept, if this hypervisor keeps it
-    /// anywhere.
-    ///
-    /// The agent bounds and reads those files (`crate::console` one crate
-    /// over is not a thing — it is `meister_agent::console`); the driver only
-    /// says where they are, because only the driver decided. An empty list is
-    /// the honest answer for a hypervisor that writes none, and it makes
-    /// "this VM has no output" a fact rather than an error.
-    ///
-    /// A path here does not promise the file exists: a VM that has been
-    /// created but never started has none yet.
+    /// Paths containing guest output. The agent reads and bounds these files.
+    /// An empty list means no output paths; listed files may not exist yet.
     fn console_paths(&self, _id: &VmId) -> Vec<(ConsoleStream, std::path::PathBuf)> {
         Vec::new()
     }
 
-    /// Files the driver writes that must be BOUNDED but are never served.
-    ///
-    /// Deliberately separate from `console_paths` rather than folded into it,
-    /// because the two answer different questions. `console_paths` is the
-    /// guest's output and `vm logs` serves it; this is the driver's own
-    /// diagnostics — a VMM's stdout and stderr — and mixing the two into one
-    /// answer would put hypervisor noise in front of somebody reading their
-    /// guest's boot.
-    ///
-    /// They still need the ring: unbounded is unbounded whoever wrote it, and
-    /// a VMM that logs on every guest write fills the same disk.
-    ///
-    /// A path here does not promise the file exists.
+    /// Driver diagnostic files, bounded by the agent and served separately
+    /// from guest output when explicitly requested. Files may not exist yet.
     fn diagnostic_paths(&self, _id: &VmId) -> Vec<std::path::PathBuf> {
         Vec::new()
     }
 
-    /// Where the guest's INTERACTIVE line listens, if this hypervisor offers
-    /// one.
-    ///
-    /// A separate question from `console_paths`, and the separation is the
-    /// whole design: those are files, and a file has no input path. This is a
-    /// socket, and the agent both records from it — into the very file
-    /// `console_paths` names for `serial` — and lends it out to at most one
-    /// client at a time. See the agent's `attach` module.
-    ///
-    /// `None` is a hypervisor with no interactive console, and every caller
-    /// treats that as "this VM cannot be attached to" rather than as an
-    /// error: a driver that cannot do it should not have to pretend.
+    /// Interactive console socket. The agent records it and permits one
+    /// interactive client at a time. None means attachment is unsupported.
     fn console_socket(&self, _id: &VmId) -> Option<std::path::PathBuf> {
         None
     }
@@ -373,17 +272,9 @@ pub trait Hypervisor: Send + Sync {
         Vec::new()
     }
 
-    /// End a VMM this agent has no record of, and everything it left behind.
-    ///
-    /// Beside `destroy` rather than folded into it, because the two act on
-    /// different evidence and one of them is a `SIGKILL` at a recorded pid.
-    /// `destroy` is "this VM of mine, whose process I own or whose pid my map
-    /// names"; this is "something is serving an api socket in my run
-    /// directory and no record of mine says what". The second has no pid to
-    /// check and must not invent one — it speaks to the socket, which by
-    /// construction reaches only the process that answers for that id here.
-    ///
-    /// Only ever called after a grace, and only about an id `strays` named.
+    /// End a VMM found by `strays` after the caller's grace period. Without
+    /// a recorded PID, use its API socket rather than guessing a process
+    /// to signal. Ordinary owned VMMs use `destroy`.
     async fn end_stray(&self, id: &VmId) -> Result<()> {
         let _ = id;
         Err(HypervisorError::Backend(anyhow::anyhow!(
@@ -391,33 +282,15 @@ pub trait Hypervisor: Send + Sync {
         )))
     }
 
-    /// What this hypervisor calls itself, e.g. `cloud-hypervisor v53.0`.
-    ///
-    /// Part of the node's machine profile, and there for a reason worth
-    /// stating: two ends of a live migration on two BUILDS is its own way for
-    /// a saved state not to restore, and it is invisible from anywhere else —
-    /// a fleet mid-rollout looks identical in every other field.
-    ///
-    /// Asked once, at start-up, because a binary does not change under a
-    /// running agent. `None` is a driver that cannot say, and an empty answer
-    /// is never compared against anything: see `live_migration_refusal`.
-    ///
-    /// The CPUID PROFILE it gives a guest is the neighbouring question and
-    /// has its own method, because the two have different lifetimes: the
-    /// version is the binary's and the profile is the configuration's.
+    /// VMM version sampled at agent startup for migration compatibility.
+    /// None means unavailable; compatibility checks cannot compare an empty
+    /// version. The configured CPU profile is reported separately.
     async fn version(&self) -> Option<String> {
         None
     }
 
-    /// The CPUID profile this hypervisor gives a guest — v53 has exactly one,
-    /// `Host`, which means "hand the guest this machine's own cpuid".
-    ///
-    /// Which is why the pre-flight comparison one tier up is a comparison of
-    /// MACHINES: with `Host` there is nothing between the silicon and the
-    /// guest to make two different machines look alike. The day `CpuProfile`
-    /// grows a second variant, a fleet that pins the same one everywhere is a
-    /// fleet whose guests can move between models — and the field is already
-    /// on the wire for it.
+    /// Guest CPU profile used by migration compatibility checks. The current
+    /// Host profile exposes host CPUID, so compatibility depends on the machines.
     fn cpu_profile(&self) -> &'static str {
         ""
     }

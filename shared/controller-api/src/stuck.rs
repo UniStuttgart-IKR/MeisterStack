@@ -18,50 +18,18 @@ use crate::events::{self, Happening};
 use crate::resources::EventType;
 use crate::store::EtcdStore;
 
-/// A phase that means "nobody has placed this yet".
-///
-/// Five minutes, and it is the shortest of the three because it is the one
-/// nothing outside this control plane is waiting on: placement is this tier's
-/// own work, it happens on the reconcile tick, and a VM that has not been
-/// placed after sixty ticks is not going to be placed by the sixty-first. The
-/// chaos run's `S1` and `F13` both settle in seconds when they settle at all.
+/// Diagnostic threshold for Pending resources awaiting placement or prerequisites.
 pub const STUCK_AFTER_PENDING: Duration = Duration::from_secs(5 * 60);
 
-/// A phase that means "a machine has been told and is working".
-///
-/// Fifteen minutes, three times the placement budget, because what is being
-/// waited on is somebody else's work on real hardware: a qcow2 being copied,
-/// an LV being zeroed, a namespace being connected, a guest being started.
-/// The longest legitimate one measured in the lab is an image fetch, and a
-/// deadline that fired during a normal one would be an alarm that teaches
-/// people to ignore alarms.
+/// Diagnostic threshold for provisioning work, allowing longer backend operations.
 pub const STUCK_AFTER_PROVISIONING: Duration = Duration::from_secs(15 * 60);
 
-/// A phase that means "nobody knows".
-///
-/// Ten minutes: twenty heartbeat timeouts, so it cannot fire on a session
-/// that is merely reconnecting, and short enough that D-C1's four and a half
-/// days would have been four and a half days of a raised gauge instead of
-/// silence. Between the other two on purpose — a silence is more urgent than
-/// a copy in flight and less urgent than a placement, because the thing it is
-/// about may be perfectly fine and unreachable.
+/// Diagnostic threshold for prolonged Unknown state; this does not prove failure.
 pub const STUCK_AFTER_UNKNOWN: Duration = Duration::from_secs(10 * 60);
 
-/// How long a phase spelled `word` may stand before it is worth saying so, or
-/// `None` for a word that may stand for ever.
-///
-/// Keyed off the WORD and not off a type, and that is what makes one function
-/// serve all seven resources: the seven `XPhaseKind` enums share their
-/// spellings by design (`as_str` at both tiers, in the proto, in the CLI), so
-/// `Creating` on a snapshot and `Provisioning` on a volume are the same
-/// statement about the same kind of wait.
-///
-/// The words with no deadline are the two ends of every one of these enums:
-/// a resting state (`Ready`, `Running`, `Stopped`, `Paused`, `Active`,
-/// `Standby`, `Succeeded`) has nothing in flight to be late, and `Failed` is
-/// left out deliberately — it is the phase the requeue curve already acts on,
-/// and a second deadline over the top of a backoff curve would be two things
-/// shouting about one VM.
+/// Diagnostic phase deadline shared across resource kinds. Stable and
+/// terminal phases have no deadline; Failed is handled by retry policy.
+/// Exceeding a deadline does not change state or authorize cleanup.
 pub fn stuck_after(word: &str) -> Option<Duration> {
     match word {
         "Pending" => Some(STUCK_AFTER_PENDING),
@@ -92,11 +60,7 @@ pub fn stuck(
     age.checked_sub(budget).filter(|over| !over.is_zero())
 }
 
-/// What a deadline needs to know about one object, out of its phase.
-///
-/// Four `&'static str`s and an instant, so that one pass can ask the same
-/// question of seven kinds without knowing which it is holding.
-/// `XStatus::standing()` builds it; see `resources::phase`.
+/// Phase facts consumed by the shared deadline checker, built by status.standing().
 #[derive(Clone, Copy, Debug)]
 pub struct Standing {
     /// `XPhaseKind::as_str`.
@@ -147,28 +111,15 @@ impl Crossed {
     }
 }
 
-/// What one pass found late: a count per (kind, phase, reason) for the gauge,
-/// and the objects that crossed in THIS pass for the events.
-///
-/// Two answers out of one walk, because they are two different statements. The
-/// gauge is a LEVEL — how many are late right now — and has to be rebuilt
-/// from scratch every pass, or an object that came unstuck would keep its
-/// series for ever. The events are EDGES, and an edge that fired every tick
-/// would be a store filling at one write per stuck object per pass, which is
-/// the churn this whole round is against.
+/// Per-pass overdue counts for gauges and recent deadline crossings for
+/// events. Rebuild counts each pass; emit edges only near the crossing.
 #[derive(Default, Debug)]
 pub struct Late {
     counted: BTreeMap<(&'static str, &'static str, &'static str), i64>,
     crossed: Vec<Crossed>,
 }
 
-/// Which object a deadline is about.
-///
-/// A struct rather than four parameters, and it earns that twice over: the
-/// six call sites per tier all read the same three fields off a `Metadata`,
-/// and the one that differs — the tenant, which lives on the spec and is
-/// spelled `Option<String>` on some kinds and `String` on others — is then
-/// the only thing a call site has to think about.
+/// Object identity and tenant context for deadline events and metrics.
 pub struct About<'a> {
     pub kind: &'static str,
     pub name: &'a str,
@@ -194,18 +145,9 @@ impl<'a> About<'a> {
 }
 
 impl Late {
-    /// Ask one object whether it is late, and remember the answer.
-    ///
-    /// `tick` is how often this pass runs, and it is what turns a level into
-    /// an edge: an object whose overshoot is smaller than one interval has
-    /// crossed its deadline SINCE the last pass, and every later pass sees a
-    /// bigger overshoot and says nothing. No mark on the object is needed for
-    /// that, which is the point — a "we told you" flag would be a field
-    /// nothing else reads and one more thing to get wrong on a restart.
-    ///
-    /// A missed pass costs at most a missed event, not a wrong one, and the
-    /// gauge is unaffected: it is a level and does not care when the crossing
-    /// happened.
+    /// Count an overdue object and record an event only when its overshoot
+    /// is less than one pass interval. Missing the crossing window may lose
+    /// the event; the current overdue gauge remains accurate.
     pub fn look(
         &mut self,
         about: About<'_>,
@@ -353,12 +295,7 @@ mod tests {
         assert_eq!(stuck_after("Ascended"), None);
     }
 
-    /// A terminal phase is not late for anything, whatever its word says.
-    ///
-    /// The half that matters is a `VmMigration`: `Preparing` carries the
-    /// provisioning budget, and a migration that is `Succeeded` is done —
-    /// asking the word alone would put a deadline on a record nobody is
-    /// waiting for.
+    /// Terminal status has no deadline even if its phase word otherwise has one.
     #[test]
     fn nothing_that_has_come_to_rest_can_be_late() {
         assert_eq!(stuck(true, "Pending", at(0), at(86_400)), None);
@@ -395,12 +332,7 @@ mod tests {
         assert_eq!(stuck(false, "Pending", at(600), at(0)), None);
     }
 
-    /// Every one of the seven enums answers `is_terminal`, and every word it
-    /// calls terminal really has no deadline left over.
-    ///
-    /// The table rather than seven tests, because the property is one: a
-    /// phase this stack has judged an END must not be able to come out of
-    /// `stuck` as late. A variant added to any of these enums shows up here.
+    /// Every terminal phase across resource kinds is excluded from stuck detection.
     #[test]
     fn every_terminal_word_is_out_of_reach_of_every_deadline() {
         let words: Vec<(bool, &'static str)> = VmPhaseKind::ALL
@@ -454,13 +386,8 @@ mod tests {
         );
     }
 
-    /// The pass: a level and an edge out of one walk.
-    ///
-    /// D-C1 as the two things a deadline buys. The gauge counts what is late
-    /// NOW, by kind, phase and reason; the event fires on the pass that
-    /// notices the crossing and on no later one — an edge derived from the
-    /// overshoot, so there is no "we told you" mark on the object to get
-    /// wrong on a restart.
+    /// Count currently overdue resources and emit events during the crossing window.
+    /// Neither diagnostic changes the object's phase.
     #[test]
     fn a_deadline_is_a_level_and_an_edge_and_never_a_verdict() {
         let tick = Duration::from_secs(60);

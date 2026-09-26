@@ -18,23 +18,12 @@ use tracing::debug;
 
 use crate::auth::{AuthRequest, Authenticator, Identity, SYSTEM_PREFIX};
 
-/// The group every identity out of a token carries.
-///
-/// It is not a permission and nothing in `permits` looks at it — `Role` is
-/// read only from `meister:admins` and `meister:members`, and this is
-/// neither. It is there so that an audit line says how somebody got in, and
-/// so that `rest::provision_from_directory` can tell an identity the
-/// provider vouched for from one a certificate did.
+/// Marker for OIDC authentication, used for audit and first-login provisioning.
+/// It grants no role; the directory supplies authorization.
 pub const GROUP_OIDC: &str = "meister:oidc";
 
-/// The prefix under which a token's tenant claim travels, when the operator
-/// has configured one.
-///
-/// Carried as a group because a group is what an `Identity` has room for and
-/// because it belongs in the audit line: what the provider SAID about
-/// somebody's tenant is worth seeing next to what the directory made of it.
-/// Read in exactly one place — first-login provisioning — and by nothing
-/// that decides anything.
+/// Carry the provider's tenant claim for audit and first-login provisioning.
+/// Authorization reads the resulting directory membership, not this claim.
 pub const GROUP_OIDC_TENANT_PREFIX: &str = "meister:oidc-tenant:";
 
 /// The tenant a token claimed, if it claimed one.
@@ -63,10 +52,7 @@ impl OidcAuthenticator {
         }
     }
 
-    /// The whole of `authenticate` with the clock passed in, the same shape
-    /// `MtlsAuthenticator` uses and for the same reason: expiry is most of
-    /// what this checks, and a test has to be able to say "and an hour
-    /// later".
+    /// Authenticate with an explicit clock for deterministic expiry checks.
     pub fn authenticate_at(
         &self,
         req: &AuthRequest,
@@ -92,10 +78,8 @@ impl OidcAuthenticator {
         {
             Ok(v) => v,
             Err(VerifyError::UnknownKey { kid }) => {
-                // The one failure a refetch could turn into a success. Ask
-                // for one — rate limited, and asking never blocks this
-                // request — and refuse this one. See `meister_oidc::cache`
-                // for why refusing beats waiting.
+                // An unknown signing key requests a rate-limited background refresh.
+                // Reject this request rather than waiting for provider I/O.
                 let asked = self.cache.request_refresh_at(now);
                 if !self.cache.loaded() {
                     bail!(
@@ -133,20 +117,9 @@ impl OidcAuthenticator {
     }
 }
 
-/// What a claim is allowed to be a name.
-///
-/// The `system:` refusal is the one that matters and it is not a hygiene
-/// check. `Identity::is_system` decides by prefix, and `permits` gives a
-/// system identity everything — that is right for a node, whose name comes
-/// out of a certificate this stack's own CA issued. A name that came out of
-/// somebody else's token must never be able to claim it: an identity
-/// provider that can be persuaded to mint a `sub` of `system:node:manacor`
-/// would otherwise be an identity provider that can do anything here.
-///
-/// The rest is what an object name and a log line can survive. `store`
-/// refuses a name with a slash at the write, which is a good second line and
-/// a bad first one: by then the name has already been through routing and an
-/// audit line.
+/// Validate an OIDC-derived identity name before routing or persistence.
+/// Reject the reserved `system:` namespace so provider claims cannot
+/// impersonate machine identities.
 fn check_name(name: &str) -> Result<String> {
     if name.starts_with(SYSTEM_PREFIX) {
         bail!(
@@ -176,16 +149,8 @@ impl Authenticator for OidcAuthenticator {
         self.authenticate_at(req, Utc::now())
     }
 
-    /// The one link in this stack whose readiness is not its construction: it
-    /// is built from an issuer URL and can only check a signature once the
-    /// provider's JWKS has been fetched at least once.
-    ///
-    /// `loaded` and not "has usable keys", which would be the stricter
-    /// reading and the wrong one: a provider that answered with an empty key
-    /// set has been REACHED, and that is a different problem from one that
-    /// cannot be reached at all — the refresher already says so with its own
-    /// warning. What this answers is the question the discovery document
-    /// asks: has this link ever been in a position to authenticate anybody.
+    /// Report whether a JWKS fetch has completed. This is discovery
+    /// readiness, not proof that the fetched set contains a usable signing key.
     fn ready(&self) -> bool {
         self.cache.loaded()
     }
@@ -232,13 +197,7 @@ mod tests {
         (auth, cache)
     }
 
-    /// D11: this link is configured the moment it is built and ready only
-    /// once the provider's keys have been fetched, and it says which.
-    ///
-    /// The lab ran for hours with `auth: "mtls,oidc"` in the discovery
-    /// document while the issuer was unreachable — the refresher logged
-    /// "keeping the ones we have" over a key set that had never existed, and
-    /// every token would have been refused.
+    /// OIDC discovery distinguishes configured authentication from a loaded key set.
     #[test]
     fn the_oidc_link_is_not_ready_until_a_key_set_has_landed() {
         use crate::auth::Authenticator;
@@ -255,10 +214,8 @@ mod tests {
             "an issuer in a config file is not a provider that has answered"
         );
 
-        // A provider that answers with an EMPTY key set has still been
-        // reached, and that is a different problem from one that cannot be:
-        // the refresher warns about it in its own words, and this link is not
-        // the place to say it a second time.
+        // An installed empty key set counts as fetched; readiness does not guarantee
+        // that any incoming token has a matching signing key.
         cache.install(meister_oidc::jwks::Keys::default());
         assert!(auth.ready());
 
@@ -281,10 +238,8 @@ mod tests {
         assert_eq!(id.groups, vec![GROUP_OIDC.to_string()]);
     }
 
-    /// The division of labour, asserted rather than described: a token
-    /// establishes a NAME and nothing else. No group it carries implies a
-    /// role, and `permits` therefore gives it nothing until the directory
-    /// has been asked.
+    /// Token claims establish identity without granting a role; directory lookup
+    /// is still required for authorization.
     #[test]
     fn a_token_never_carries_a_role_however_hard_it_tries() {
         let idp = TestIdp::new("k1");
@@ -337,13 +292,8 @@ mod tests {
         ));
     }
 
-    /// The one refusal that would be a total bypass if it were missing.
-    ///
-    /// `permits` gives a `system:` identity everything, because a
-    /// `system:node:manacor` name comes out of a certificate this stack's own
-    /// CA issued. A `sub` is somebody else's string. An identity provider
-    /// that can be talked into minting one of these must not be an identity
-    /// provider that owns this control plane.
+    /// Reject reserved system names from provider-controlled subjects so external
+    /// identity cannot impersonate stack machinery.
     #[test]
     fn a_token_may_not_name_itself_part_of_the_stacks_own_machinery() {
         let idp = TestIdp::new("k1");
@@ -417,10 +367,8 @@ mod tests {
             Authenticated::As(Identity::new("alice", vec![GROUP_OIDC.to_string()]))
         );
 
-        // The static token: not a jwt, so the oidc link passes and the one
-        // behind it recognises it. This is the assertion that the bootstrap
-        // path still exists — without it, turning oidc on would have taken
-        // the way in for a brand new user with it.
+        // Non-JWT static tokens defer to the later bearer authenticator, preserving
+        // bootstrap access when OIDC is enabled.
         assert_eq!(
             chain.authenticate(&bearer("the-lab-token")).unwrap(),
             Authenticated::As(Identity::new(
@@ -438,10 +386,8 @@ mod tests {
         assert!(err.to_string().contains("no credentials"), "{err}");
     }
 
-    /// A BROKEN token is the oidc link's, and it must not be handed on. If
-    /// it were, a token this link had just refused would get a second
-    /// opinion from a weaker one behind it, which is the bypass the chain's
-    /// "Err ends the walk" rule exists to prevent.
+    /// An OIDC rejection terminates authentication rather than allowing a weaker
+    /// later authenticator to accept the rejected token.
     #[test]
     fn a_token_the_oidc_link_refused_does_not_reach_the_link_behind_it() {
         let idp = TestIdp::new("k1");
@@ -483,10 +429,8 @@ mod tests {
 
     // --- the key cache, from the authenticator's side ----------------------
 
-    /// An unknown key id asks the provider — once per interval, however many
-    /// tokens arrive. This is the rate limit seen from the request path: an
-    /// attacker minting tokens with random key ids gets one fetch a minute,
-    /// not one per token.
+    /// Unknown-key floods trigger at most one refresh per interval, not one
+    /// provider request per token.
     #[test]
     fn a_flood_of_unknown_keys_is_refused_and_asks_the_provider_once() {
         let idp = TestIdp::new("k1");
@@ -512,10 +456,7 @@ mod tests {
         assert!(cache.request_refresh_at(later));
     }
 
-    /// Before the first fetch lands, every token is refused — and the
-    /// sentence says which of the two empty states this is, because "try
-    /// again in a moment" and "that key does not exist" are different
-    /// problems for whoever is reading the 401.
+    /// Distinguish an unfetched key cache from a fetched set lacking the token's key.
     #[test]
     fn a_cache_that_has_never_fetched_says_so_rather_than_blaming_the_token() {
         let idp = TestIdp::new("k1");

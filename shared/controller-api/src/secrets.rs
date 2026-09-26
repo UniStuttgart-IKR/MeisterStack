@@ -18,15 +18,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use ring::aead;
 use ring::rand::SecureRandom;
 
-/// The key-encryption key, held in memory for the life of the process.
-///
-/// `/opt/meisterstack/pki/secrets.key` in the lab, put there by
-/// `push.sh pki` on BOTH controller tiers — the cloud seals and the cluster
-/// has to open, because it is the cluster that hands a node its cloud-init.
-///
-/// No `Debug`, no `Clone`, no accessor: the only thing that can be done with
-/// this type is `seal` and `open`. A key that could be printed would
-/// eventually be printed.
+/// Process-local encryption key shared by cloud and cluster when secrets
+/// are mirrored. Expose seal/open operations without Debug or a raw-key accessor.
 pub struct Kek {
     key: aead::LessSafeKey,
     /// Where it was read from, for the one log line at start-up. The PATH,
@@ -38,14 +31,8 @@ pub struct Kek {
 const KEY_LEN: usize = 32;
 
 impl Kek {
-    /// Read a key from disk.
-    ///
-    /// Two encodings, both unambiguous because 32 raw bytes cannot also be 64
-    /// hex characters: raw (what `head -c 32 /dev/urandom > secrets.key`
-    /// gives) or hex (what an operator can paste into a password manager and
-    /// read back). Anything else is refused by length with the sentence that
-    /// says how to make one — a key that was silently padded or truncated
-    /// would decrypt nothing anybody wrote before it.
+    /// Read exactly 32 raw key bytes or their 64-character hexadecimal encoding.
+    /// Reject other lengths rather than padding or truncating key material.
     pub fn read(path: &Path) -> Result<Self> {
         let raw = std::fs::read(path)
             .with_context(|| format!("reading the secrets key {}", path.display()))?;
@@ -84,14 +71,8 @@ impl Kek {
         &self.source
     }
 
-    /// Seal one value into the slot it belongs in.
-    ///
-    /// The output is `base64(nonce || ciphertext || tag)`: one string, because
-    /// what holds it is a JSON object in etcd, and base64 because that object
-    /// is read by `jq` often enough that a byte array would be a nuisance.
-    /// The nonce travels with the ciphertext rather than being derived —
-    /// deriving it from the path would make two writes of the same key reuse
-    /// it, which is the one thing GCM must never do.
+    /// Seal a value as base64(nonce || ciphertext || tag) with a fresh random nonce.
+    /// Do not derive the nonce from the path: repeated writes must not reuse it.
     pub fn seal(&self, aad: &Aad, plaintext: &str) -> Result<String> {
         let mut nonce = [0u8; aead::NONCE_LEN];
         ring::rand::SystemRandom::new()
@@ -110,12 +91,8 @@ impl Kek {
         Ok(B64.encode(out))
     }
 
-    /// Open one value, checked against the slot it is being read from.
-    ///
-    /// An error here is tampering or a wrong key, and it is never "the value
-    /// was empty": an empty plaintext seals to a perfectly good ciphertext.
-    /// The sentence stays vague on purpose — which of the two it was is not
-    /// something to tell whoever provoked it.
+    /// Decrypt and authenticate a value against its storage slot.
+    /// Empty plaintext is valid; malformed or unauthenticated ciphertext is an error.
     pub fn open(&self, aad: &Aad, sealed: &str) -> Result<String> {
         let raw = B64
             .decode(sealed.as_bytes())
@@ -160,11 +137,7 @@ impl Kek {
     }
 }
 
-/// Where a value lives, as the cipher is told about it.
-///
-/// A type rather than a `&str` so that a caller cannot pass the value, the
-/// key or the name by mistake — the whole point is that it is built from all
-/// three, in one place, and read the same way on both tiers.
+/// Typed authenticated-data identity derived from resource, object name and key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aad(String);
 

@@ -24,23 +24,13 @@ pub struct VmmUser {
     /// VMM creates. Deliberately the user's own and not the agent's: see the
     /// module note on what this user must not be in.
     pub gid: u32,
-    /// Every group this user is in, `gid` included — resolved from
-    /// `/etc/group` at start-up.
-    ///
-    /// **This is how the VMM reaches devices, and it is the whole of how.**
-    /// `/dev/kvm` is `crw-rw---- root:kvm` on a node that has not loosened
-    /// it, `/dev/dri/renderD*` is `root:render`, `/dev/input/event*` is
-    /// `root:input` — the answer every reference gives is group membership,
-    /// not a descriptor per device. So the list has to survive the switch,
-    /// and it does not survive it for free: see `switch_to`.
+    /// Primary and supplementary groups resolved at startup. Credential
+    /// switching retains these groups for KVM, render and input device access.
     pub groups: Vec<u32>,
 }
 
 impl VmmUser {
-    /// Look the name up, or say why not.
-    ///
-    /// `getpwnam`, through `nix`, rather than shelling out to `id` — a unit's
-    /// `PATH` is not something a privilege decision should depend on.
+    /// Resolve the account directly through getpwnam without depending on a helper executable.
     pub fn resolve(name: &str) -> anyhow::Result<Self> {
         let user = nix::unistd::User::from_name(name)
             .map_err(|e| anyhow::anyhow!("looking up the user {name:?}: {e}"))?
@@ -75,12 +65,9 @@ impl VmmUser {
         })
     }
 
-    /// Set child credentials between fork and exec: supplementary groups, then
-    /// GID, then UID. The retained groups provide access to devices such as KVM.
-    ///
-    /// Only syscalls are permitted here: the multithreaded parent may have held
-    /// locks at fork. Resolve groups before spawning; do not allocate or lock in
-    /// this hook.
+    /// Apply stored supplementary groups, then GID, then UID in the child before exec.
+    /// The groups retain device access such as KVM. This currently allocates a
+    /// temporary GID vector before the syscalls, so the hook is not allocation-free.
     pub fn switch_to(&self) -> std::io::Result<()> {
         let groups: Vec<libc::gid_t> = self.groups.iter().map(|g| *g as libc::gid_t).collect();
         // SAFETY: three FFI calls with a slice this function owns and scalars.
@@ -98,14 +85,7 @@ impl VmmUser {
         Ok(())
     }
 
-    /// The one sentence a failed uid change needs.
-    ///
-    /// `switch_to` does its work in the child, between `fork` and `exec`, so
-    /// a missing capability surfaces as `EPERM` on the spawn with
-    /// nothing said about which of the three calls failed or why. An agent that
-    /// is root has both capabilities; an agent that is not needs them
-    /// granted, and that is a line in a unit file rather than anything code
-    /// can fix.
+    /// Explain spawn failures caused by missing UID/GID-changing capabilities.
     pub fn cannot_switch(&self, e: &std::io::Error) -> String {
         format!(
             "starting it as {self} failed: {e}. Changing uid and gid needs CAP_SETUID and \
@@ -115,17 +95,8 @@ impl VmmUser {
         )
     }
 
-    /// Give a file to this user, and let its group at it.
-    ///
-    /// `0660` for a file and `0770` for a directory, which is what the VMM's
-    /// own umask produces for everything it makes itself (see the spawn
-    /// paths) — this is the same rule applied to the things the AGENT made
-    /// and then handed over: the per-VM run directory, the VMM's log, a file
-    /// volume.
-    ///
-    /// Best effort is not acceptable here and it does not pretend to be: a
-    /// console file the VMM cannot open is a VM that does not boot, and the
-    /// caller gets to decide that with the error in hand.
+    /// Transfer ownership to the VMM user and group, with mode 0660 for
+    /// files or 0770 for directories. Propagate ownership/permission errors.
     pub fn take(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(path)?;
@@ -139,14 +110,8 @@ impl VmmUser {
         .map_err(std::io::Error::from)
     }
 
-    /// Give a file back to whoever is running this agent.
-    ///
-    /// The other half of libvirt's `dynamic_ownership`, and the same shape:
-    /// what was handed over on attach is handed back on detach, so a volume
-    /// does not stay readable by the VMM user after the VM that used it is
-    /// gone. The agent's own euid rather than a remembered original, which is
-    /// the same thing for every file in this tree — the agent is what created
-    /// all of them — and is the one answer that cannot go stale in a record.
+    /// Restore file ownership to the agent's effective UID and GID. This does
+    /// not restore a separately remembered original owner.
     pub fn give_back(path: &std::path::Path) -> std::io::Result<()> {
         nix::unistd::chown(
             path,
@@ -167,8 +132,7 @@ impl fmt::Display for VmmUser {
 mod tests {
     use super::*;
 
-    /// A name nobody has is a start-up failure with the name in it, because
-    /// the alternative is a node that starts and cannot boot a VM.
+    /// Unknown VMM users fail with the requested name in the error.
     #[test]
     fn an_unknown_user_says_which_name_it_could_not_find() {
         let said = format!("{:#}", VmmUser::resolve("no-such-user-b7f3c1").unwrap_err());
@@ -196,17 +160,14 @@ mod tests {
         }
     }
 
-    /// `root` is refused rather than accepted as a no-op: an operator who
-    /// wrote it meant to change something, and silently doing nothing is the
-    /// worst of the three possible answers.
+    /// Reject root as the requested reduced-privilege VMM identity.
     #[test]
     fn root_is_refused_because_it_is_the_thing_being_escaped() {
         let said = format!("{:#}", VmmUser::resolve("root").unwrap_err());
         assert!(said.contains("uid 0"), "{said}");
     }
 
-    /// The sentence a missing capability produces names both capabilities and
-    /// the key, because those are the two things an operator acts on.
+    /// Credential-switch errors identify required capabilities and the configuration key.
     #[test]
     fn a_failed_switch_names_the_capabilities_and_the_key() {
         let user = VmmUser {
@@ -226,9 +187,7 @@ mod tests {
         1
     }
 
-    /// Handing a file over and taking it back are one pair, and the mode is
-    /// part of the handover: a file the VMM owns but cannot write is the same
-    /// failure as one it does not own.
+    /// Apply the writable mode even when ownership transfer fails.
     #[test]
     fn taking_a_file_sets_the_mode_even_when_the_chown_cannot_happen() {
         use std::os::unix::fs::PermissionsExt;

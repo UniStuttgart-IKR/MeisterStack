@@ -17,10 +17,7 @@ use tracing::debug;
 
 use crate::discovery::Provider;
 
-/// The scopes asked for unless the operator says otherwise.
-///
-/// `offline_access` is what makes a refresh token appear at all, and it is
-/// in the default for the reason in the module docs.
+/// Default login scopes, including offline_access to request refresh-token support.
 pub const DEFAULT_SCOPE: &str = "openid profile email offline_access";
 
 /// What the provider says when the person still has to go and approve.
@@ -31,7 +28,7 @@ const FALLBACK_POLL_INTERVAL: u64 = 5;
 /// RFC 8628 section 3.5: `slow_down` means add five seconds and try again.
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
-/// The provider's answer to "somebody wants to log in".
+/// Provider response starting device authorization.
 #[derive(Debug, Deserialize)]
 pub struct DeviceAuth {
     pub device_code: String,
@@ -72,8 +69,7 @@ pub struct Tokens {
     pub token_type: Option<String>,
 }
 
-/// What a failing one returns. OAuth puts the reason in the body, and the
-/// three that are not failures at all are in here.
+/// OAuth error response, including polling states that permit retry.
 #[derive(Debug, Deserialize)]
 struct OauthError {
     error: String,
@@ -145,9 +141,7 @@ async fn poll_once(
         return Ok(Poll::Got(Box::new(tokens)));
     }
 
-    // Everything else arrives as a 400 with a machine-readable reason. A
-    // body that is not one of those is a provider doing something else, and
-    // guessing about it would be worse than saying so.
+    // Require a recognized OAuth error document before interpreting the polling response.
     let Ok(err) = serde_json::from_slice::<OauthError>(&res.body) else {
         bail!(
             "the provider answered {} while waiting for approval: {}",
@@ -164,11 +158,7 @@ async fn poll_once(
     }
 }
 
-/// Step two: wait for the person to finish in their browser.
-///
-/// `notify` is called once per poll with how long is left, so that the
-/// caller can print whatever it prints — this crate has no opinion about a
-/// terminal.
+/// Poll for browser approval, notifying the caller of remaining time on each poll.
 pub async fn wait_for_approval(
     provider: &Provider,
     client_id: &str,
@@ -204,11 +194,8 @@ pub async fn wait_for_approval(
     }
 }
 
-/// Trade a refresh token for a fresh access token.
-///
-/// A provider is allowed to rotate the refresh token as it does this and
-/// several do, so the caller has to store what comes back rather than
-/// keeping the one it sent.
+/// Exchange a refresh token for new tokens. Callers must persist a rotated
+/// refresh token when the provider returns one.
 pub async fn refresh(provider: &Provider, client_id: &str, refresh_token: &str) -> Result<Tokens> {
     let url = endpoint(&provider.token_endpoint, "token_endpoint", &provider.issuer)?;
     let res = crate::http::post_form(

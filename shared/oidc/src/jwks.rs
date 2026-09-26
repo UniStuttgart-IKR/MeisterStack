@@ -21,11 +21,7 @@ pub fn b64(raw: &str) -> Result<Vec<u8>> {
         .context("not base64url")
 }
 
-/// The signature algorithms this crate can check.
-///
-/// The list is short and it is asymmetric all the way through, which is the
-/// point: `none` and `HS256` are not variants that happen to be unused, they
-/// are values this type cannot hold. See the module docs.
+/// Supported asymmetric signature algorithms. Unsigned and HMAC tokens are not representable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Alg {
     Rs256,
@@ -69,7 +65,7 @@ impl Alg {
     }
 }
 
-/// The curves a JWK may name. Two, matching the two `ES*` algorithms.
+/// Supported EC curves matching the ES algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Curve {
     P256,
@@ -95,14 +91,8 @@ pub enum PublicKey {
 }
 
 impl PublicKey {
-    /// Check one signature over `signed` (the token's `header.payload`).
-    ///
-    /// The kind check comes first and is not a formality: it is the half of
-    /// the algorithm pin that a configured allow-list cannot do. An operator
-    /// who allows both `RS256` and `ES256` has said nothing about which key
-    /// may be used for which, and without this an EC key and an RSA
-    /// algorithm would reach ring as a decoding error rather than as the
-    /// refusal it is.
+    /// Verify a signature over header.payload with an algorithm compatible
+    /// with this key's type and curve.
     pub fn verify(&self, alg: Alg, signed: &[u8], sig: &[u8]) -> Result<()> {
         match (self, alg.is_rsa()) {
             (PublicKey::Rsa { n, e }, true) => {
@@ -117,10 +107,7 @@ impl PublicKey {
                     .map_err(|_| anyhow::anyhow!("the signature does not match the key"))
             }
             (PublicKey::Ec { curve, point }, false) => {
-                // FIXED, not ASN1: JWS puts r and s side by side as fixed
-                // width integers, where X.509 would wrap them in a DER
-                // sequence. Same curve, different encoding, and the ASN.1
-                // parameters would reject every real token.
+                // JWS ECDSA signatures use fixed-width concatenated r and s, not ASN.1 DER.
                 let params = match (alg, curve) {
                     (Alg::Es256, Curve::P256) => &signature::ECDSA_P256_SHA256_FIXED,
                     (Alg::Es384, Curve::P384) => &signature::ECDSA_P384_SHA384_FIXED,
@@ -217,13 +204,8 @@ pub struct JwkSet {
     pub keys: Vec<Jwk>,
 }
 
-/// The usable half of a JWKS: what survived parsing, by `kid`.
-///
-/// A key that does not parse is dropped with a warning rather than failing
-/// the whole document, and that direction is deliberate. Providers publish
-/// encryption keys, curves we do not implement and occasionally a malformed
-/// entry, and a set that refused to load because of one of them would turn
-/// somebody else's stray key into an outage here.
+/// Usable signing keys indexed by optional kid. Skip malformed or unsupported
+/// entries with warnings while retaining the rest of the document.
 #[derive(Debug, Default)]
 pub struct Keys {
     by_kid: Vec<(Option<String>, PublicKey)>,
@@ -256,12 +238,7 @@ impl Keys {
         self.by_kid.is_empty()
     }
 
-    /// The key a token's `kid` names.
-    ///
-    /// A token with no `kid` is answered only when the set holds exactly one
-    /// key. That is RFC 7515's own reading — a `kid` is a hint for choosing
-    /// among several — and the alternative, trying every key in turn, would
-    /// mean a token verifying against a key its issuer never meant for it.
+    /// Select by kid. Without one, accept a key only when exactly one is available.
     pub fn get(&self, kid: Option<&str>) -> Option<&PublicKey> {
         match kid {
             Some(kid) => self
@@ -299,10 +276,7 @@ mod tests {
         assert_eq!(Alg::DEFAULT_ALLOWED.to_vec(), vec![Alg::Rs256, Alg::Es256]);
     }
 
-    /// One bad key in a document does not cost us the good ones. Providers
-    /// publish encryption keys and curves we do not implement, and a set
-    /// that refused to load over one of them would be somebody else's stray
-    /// key causing an outage here.
+    /// Retain usable keys when the JWKS also contains unsupported or malformed entries.
     #[test]
     fn an_unusable_key_is_dropped_and_the_rest_of_the_set_survives() {
         let idp = TestIdp::new("good");
@@ -367,8 +341,7 @@ mod tests {
     #[test]
     fn base64url_is_the_unpadded_kind() {
         assert_eq!(b64("AQAB").unwrap(), vec![0x01, 0x00, 0x01]);
-        // The padded, non-url alphabet is a different encoding and not one
-        // a JOSE field is ever in.
+        // Reject padded or non-URL-safe JOSE encodings.
         assert!(b64("AQAB==").is_err());
         assert!(b64("++//").is_err());
     }

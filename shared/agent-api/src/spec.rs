@@ -37,10 +37,7 @@ pub enum Desired {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-// `deny_unknown_fields` here as everywhere else in this document. It was the
-// one part that took a stray field in silence, which the first foreign client
-// found and wrote down: a boot block is the shortest thing anybody types by
-// hand and therefore the one they most often misspell.
+// Reject unknown boot-source fields, including misspelled variant parameters.
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BootSourceSpec {
     DirectKernel {
@@ -59,23 +56,16 @@ pub enum BootSourceSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CloudInit {
-    /// The `#cloud-config` document, or a script, or whatever else cloud-init
-    /// accepts. Passed through untouched: what is valid user-data is
-    /// cloud-init's question and not this control plane's, and a stack that
-    /// validated it would be a stack that rejects next year's syntax.
+    /// Cloud-init user-data, passed through without interpreting its format.
     pub user_data: String,
     /// Derived when absent — see `meta_data_for`. Given, it is used verbatim.
     #[serde(default)]
     pub meta_data: Option<String>,
-    /// The optional third file. Only written when it is there: an empty
-    /// `network-config` is not the same thing as none, and cloud-init treats
-    /// the two differently.
+    /// Optional network-config file. Absence omits it; an empty supplied value creates an empty file.
     #[serde(default)]
     pub network_config: Option<String>,
-    /// What the guest should call itself. Filled in by the cluster tier from
-    /// the VM object's name, because that is the only tier that knows it —
-    /// the agent has a uid and nothing else. Absent falls back to the uid,
-    /// which is an ugly hostname and an honest one.
+    /// Guest hostname, normally supplied from the VM object name by the controller.
+    /// The agent falls back to the VM UID when absent.
     #[serde(default)]
     pub local_hostname: Option<String>,
 }
@@ -94,9 +84,7 @@ pub struct NewVmSpec {
     pub nics: Vec<NewNic>,
     #[serde(default)]
     pub devices: Vec<NewDevice>,
-    /// The NoCloud seed this VM boots with, if it has one. Absent — which is
-    /// every spec ever written before this — means no second disk is built
-    /// and no line of the VM's configuration changes.
+    /// Optional NoCloud seed. Absence adds no seed disk to the VM.
     #[serde(default)]
     pub cloud_init: Option<CloudInit>,
 }
@@ -109,59 +97,26 @@ pub struct NewVmSpec {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewVolume {
-    /// The `Volume` this entry REFERS to rather than describes.
-    ///
-    /// At the API edge it is the object's NAME, inside the tenant, the way
-    /// `FloatingIp.spec.vm` names a VM. What reaches this node is the object's
-    /// UID — the controller resolves it on the way down, because a name is
-    /// what people call a volume and a node has no directory to look one up
-    /// in.
-    ///
-    /// Set: this node ATTACHES a volume it already owns a record of (see
-    /// `crate::volumes`) and provisions nothing; the disk was there before
-    /// this VM and stays after it. Every other field except `params` is then
-    /// refused — a referenced volume has its size and its image already, and
-    /// a second statement about them is one that can disagree.
-    ///
-    /// Unset: everything below describes a disk to be MADE for this VM and
-    /// unmade with it. That is the ephemeral case and the only one that
-    /// existed before this field.
+    /// Reference to an independently managed Volume. The API accepts its
+    /// name; controllers resolve it to a UID before agent dispatch. The agent
+    /// attaches existing storage and does not provision inline data. Only
+    /// `params` may accompany the reference. None selects VM-owned inline storage.
     #[serde(default)]
     pub volume: Option<String>,
     #[serde(default)]
     pub base_image: Option<String>,
-    /// Where `base_image` can be fetched from if this node does not have it,
-    /// and what the bytes must hash to. Both control-plane-owned: the cloud
-    /// resolves them from the Image object and writes them into the spec, and
-    /// the create edge refuses them from a client — a URL somebody else chose
-    /// is a base image somebody else chose.
-    ///
-    /// Both default, so every spec ever written is still exactly the spec it
-    /// was: a `base_image` with no url beside it is looked up under the
-    /// node's image_dir exactly as it always has been.
+    /// Control-plane-resolved image URL and digest. Cloud admission rejects
+    /// client overrides; absent download metadata selects the node image directory.
     #[serde(default)]
     pub base_image_url: Option<String>,
     #[serde(default)]
     pub base_image_sha256: Option<String>,
-    /// The uid of the `Image` object the two fields above came from.
-    ///
-    /// Control-plane-owned exactly as they are, and written in beside them:
-    /// the catalogue name is global, so it is the one thing about an image
-    /// that cannot say WHICH registration a node fetched. Astra finding S02,
-    /// 2026-09-23: the node addresses its cache entry by this and the digest,
-    /// so one tenant's bytes can never answer for another tenant's image of
-    /// the same name.
-    ///
-    /// Absent on a standalone cluster with no cloud above it — there is no
-    /// catalogue there to mint a uid — and on every spec written before the
-    /// field existed. The node falls back to the digest alone, which is what
-    /// it always did.
+    /// Control-plane-owned image incarnation, combined with its digest in
+    /// cache identity. Standalone and legacy specs without a UID use the digest.
     #[serde(default)]
     pub base_image_uid: Option<String>,
-    /// How big, for a disk this node is to MAKE. Defaults so that a
-    /// referenced entry need not name it — the size belongs to the volume
-    /// that already exists — and an INLINE entry that names none is refused
-    /// by `into_spec` with a sentence rather than by serde with a field path.
+    /// Inline disk size. Zero defaults permit referenced entries to omit it;
+    /// agent conversion rejects inline entries without a positive size.
     #[serde(default)]
     pub size_bytes: u64,
     /// None = the node's default, `filesystem`.
@@ -178,26 +133,18 @@ pub struct NewNic {
     pub bridge: Option<String>,
     #[serde(default)]
     pub mac: Option<String>,
-    /// The tenant overlay this NIC belongs on. Defaults, so every spec ever
-    /// written is still exactly the spec it was.
-    ///
-    /// Normally injected by the controller out of the VM's tenant (see
-    /// `controller_api::vni`); set by hand on a standalone cluster with no
-    /// cloud above it, which has no Tenant object to resolve.
+    /// Optional tenant VNI, injected by the controller or supplied directly
+    /// in standalone specs.
     #[serde(default)]
     pub vxlan_id: Option<u32>,
-    /// Floating addresses this VM holds, and the tenant's routed subnets.
-    /// Both default to empty and both travel the road `vxlan_id` travels —
-    /// injected by the controller out of the cloud's objects, or written by
-    /// hand on a standalone cluster. See `agent_api::networking::NicSpec`.
+    /// Floating addresses and routed tenant subnets, defaulting to empty.
+    /// Controllers may inject them; standalone specs may supply them directly.
     #[serde(default)]
     pub floating_ips: Vec<String>,
     #[serde(default)]
     pub routed_subnets: Vec<String>,
-    /// Put this NIC on a PROVIDER network rather than on an overlay: the
-    /// name of one of the node's physnets. See
-    /// `agent_api::networking::NicSpec::physnet`; naming both this and
-    /// `vxlan_id` is refused.
+    /// Direct provider-network name, mutually exclusive with vxlan_id.
+    /// See `crate::networking::NicSpec::physnet`.
     #[serde(default)]
     pub physnet: Option<String>,
 }
@@ -208,26 +155,12 @@ pub struct NewDevice {
     #[serde(default, alias = "driver_name")]
     pub driver: Option<String>,
     pub partition: String,
-    /// The name of a section the NODE's configuration wrote. This is the
-    /// ordinary way to ask a device for more than its defaults, and it is the
-    /// safe one: what the name stands for was written by whoever runs the
-    /// node.
+    /// Named device profile defined by the node operator.
     #[serde(default)]
     pub profile: Option<String>,
-    /// What this device's driver is to make of the request, in the driver's
-    /// own vocabulary.
-    ///
-    /// Free-form here and NOT free-form at the node. Astra finding S03,
-    /// 2026-09-23: this map reached the nvrm driver as the whole of its
-    /// configuration — `admin_priv`, which keeps `CAP_SYS_ADMIN` in the
-    /// backend process, and `env`, which is that process's environment — so a
-    /// document could configure a backend the node was supposed to configure.
-    /// The node now refuses every key a driver has not declared a tenant's to
-    /// set (`agent::types::refuse_operator_only_device_params`), and the
-    /// refusal arrives while a person still holds the request.
-    ///
-    /// A schema cannot say this, because what is allowed depends on which
-    /// driver the device lands on and that is a fact about a node.
+    /// Driver-specific request parameters. The agent rejects keys that the
+    /// driver has not declared tenant-configurable; operator process settings
+    /// such as environment and privileges cannot be supplied through this map.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
 }

@@ -63,10 +63,8 @@ struct CloudInitAtEdge {
     local_hostname: Option<String>,
 }
 
-/// A `cloud_init.user_data_from` reference: which `Secret` and which key of
-/// it. Read again, off the raw document, by `resources::VmSpec::user_data_from`
-/// — the shape is asserted in exactly one place; this is only the other one
-/// that has to agree with it structurally.
+/// Secret and key reference shape, also read from raw JSON by VmSpec.
+/// Keep both representations structurally aligned.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserDataFrom {
@@ -76,17 +74,11 @@ struct UserDataFrom {
     key: String,
 }
 
-/// Deserialise `spec.vm` into the node's own create document, or say why not.
-///
-/// Called from the POST and the PUT of both tiers. `Ok` means the node will
-/// take this document — not that it will succeed, which is a question about a
-/// machine and not about a document.
+/// Validate the cloud VM document using shared agent field types.
+/// Secret resolution and node-specific feasibility remain separate.
 pub fn check(vm: &serde_json::Value) -> Result<(), ApiError> {
-    // The two numbers first, off the raw JSON, because serde would answer
-    // `-1` with "invalid type: integer" and name no field at all — and this
-    // refusal has said which field and why since api-honesty. It was made at
-    // the cloud edge and nowhere else; both tiers make it now, because the
-    // cluster edge is reachable on its own.
+    // Check numeric bounds first so invalid values receive a precise field path
+    // instead of an unlocated serde type error.
     sizes(vm)?;
     let spec: CloudVmSpec = match serde_json::from_value(vm.clone()) {
         Ok(spec) => spec,
@@ -101,12 +93,8 @@ pub fn check(vm: &serde_json::Value) -> Result<(), ApiError> {
             "a vm needs at least one volume as boot disk",
         ));
     }
-    // The other structural rule `CloudVmSpec` cannot state by being
-    // `deny_unknown_fields` any more, now that `user_data` is optional: a
-    // `cloud_init` block needs a starting point. `user_data_said_twice`
-    // (`resources::VmSpec`, checked right after this by both callers) is the
-    // other half of the same rule — it refuses BOTH named at once; this
-    // refuses NEITHER.
+    // Require a cloud-init source. This rejects neither being supplied;
+    // VmSpec.user_data_said_twice separately rejects both literal and reference.
     if let Some(seed) = &spec.cloud_init {
         let literal = seed.user_data.as_deref().is_some_and(|s| !s.is_empty());
         if !literal && seed.user_data_from.is_none() {
@@ -119,12 +107,8 @@ pub fn check(vm: &serde_json::Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The line between "not a VM" and "no room today", and it is the line this
-/// control plane refuses to move: a machine with no cpu is malformed, and a
-/// machine nothing has room for is `Pending` with a reason.
-///
-/// Off the raw document rather than off the parsed one, so that it can also
-/// answer a value that is not a number of anything.
+/// Reject present CPU and memory values that are not positive integers.
+/// Valid demand exceeding available capacity is a placement issue instead.
 fn sizes(vm: &serde_json::Value) -> Result<(), ApiError> {
     for field in ["vcpus", "memory_mib"] {
         let Some(value) = vm.get(field) else { continue };
@@ -138,14 +122,8 @@ fn sizes(vm: &serde_json::Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The refusal, pointed at the part of the document that really makes it.
-///
-/// `serde_json::from_value` keeps no path, so its sentence names a field and
-/// not a place — and `kind` is a field of `boot` AND a typo somebody wrote in
-/// a volume. So the document is taken apart instead: every nested part is
-/// offered to its own type, and the first one that refuses owns the refusal
-/// and lends it its own path. A `None` means every part parses on its own and
-/// the fault is at the top level, where the whole-document message is exact.
+/// Reparse nested fields to locate a serde failure within the VM document.
+/// If each part parses, return None and use the top-level deserialization error.
 fn narrow(vm: &serde_json::Value) -> Option<ApiError> {
     if let Some(boot) = vm.get("boot")
         && let Err(e) = serde_json::from_value::<BootSourceSpec>(boot.clone())
@@ -187,14 +165,8 @@ fn entries<'a>(
         .enumerate()
 }
 
-/// The 422, with `details.field` one segment deeper where serde named a field
-/// of the object it was given.
-///
-/// Only the two messages that really name a field of THIS object are followed
-/// — `missing field` and `unknown field`. `unknown variant` and `invalid
-/// type` also carry a backtick, and what is between it is a value rather than
-/// a field: a path built out of those would point at something the client
-/// cannot find in its own request, which is worse than no path.
+/// Extend the error path only for serde missing-field and unknown-field messages.
+/// Quoted variants and invalid values are not field names.
 fn point(prefix: &str, message: &str) -> ApiError {
     let named = message.starts_with("missing field") || message.starts_with("unknown field");
     match quoted(message).filter(|_| named) {
@@ -351,13 +323,7 @@ mod tests {
         .expect("a spec the node takes");
     }
 
-    /// Astra finding S21, 2026-09-23: this edge used to deserialise straight
-    /// into the node's own `CloudInit` — `deny_unknown_fields`, `user_data`
-    /// required — so a `user_data_from` reference was "unknown field", refused
-    /// before `check_volume_refs` (one tier up, in each of the two REST
-    /// edges) ever got a chance to validate it. It has to be accepted HERE:
-    /// the resolution that turns the reference into a literal runs at the
-    /// cluster tier, downstream of this check.
+    /// Accept unresolved cloud-init secret references for downstream resolution.
     #[test]
     fn a_cloud_init_secret_reference_is_accepted() {
         let mut doc = valid();
@@ -367,11 +333,8 @@ mod tests {
         check(&doc).expect("a reference is not an unknown field");
     }
 
-    /// The structural rule `deny_unknown_fields` used to state for free, now
-    /// that `user_data` is optional: a `cloud_init` block still needs a
-    /// starting point. The other direction — BOTH named — is
-    /// `user_data_said_twice`'s (`resources::VmSpec`), checked right after
-    /// this by both callers; this is only the "neither" half.
+    /// Cloud-init requires a source even though literal user_data is optional.
+    /// Supplying both sources is checked separately.
     #[test]
     fn a_cloud_init_naming_no_starting_point_is_refused() {
         let mut doc = valid();

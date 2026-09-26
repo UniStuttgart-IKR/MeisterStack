@@ -46,7 +46,7 @@ impl Response {
     }
 }
 
-/// A url split into the three pieces a request needs.
+/// Parsed HTTPS request authority, host and path.
 #[derive(Debug)]
 struct Url<'a> {
     host: &'a str,
@@ -65,9 +65,7 @@ fn parse(url: &str) -> Result<Url<'_>> {
     if authority.is_empty() {
         bail!("{url:?} has no host");
     }
-    // The name the certificate is checked against is the host, and ":443" is
-    // not part of it. Bracketed IPv6 for the same reason the CLI's transport
-    // does it: only a colon after the closing bracket separates a port.
+    // Separate the port from the TLS server name, respecting bracketed IPv6 literals.
     let port_sep = match authority.rfind(']') {
         Some(close) => authority[close + 1..].find(':').map(|i| close + 1 + i),
         None => authority.rfind(':'),
@@ -91,14 +89,8 @@ fn parse(url: &str) -> Result<Url<'_>> {
     })
 }
 
-/// Whom to trust for a provider.
-///
-/// `None` means the platform's roots, which is the opposite of what
-/// `pki::tls::client_config` does with `None` and is right for the opposite
-/// reason: a controller is a private name signed by a lab CA, a provider is
-/// a public name signed by a public one. A lab provider with its own CA
-/// names the bundle and gets that instead of, not as well as, the public
-/// list.
+/// Use the default public trust roots unless a custom CA bundle is supplied.
+/// A custom bundle replaces those roots rather than extending them.
 fn tls_config(ca: Option<&Path>) -> Result<Arc<ClientConfig>> {
     let roots = match ca {
         Some(path) => pki::tls::roots(path)?,
@@ -120,8 +112,7 @@ pub async fn get(url: &str, ca: Option<&Path>) -> Result<Response> {
     send(Method::GET, url, None, ca).await
 }
 
-/// `application/x-www-form-urlencoded`, which is what every OAuth endpoint
-/// takes and the only body this client ever sends.
+/// POST an application/x-www-form-urlencoded OAuth request.
 pub async fn post_form(url: &str, form: &[(&str, &str)], ca: Option<&Path>) -> Result<Response> {
     let body = form
         .iter()
@@ -131,11 +122,7 @@ pub async fn post_form(url: &str, form: &[(&str, &str)], ca: Option<&Path>) -> R
     send(Method::POST, url, Some(body), ca).await
 }
 
-/// Percent-encoding for a form field: everything but the unreserved set.
-///
-/// By hand because the alternative is a crate for eleven lines, and because
-/// what goes through here is a client id, a scope and a device code — all of
-/// them already restricted alphabets, none of them worth a dependency.
+/// Percent-encode form bytes outside the unreserved set.
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

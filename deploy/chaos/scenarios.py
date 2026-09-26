@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""The named scenarios: the fault catalog of the brief (F*) and the
-once-through list of things that are new and untested (S*).
+"""Named lab operations and fault scenarios with candidate finding messages.
 
-Each scenario is a function that returns a list of (id, message) findings. It
-sets up, acts, judges against the EXPECTED behaviour the brief names, and
-tears its own objects down. Everything it creates is called chaos-*.
-
-    ./scenarios.py --list
-    ./scenarios.py S1 S2
-    ./scenarios.py --all
+--list prints the catalogue. Executing cases can create/delete resources,
+change node intent or agent configuration, stop services and install DROP
+rules. Cases generally use chaos-* fixture names but host effects are broader.
+Cleanup and setup checks differ by case; there is no global restoration guard.
 """
 
 import argparse
@@ -51,13 +47,7 @@ def rm(name, res="vms"):
 
 
 def ensure_tenant(name, description="chaos scenario"):
-    """A tenant to own this scenario's objects, made if it is not there.
-
-    Since runde 4 every tenant-scoped create at the cloud needs a tenant --
-    the rule a volume, a floating address and a secret always had, and which
-    a VM was the exception to (D-P10). The harness runs as an admin, who is
-    confined to no tenant, so it has to say which one.
-    """
+    """Create the explicitly named cloud tenant, accepting an existing-name conflict."""
     c, _ = cloud("POST", "/tenants", obj("Tenant", name, {"description": description}))
     if c not in (200, 201, 409):
         log(f"tenant {name}: HTTP {c}")
@@ -65,19 +55,10 @@ def ensure_tenant(name, description="chaos scenario"):
 
 
 def ensure_filesystem_pool(cname, name="chaos-pool"):
-    """A pool this scenario can put a plain disk in, made if it needs to be.
+    """Use an existing default pool, otherwise attempt to create a filesystem pool.
 
-    A create with no `pool` lands in the one marked `default`, and whether an
-    estate HAS one is the estate's business: round 4's e2e ran against a lab
-    whose only pool was the nvme-oF import, unmarked and with all three of its
-    namespaces spoken for, so S6's every create came back
-    `422 no storage pool is marked default; name one with spec.pool` and the
-    scenario measured nothing at all. A scenario that only runs on estates
-    shaped like the one it was written on is a scenario that reports on the
-    estate instead of on the software.
-
-    `chaos-` so that `--cleanup` knows it (`_mine`), and `filesystem` because
-    that is the backend every agent in every cluster offers.
+    Returning None can mean either a default exists or creation failed; callers
+    must inspect their later create result. Backend availability is a fixture.
     """
     c, o = cluster(cname, "GET", "/storagepools")
     if c == 200:
@@ -359,18 +340,10 @@ def s6():
 
 @scenario("S7", "image create with a right and a wrong checksum")
 def s7():
-    """The checksum half of this scenario tested nothing for a whole schema
-    generation (D-H4). It sent `spec.checksum`, the field is `spec.sha256`, and
-    the API answered
+    """Check image-registration field validation and missing-byte evidence.
 
-        400: spec.checksum: unknown field `checksum`, expected one of
-             `source`, `url`, `sha256`, `format`, `sizeBytes`, `tenant`, …
-
-    which the scenario neither reported nor noticed, because the `c == 201`
-    guard silently skipped the check behind it. So: the field is the right one
-    now, and every create says whether the code it got is the code it wanted.
-    A rejection that was expected is a pass; a rejection that was not is the
-    finding.
+    A syntactically valid SHA-256 value is not proof of successful fetching or
+    content verification; this scenario uses an unreachable URL.
     """
     f = []
     # want: the http code this body is supposed to get. Anything else is a
@@ -1225,15 +1198,10 @@ def i13():
 
 @scenario("I6", "the anti-affinity reproducer: bursts of creates one pass sees together")
 def i6():
-    """The headline finding of the run, in a form somebody else can re-run.
+    """Create concurrent VM bursts with a required anti-affinity term.
 
-    A required anti-affinity term is only measured against `Candidate.hosted`,
-    which is derived once per reconcile pass. place() spends the capacity of a
-    binding under the pass lock (controller_api::deduct) and never adds the
-    bound VM's labels to that list, so every further VM of the same pass is
-    judged against an inventory from before the pass started. Three rounds,
-    because a burst that happens to be split over two passes places correctly
-    and would read as a pass.
+    Inspect actual placement for collisions across three rounds. A burst may
+    span multiple reconciliation passes, so a clean run is bounded evidence.
     """
     f = []
     cn = "cluster-1"

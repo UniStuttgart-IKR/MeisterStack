@@ -37,12 +37,8 @@ fn secret(tenant: &str) -> Secret {
     )
 }
 
-/// Tenant A reads and authorises `db`, then pauses (the Acks `delete_secret`
-/// awaits, one per connected cluster). While it waits, `db` is removed and a
-/// DIFFERENT tenant creates a secret under the same name. A's request resumes
-/// and, with the plain `delete`, would remove B's object by name alone.
-/// `delete_if` compares the resource_version A read against what is there
-/// now — B's, not A's — and refuses.
+/// A revision-guarded delete must reject a secret recreated under the same
+/// name after authorization, preserving the replacement tenant's object.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_delete_does_not_remove_a_secret_that_was_recreated_under_the_same_name() {

@@ -16,12 +16,9 @@ use tracing::info;
 
 use crate::auth::{AuthChain, AuthRequest, Authenticated, GROUP_ADMINS};
 
-/// Server TLS for a session port. `None` = plain gRPC, as today.
-///
-/// Client authentication is optional here for the same reason it is optional
-/// at the REST edge: a peer with no certificate has to get far enough to be
-/// told so in words. The chain is what refuses it, and a refusal that names
-/// the reason is worth more than a handshake that resets.
+/// Build session-server TLS, or return None for an unconfigured plaintext port.
+/// Client certificates are optional at the handshake so the authentication chain
+/// can report missing credentials through the session protocol.
 pub fn server_tls(
     cert: Option<&Path>,
     key: Option<&Path>,
@@ -32,10 +29,8 @@ pub fn server_tls(
         if cert.is_some() || key.is_some() {
             anyhow::bail!("tls_cert and tls_key go together; set both or neither");
         }
-        // A client_ca without a server identity is an operator who believes
-        // this port demands client certificates. Returning Ok(None) here would
-        // hand them plain gRPC and say nothing — the REST edge refuses the same
-        // combination, and a session port has more to lose by staying quiet.
+        // Reject a client CA without server TLS instead of silently serving plaintext
+        // under a configuration that appears to require certificate authentication.
         if client_ca.is_some() {
             anyhow::bail!(
                 "client_ca is set but tls_cert/tls_key are not; a port without an identity \
@@ -65,12 +60,8 @@ pub fn server_tls(
     Ok(Some(config))
 }
 
-/// Client TLS for dialling a session port: whom to trust, and who we are.
-///
-/// The config paths are this crate's business — they are relative to the file
-/// that named them — and building the thing out of PEM is `proto`'s, because
-/// the agent tier dials with a certificate too and does not depend on this
-/// crate. One builder, three tiers.
+/// Resolve client TLS paths relative to the configuration file, then use the
+/// shared proto builder also used by agents.
 pub fn client_tls(
     ca: Option<&Path>,
     identity: Option<(&Path, &Path)>,
@@ -120,16 +111,9 @@ fn bearer_of<T>(request: &tonic::Request<T>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Once the Hello has said which peer this is: may that certificate say so?
-///
-/// Two questions, and both of them are the point of putting certificates on
-/// the sessions at all. A session is for the stack's own machinery, so a
-/// user's certificate — valid, in the directory, perfectly good for the REST
-/// API — must not open one. And a certificate that names a peer must name
-/// THIS peer, or one node's key would let it report as any other, including
-/// as the node whose VMs it wants to be told about.
-///
-/// Anonymous mode is anonymous mode: no chain, no check, exactly as before.
+/// Require a machine credential authorized for the Hello peer kind and
+/// name. User REST credentials cannot open sessions. An empty authentication
+/// chain retains anonymous mode.
 pub fn check_session_identity(
     who: &Authenticated,
     kind: &str,
@@ -156,18 +140,9 @@ pub fn check_session_identity(
 /// The chain a session server was built with, for the handler to reach.
 pub type SessionAuth = Arc<AuthChain>;
 
-/// Take the session port NOW, at start-up, where a refusal is an exit code.
-///
-/// `Server::serve(addr)` binds inside its future, and both tiers spawned that
-/// future and forgot it: a port somebody else held came back as one error
-/// line from a task nobody awaited, while the REST half went on answering
-/// `/readyz` 200 off a healthy store. A replica in rotation that no peer can
-/// ever dial is the worst of the available answers, because nothing about it
-/// looks wrong from the load balancer.
-///
-/// The accept options are the ones `serve` would have set with a default
-/// builder (`TCP_NODELAY` on, no keepalive), so a session is exactly the
-/// session it was.
+/// Bind the session listener before reporting startup success. A bind
+/// failure must stop startup rather than leave a healthy REST-only shell.
+/// Use the transport defaults: TCP_NODELAY enabled, no TCP keepalive.
 pub fn bind_sessions(listen: &str) -> Result<tonic::transport::server::TcpIncoming> {
     let addr: std::net::SocketAddr = listen
         .parse()
@@ -180,18 +155,9 @@ pub fn bind_sessions(listen: &str) -> Result<tonic::transport::server::TcpIncomi
 /// A running session server, as the task it runs in.
 pub type SessionServer = tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>;
 
-/// Serve the REST API, and end the moment the session server ends.
-///
-/// The session port is not an optional extra on a replica configured to have
-/// one: it is how every peer of this tier reaches it. So a server that stops
-/// ends the process, with the reason, and whatever supervises the process
-/// sees an exit rather than a replica that answers every probe and is dialled
-/// by nobody. `None` is a REST-only replica (`listen_session` empty), which
-/// is a real configuration and is served exactly as before.
-///
-/// What this is NOT is a readiness input for the streams themselves: a
-/// session that drops and redials is ordinary, and `readiness` says why it
-/// leaves those out. This is about the listener.
+/// Serve REST alongside the session listener and exit if that server
+/// ends. None selects an intentional REST-only deployment. Individual
+/// peer reconnects do not imply listener failure.
 pub async fn serve_beside(
     rest: impl std::future::Future<Output = Result<()>>,
     sessions: Option<SessionServer>,

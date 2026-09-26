@@ -19,11 +19,7 @@ use crate::object::Resource;
 use crate::resources::{Ticket, TicketBearer, TicketSpec};
 use crate::store::{EtcdStore, Result};
 
-/// How long a ticket lives, used or not.
-///
-/// Thirty seconds is a person clicking a button and a page opening a socket,
-/// with room for a slow network — and short enough that a ticket in a log or
-/// a shoulder-surfed URL is already dead by the time anybody reads it.
+/// Lifetime of an unused ticket, enforced by its etcd lease.
 pub const TICKET_TTL: Duration = Duration::from_secs(30);
 
 /// What a redeemed ticket puts back on the request: the caller as they were
@@ -47,26 +43,13 @@ impl Tickets {
         Self { store }
     }
 
-    /// A ticket for `path`, carrying `bearer`'s permission and nothing more.
-    ///
-    /// 248 bits from the system's own generator. Not a uuid: a uuid is an
-    /// identifier and this is a secret, and the two have different jobs even
-    /// where they have the same length.
-    ///
-    /// Lowercase hex and not base64, and thirty-one bytes rather than
-    /// thirty-two, because the token is `metadata.name` now: a name in this
-    /// store is a DNS label — one etcd key segment, no uppercase, at most 63
-    /// bytes. Sixty-two hex characters fit; sixty-four did not, and finding
-    /// that out is what the integration test is for. 248 bits is not a
-    /// weakening anybody can use — it is a thirty-second secret with 2^248
-    /// values.
+    /// Mint a path-bound, expiring ticket with the caller's existing grant.
+    /// Use 31 random bytes encoded as 62 lowercase hex characters to fit the
+    /// 63-byte resource-name limit.
     pub async fn mint(&self, bearer: Bearer, path: &str) -> Result<String> {
         use ring::rand::SecureRandom as _;
         let mut raw = [0u8; 31];
-        // A generator that cannot produce randomness is not a case to paper
-        // over with a weaker secret: nothing else in this process would work
-        // either (rustls uses the same one), and a panic here is louder and
-        // shorter than a ticket somebody can guess.
+        // Fail if secure randomness is unavailable; never substitute a predictable token.
         ring::rand::SystemRandom::new()
             .fill(&mut raw)
             .expect("the system random generator");
@@ -93,19 +76,11 @@ impl Tickets {
         Ok(token)
     }
 
-    /// Spend a ticket on the path it was made for. `None` for a ticket that
-    /// was never issued, was already spent, has expired, or names another
-    /// path — four different mistakes with one answer, because telling them
-    /// apart would tell a guesser which half they got right.
-    ///
-    /// A store that cannot be reached is a fifth, and it answers the same
-    /// way: a console that fails closed does not open, and one that failed
-    /// open would be this whole file undone.
+    /// Redeem once for the exact path. Missing, spent, expired, mismatched and
+    /// unreadable tickets all return None without exposing which condition failed.
     pub async fn redeem(&self, token: &str, path: &str) -> Option<Bearer> {
-        // Taken before it is judged: a ticket presented at all is a ticket
-        // spent, so a wrong path cannot be retried against the right one. The
-        // take is one round trip and the delete inside it is what makes it
-        // exclusive — the sister replica's take of the same key finds nothing.
+        // Atomically take before validation: even presentation on the wrong path
+        // consumes the ticket, and another replica cannot redeem it again.
         let taken = match self.store.take::<Ticket>(token).await {
             Ok(taken) => taken,
             Err(e) => {
@@ -133,11 +108,7 @@ impl Tickets {
     }
 }
 
-/// The `ticket=` of a query string, if there is one.
-///
-/// Hand-parsed rather than through a query extractor because the guard sees a
-/// path and a query and no route yet — and because this must not be fooled by
-/// a parameter that merely ENDS in `ticket`.
+/// Extract the first exact ticket query parameter without matching key suffixes.
 pub fn from_query(query: Option<&str>) -> Option<&str> {
     query?
         .split('&')
@@ -158,12 +129,7 @@ mod tests {
         assert_eq!(from_query(None), None);
     }
 
-    /// The stored shape, which is now a wire document and has to read like
-    /// one.
-    ///
-    /// `camelCase` and `deny_unknown_fields` like every other spec here, and
-    /// no `status`: a ticket is a thing that is taken, not a thing anything
-    /// observes.
+    /// Ticket storage uses strict camelCase spec fields and no status.
     #[test]
     fn a_stored_ticket_carries_the_path_and_the_caller_and_no_status() {
         let object = Ticket::new(
@@ -194,12 +160,8 @@ mod tests {
         assert_eq!(back.spec.bearer.role, Some(Role::Member));
     }
 
-    /// A token is a name in this store, so it has to be one.
-    ///
-    /// Two rules, and the mint broke both on the way here: base64url carries
-    /// uppercase, and thirty-two bytes of hex is 64 characters against a
-    /// limit of 63. Neither shows up anywhere but a live store, which is why
-    /// this test states them where the mint can be read beside them.
+    /// Minted hexadecimal tokens fit the store's lowercase name syntax and
+    /// 63-character limit.
     #[test]
     fn a_token_is_a_name_this_store_accepts() {
         let token: String = (0u8..31).map(|b| format!("{b:02x}")).collect();

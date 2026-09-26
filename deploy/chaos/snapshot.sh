@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Step 0 of the chaos brief: freeze the binary the fleet runs today, so the
-# way back is a file copy and not a rebuild of a commit nobody wrote down.
+# Copy installed binaries to *.pre-chaos on every configured host.
+# Re-running overwrites those backups; this does not snapshot data or configuration.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 for ip in $ALL_IPS; do

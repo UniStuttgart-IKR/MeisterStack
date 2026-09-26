@@ -75,10 +75,7 @@ fn check_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Config files name PEM paths, and a path in a config file is read relative
-/// to the file that named it — so a controller's config and its `pki/`
-/// directory travel as one unit, exactly as the agent's config and its data
-/// directory do.
+/// Resolve relative PEM paths against the supplied configuration directory.
 pub fn resolve(base: Option<&Path>, path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();

@@ -63,10 +63,8 @@ pub enum DeviceAttachment {
 }
 
 impl DeviceAttachment {
-    /// Whether this attachment needs the guest's memory to be shareable — the
-    /// same question `VolumeAttachment` answers, asked of the other half of
-    /// the spec. A vhost-user backend maps guest memory and cannot map what
-    /// is not shared; passthrough and mdev have no backend to map anything.
+    /// Vhost-user attachments require shared guest memory; passthrough and
+    /// mdev attachments have no backend process mapping it.
     pub fn needs_shared_memory(&self) -> bool {
         matches!(self, DeviceAttachment::VhostUser { .. })
     }
@@ -100,21 +98,12 @@ pub trait DeviceDriver: Send + Sync {
         Vec::new()
     }
 
-    /// Whether this driver can serve `requested` alongside what other VMs on
-    /// this node already claim from it. Called before anything is built, so a
-    /// refusal costs nothing.
+    /// Check declared device claims before creating resources. `claimed`
+    /// contains this driver's specs from every other VM in the persistent
+    /// store, so conflicts remain visible after agent restart.
     ///
-    /// The split of labour is the point: only the agent can read its store,
-    /// and only the driver knows what a conflict IS — which param names the
-    /// resource, whether two VMs may share it, what the message should say.
-    /// `claimed` is every device spec of every OTHER vm on this node that
-    /// names this driver; a driver that has no such constraint says nothing.
-    ///
-    /// Not the same thing as the admission a driver does over its own live
-    /// backends (nvrm's max_instance and VRAM budget): that one is about what
-    /// is running and belongs in `create`. This one is about what is
-    /// declared, and it has to survive an agent restart — which is why the
-    /// specs come from the caller's store rather than from driver state.
+    /// Drivers may separately enforce live-backend limits in `create`, such
+    /// as NVRM VRAM and instance budgets.
     fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],

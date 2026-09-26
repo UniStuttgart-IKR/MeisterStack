@@ -8,9 +8,8 @@
 #
 # Resumable on purpose: a cell whose JSON is already in out/ is skipped, so an
 # aborted run continues where it stopped instead of re-measuring six hours.
-# Every cell lifts its own shaping; this lifts everything again between cells,
-# because "the next cell measured the previous cell's qdisc" is the one way to
-# get a whole matrix of plausible, wrong numbers.
+# Between cells, attempt root-qdisc removal on the fixed fleet. This does not
+# restore pre-existing qdiscs or remove DROP tables left by process termination.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 OUT=out

@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""The seeded loop.
+"""Run seeded operations and optional faults against the configured lab.
 
-One seed produces one exact sequence of operations and fault injections, so a
-finding carries a way to make it happen again. After every operation the whole
-invariant set runs; a violation is one line in findings.txt with the seed and
-the step number that produced it.
-
-    ./chaos.py --seed 4711 --steps 200
-    ./chaos.py --seed 4711 --steps 200 --no-faults   # operations only
-    ./chaos.py --seed 4711 --replay 137              # print the sequence, act on nothing
-
-Everything it creates is called chaos-*; --cleanup removes the lot.
+The sequence log records attempted operations and observed responses. A seed
+alone does not reproduce response-dependent branches or distributed timing.
+--replay prints top-level random choices without consuming the random draws
+inside operations, so it is not a replay of an executed sequence. Findings
+are appended to findings.txt; completion still returns exit status zero.
 """
 
 import argparse
@@ -241,7 +236,7 @@ VERBS = {"create": do_create, "delete": do_delete, "stop": do_stop, "start": do_
 
 
 def heal(w):
-    """Put the fleet back into a shape the next step can be judged against."""
+    """Start known services and uncordon known nodes, including nodes cordoned before this run."""
     for ip in CLUSTER1 + CLUSTER2:
         ctl(ip, "systemctl is-active meister-cluster-controller >/dev/null || "
                 "systemctl start meister-cluster-controller")

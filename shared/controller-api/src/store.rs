@@ -23,24 +23,13 @@ use tracing::{error, info, warn};
 
 use crate::object::{NameShape, Resource, StoredObject};
 
-/// What a lease key holds: one instant, and nothing else.
-///
-/// An object rather than a bare timestamp, because it is a document in etcd
-/// and a document that may need a second field one day should not have to
-/// change shape to get one. Sixty bytes either way.
+/// Heartbeat lease document containing its last observed instant.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Lease {
     at: DateTime<Utc>,
 }
 
-/// `<prefix>/leases/<resource>/<name>` — spelled once, and beside the
-/// registry rather than inside it so that a `list` of a resource cannot walk
-/// over its own leases.
-///
-/// Free functions and not methods, so the shape of the key can be asserted
-/// without an etcd client. The shape IS the interface: `etcdctl get --prefix
-/// /cluster/leases/nodes/` is what an operator reads when they want to know
-/// which machine went quiet, and it is what proved D-C7 in the first place.
+/// Heartbeat key outside registry prefixes so resource listings exclude leases.
 fn lease_key(prefix: &str, resource: &str, name: &str) -> String {
     format!("{prefix}/leases/{resource}/{name}")
 }
@@ -75,24 +64,14 @@ pub enum StoreError {
     NotFound(String),
     #[error("object already exists: {0}")]
     AlreadyExists(String),
-    /// The name is taken by an object that is on its way out: deleted, and
-    /// waiting for a finalizer. Its own variant and not `AlreadyExists`,
-    /// because the two ask different things of the caller — one means "pick
-    /// another name" and this one means "wait a moment". Both are 409, and
-    /// telling them apart is the whole point.
+    /// The name is occupied by an object awaiting finalization. Distinct from an
+    /// ordinary collision so callers can wait for deletion rather than choose a name.
     #[error("object is being deleted: {0}")]
     Terminating(String),
-    /// Two writers wanted the same thing and one of them lost. The message is
-    /// the WHOLE sentence and not a subject the variant decorates: a lost CAS
-    /// on a resourceVersion and a floating address somebody already holds are
-    /// both 409s and read nothing alike, and the one that reaches an operator
-    /// is whichever the server wrote.
+    /// A state or revision conflict. The payload is the complete client-facing message.
     #[error("{0}")]
     Conflict(String),
-    /// The request cannot be carried out as written. The message is the whole
-    /// sentence, for the same reason `Conflict`'s is: a malformed object and a
-    /// quota that is used up are both 422s, both reach an operator's terminal
-    /// verbatim, and only one of them is about an object being invalid.
+    /// An invalid request or failed admission constraint, with its complete message.
     #[error("{0}")]
     Invalid(String),
     #[error("etcd: {0}")]
@@ -104,13 +83,8 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 impl StoreError {
-    /// One word for the KIND of failure, for the `result` label on
-    /// `meister_etcd_errors_total`.
-    ///
-    /// The variant and never the message: the messages name keys, object
-    /// names and whole sentences, and a label built from one of those is the
-    /// unbounded label that takes a Prometheus down. Six words, one per
-    /// variant, and adding a variant is a compile error here.
+    /// Bounded failure category for metrics. Never label errors with messages,
+    /// which can contain arbitrary object names and keys.
     pub fn metric_result(&self) -> &'static str {
         match self {
             StoreError::NotFound(_) => "not-found",
@@ -129,39 +103,16 @@ pub struct EtcdStore {
     prefix: String,
 }
 
-/// How long one etcd request may take before the caller stops waiting.
-///
-/// Not a network setting but a liveness one. An etcd that has lost quorum
-/// accepts a request and answers nothing at all, and a caller that waits for
-/// that answer for ever is a caller that never runs its next pass — the
-/// reconcile pass on its 5s tick, the session ingest writing a heartbeat, the
-/// REST handler somebody is waiting on.
-///
-/// Requests no longer queue behind one another (see `EtcdStore::handle`), so
-/// one that hangs costs its own caller and nobody else. The bound is what
-/// turns that cost into an error the caller can act on rather than a task
-/// that is simply gone.
-///
-/// Five seconds is one tick. A pass that skips a tick and warns is a
-/// controller that is behind; a pass that never returns is one that is gone,
-/// and the difference is which of those a partition looks like from outside.
+/// Deadline for one ordinary etcd request. Bounds stalled callers during
+/// quorum loss without treating timeout as proof that a write did not occur.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The same bound on getting a connection in the first place, and the reason
-/// is the one from `proto::DIAL_TIMEOUT`: a blackholed endpoint costs the
-/// kernel's `tcp_syn_retries` — about two minutes — before it gives up, and
-/// `main` has a retry loop that cannot retry while it is still waiting.
+/// Bound initial connection attempts so startup retry can recover from
+/// blackholed endpoints without waiting for kernel TCP retry exhaustion.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Bound one request. `what` names the operation in the error, because a
-/// timeout that only says "etcd" tells an operator nothing about which of
-/// several concurrent callers is the one that is stuck.
-///
-/// Watches are deliberately NOT wrapped, and the etcd client's own
-/// `with_timeout` is deliberately not used: both bound a whole response, and
-/// a watch is a stream that is SUPPOSED to stay silent for hours. Setting it
-/// there would tear the watch down every five seconds and leave the tick
-/// carrying the whole reconciler.
+/// Bound and label one request. Exclude watches: their long-lived stream
+/// may be idle, so an ordinary response deadline would repeatedly close it.
 async fn timed<T, E>(
     what: &'static str,
     fut: impl Future<Output = std::result::Result<T, E>>,
@@ -184,11 +135,7 @@ where
     outcome
 }
 
-/// Where this process is in the store's history, from whatever answer just
-/// came back. Every etcd response carries the revision it was served at, so
-/// this costs nothing beyond the read — and a controller whose observed
-/// revision stops moving while another replica's climbs is a controller that
-/// has been partitioned off, which is not visible from anything else here.
+/// Record the revision returned by etcd for progress and partition diagnostics.
 fn observe_revision(header: Option<&etcd_client::ResponseHeader>) {
     if let Some(header) = header {
         telemetry::metrics::etcd().saw_revision(header.revision());
@@ -232,18 +179,8 @@ impl EtcdStore {
         Ok(obj)
     }
 
-    /// The bytes that go into etcd, and the one place [`Resource::settle`] is
-    /// called from.
-    ///
-    /// Here rather than in `update` and `create` separately, because "before
-    /// the bytes are made" is exactly what the hook has to mean: every write
-    /// in this file passes through here, `mutate` included (it writes through
-    /// `update`), so there is no path that stores an object the derivation
-    /// never saw. A caller that wants the settled object back reads the
-    /// return value of the write, which is decoded from these very bytes.
-    ///
-    /// It costs no clone that was not already being made: the copy exists
-    /// anyway, to keep `resourceVersion` out of the store.
+    /// Settle derived resource state and serialize without resourceVersion.
+    /// Every write uses this path; returned objects decode these same bytes.
     fn encode<T: Resource>(obj: &T, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<u8>> {
         // resource_version is derived state; never persist it.
         let mut clean = obj.clone();
@@ -252,17 +189,8 @@ impl EtcdStore {
         serde_json::to_vec(&clean).map_err(|e| StoreError::Invalid(format!("invalid object: {e}")))
     }
 
-    /// One read against the store, for a readiness probe.
-    ///
-    /// A key that need not exist, and that is deliberate: what is being asked
-    /// is whether the store ANSWERS, not whether it holds anything in
-    /// particular. A probe that depended on content would go red the first
-    /// time somebody emptied a directory, which is a working control plane
-    /// with nothing in it.
-    ///
-    /// The read goes through `timed` like every other, so it also lands in
-    /// the etcd latency and failure metrics — a replica that is flapping
-    /// ready shows up there before anybody reads its probe log.
+    /// Probe store responsiveness using a key that need not exist. Use the
+    /// ordinary request deadline and metrics without depending on data content.
     pub async fn probe(&self) -> Result<()> {
         let key = format!("{}/readyz", self.prefix);
         let resp = timed("probe", self.handle().get(key, None)).await?;
@@ -284,15 +212,8 @@ impl EtcdStore {
         Ok(self.list_counted().await?.0)
     }
 
-    /// `list`, and how many keys the SAME answer held.
-    ///
-    /// For the callers whose correctness rests on the list being all of them:
-    /// fewer objects than keys means something did not decode. They used to
-    /// ask `count` for the second number, which is a second read at a later
-    /// revision — so an object created between the two made a complete list
-    /// look short, and a quota check under concurrent creates refused with
-    /// "some vm objects did not decode" about objects that decoded fine.
-    /// Found by the F03 stress test; one response cannot disagree with itself.
+    /// Return decoded objects and the raw key count from the same response.
+    /// A mismatch exposes decode failures without races from a separate count read.
     pub async fn list_counted<T: Resource>(&self) -> Result<(Vec<T>, usize)> {
         let dir = self.dir(T::RESOURCE);
         let resp = timed(
@@ -328,11 +249,8 @@ impl EtcdStore {
         Ok(())
     }
 
-    /// When this peer last spoke, or `None` if this store has never heard it.
-    ///
-    /// `None` and not an error for a key that is not there: a peer whose
-    /// object exists because somebody said Hello once has no lease, and that
-    /// is exactly what `expired(None, now)` is written to answer.
+    /// Read the last heartbeat, returning None for an absent lease.
+    /// Heartbeat policy treats absent evidence as expired.
     pub async fn last_beat<T: Resource>(&self, name: &str) -> Result<Option<DateTime<Utc>>> {
         let key = lease_key(&self.prefix, T::RESOURCE, name);
         let resp = timed("lease_get", self.handle().get(key, None)).await?;
@@ -343,11 +261,7 @@ impl EtcdStore {
             .and_then(|kv| Self::read_lease(kv.value())))
     }
 
-    /// Every peer's lease, by name, in ONE read.
-    ///
-    /// The batched half, and the reason it exists rather than a loop of
-    /// `last_beat`: a reconcile pass asks this of every node it has, and a
-    /// LIST of ten nodes must not become eleven round trips.
+    /// Read all resource heartbeat leases in one request for reconciliation.
     pub async fn beats<T: Resource>(&self) -> Result<HashMap<String, DateTime<Utc>>> {
         let dir = lease_dir(&self.prefix, T::RESOURCE);
         let resp = timed(
@@ -370,10 +284,8 @@ impl EtcdStore {
         Ok(out)
     }
 
-    /// A lease this store cannot read is a peer that has not reported, and
-    /// not an error anybody can act on: the next beat replaces the key.
-    /// Warned about once per read rather than propagated, because the caller
-    /// of a liveness question has no repair to make.
+    /// Treat an undecodable lease as missing evidence and log it.
+    /// A subsequent heartbeat can replace the malformed record.
     fn read_lease(bytes: &[u8]) -> Option<DateTime<Utc>> {
         match serde_json::from_slice::<Lease>(bytes) {
             Ok(lease) => Some(lease.at),
@@ -384,10 +296,9 @@ impl EtcdStore {
         }
     }
 
-    /// How many keys the resource prefix actually holds. `list` degrades on
-    /// an object it cannot decode — it says so and drops it — which is right
-    /// for a reconcile pass and wrong for any caller whose correctness rests
-    /// on the list being complete. Those compare against this.
+    /// Count resource keys, including entries an ordinary list cannot decode.
+    /// A separate list/count comparison can detect mismatch but is not one snapshot;
+    /// use list_counted when both must describe the same read.
     pub async fn count<T: Resource>(&self) -> Result<usize> {
         let dir = self.dir(T::RESOURCE);
         let opts = GetOptions::new().with_prefix().with_count_only();
@@ -396,11 +307,7 @@ impl EtcdStore {
         Ok(resp.count().max(0) as usize)
     }
 
-    /// The longest a name may be. Not arbitrary: a name reaches a node as
-    /// part of a network interface name, and Linux allows fifteen bytes for
-    /// one of those. This is the object name and not the interface name — the
-    /// drivers derive those and keep their own budget — but a name that can
-    /// never fit anywhere downstream is not worth storing.
+    /// Maximum object-name length under DNS-label validation.
     const MAX_NAME: usize = 63;
 
     /// Validate a bounded ASCII DNS-label name used in keys and downstream paths.
@@ -455,21 +362,9 @@ impl EtcdStore {
         self.create_inner(obj, None).await
     }
 
-    /// Create an object that etcd itself will delete again after `ttl_secs`.
-    ///
-    /// The one resource that expires — events. A lease is granted for this
-    /// object alone and etcd reaps the key when it runs out, so the expiry
-    /// needs no sweeper task, no reconcile pass and nobody alive at all: a
-    /// control plane that is down for two hours comes back to an event log
-    /// that has already tidied itself.
-    ///
-    /// One grant per created object rather than a shared one per process or
-    /// per time bucket. A shared lease would take every event with it when
-    /// the process holding it stopped renewing, and a bucketed one would give
-    /// the last object of each bucket a shorter life than it was promised.
-    /// Objects that expire are rare by construction — see `events`, which
-    /// writes one only when something CHANGED — so the extra round trip is
-    /// paid about as often as something happens.
+    /// Create with a dedicated expiry lease, used by transient resources.
+    /// Each object receives its full TTL independently of process lifetime
+    /// or other objects' creation times.
     pub async fn create_with_ttl<T: Resource>(&self, obj: &T, ttl_secs: i64) -> Result<T> {
         let lease = timed("lease_grant", self.handle().lease_grant(ttl_secs, None)).await?;
         self.create_inner(obj, Some(lease.id())).await
@@ -478,10 +373,7 @@ impl EtcdStore {
     async fn create_inner<T: Resource>(&self, obj: &T, lease: Option<i64>) -> Result<T> {
         let name = obj.metadata().name.clone();
         Self::check_name(&name, T::NAME_SHAPE)?;
-        // Every object starts at generation 1, and here rather than in the
-        // handlers because there are a dozen of those and one of these. What
-        // a client sent in the field is not consulted: the count is the
-        // server's, or it is worth nothing. See `Metadata::generation`.
+        // Initialize generation centrally to one, ignoring client-supplied values.
         let mut obj = obj.clone();
         obj.metadata_mut().generation = 1;
         let obj = &obj;
@@ -514,12 +406,8 @@ impl EtcdStore {
         self.written(&name, &value, &resp).await
     }
 
-    /// Does the object that holds this name carry a deletion timestamp?
-    ///
-    /// Read as JSON and not as `T`: this runs on a failure path, and a
-    /// decode that fails there would turn "the name is taken" into "the store
-    /// is broken". Anything unreadable is reported as a plain collision,
-    /// which is the answer that was given before this existed.
+    /// Identify a deleting collision from raw JSON. If decoding fails, retain the
+    /// ordinary name-collision error instead of replacing it with a decode failure.
     fn is_terminating(ops: Vec<etcd_client::TxnOpResponse>) -> bool {
         ops.into_iter().any(|op| match op {
             etcd_client::TxnOpResponse::Get(r) => {
@@ -576,14 +464,8 @@ impl EtcdStore {
                 CompareOp::Equal,
                 rev,
             )])
-            // A copy for the same reason `create` makes one.
-            //
-            // `ignore_lease` is what lets an expiring object be UPDATED
-            // without stopping expiring: a put with no lease named would
-            // otherwise take the key's lease off and make it permanent, which
-            // for an event that is being aggregated is exactly the wrong
-            // direction. Harmless on every other resource — a key with no
-            // lease has none to keep.
+            // Preserve an existing lease during update; otherwise aggregating an event
+            // would remove its expiry and make it permanent.
             .and_then(vec![TxnOp::put(
                 key.clone(),
                 value.clone(),
@@ -599,13 +481,8 @@ impl EtcdStore {
         self.written(&name, &value, &resp).await
     }
 
-    /// Where the fence called `name` stands right now.
-    ///
-    /// Read BEFORE whatever the fence guards is looked at: the promise
-    /// `create_fenced` and `update_fenced` keep is that nothing guarded by it
-    /// was written between this read and their own write, so a decision made
-    /// from reads that came after this one is still a decision about the
-    /// store the write lands in. See [`Fence`].
+    /// Read the fence before inspecting the objects it guards. A later fenced
+    /// write must retry if another participating writer advanced it.
     pub async fn fence(&self, name: &str) -> Result<Fence> {
         let key = format!("{}/fences/{}", self.prefix, name);
         let resp = timed("fence", self.handle().get(key.clone(), None)).await?;
@@ -614,13 +491,9 @@ impl EtcdStore {
         Ok(Fence { key, revision })
     }
 
-    /// `create`, and only if `fence` has not moved since it was read — in one
-    /// transaction that moves it.
-    ///
-    /// `Ok(None)` is "the fence moved": somebody else got through the same
-    /// door first, the decision this write rested on may be stale, and the
-    /// caller decides again. A name that is taken is the error `create`
-    /// gives, whichever of the two conditions failed first.
+    /// Create and advance an unchanged fence atomically.
+    /// Ok(None) requests a new admission decision after fence movement; an occupied
+    /// object name returns the usual create error.
     pub async fn create_fenced<T: Resource>(&self, obj: &T, fence: &Fence) -> Result<Option<T>> {
         let name = obj.metadata().name.clone();
         Self::check_name(&name, T::NAME_SHAPE)?;
@@ -653,12 +526,8 @@ impl EtcdStore {
         self.written(&name, &value, &resp).await.map(Some)
     }
 
-    /// `update`, and only if `fence` has not moved since it was read — in one
-    /// transaction that moves it.
-    ///
-    /// `Ok(None)` is "the fence moved", as for `create_fenced`. An object that
-    /// moved is the conflict `update` gives: that is the CALLER's version
-    /// being stale, and deciding again would not make it any less so.
+    /// Update under both object revision and admission fence, advancing the fence.
+    /// Fence movement returns Ok(None); a stale object version remains a conflict.
     pub async fn update_fenced<T: Resource>(&self, obj: &T, fence: &Fence) -> Result<Option<T>> {
         let name = obj.metadata().name.clone();
         Self::check_name(&name, T::NAME_SHAPE)?;
@@ -736,18 +605,8 @@ impl EtcdStore {
         )))
     }
 
-    /// `mutate`, for a caller whose `name` came off a listing that may
-    /// already be stale.
-    ///
-    /// Astra finding S20, 2026-09-23: `mutate` re-reads BY NAME on every
-    /// retry and reapplies the closure without asking whether the name still
-    /// names the object the caller resolved `uid` from. A cached listing
-    /// (`VmIndex` and its like) can be seconds old, so between the read that
-    /// produced `uid` and the write that finally lands, the name may have
-    /// been freed and taken by an unrelated object — same shape as the
-    /// ABA `delete_if` guards against, one level up: a write instead of a
-    /// delete. `uid` is checked after EVERY get, including retries, because
-    /// a recreation can happen between any two of them.
+    /// Mutate only the expected UID, checking after every read and retry.
+    /// This prevents a stale name from targeting a recreated object.
     pub async fn mutate_if<T, F>(&self, name: &str, uid: &str, mut f: F) -> Result<T>
     where
         T: Resource,
@@ -782,18 +641,8 @@ impl EtcdStore {
         Ok(())
     }
 
-    /// `delete`, and only if `resource_version` still names the object as it
-    /// was when the caller last read it — the same CAS `update_fenced` (see
-    /// above) guards a write with, applied to a delete.
-    ///
-    /// Astra finding S19, 2026-09-23: a delete by NAME alone is an ABA hole
-    /// wherever names are reused — `delete_secret` reads and authorises one
-    /// object, then AWAITS an Ack from every connected cluster before it
-    /// deletes, and a delete that resumes after the old object was removed
-    /// and a new one created under the same name would remove the wrong
-    /// object. A failed compare means the name no longer names what the
-    /// caller authorised against, and the caller sees `Conflict` — a 409 —
-    /// rather than a silent wrong delete.
+    /// Delete only the observed resourceVersion. A failed comparison returns
+    /// Conflict rather than deleting an object changed or recreated after authorization.
     pub async fn delete_if<T: Resource>(&self, name: &str, resource_version: &str) -> Result<()> {
         let rev: i64 = resource_version.parse().map_err(|_| {
             StoreError::Invalid(
@@ -819,19 +668,8 @@ impl EtcdStore {
         Ok(())
     }
 
-    /// Take an object: delete it and hand back what was there, or `None` if
-    /// nothing was.
-    ///
-    /// One round trip, and that is the whole of it. A `get` followed by a
-    /// `delete` is two, and between them a second replica does the same get
-    /// and gets the same answer — so a thing that may be had exactly once is
-    /// had twice. etcd's `with_prev_key` makes the read the delete's own
-    /// return value, and a delete of a key that is already gone deletes
-    /// nothing and returns nothing: exactly one caller can win.
-    ///
-    /// Written for console tickets (Fremdsicht 6) and named for what it is
-    /// rather than for them, because "remove and tell me what it was" is the
-    /// shape every once-only object needs.
+    /// Atomically delete and return the previous object, or None when absent.
+    /// Concurrent callers cannot consume the same stored object twice.
     pub async fn take<T: Resource>(&self, name: &str) -> Result<Option<T>> {
         let key = self.key(T::RESOURCE, name);
         let options = DeleteOptions::new().with_prev_key();
@@ -871,14 +709,8 @@ impl EtcdStore {
         Ok(rx)
     }
 
-    /// One etcd watch event in this store's own words, or `None` for one
-    /// there is nothing to say about.
-    ///
-    /// An event without a key-value is one etcd told us nothing with. A
-    /// Delete carries only the name, because the value is gone. A Put that
-    /// will not decode is dropped with an error, for the reason `list` logs
-    /// one: nothing heals a key that will not decode, and a watch that
-    /// stopped at one would take the reconciler down with it.
+    /// Decode a watch event. Delete carries a name only; undecodable Put values
+    /// are logged and skipped without terminating the watch.
     fn observed<T: Resource>(ev: &Event) -> Option<(WatchEvent, String, Option<T>)> {
         let kv = ev.kv()?;
         let name = String::from_utf8_lossy(kv.key())
@@ -899,19 +731,9 @@ impl EtcdStore {
     }
 }
 
-/// Why a reconcile pass runs: a periodic tick, or something changed.
-///
-/// Level-triggered reconcilers do not act on events — they re-derive
-/// everything from the store every pass — so the watch is only ever a reason
-/// to run one sooner than the tick would. That makes losing it survivable
-/// rather than fatal, and this is where that is arranged: the initial watch is
-/// retried until it takes, a closed stream is re-established on the next wake,
-/// and the tick carries the reconciler in the meantime.
-///
-/// Both tiers ran this loop, identically, thirty-odd lines each. What is
-/// generic about it is `T` — the object type the watch decodes — which is the
-/// same parameter `EtcdStore::watch` already takes, so nothing here is a
-/// contortion to make two things one.
+/// Wake reconciliation on a periodic tick or a watch event. Watches only
+/// accelerate a fresh state read; ticks preserve progress while watch setup
+/// or reconnect fails.
 pub struct PassTrigger<T: Resource> {
     watch: Option<tokio::sync::mpsc::Receiver<(WatchEvent, String, Option<T>)>>,
     tick: tokio::time::Interval,
@@ -945,16 +767,9 @@ impl<T: Resource> PassTrigger<T> {
         }
     }
 
-    /// Wait for the next reason to run a pass. Returns when the tick fires or
-    /// the store says something changed; a watch that closed is re-opened
-    /// here, and until it is, the tick is what keeps the reconciler running.
-    /// This never waits twice: every path here is a reason to run a pass, and
-    /// a reconnect that failed is one too. Looping until the watch came back
-    /// would swallow the tick that woke us and leave the reconciler making no
-    /// passes at all for as long as the store stays unreachable — the opposite
-    /// of what the tick is for, and exactly when a level-triggered pass is
-    /// worth the most. A failed reconnect costs nothing extra either: the next
-    /// call finds `watch: None` and waits for a tick before trying again.
+    /// Wake on a tick or store change. Reopen a closed watch when possible,
+    /// but return for a pass even when reconnect fails. The next call waits
+    /// for another tick rather than spinning on reconnect.
     pub async fn wait(&mut self, store: &EtcdStore) {
         let closed = match &mut self.watch {
             Some(watch) => {
@@ -999,17 +814,8 @@ impl<T: Resource> PassTrigger<T> {
 mod tests {
     use super::*;
 
-    /// The name is the last segment of the key. A name that is not a segment
-    /// produces an object at a path the API cannot address back — reachable
-    /// by no GET, no DELETE, and no reconcile decision that needs its name.
-    /// What the lab got past the old check, and what each one would have
-    /// become downstream. A name is an etcd key, a file name and part of an
-    /// interface name — three places with three different ideas of what a
-    /// byte is.
-    /// The difference between "pick another name" and "wait a moment". A
-    /// create that loses to an object on its way out used to say the name was
-    /// taken, which is not true — the object is gone and its finalizer is
-    /// not done yet.
+    /// Validate resource names as addressable key segments, and distinguish
+    /// a taken name from an object still waiting for finalizer cleanup.
     #[test]
     fn a_name_held_by_a_dying_object_is_told_apart_from_a_name_that_is_taken() {
         let alive = br#"{"metadata":{"name":"a"}}"#;
@@ -1066,13 +872,8 @@ mod tests {
         assert!(e.contains("64 bytes"), "{e}");
     }
 
-    /// The wider shape, and the two resources it exists for.
-    ///
-    /// Both of them are named after something that was never a word an
-    /// operator chose — an address, and the file a node looks an image up as
-    /// — and while the label was demanded of them, NEITHER could be created
-    /// at all: every floating reservation was a 422, and an image with an
-    /// extension could not be catalogued.
+    /// Dotted names permit address and image-file identifiers while rejecting
+    /// path traversal.
     #[test]
     fn a_dotted_name_holds_an_address_and_a_file_name_and_still_no_traversal() {
         let dotted = |n: &str| EtcdStore::check_name(n, NameShape::Dotted);
@@ -1136,12 +937,8 @@ mod tests {
         }
     }
 
-    /// A request that never answers becomes an error the caller can act on,
-    /// naming the operation. An etcd that has lost quorum does exactly this:
-    /// it accepts the request and says nothing. Since every caller holds its
-    /// own client handle the cost stops at that caller — but a caller that
-    /// waits for ever is a reconcile pass that makes no more passes, so the
-    /// bound is what makes it an error instead of a task that is gone.
+    /// A stalled store request expires with its operation name so the caller can
+    /// recover instead of blocking reconciliation indefinitely.
     #[tokio::test(start_paused = true)]
     async fn a_request_that_never_answers_becomes_a_timeout() {
         let err = timed::<(), StoreError>("list", std::future::pending())
@@ -1167,10 +964,7 @@ mod tests {
         assert_eq!(timed("get", just_in_time).await.unwrap(), 7);
     }
 
-    /// A real etcd error is passed through as itself, not repackaged as a
-    /// timeout — "not found" and "nobody answered" are different problems and
-    /// the caller treats them differently (StoreError::NotFound is a 404, a
-    /// Timeout is a 503).
+    /// Errors returned before the deadline retain their original category.
     #[tokio::test(start_paused = true)]
     async fn an_error_inside_the_window_stays_the_error_it_was() {
         let failed = async { Err::<(), _>(StoreError::NotFound("vms/x".into())) };
@@ -1178,23 +972,16 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
     }
 
-    /// The whole of what lets `handle` replace the mutex: an etcd client is a
-    /// handle and clones as one. If a future version of the crate takes that
-    /// away, every store operation in the process silently goes back to
-    /// standing in one queue behind whichever request is slowest — so the
-    /// assumption is asserted here rather than left in a comment.
+    /// Assert the Clone, Send and Sync bounds needed for per-request client handles.
+    /// This checks API compatibility, not connection-sharing or runtime concurrency.
     #[test]
     fn an_etcd_client_is_a_handle_and_clones_as_one() {
         fn shares_one_connection<T: Clone + Send + Sync>() {}
         shares_one_connection::<Client>();
     }
 
-    /// What `create` and `update` are allowed to return without reading the
-    /// key back: the bytes they wrote, decoded, stamped with the revision the
-    /// write produced. That is only the same object as a `get` if the encode
-    /// is faithful — so this is the round trip, over a real resource with
-    /// every kind of field the envelope has (skipped-when-empty, defaulted,
-    /// optional timestamps, a map).
+    /// Encoded resources round-trip faithfully so writes can return their serialized
+    /// object with the new revision without a second store read.
     #[test]
     fn what_was_written_decodes_back_to_what_was_written() {
         use crate::resources::{FloatingIp, FloatingIpSpec};
@@ -1230,13 +1017,7 @@ mod tests {
         );
     }
 
-    /// The heartbeat's own key, and what is in it.
-    ///
-    /// D-C7's fix in two assertions. The KEY is beside the registry and not
-    /// inside it, so `list::<Node>()` cannot walk over a lease and a lease
-    /// cannot be mistaken for an object. The VALUE is one instant — sixty
-    /// bytes against the 1.5 kB `Node` object a beat used to rewrite, which
-    /// is the factor of 25 the report asked for.
+    /// Heartbeat keys are outside registry listings and contain only lease data.
     #[test]
     fn a_heartbeat_has_a_key_of_its_own_beside_the_registry() {
         use crate::resources::{Cluster, Node};
@@ -1276,14 +1057,8 @@ mod tests {
         assert_eq!(EtcdStore::read_lease(b"not json"), None);
     }
 
-    /// The store runs [`Resource::settle`] on the way out, and this is where
-    /// that is nailed down without an etcd.
-    ///
-    /// Two halves. The default is a NO-OP, which is what makes struktur 4's
-    /// type half behaviour-neutral: every resource in the tree writes exactly
-    /// the bytes it wrote before. And a resource that does implement it is
-    /// really called, with the instant the store chose — which is the
-    /// contract the derivation lane is going to build on.
+    /// Encoding invokes Resource::settle before serialization, using the supplied
+    /// time; the default implementation leaves the object unchanged.
     #[test]
     fn the_store_settles_an_object_before_it_makes_the_bytes() {
         use crate::object::Object;

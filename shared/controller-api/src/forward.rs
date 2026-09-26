@@ -16,27 +16,11 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 
-/// The header a forwarded request carries, and the whole of the loop
-/// prevention. One hop is the design: a tier's replicas all see the same
-/// endpoint, so a second hop could only ever be a mistake — and a mistake
-/// that costs a request bouncing between two processes until one of them
-/// times out.
+/// Mark a forwarded request to prohibit a second hop through a stale endpoint.
 pub const FORWARDED: &str = "x-meister-forwarded";
 
-/// How long a forward waits on a sibling, connect and answer together.
-///
-/// One budget for the whole hop rather than one per step, because a client
-/// hanging on a read cannot tell the steps apart and neither can the operator
-/// reading the 503. What it is really for is the address that is BLACKHOLED
-/// rather than refusing: a replica behind a dropped route or a DROP rule
-/// answers nothing at all, and a connect to one costs the TCP SYN retry
-/// budget — minutes on Linux — with a handler and a client hanging off it the
-/// whole time. A refused connection was always instant; this is the other
-/// half.
-///
-/// Five seconds: a sibling is one hop away on the same control-plane network
-/// and reads something it already has, so a healthy forward is milliseconds.
-/// Anything past five seconds is not slow, it is gone.
+/// Total sibling-hop deadline, including connection and response. Bounds
+/// blackholed connections as well as slow replies; timeout is uncertainty.
 pub const SIBLING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Who can answer, and how.
@@ -50,11 +34,7 @@ pub enum Holder {
     Nowhere(String),
 }
 
-/// What the tier is talking about, for the two sentences `holder` writes.
-///
-/// A pair of words rather than a format string at each call site: the
-/// sentences are the operator's, they name a key in a config file, and there
-/// are two tiers writing the same two of them.
+/// Peer and tier names used in shared forwarding diagnostics.
 #[derive(Clone, Copy, Debug)]
 pub struct About {
     /// What holds the session — `"node"`, `"cluster"`.
@@ -63,10 +43,7 @@ pub struct About {
     pub tier: &'static str,
 }
 
-/// Who can answer, as a pure decision.
-///
-/// Three inputs and three outcomes, so that the rule can be read and tested
-/// without a session, a store or a second process.
+/// Choose the local holder, one sibling hop, or an unavailable result.
 pub fn holder(
     about: About,
     has_session: bool,
@@ -106,18 +83,13 @@ pub struct Sibling {
     /// `system:<kind>:<name>` certificate, verified against the CA it trusts
     /// its own clients with. `None` = plain http, which is what a lab runs.
     pub tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
-    /// Whether THIS replica serves TLS on its REST port — which is the only
-    /// honest answer to "does my sibling?", because both run one
-    /// configuration. See `dial`: the address a sibling publishes carries no
-    /// scheme, so this is where the scheme comes from.
+    /// TLS default for endpoints without a scheme, inferred from this replica.
+    /// This assumes sibling replicas share transport configuration.
     pub serves_tls: bool,
 }
 
-/// The authority to connect to and whether to wrap it in TLS.
-///
-/// An endpoint that names a scheme decides for itself; one that does not —
-/// which is what `advertise_api` usually holds — is read as whatever this
-/// replica serves.
+/// Return authority and TLS mode. An explicit scheme wins; otherwise use
+/// this replica's serving mode.
 pub fn dial(endpoint: &str, serves_tls: bool) -> (&str, bool) {
     if let Some(authority) = endpoint.strip_prefix("https://") {
         return (authority.trim_end_matches('/'), true);
@@ -128,23 +100,13 @@ pub fn dial(endpoint: &str, serves_tls: bool) -> (&str, bool) {
     (endpoint.trim_end_matches('/'), serves_tls)
 }
 
-/// GET this path from the sibling at `endpoint`, once, within the budget.
-///
-/// The body comes back unopened. What a console printed is the node's answer
-/// and what a cluster reported is the cluster's; a tier that reshaped it on
-/// the way through would be a tier that could get it wrong, and there are two
-/// of them above the node.
-///
-/// A status the sibling did not call a success becomes an error carrying its
-/// SENTENCE. That is right for a read — the caller turns it into one 503 —
-/// and wrong for a write, which is what `relay` is for.
+/// GET once within the sibling deadline and return the body unchanged.
+/// Convert a non-success status into an error with its message. Writes
+/// use `relay` to preserve their response semantics.
 pub async fn ask(sibling: &Sibling, endpoint: &str, path: &str) -> anyhow::Result<Bytes> {
     let answer = relay(sibling, endpoint, hyper::Method::GET, path, Bytes::new()).await?;
     if !answer.status.is_success() {
-        // The sibling's own SENTENCE and not its whole body: it answers in
-        // this API's error envelope, and quoting the json around the sentence
-        // would put an escaped document in front of the operator instead of
-        // what the peer said.
+        // Extract the API error message rather than quoting its JSON envelope.
         bail!(
             "the replica at {endpoint} answered {}: {}",
             answer.status,
@@ -154,21 +116,15 @@ pub async fn ask(sibling: &Sibling, endpoint: &str, path: &str) -> anyhow::Resul
     Ok(answer.body)
 }
 
-/// What a sibling said, whole: the status and the body it came with.
-///
-/// `ask` throws the status away because a read either has its answer or does
-/// not. A WRITE cannot: a node PATCH the sibling refused with 404 "cluster
-/// reports no node manacor" is a 404 and not a 503, and collapsing it would
-/// make a client retry a request that will never work.
+/// Sibling response status and body. Forwarded writes preserve both so a
+/// permanent refusal is not converted into a retryable transport error.
 pub struct Answer {
     pub status: hyper::StatusCode,
     pub body: Bytes,
 }
 
-/// One hop to the sibling with a method and a body, and its answer whole.
-///
-/// The single place the forward is actually made; `ask` is this with GET, an
-/// empty body, and the read's own reading of a failure.
+/// Perform one sibling hop, preserving response status and body.
+/// `ask` wraps this for GET requests with its own error conversion.
 pub async fn relay(
     sibling: &Sibling,
     endpoint: &str,
@@ -267,14 +223,8 @@ where
     Ok(sender.send_request(request).await?)
 }
 
-/// Percent-encoding for a query VALUE, by hand and only as far as a needle
-/// needs it.
-///
-/// A log filter is an arbitrary string a person typed and it travels in a
-/// query string on this one hop. Everything that is not unreserved goes as
-/// `%XX`, which is more than strictly necessary and is the right side to err
-/// on: the alternative is a needle containing `&` splitting into two
-/// parameters at the sibling.
+/// Percent-encode every non-unreserved UTF-8 byte in a query value so filters
+/// containing separators cannot introduce sibling query parameters.
 pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -348,12 +298,8 @@ mod tests {
         assert_eq!(dial("a:3000/", false), ("a:3000", false));
     }
 
-    /// A blackholed sibling is the whole reason there is a clock here.
-    ///
-    /// The unreachable half of that — a SYN into a DROP rule — costs the
-    /// kernel's retry budget and cannot be built in a test; the reachable
-    /// half can: accepted, then silent. Both are inside the same budget, so
-    /// this proves the clock.
+    /// An accepted but silent connection must expire under the sibling deadline.
+    /// This exercises response timeout without requiring a network DROP rule.
     #[tokio::test(start_paused = true)]
     async fn a_sibling_that_answers_nothing_is_given_up_on_rather_than_waited_for() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

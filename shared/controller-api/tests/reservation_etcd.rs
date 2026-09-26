@@ -41,10 +41,7 @@ fn reservation(migration: &str, migration_uid: &str, node: &str) -> CapacityRese
     )
 }
 
-/// One migration, one promise. The write is create-only — the same
-/// compare-on-create-revision every `create` in this store makes — so a
-/// second replica that reaches `prepare` for the same migration finds the
-/// room already spoken for by that migration rather than booking it twice.
+/// Create-only reservation keys let competing replicas reserve once per migration.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_migration_can_reserve_room_once_and_not_twice() {
@@ -77,14 +74,8 @@ async fn a_migration_can_reserve_room_once_and_not_twice() {
     assert_eq!(reserved_on("agent-3", &all).mem_mib, 0, "nothing there");
 }
 
-/// A reservation outlives nothing — and the giving back is guarded, because
-/// a migration is named for a vm and a moment and a record can be made again
-/// under a name that was used before.
-///
-/// The ABA S19 closed for secrets, in the one place where losing it costs a
-/// machine: the first migration's late release would otherwise remove the
-/// SECOND one's promise, and the node would then be offered to an ordinary
-/// create while a guest was still flying into it.
+/// Revision-guarded release preserves a replacement reservation under a reused
+/// name; otherwise stale cleanup could erase another migration's capacity claim.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_release_gives_back_only_the_promise_the_releaser_made() {

@@ -13,21 +13,15 @@ use rustls_pki_types::CertificateSigningRequestDer;
 use rustls_pki_types::pem::PemObject;
 use x509_parser::prelude::*;
 
-/// A fresh key pair and the request that goes with it, both as PEM.
-///
-/// `key_pem` is the secret. It is returned rather than written so that the
-/// caller decides where it lands and with which permissions — and so that the
-/// test below can prove it never appears in the request.
+/// New private key and CSR as PEM. Return the secret key to the caller
+/// for storage with appropriate permissions; the CSR contains only its public key.
 pub struct KeyAndCsr {
     pub key_pem: String,
     pub csr_pem: String,
 }
 
-/// Generate a P-256 key pair and a CSR asking to be `common_name`.
-///
-/// The name in the request is a courtesy: it is what the operator typed, it
-/// travels so the server can compare it against what it was told, and the
-/// server overwrites it in the certificate either way (`ca::Ca::sign_csr`).
+/// Generate a P-256 key and CSR with the requested name. Issuance replaces
+/// the requested subject with the server-approved subject.
 pub fn generate_key_and_csr(common_name: &str) -> Result<KeyAndCsr> {
     if common_name.is_empty() {
         bail!("a certificate request needs a name");
@@ -49,17 +43,8 @@ pub fn generate_key_and_csr(common_name: &str) -> Result<KeyAndCsr> {
     })
 }
 
-/// Another request over a key that is already on this machine.
-///
-/// The idempotent half of enrolment. `meister-activate keygen` is run over
-/// ssh by a rollout that can be interrupted, and a second run must not make
-/// a SECOND identity: a host with two keys has two identities, and the one
-/// the certificate was issued over is then a coin toss. So the key stays and
-/// only the request is made again.
-///
-/// The key is read as a value rather than a path because the caller here
-/// goes through its own file door (`meister-deploy`'s `Files` trait); this
-/// function opens nothing.
+/// Create a CSR from an existing private key, preserving identity across
+/// interrupted enrollment retries. The caller supplies PEM; no file is opened.
 pub fn csr_for_key(key_pem: &str, common_name: &str) -> Result<String> {
     if common_name.is_empty() {
         bail!("a certificate request needs a name");
@@ -78,19 +63,12 @@ pub fn csr_for_key(key_pem: &str, common_name: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("encoding the request: {e}"))
 }
 
-/// A name for a key that is safe to print: the sha256 of its PUBLIC half
-/// in SubjectPublicKeyInfo form, as hex.
-///
-/// What it is for is comparing — "is the key on that host still the one the
-/// certificate was issued over" — without anything that could be mistaken
-/// for the key itself ever reaching a log, a journal or a receipt.
+/// Hex SHA-256 of the public key's SubjectPublicKeyInfo PEM bytes.
 pub fn public_key_sha256(key_pem: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let key = KeyPair::from_pem(key_pem)
         .map_err(|e| anyhow::anyhow!("reading the key to name its public half: {e}"))?;
-    // The PEM of the SubjectPublicKeyInfo: the same bytes any tool would
-    // print for this key, so the digest is one somebody can reproduce with
-    // `openssl pkey -pubout`.
+    // Hash the SubjectPublicKeyInfo PEM representation, not its DER bytes.
     let digest = Sha256::digest(key.public_key_pem().as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -99,17 +77,9 @@ pub fn public_key_sha256(key_pem: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The name a request is made out to, having established that the request
-/// parses and that the key inside it signed it.
-///
-/// The signature check is the point. It proves the sender holds the private
-/// half of the key it is asking us to certify — without it, anyone could take
-/// somebody else's public key, submit it under their own name, and have the
-/// CA vouch for a key they do not have. It costs one function call and it is
-/// the difference between a CSR and a form.
-///
-/// What comes back is a claim and is treated as one: the server compares it
-/// against the name being asked for, and then writes its own subject anyway.
+/// Parse a CSR and verify its signature before returning the claimed
+/// subject name. The signer must still authorize that name and choose
+/// the issued subject and privileges.
 pub fn requested_name(csr_pem: &str) -> Result<String> {
     let der = CertificateSigningRequestDer::from_pem_slice(csr_pem.as_bytes())
         .map_err(|e| anyhow!("not a PEM certificate request: {e}"))?;
@@ -132,9 +102,7 @@ pub fn requested_name(csr_pem: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// The claim the whole flow rests on, checked rather than asserted in
-    /// prose: what goes on the wire is a CERTIFICATE REQUEST and the private
-    /// key is not in it.
+    /// Verify that the CSR contains no private key material.
     #[test]
     fn the_private_key_is_not_in_the_request() {
         let made = generate_key_and_csr("alice").unwrap();
@@ -163,16 +131,14 @@ mod tests {
         assert!(csr_for_key(&generate_key_and_csr("a").unwrap().key_pem, "").is_err());
     }
 
-    /// The property a resumed enrolment stands on: asking the same key for a
-    /// second request does not make a second key.
+    /// Reusing a key for enrollment must preserve its public identity.
     #[test]
     fn a_second_request_over_the_same_key_is_the_same_key() {
         let made = generate_key_and_csr("system:node:n1").unwrap();
         let again = csr_for_key(&made.key_pem, "system:node:n1").unwrap();
         assert!(again.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
         assert_eq!(requested_name(&again).unwrap(), "system:node:n1");
-        // Same key, so the same public half — which is what a certificate is
-        // issued over.
+        // Compare the reused key's public identity.
         assert_eq!(
             public_key_sha256(&made.key_pem).unwrap(),
             public_key_sha256(&made.key_pem).unwrap()
@@ -201,9 +167,7 @@ mod tests {
         assert_eq!(requested_name(&made.csr_pem).unwrap(), "alice");
     }
 
-    /// A request whose signature does not check out is not a request. Without
-    /// this, anybody could submit somebody else's public key under their own
-    /// name and have the CA vouch for a key they do not hold.
+    /// Reject CSRs without valid proof of possession of their private key.
     #[test]
     fn a_request_nobody_signed_is_not_one() {
         let made = generate_key_and_csr("alice").unwrap();

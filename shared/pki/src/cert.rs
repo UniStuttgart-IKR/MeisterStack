@@ -14,13 +14,8 @@ use rustls_pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 
-/// Everything this control plane reads out of a certificate.
-///
-/// The Kubernetes mapping, deliberately: CN is who you are, every O is a
-/// group you are in. Nothing else in a certificate is an authorisation
-/// statement here — what a name may *do* is an object in etcd, and keeping
-/// those two apart is what makes a role change something other than a
-/// re-issue.
+/// Certificate identity: CN supplies the name and organization values supply
+/// groups. Local authorization is resolved separately from this certificate data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertInfo {
     pub common_name: String,
@@ -61,13 +56,8 @@ impl CertInfo {
         })
     }
 
-    /// Read a certificate, having established that one of `cas` signed it and
-    /// that it is valid at `now`.
-    ///
-    /// The two failures are told apart on purpose. "Expired eleven days ago"
-    /// is an operator's problem with a known fix; "no configured CA signed
-    /// this" is somebody presenting a certificate from somewhere else, and an
-    /// error that blurred them would make the second one look routine.
+    /// Verify validity at now and a direct signature by a configured CA.
+    /// Report expiry separately from an unrecognized issuer.
     pub fn verified_by(
         der: &[u8],
         cas: &[CertificateDer<'static>],

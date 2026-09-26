@@ -28,66 +28,27 @@ pub enum Verdict {
     Stays(StayReason),
 }
 
-/// The facts about one VM that the table reads and neither tier's object
-/// carries directly.
-///
-/// Gathered by the caller because gathering them is where the tiers differ: a
-/// cluster asks its own pools and its own nodes, the cloud asks its clusters'
-/// mirrored answers. What is decided from them is the same either way.
+/// Facts gathered from each tier's inventory for the shared drain decision.
 #[derive(Clone, Debug, Default)]
 pub struct DrainFacts {
-    /// The VM's spec names at least one passthrough or paravirtual device.
-    ///
-    /// A device is the one fact that rules live migration out whatever else
-    /// is true: the state of a GPU is not in the guest's memory, and NVIDIA's
-    /// own vGPU live migration is deliberately out of scope here.
+    /// Whether passthrough or paravirtual device state prevents supported live
+    /// migration; that state is not carried in the guest-memory transfer.
     pub has_device: bool,
-    /// A persistent disk whose bytes are on this very machine, by name.
-    ///
-    /// `Some` pins the VM outright — no reschedule, no restart, no live.
-    /// EPHEMERAL disks are absent from this by construction: an inline entry
-    /// has no `Volume` object, it was made with the VM on that machine, and
-    /// it is made fresh at the destination. Instance-store semantics, and the
-    /// whole reason the ephemeral axis was worth building.
+    /// Persistent node-local volume that pins the VM against relocation.
+    /// Inline disks are excluded because restart evacuation recreates them.
     pub node_local_disk: Option<String>,
-    /// Whether this tier can move a running VM at all.
-    ///
-    /// False until live migration is built, and false FOREVER at the cloud:
-    /// there is no live migration across clusters. When it is false a VM that
-    /// would have moved live is treated exactly as `evacuation = never` —
-    /// which is the honest answer, because it is not going anywhere.
+    /// Whether this tier can perform live relocation for the VM.
+    /// False at cloud scope, where cross-cluster live migration is unsupported.
     pub live_possible: bool,
-    /// Why no machine here could take this guest's saved state, when that is
-    /// the reason `live_possible` is false.
-    ///
-    /// One of [`crate::live_migration_refusal`]'s sentences, carried so that
-    /// the drain's own line can say it. Without it a node in a heterogeneous
-    /// fleet reports the ordinary `evacuation is never`, and an operator reads
-    /// "the owner said no" about a machine that is in fact the wrong shape —
-    /// which is the difference between changing a spec field and buying a
-    /// matching host.
-    ///
-    /// `None` on every other path, including the ordinary one where live
-    /// migration simply was not asked for.
+    /// Machine-compatibility refusal from `live_migration_refusal`, when
+    /// that prevents live evacuation. None on other refusal paths.
     pub live_refusal: Option<String>,
 }
 
-/// The table from the brief, line for line.
-///
-/// The order of the arms is the order of the rules, and two of them come
-/// first for a reason:
-///
-///   * a VM already on its way is not re-decided, or a pass that ran while a
-///     stop was in flight would set the mark again from the top;
-///   * a persistent node-local disk beats everything below it, `restart`
-///     included. Moving that VM means booting it where its data is not, and
-///     an owner who wrote `evacuation: restart` was answering a question
-///     about reboots, not offering up their disk.
-///
-/// After that it is the owner's word: `never` stays, `restart` moves the way
-/// the owner allowed, and a stopped VM moves without anybody having to allow
-/// anything — nothing is running to be disturbed, which is what makes the
-/// third verb the one that covers 95 % of the cases.
+/// Choose drain action in policy order: preserve in-flight evacuation,
+/// then reject relocation of persistent node-local data. Apply the owner's
+/// evacuation policy after those guards; stopped guests can move without
+/// interrupting a running workload.
 pub fn verdict(vm: &Vm, facts: &DrainFacts) -> Verdict {
     // Already going: a mark from an earlier pass, or a binding that has
     // already fallen and is waiting for a placement.
@@ -110,10 +71,8 @@ pub fn verdict(vm: &Vm, facts: &DrainFacts) -> Verdict {
     // answer, which is the next arm.
     let could_live = facts.live_possible && !facts.has_device;
     match vm.spec.evacuation {
-        // `restart` first, even where live would work: it is what the owner
-        // asked for, it is cheaper to reason about, and a live migration that
-        // does not converge would leave a VM the owner had already agreed to
-        // reboot sitting on a machine somebody wants to switch off.
+        // Honor explicit restart evacuation even when live migration is possible;
+        // the owner has already authorized the interruption.
         Evacuation::Restart => Verdict::Restart,
         Evacuation::Never if could_live => Verdict::Live,
         // The default, and the ordinary end of a drain: the owner never said
@@ -123,11 +82,7 @@ pub fn verdict(vm: &Vm, facts: &DrainFacts) -> Verdict {
     }
 }
 
-/// The sentence beside the category, for the operator reading `node get`.
-///
-/// Says what would have to change, because that is the only useful thing a
-/// refusal can say: a category tells a program what happened and a person
-/// needs to know what to do about it.
+/// Explain a drain refusal and the constraint an operator would need to change.
 pub fn sentence(reason: StayReason, vm: &str, facts: &DrainFacts) -> String {
     match reason {
         StayReason::EvacuationNever => format!(

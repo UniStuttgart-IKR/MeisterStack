@@ -32,10 +32,8 @@ pub struct Metadata {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-    /// Non-identifying metadata, K8s' own distinction: labels are what a
-    /// selector matches on, annotations are what something carries along.
-    /// The trace context is the first of them and the reason the field
-    /// exists — it belongs to the request, not to the VM.
+    /// Metadata carried with the object but not matched by selectors, including
+    /// the originating request's trace context.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,13 +46,8 @@ pub struct Metadata {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-// `deny_unknown_fields` at the ENVELOPE, and it is the same rule the spec
-// types already carry, one layer out. Without it a key nobody claims falls
-// away silently: `{"metdata": {"name": "web-1"}, …}` used to come back as
-// "metadata.name must be set" — a true sentence about the wrong thing, and
-// the client is left believing the server read a name it never saw. The
-// generic type is the right place for it, because this is one statement about
-// the envelope every resource wears and not a special case for one kind.
+// Reject unknown envelope fields so misspellings fail explicitly instead of
+// being silently discarded before resource-specific validation.
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 // `status` is `#[serde(default)]`, so the schema wants to name that default —
 // which needs the bound serde never had to state.
@@ -64,26 +57,14 @@ pub struct Object<S, St> {
     pub kind: String,
     pub metadata: Metadata,
     pub spec: S,
-    /// Left out entirely when it serialises to nothing.
-    ///
-    /// A resource whose status type is `()` — `Secret` is the one today —
-    /// used to answer every GET with `"status": null`. Honest ("this kind has
-    /// no status") and still noise in a JSON API, and noise a client has to
-    /// learn to ignore. The rule is generic on purpose: it is one statement
-    /// about the envelope every resource wears, not a special case for one
-    /// kind, and a status that says something (an all-default struct is still
-    /// `{}`) is still there.
+    /// Omit status when it serializes to null, as for Secret's unit status.
+    /// Meaningful objects, including an empty status object, remain present.
     #[serde(default, skip_serializing_if = "says_nothing")]
     pub status: St,
 }
 
-/// Does this status serialise to `null`?
-///
-/// Asked of the VALUE rather than of the type, because a `skip_serializing_if`
-/// gets a value and Rust has no stable way to ask "is this `()`". `()` is the
-/// one type in this tree that answers yes; an empty struct serialises to `{}`
-/// and stays in the document, which is right — `{}` is a status that exists
-/// and is empty, `null` is a status that was never a thing.
+/// Omit status only when its serialized value is null. Empty object status
+/// remains present; unit status is omitted.
 fn says_nothing<St: Serialize>(status: &St) -> bool {
     serde_json::to_value(status).is_ok_and(|v| v.is_null())
 }
@@ -105,42 +86,17 @@ impl<S, St: Default> Object<S, St> {
     }
 }
 
-/// The W3C trace context of the request that created this object.
-///
-/// It is on the object because nothing in this control plane is a call stack:
-/// a POST writes and returns, and the reconciler that acts on the object
-/// wakes up later, in another task, possibly after a restart. There is no
-/// ambient context to inherit, so the context travels as data — exactly like
-/// the spec does, and through the same store.
-///
-/// It says which REQUEST this object came from, and it stays what it was: the
-/// provisioning chain from that request down to the backend spawn is one
-/// trace, and the level-triggered work afterwards (requeues, drift commands
-/// years later) is deliberately not part of it. A trace that grew for the
-/// lifetime of a VM would be unreadable and would never end.
+/// Originating request trace context, persisted for later reconciliation
+/// and command dispatch across task/process boundaries.
 pub const ANNOTATION_TRACEPARENT: &str = "meister.io/traceparent";
 
-/// What a `?dryRun=All` answer wears, so that nobody can mistake it for a
-/// thing that exists.
-///
-/// On the object rather than beside it, because the object is what travels: a
-/// preview handed to a person, pasted into a file and fed back to `apply` has
-/// to be recognisable at every one of those steps, and a field of the HTTP
-/// response would survive none of them. The write path strips it — a client
-/// that sends it back is sending a document it was given, not making a claim.
+/// Mark preview objects so dry-run identity survives copying or saving the body.
+/// Write paths remove this annotation from resubmitted objects.
 pub const ANNOTATION_DRY_RUN: &str = "meister.io/dry-run";
 
-/// The `metadata.generation` of the CLOUD object a mirrored copy stands for.
-///
-/// On the copy rather than derived, because the two objects count different
-/// things: the cluster's own generation counts writes made here, and this is
-/// the version of the thing up there that this copy was made from. It is what
-/// the cluster reports back in `ClusterStatus.secrets`, and therefore what
-/// lets the cloud stop re-sending a secret that has not changed.
-///
-/// An annotation and not a field, by the rule annotations are for: it is
-/// non-identifying, nothing selects on it, and it belongs to the ACT of
-/// mirroring rather than to what a Secret is.
+/// Source cloud generation on a mirrored object. The cluster reports it
+/// back so unchanged secrets need not be resent; the local object's
+/// generation counts different writes.
 pub const ANNOTATION_CLOUD_GENERATION: &str = "meister.io/cloud-generation";
 
 impl Metadata {
@@ -171,14 +127,8 @@ pub trait StoredObject: Serialize + DeserializeOwned + Clone + Send + Sync + 'st
     fn metadata_mut(&mut self) -> &mut Metadata;
 }
 
-/// What a resource is called: the directory it lives in under the registry
-/// prefix, and the `kind` its envelope wears.
-///
-/// The two used to be a pair of loose constants per resource, and every store
-/// call took the first of them as a `&str` parameter NEXT to the type it was
-/// reading — so `store.get::<Node>(RESOURCE_VMS, name)` compiled and read a
-/// Node out of the vms directory. Bound to the type, that sentence cannot be
-/// written down: the name follows from what is being read.
+/// Associate registry path and envelope kind with the stored Rust type,
+/// preventing callers from choosing a different resource directory.
 pub trait Resource: StoredObject {
     /// The registry directory: `<prefix>/registry/<RESOURCE>/<name>`. Also the
     /// path segment the REST API serves it under, and the word the
@@ -186,10 +136,8 @@ pub trait Resource: StoredObject {
     const RESOURCE: &'static str;
     /// The `kind` of the envelope, as a client spells it in a body.
     const KIND: &'static str;
-    /// What a name of this kind may look like. See [`NameShape`]; the DNS
-    /// label is the answer for everything an operator names, and the two
-    /// resources whose name is not a word an operator chose say so in the
-    /// resource table.
+    /// Resource name syntax. Operator-assigned names default to DNS labels;
+    /// resources with derived names override it.
     const NAME_SHAPE: NameShape = NameShape::DnsLabel;
 
     /// Derive status from facts already present on the object before persistence.
@@ -201,22 +149,9 @@ pub trait Resource: StoredObject {
     fn settle(&mut self, _now: DateTime<Utc>) {}
 }
 
-/// What a name may hold.
-///
-/// A name goes to three places downstream and the DNS label is the
-/// intersection of what all three survive — but those three places do not
-/// all apply to every resource, and treating them as if they did made two
-/// resources impossible to create at all:
-///
-/// * a `FloatingIp` is NAMED after its address, and no address has ever been
-///   a DNS label. Every reservation was a 422.
-/// * an `Image` is named after the file a node looks it up as, and a file
-///   with an extension — `debian.raw`, which is every image anybody has —
-///   could not be catalogued.
-///
-/// Neither of those names ever becomes a network interface, which is the one
-/// downstream place that actually demands the label. So the rule stays where
-/// it is earned and is widened by exactly one character where it is not.
+/// Resource-specific name syntax. DNS-label rules apply by default;
+/// FloatingIp and Image names additionally allow dots for addresses and
+/// filenames. All names remain bounded and exclude path traversal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameShape {
     /// Lowercase alphanumerics and `-`, starting and ending alphanumeric.

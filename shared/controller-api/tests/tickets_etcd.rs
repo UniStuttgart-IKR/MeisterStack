@@ -23,11 +23,7 @@ fn endpoint() -> String {
     std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string())
 }
 
-/// One replica: its own connection, the same store underneath.
-///
-/// A prefix per test, so two of these running side by side cannot read each
-/// other's tickets and a failed run leaves nothing behind that the next one
-/// trips over.
+/// Independent replica connection using the test's isolated store prefix.
 async fn replica(prefix: &str) -> Tickets {
     let store = EtcdStore::connect(&[endpoint()], prefix)
         .await
@@ -45,16 +41,8 @@ fn bearer() -> Bearer {
 
 const CONSOLE: &str = "/apis/meister.io/v1/vms/web-1/console";
 
-/// The whole of the fix, and the reason it needed a real store.
-///
-/// A browser mints at whichever replica the load balancer picked and opens
-/// the `WebSocket` at whichever it picks next. While a ticket lived in one
-/// process's memory that was two thirds of the consoles at a three-replica
-/// cloud, refused with a sentence that reads like a forged credential.
-///
-/// And the other half in the same test, because they are one property: the
-/// ticket that crosses is still spent exactly once. B redeems it, and A —
-/// the replica that made it — is then refused.
+/// Tickets minted by one replica can be spent by another exactly once,
+/// using their shared etcd store.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_ticket_minted_at_one_replica_is_spent_once_at_another() {
@@ -86,12 +74,8 @@ async fn a_ticket_minted_at_one_replica_is_spent_once_at_another() {
     assert_eq!(a.outstanding().await, 0);
 }
 
-/// The four ways a ticket is not one, and the one way it is.
-///
-/// Verbatim in intent from the unit test this replaces: the same five
-/// assertions, now against the store they really run on. The path binding and
-/// the spend-on-presentation are the two that carry security weight, and both
-/// are asked across replicas here rather than within one process.
+/// Across replica connections, tickets open only their bound path and are
+/// consumed on presentation, including a wrong-path attempt.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_ticket_opens_one_path_once() {
@@ -131,18 +115,8 @@ impl Authenticator for Never {
     }
 }
 
-/// The guard's half, moved here with the store it now needs.
-///
-/// A browser opening a `WebSocket` cannot set an `Authorization` header, so
-/// the only credential it can present is in the query string — and a
-/// credential in a query string is a credential in an access log. This is
-/// what makes that acceptable: the guard spends it, once, for the one path it
-/// was minted for, and it carries what its holder already had.
-///
-/// It used to run in process with an in-memory map. It cannot any more, and
-/// that is the point of the change rather than a cost of it: the redeem is a
-/// round trip to the store, because that is the only place "once" is true for
-/// more than one replica.
+/// The guard accepts a path-bound, single-use query ticket for browser
+/// upgrades. Redemption uses etcd so the once-only rule spans replicas.
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_console_ticket_is_a_credential_for_one_url_and_one_use() {

@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""The invariant checker of the chaos brief.
+"""Collect REST and host observations and report candidate invariant violations.
 
-Blackbox: everything here comes from the two REST tiers and from what a shell
-on a node can see. No product code is imported, nothing is read out of etcd
-directly. Every check is an assertion with a name; a violation is one line in
-findings.txt and one line on stdout, nothing else.
-
-    ./invariants.py                 # check once, print PASS/FAIL per invariant
-    ./invariants.py --baseline      # record today's leftovers so leak checks
-                                    # only ever report what THIS run created
-    ./invariants.py --seed 1234     # stamp findings with the seed that made them
+Run --baseline before a fault experiment to record existing resources. The
+checks are heuristics over sequential observations, not a consistent snapshot.
+Some failed reads become empty lists; consult README.md before interpreting
+a clean verdict or a reported violation.
 """
 
 import argparse
@@ -38,14 +33,7 @@ from phases import hole as phase_hole
 
 
 def _addrs(name, default):
-    """A comma-separated address list from the environment, or the lab's.
-
-    The topology is the lab's and stays the lab's; what this adds is a way to
-    point the harness somewhere else without editing it. `selftest.sh` needs
-    exactly that — a stack on loopback that proves the harness can still
-    reach a tier at all — and a self-test that had to patch this file would
-    be a self-test nobody runs.
-    """
+    """Read a comma-separated endpoint list; an explicitly empty value disables that tier."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -300,7 +288,10 @@ def ours(o):
 
 
 def check(st, base):
-    """Returns list of (id, message). Empty list = everything held."""
+    """Return candidate (id, message) violations from the observations.
+
+    An empty result means no implemented check fired, not complete coverage.
+    """
     v = []
     all_cl_vms = [(c, x) for c in CLUSTERS for x in st.cl_vms[c]]
 
@@ -388,8 +379,8 @@ def check(st, base):
             if fields[0].startswith("chaos-") and not any(fields[0].endswith(str(u)[-12:]) for u in live_uids):
                 v.append(("I3", f"orphan LV {fields[0]} on {node}"))
 
-    # I4 — tenant B never reaches tenant A. Any nftables counter that a drop
-    # rule owns and that moved off zero is a crossing that happened.
+    # I4 inspects generic drop counters. A nonzero counter records blocked
+    # traffic; it neither identifies a tenant nor demonstrates a crossing.
     for node, p in st.node_probe.items():
         blob = "\n".join(p.get("NFT", []))
         if not blob.strip():
@@ -548,10 +539,8 @@ def check(st, base):
             if up and up != c:
                 v.append(("I1", f"cloud says {name(x)} is on {up}, but {c} holds a copy"))
 
-    # I15 — etcd stays well under its quota. Rollout Neutron lost two hours to
-    # a full store that looked like a product bug from above, and this run found
-    # cluster-1 at 99 % before it started. One member per tier: the members of a
-    # raft group grow together, and three ssh round-trips is what this can cost.
+    # I15 samples one etcd member per tier. This fixed list assumes both
+    # clusters exist, even when endpoint overrides disabled one of them.
     for tier, ip in (("cloud", CLOUD[0]), ("cluster-1", CLUSTERS["cluster-1"][0]),
                      ("cluster-2", CLUSTERS["cluster-2"][0])):
         if not ip:

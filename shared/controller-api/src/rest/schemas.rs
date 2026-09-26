@@ -8,25 +8,11 @@ use super::*;
 
 // --- schemas ----------------------------------------------------------------
 
-/// Where a client asks what an object of this API LOOKS like.
-///
-/// The discovery document says which resources exist and what may be done to
-/// them; it says nothing about fields, and that gap is why every client so far
-/// had to be handed a written reference and a human to read it. This is the
-/// other half: one JSON Schema per resource, derived from the very types serde
-/// deserialises, plus the mutability table the update handler enforces.
-///
-/// Under `/apis/meister.io/v1/` so `classify` sees it as an API path with no
-/// object under it and lets it past ungated, exactly as it lets discovery
-/// past — the shape of an object is not a secret, and a client needs it
-/// before it has a credential to ask with.
+/// Public endpoint for derived resource JSON schemas and enforced
+/// mutability tables. Complements resource/verb discovery.
 pub const SCHEMAS_PATH: &str = "/apis/meister.io/v1/schemas";
 
-/// The schema of one resource, as `/schemas` publishes it.
-///
-/// Generic over the object rather than taking a `Value`, so that the call site
-/// reads `schema_of::<Vm>()` and cannot name a type this endpoint does not
-/// actually serve.
+/// Generate the complete JSON Schema for a resource type.
 pub fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or(serde_json::Value::Null)
 }
@@ -81,16 +67,8 @@ pub(super) async fn api_schemas(
     Json((*doc).clone())
 }
 
-/// Every path a mutability table names has to be a field the schema
-/// really has.
-///
-/// This is what holds the two statements together, and it is the whole
-/// reason the table travels beside the schema rather than in prose. The
-/// table is hand-written; the schema is derived from the type serde
-/// deserialises. Rename `sizeGib` in `VolumeSpec` and this fails —
-/// whereas a sentence in a document would have gone on being wrong
-/// quietly, which is exactly what happened to `spec.size` in the brief
-/// this came from.
+/// Assert that every hand-written mutability path exists in its derived
+/// resource schema, so field renames cannot silently leave stale policy.
 pub fn assert_tables_match_schemas(resources: &'static [ApiResource]) {
     for resource in resources {
         let Some(build) = resource.schema else {
@@ -113,14 +91,9 @@ pub fn assert_tables_match_schemas(resources: &'static [ApiResource]) {
     }
 }
 
-/// Walk a dotted path through a JSON Schema's `properties`.
-///
-/// Deliberately only `properties`: every path any table names today is a
-/// plain field, and a walker that also followed `$ref`, `oneOf` and
-/// `additionalProperties` would be a walker that finds something for
-/// almost any string — which would make the assertion above pass for a
-/// typo. `$ref` IS followed, because schemars puts every named struct
-/// behind one and `spec` is always a `$ref`.
+/// Find a dotted field through properties and local references.
+/// Do not treat unions or additionalProperties as evidence that a named field
+/// exists; mutability tables require explicit schema fields.
 pub fn schema_has_field(schema: &serde_json::Value, path: &str) -> bool {
     let root = schema;
     let mut here = schema;

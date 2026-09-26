@@ -27,21 +27,15 @@ use std::time::Duration;
 
 use crate::storage::{self, StorageError};
 
-/// The formats a base image may be in.
-///
-/// Short on purpose. `raw` is a disk and nothing else; `qcow2` is what every
-/// cloud image in this lab ships as. Everything else — vmdk, vdi, vhdx, and
-/// the qcow2 variants that reference other files — is a format whose
-/// behaviour on `convert` somebody would have to read the source of QEMU to
-/// state, and a base image is not the place to find out.
+/// Accepted base-image formats. Additional checks reject qcow2 variants
+/// that reference backing or external data files.
 pub const CONVERTIBLE_FORMATS: [&str; 2] = ["raw", "qcow2"];
 
 /// The account the conversion runs as. See the module note on why it is a
 /// name and not `DynamicUser=yes`.
 pub const CONVERT_USER: &str = "meister-convert";
 
-/// A base image this node is willing to convert, and the two facts about it
-/// that the caller needs.
+/// Validated base-image format and virtual size needed for conversion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseImage {
     /// What qemu-img says the file IS, handed straight back to it as `-f` so
@@ -53,13 +47,7 @@ pub struct BaseImage {
     pub virtual_size: u64,
 }
 
-/// How much of the node one sandboxed run may take.
-///
-/// Bounds and not guesses at what qemu-img needs: `MemoryMax` is what the
-/// unit is killed at, `CPUQuota` is what it may not exceed while other
-/// guests are running on the same node, and `RuntimeMaxSec` is the one that
-/// matters most — a convert that never returns used to be a provision that
-/// never returned, holding the driver's lock while it did not.
+/// Systemd resource and runtime limits for one sandboxed operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// `MemoryMax=`, in systemd's spelling (`512M`, `2G`).
@@ -82,11 +70,7 @@ impl Limits {
         }
     }
 
-    /// For `qemu-img convert`: measured in this lab at well under 300 MiB
-    /// for the cloud images it boots, and single-threaded unless it is told
-    /// otherwise, so one core's worth is what it can use. Half an hour is
-    /// the deadline; a 64 GiB image onto a slow disk is minutes, and an hour
-    /// would be a stuck provision nobody notices during a shift.
+    /// Default limits for qemu-img conversion.
     pub fn convert() -> Self {
         Self {
             memory_max: "2G".to_string(),
@@ -102,19 +86,11 @@ impl Default for Limits {
     }
 }
 
-/// The one thing a conversion may write.
-///
-/// Two variants because the two drivers write two different kinds of object
-/// and systemd reaches them differently: a file is made writable by binding
-/// it into the unit (everything else is read-only under
-/// `ProtectSystem=strict`), and a device node is reached through the cgroup
-/// device controller, which a bind mount does not touch.
+/// Writable conversion destination. Regular files need a writable bind;
+/// block devices additionally require device-controller access.
 #[derive(Clone, Copy, Debug)]
 pub enum Destination<'a> {
-    /// A regular file the agent has already created — the filesystem
-    /// driver's `<id>.tmp`. Bound into the unit by itself and not by its
-    /// directory: a writable directory is a writable directory, and the
-    /// volumes of other guests are in it.
+    /// Precreated staging file. Bind only the file, not its volume directory.
     File(&'a Path),
     /// A block device node, already resolved to the real node rather than a
     /// symlink to it — lvm-thin's `/dev/<vg>/<lv>.staging`.
@@ -130,10 +106,7 @@ impl Destination<'_> {
     }
 }
 
-/// What the sandbox is being asked to do.
-///
-/// Both jobs read the same untrusted file, which is why both are jobs of
-/// this type and not one job and one shortcut.
+/// Sandboxed probe or conversion; both read untrusted image bytes.
 #[derive(Clone, Copy, Debug)]
 pub enum Job<'a> {
     /// `qemu-img info --output=json <src>`, whose answer [`judge`] reads.
@@ -146,18 +119,11 @@ pub enum Job<'a> {
     },
 }
 
-/// How the destination is given to the converter and taken back.
-///
-/// A function and not a call, so that a test can watch the hand-over happen
-/// without being root and without a block device. See [`Sandbox::resolved_as`].
+/// Ownership-change callback, replaceable for tests without privileged chown.
 pub type ChangeOwner = Arc<dyn Fn(&Path, u32, u32) -> std::io::Result<()> + Send + Sync>;
 
-/// The destination, for as long as the converter has it.
-///
-/// A value and not a pair of calls, because the giving back has to happen on
-/// every way out of a conversion — the failure, the deadline, the panic —
-/// and "remember to chown it back" is an instruction that survives exactly
-/// until somebody adds a `?`.
+/// Ownership guard restoring the destination on explicit completion or drop.
+/// Drop covers early returns and unwinding; callers use give_back to observe restoration errors.
 #[must_use = "the destination belongs to the converter until it is given back"]
 pub struct HandedOver {
     path: PathBuf,
@@ -170,10 +136,7 @@ pub struct HandedOver {
 }
 
 impl HandedOver {
-    /// Take the destination back, and say so if that failed.
-    ///
-    /// Not best effort: see the module note. A device node left owned by the
-    /// converter is the hole this whole file is about.
+    /// Restore destination ownership and propagate any failure.
     pub fn give_back(mut self) -> Result<(), String> {
         self.given_back = true;
         (self.chown)(&self.path, self.uid, self.gid).map_err(|e| {
@@ -199,14 +162,10 @@ impl Drop for HandedOver {
     }
 }
 
-/// The transient unit a base image is read inside.
-///
-/// Cheap to clone and to hold: it is four fields and no state, so a driver
-/// keeps one in its config and hands it to every conversion.
+/// Reusable configuration for transient conversion units.
 #[derive(Clone)]
 pub struct Sandbox {
-    /// `systemd-run`. Resolved by the OS from the agent's own `PATH`, which
-    /// is the one place a binary name is still allowed to be one.
+    /// systemd-run executable, resolved through the agent's PATH.
     systemd_run: PathBuf,
     /// The account the unit runs as.
     user: String,
@@ -234,8 +193,7 @@ impl Default for Sandbox {
 }
 
 impl Sandbox {
-    /// The sandbox a node has unless somebody said otherwise: this
-    /// `systemd-run`, the [`CONVERT_USER`] account, and [`Limits::convert`].
+    /// Construct with the configured systemd-run, CONVERT_USER and default conversion limits.
     pub fn new(systemd_run: impl Into<PathBuf>) -> Self {
         Self {
             systemd_run: systemd_run.into(),
@@ -259,21 +217,13 @@ impl Sandbox {
         self
     }
 
-    /// What a conversion may take. The driver decides, because the driver is
-    /// what knows how big the disks on this backend get.
+    /// Override per-conversion resource and runtime limits.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
     }
 
-    /// The one seam this type has, and it is here for tests.
-    ///
-    /// A test cannot create `meister-convert`, and a test that is not root
-    /// cannot chown anything to it. So a test says what the account resolves
-    /// to and watches the hand-over instead of performing it — everything
-    /// else, the argv included, is the code a node runs. Nothing but a test
-    /// calls this: on a node the account is looked up with `getpwnam` and
-    /// the ownership really changes.
+    /// Override account resolution and ownership changes for unprivileged test fixtures.
     pub fn resolved_as(mut self, uid: u32, gid: u32, chown: ChangeOwner) -> Self {
         self.resolved = Some((uid, gid));
         self.chown = chown;
@@ -285,11 +235,7 @@ impl Sandbox {
         &self.systemd_run
     }
 
-    /// Look the account up, or say why the conversion cannot happen.
-    ///
-    /// `getpwnam` through `nix` rather than a `systemd-run` that fails with
-    /// "Failed to start transient service unit": the name is the thing that
-    /// is wrong, and this is the only place that can say so.
+    /// Resolve the converter account and report an identifying error when unavailable.
     fn resolve(&self) -> Result<(u32, u32), String> {
         if let Some(known) = self.resolved {
             return Ok(known);
@@ -315,10 +261,7 @@ impl Sandbox {
         Ok((user.uid.as_raw(), user.gid.as_raw()))
     }
 
-    /// The whole command line, `systemd-run` included.
-    ///
-    /// Pure, and public for that reason: what the sandbox IS is this list,
-    /// so the tests read the list rather than a node's journal.
+    /// Build the complete systemd-run invocation without starting a process.
     pub fn argv(&self, qemu_img: &Path, job: &Job<'_>) -> Result<Vec<OsString>, String> {
         let (src, description, limits) = match job {
             Job::Probe { src } => (*src, "MeisterStack base image probe", Limits::probe()),
@@ -333,11 +276,7 @@ impl Sandbox {
             nameable(dst.path(), "the destination")?;
         }
 
-        // The description is fixed text and carries no image name. A unit
-        // property is not a shell and nothing here is interpolated into one,
-        // but the catalogue name is the one string on this path that came
-        // from outside the node, and it is already in the log line, the
-        // error and the span.
+        // Use a fixed unit description; image identity belongs in logs and errors.
         let mut argv: Vec<OsString> = vec![
             "--wait".into(),
             "--pipe".into(),
@@ -358,26 +297,12 @@ impl Sandbox {
         prop(text("LockPersonality", "yes"));
         prop(text("RestrictNamespaces", "yes"));
         prop(text("RestrictRealtime", "yes"));
-        // A converter has nobody to talk to. `PrivateNetwork` takes the
-        // stack away and the line below takes the socket syscalls with it,
-        // unix sockets included.
-        //
-        // And it is EMPTY on purpose, where a unit file would say `none`.
-        // The two are not the same word for the same thing: `none` is
-        // understood by the unit-file parser and refused by the transient
-        // one, so `systemd-run -p RestrictAddressFamilies=none` fails with
-        // "Failed to set unit properties: Invalid argument" and the
-        // conversion never runs at all. Over the bus the property is a
-        // (allow-list?, families) pair, and an EMPTY allow-list is what
-        // denies everything — measured on systemd 261: a probe under
-        // `RestrictAddressFamilies=` got EAFNOSUPPORT for AF_INET and for
-        // AF_UNIX, and the same probe with no property at all got neither.
-        // Changing this line to the word that reads better breaks every
-        // conversion on every node.
+        // Deny networking and socket families, including AF_UNIX. The transient
+        // unit API requires an empty RestrictAddressFamilies allowlist; the
+        // unit-file spelling "none" is rejected by systemd-run.
         prop(text("PrivateNetwork", "yes"));
         prop(text("RestrictAddressFamilies", ""));
-        // The filesystem: read-only everywhere, with the two exceptions
-        // below, and no home directories at all.
+        // Make the filesystem read-only except for explicitly granted destinations; hide homes.
         prop(text("ProtectSystem", "strict"));
         prop(text("ProtectHome", "yes"));
         prop(text("PrivateTmp", "yes"));
@@ -399,7 +324,7 @@ impl Sandbox {
         ));
         // The one file it may read.
         prop(path("BindReadOnlyPaths", src));
-        // ... and the one thing it may write, if it writes anything.
+        // Grant the destination-specific write access, if conversion requires it.
         match job {
             Job::Probe { .. } => prop(text("PrivateDevices", "yes")),
             Job::Convert { dst, .. } => match dst {
@@ -408,12 +333,8 @@ impl Sandbox {
                     prop(text("PrivateDevices", "yes"));
                 }
                 Destination::Device(node) => {
-                    // No `PrivateDevices`: it would hide the very node this
-                    // conversion is for. `DeviceAllow` names it instead, and
-                    // naming one device sets `DevicePolicy=closed`, so the
-                    // unit reaches that node and the handful systemd always
-                    // allows (null, zero, full, random, urandom) and nothing
-                    // else on the machine.
+                    // PrivateDevices would hide the destination. DeviceAllow grants access
+                    // to that node under the closed policy, alongside systemd's standard devices.
                     let mut allow = path("DeviceAllow", node);
                     allow.push(" rw");
                     prop(allow);
@@ -447,12 +368,8 @@ impl Sandbox {
         self.finish(&tool, handed, spawned)
     }
 
-    /// The same, for a driver that is already on an async path.
-    ///
-    /// Two functions and not one because the two callers are two kinds of
-    /// call site, and everything they do differently is on the line that
-    /// starts the process — the argv, the hand-over and the reading of what
-    /// came back are the same code for both.
+    /// Run asynchronously using the same command construction and ownership handling
+    /// as the blocking entry point.
     pub async fn run(&self, qemu_img: &Path, job: &Job<'_>) -> Result<Vec<u8>, String> {
         let tool = absolute(qemu_img)?;
         let (argv, handed) = self.plan(&tool, job)?;
@@ -486,18 +403,8 @@ impl Sandbox {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)
             .map_err(|e| format!("the destination {} cannot be stat'ed: {e}", path.display()))?;
-        // What it goes back to afterwards. Normally whoever owns it now:
-        // the agent for a tmp file it has just made, `root:disk` for a
-        // device node udev made — restoring what was there is what keeps
-        // this from deciding anything about a device it did not create.
-        //
-        // Unless what is there is the converter itself. That is what a run
-        // which died between the hand-over and the hand-back leaves, and
-        // giving such a destination "back" to the converter would make the
-        // leftover permanent — and in the filesystem driver's case it would
-        // then be renamed into place as the guest's volume. So that one case
-        // goes to whoever runs this agent instead, which is the answer
-        // `vmm_user::give_back` gives for the same reason.
+        // Restore the original owner after conversion. If an interrupted run
+        // left the converter as owner, return ownership to the agent instead.
         let (mut back_uid, mut back_gid) = (meta.uid(), meta.gid());
         if back_uid == uid {
             back_uid = nix::unistd::Uid::effective().as_raw();
@@ -536,10 +443,7 @@ impl Sandbox {
         };
         match (ran, given_back) {
             (Ok(out), Ok(())) => Ok(out),
-            // The bytes may well be right, and the node is still wrong: the
-            // destination is owned by the converter. Both drivers drop the
-            // half-written volume on an error, and dropping it is what takes
-            // the file or the device node with it.
+            // Successful conversion still fails if destination ownership cannot be restored.
             (Ok(_), Err(back)) => Err(back),
             (Err(ran), Ok(())) => Err(ran),
             (Err(ran), Err(back)) => Err(format!("{ran} — and worse: {back}")),
@@ -600,13 +504,8 @@ fn path(key: &str, value: &Path) -> OsString {
     out
 }
 
-/// Refuse a path systemd would read as more than one path.
-///
-/// `BindPaths=` and `BindReadOnlyPaths=` are `source:destination:options`,
-/// so a colon in a path is a second path — and the left half of a base image
-/// name is a path this node did not choose. A newline ends a property. Both
-/// are refused here rather than escaped, because an image whose name needs
-/// escaping is an image nobody meant to boot.
+/// Reject colon and newline in systemd path properties to prevent their
+/// interpretation as bind-field separators or additional properties.
 fn nameable(value: &Path, what: &str) -> Result<(), String> {
     let bytes = value.as_os_str().as_bytes();
     if bytes.contains(&b':') || bytes.contains(&b'\n') {
@@ -619,13 +518,8 @@ fn nameable(value: &Path, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Where the tool really is.
-///
-/// systemd resolves a bare `ExecStart=` name against the MANAGER's `PATH`,
-/// which is not the agent's: on a NixOS node `qemu-img` is on the unit's
-/// path (`systemd.services.meister-agent.path`) and need not be anywhere the
-/// manager would look. So the agent resolves it itself, with its own
-/// environment, and hands systemd an absolute path.
+/// Resolve tools through the agent's PATH before handing systemd an absolute
+/// path; the manager may use a different executable search path.
 fn absolute(tool: &Path) -> Result<PathBuf, String> {
     let looks_like_a_path = tool.components().count() > 1;
     if looks_like_a_path {
@@ -647,22 +541,16 @@ fn absolute(tool: &Path) -> Result<PathBuf, String> {
         })
 }
 
-/// Run `qemu-img info --output=json` over the file and judge what it says.
-///
-/// One subprocess, in the sandbox, where there used to be one per backend in
-/// the agent for the size alone. `name` is the catalogue name and is only
-/// ever used to write the sentence a person reads.
+/// Run sandboxed qemu-img info and validate its document. The catalogue
+/// name is used only for diagnostics.
 pub async fn probe(
     sandbox: &Sandbox,
     qemu_img: &Path,
     path: &Path,
     name: &str,
 ) -> storage::Result<BaseImage> {
-    // A directory, a fifo or a device node under a catalogue name is not an
-    // image. Asked before qemu-img is started, because "qemu-img could not
-    // open it" is a worse sentence than this one and because a fifo would
-    // hang the probe rather than fail it — the sandbox's `RuntimeMaxSec`
-    // would end it a minute later, which is still a minute of a provision.
+    // Require a regular file before starting qemu-img, rejecting directories,
+    // devices and FIFOs without waiting for a sandbox timeout.
     let meta = tokio::fs::metadata(path)
         .await
         .map_err(|e| StorageError::ImageNotFound(format!("{name}: {} ({e})", path.display())))?;
@@ -682,10 +570,8 @@ pub async fn probe(
     judge(name, &info)
 }
 
-/// Write the image out as raw, in the sandbox, onto `dst`.
-///
-/// The destination belongs to the converter for the length of this call and
-/// to the agent again when it returns — see [`HandedOver`].
+/// Convert to raw inside the sandbox. Success requires restoring destination
+/// ownership to the agent; see `HandedOver`.
 pub async fn convert(
     sandbox: &Sandbox,
     qemu_img: &Path,
@@ -706,7 +592,7 @@ pub async fn convert(
         })
 }
 
-/// The same, for a caller that is already on a blocking thread.
+/// Blocking conversion entry point for callers already on a blocking thread.
 pub fn convert_blocking(
     sandbox: &Sandbox,
     qemu_img: &Path,
@@ -726,21 +612,14 @@ pub fn convert_blocking(
         })
 }
 
-/// Read one `qemu-img info --output=json` document and say whether the file
-/// it describes may be converted.
-///
-/// Split from [`probe`] so that the judgement can be tested against the
-/// documents qemu-img really writes, without a qemu-img.
+/// Validate a qemu-img info JSON document independently of invoking the tool.
 pub fn judge(name: &str, info: &[u8]) -> storage::Result<BaseImage> {
     let info: serde_json::Value = serde_json::from_slice(info).map_err(|e| {
         StorageError::Backend(anyhow::anyhow!("qemu-img info json for {name}: {e}"))
     })?;
 
-    // A backing file is the whole finding in one field: it names a SECOND
-    // file, that name is inside the image and was chosen by whoever made it,
-    // and `qemu-img convert` reads it as part of the conversion. Both
-    // spellings, because qemu-img writes the resolved one beside the one the
-    // image holds and an image may carry either.
+    // Reject both backing-path fields because conversion would follow a
+    // second path selected by the image author.
     for field in ["backing-filename", "full-backing-filename"] {
         if let Some(named) = info.get(field).and_then(serde_json::Value::as_str) {
             return Err(StorageError::InvalidSpec(format!(
@@ -750,8 +629,7 @@ pub fn judge(name: &str, info: &[u8]) -> storage::Result<BaseImage> {
             )));
         }
     }
-    // The same thing said the other way round: a qcow2 whose data lives in an
-    // external file is metadata pointing at bytes somewhere else.
+    // Reject qcow2 metadata referencing an external data file.
     if let Some(named) = info
         .pointer("/format-specific/data/data-file")
         .and_then(serde_json::Value::as_str)
@@ -777,11 +655,7 @@ pub fn judge(name: &str, info: &[u8]) -> storage::Result<BaseImage> {
         )));
     }
 
-    // Parsed and not scanned. The document is not flat: `children[0].info`
-    // carries a `virtual-size` of its own for the FILE node — a few hundred
-    // kilobytes for a fresh qcow2 — before the top-level one that describes
-    // the disk. Taking the first match is how a 64M image passes a check
-    // meant to reject it.
+    // Read top-level virtual-size, not a nested child's underlying file size.
     let virtual_size = info
         .get("virtual-size")
         .and_then(serde_json::Value::as_u64)
@@ -797,12 +671,8 @@ pub fn judge(name: &str, info: &[u8]) -> storage::Result<BaseImage> {
     })
 }
 
-/// The argv of the one conversion this stack performs — the qemu-img half of
-/// it, which the sandbox puts after its own `--`.
-///
-/// `-f` is the point of it: without it qemu-img decides for itself what the
-/// source is, every time it opens it, and the decision it makes at convert
-/// time is not the one the probe judged.
+/// Build qemu-img conversion arguments with the probed format pinned by -f,
+/// avoiding another format-autodetection decision.
 pub fn convert_argv(image: &BaseImage, src: &Path, dst: &Path) -> Vec<OsString> {
     vec![
         OsString::from("convert"),
@@ -850,8 +720,7 @@ mod tests {
         serde_json::to_vec(&serde_json::Value::Object(doc.clone())).expect("json")
     }
 
-    /// An image that is whole in itself is converted, and the size that comes
-    /// back is the disk it describes rather than the length of the file.
+    /// Accept self-contained images and report their virtual disk size.
     #[test]
     fn an_image_that_is_whole_in_itself_is_accepted() {
         let judged = judge("noble.qcow2", &info(serde_json::json!({}))).expect("accepted");
@@ -866,10 +735,7 @@ mod tests {
         assert_eq!(raw.format, "raw");
     }
 
-    /// Astra finding S01, 2026-09-23: a backing file names a SECOND file, the
-    /// name is inside the image, and `qemu-img convert` reads it. An image
-    /// somebody uploaded could name a path on the node, and the converter
-    /// runs as the agent.
+    /// Reject backing-file references in either qemu-img JSON spelling.
     #[test]
     fn an_image_that_reads_another_file_is_refused() {
         for field in ["backing-filename", "full-backing-filename"] {
@@ -884,8 +750,7 @@ mod tests {
         }
     }
 
-    /// The same thing said the other way round: the metadata is here and the
-    /// data is somewhere else.
+    /// Reject images with external data files.
     #[test]
     fn an_image_whose_data_is_elsewhere_is_refused() {
         let err = judge(
@@ -903,8 +768,7 @@ mod tests {
         assert!(said.contains("other-tenant"), "and names it: {said}");
     }
 
-    /// A format nobody here has reasoned about is refused by name, so the
-    /// operator learns which one it was.
+    /// Reject unsupported formats and identify them in the error.
     #[test]
     fn a_format_that_is_not_on_the_list_is_refused() {
         let err = judge(
@@ -923,12 +787,7 @@ mod tests {
         assert!(judge("x.raw", serde_json::to_vec(&headless).unwrap().as_slice()).is_err());
     }
 
-    /// The conversion is TOLD what it is reading.
-    ///
-    /// Astra finding S01, 2026-09-23: without `-f` the format is detected
-    /// again at convert time, which is a second decision about a file that
-    /// may have changed since the first one — and the first one is the only
-    /// one anything checked.
+    /// Pin the validated source format during conversion.
     #[test]
     fn the_conversion_is_told_the_format_that_was_judged() {
         let image = BaseImage {
@@ -961,12 +820,7 @@ mod tests {
         }
     }
 
-    /// Every property the sandbox is, in the command line that makes it.
-    ///
-    /// Astra finding S01, 2026-09-23, second half: the conversion used to be
-    /// a subprocess of the agent, which is root by default. This list is
-    /// what it is instead, and a test that reads the list is the only test
-    /// that can be written without a systemd and a node.
+    /// Verify sandbox properties through the generated systemd-run arguments.
     #[test]
     fn the_sandbox_carries_every_property_the_finding_asks_for() {
         let dst = PathBuf::from("/var/lib/meister/volumes/v.tmp");
@@ -1045,9 +899,7 @@ mod tests {
         );
     }
 
-    /// A block device is reached through the device controller, because a
-    /// bind mount does not open a device node and `PrivateDevices` would
-    /// hide the one the conversion is for.
+    /// Block destinations require device access without PrivateDevices hiding them.
     #[test]
     fn a_block_destination_is_named_as_a_device_and_not_bound() {
         let node = PathBuf::from("/dev/dm-7");
@@ -1080,8 +932,7 @@ mod tests {
         );
     }
 
-    /// The probe is inside the same boundary — same parser, same file — and
-    /// it may write nothing at all.
+    /// Run image probing inside the sandbox without writable destinations.
     #[test]
     fn the_probe_is_in_the_same_sandbox_and_writes_nothing() {
         let argv = Sandbox::default()
@@ -1111,7 +962,7 @@ mod tests {
                 .any(|a| a.starts_with("BindPaths=") || a.starts_with("DeviceAllow=")),
             "a probe writes nothing: {said:?}"
         );
-        // Its own deadline, because `qemu-img info` reads a header.
+        // Image probing has a shorter runtime limit.
         assert!(said.contains(&"RuntimeMaxSec=60".to_string()), "{said:?}");
         let separator = said.iter().position(|a| a == "--").expect("a separator");
         assert_eq!(
@@ -1125,8 +976,7 @@ mod tests {
         );
     }
 
-    /// A path with a colon in it would be two paths to systemd. It is
-    /// refused rather than quoted, at the one place that knows.
+    /// Reject path syntax that would change systemd property interpretation.
     #[test]
     fn a_path_a_property_cannot_hold_is_refused() {
         let err = Sandbox::default()
@@ -1141,9 +991,8 @@ mod tests {
         assert!(err.contains("no:ble.qcow2"), "and names it: {err}");
     }
 
-    /// `systemd-run` and `qemu-img` as shell scripts, so that the whole path
-    /// — argv, hand-over, what came back — can be run by a test that is not
-    /// root and has no systemd to ask.
+    /// Scripted systemd-run and qemu-img fixtures exercising arguments, ownership
+    /// and results without root or a system manager.
     struct Fake {
         temp: tempfile::TempDir,
         chowns: Arc<Mutex<Vec<(PathBuf, u32, u32)>>>,
@@ -1267,10 +1116,7 @@ mod tests {
         assert!(fake.qemu_ran(), "and the conversion really happened");
     }
 
-    /// A destination that is ALREADY the converter's is what a run that died
-    /// halfway leaves. It goes back to the agent and not to the converter,
-    /// because the filesystem driver renames that very file into place as
-    /// the guest's volume.
+    /// A leftover destination owned by the converter must be restored to the agent.
     #[tokio::test]
     async fn a_leftover_destination_goes_back_to_the_agent_and_not_to_the_converter() {
         use std::os::unix::fs::MetadataExt;
@@ -1356,17 +1202,13 @@ mod tests {
         assert_eq!(*calls.lock().expect("the count"), 2, "it did try");
     }
 
-    /// No `systemd-run`, no conversion — and no qemu-img either. There is no
-    /// road on which the agent reads the image itself.
-    ///
-    /// Astra finding S01, 2026-09-23: a fallback would mean the most
-    /// privileged path is the one that runs when something is wrong.
+    /// Without systemd-run, fail without invoking an unsandboxed qemu-img.
     #[tokio::test]
     async fn without_systemd_run_the_image_is_refused_rather_than_read_by_the_agent() {
         let fake = Fake::new(true);
         let src = fake.file("noble.qcow2");
         let dst = fake.file("v.tmp");
-        // A node that has everything except the one binary this depends on.
+        // Exercise an unavailable systemd-run executable.
         let sandbox = Sandbox::new(fake.bin("no-systemd-run")).resolved_as(
             4242,
             4343,
@@ -1434,15 +1276,9 @@ mod tests {
         assert!(fake.chowns().is_empty(), "a probe hands nothing over");
     }
 
-    /// The sandbox as it really is, on a node that really has one.
-    ///
-    /// Ignored, and it says why rather than skipping quietly: this needs a
-    /// systemd SYSTEM instance, the right to ask it for a transient unit
-    /// (root, on this fleet), the `meister-convert` account from
-    /// nix/services.nix and a qemu-img. A `--user` unit would not do — a
-    /// user manager has no `User=`, no `DeviceAllow=` worth the name and no
-    /// account to hand a destination to, so a test built on one would be
-    /// green about something else. Run it on an agent node with
+    /// Requires a system systemd instance, permission to create transient
+    /// units, the meister-convert account and qemu-img. A user manager does
+    /// not exercise this isolation boundary. Run explicitly on a test node:
     /// `cargo test -p meister-agent-api -- --ignored`.
     #[tokio::test]
     #[ignore = "needs a systemd system instance, root and the meister-convert account"]
@@ -1499,8 +1335,7 @@ mod tests {
         );
     }
 
-    /// A tool named without a directory is resolved against the AGENT's
-    /// PATH, because systemd would resolve it against the manager's.
+    /// Resolve qemu-img against the agent PATH before invoking the system manager.
     #[test]
     fn the_tool_is_handed_over_as_an_absolute_path() {
         let fake = Fake::new(true);

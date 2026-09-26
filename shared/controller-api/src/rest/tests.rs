@@ -243,14 +243,8 @@ fn a_preflight_is_not_classified_as_anything() {
     );
 }
 
-/// A replica whose store does not answer says so, and says it inside its
-/// own second rather than the store's five.
-///
-/// The endpoint accepts the connection and then goes silent, which is
-/// what a blackholed etcd looks like from here — and it is the case the
-/// bound exists for, because a refused connection was always instant.
-/// The etcd client connects lazily, so the store is built without ever
-/// having spoken to anything.
+/// An accepted but silent store connection must fail readiness within its
+/// own probe deadline, without waiting for the longer store timeout.
 #[tokio::test(start_paused = true)]
 async fn a_replica_that_cannot_read_its_store_is_not_ready() {
     use axum::body::to_bytes;
@@ -291,20 +285,12 @@ async fn a_replica_that_cannot_read_its_store_is_not_ready() {
     );
 }
 
-/// Every refusal this API can give, through the one function that writes
-/// them down.
-///
-/// The point of the shape is that a client switching on `kind` has no
-/// special case left: an error IS an object of this API. So the test
-/// asserts the envelope on every reason rather than the sentence on one.
+/// Every refusal uses the shared Status envelope and machine-readable reason.
 #[tokio::test]
 async fn every_refusal_is_a_status_object_and_names_its_reason() {
     use axum::body::to_bytes;
 
-    // The whole vocabulary, and the status each is paired with. A reason
-    // that appears here with two different codes is two endpoints
-    // answering the same problem differently, which is what keeping the
-    // constructors private is for.
+    // Expected reason/status mappings, independently asserted for each constructor.
     let refusals: Vec<(ApiError, StatusCode, &str)> = vec![
         (
             StoreError::NotFound("vms/web-1".into()).into(),
@@ -453,10 +439,7 @@ fn the_same_value_passes_a_different_one_is_refused_and_the_path_is_named() {
         .expect_err("spec.selector moved");
     assert!(selector.message().starts_with("spec.selector "));
 
-    // A field DROPPED from a PUT body is a field the client means to
-    // clear, and it is refused as such. A PUT already had to read the
-    // object to get its resourceVersion, so round-tripping it is the
-    // normal flow and not a burden this adds.
+    // Omitting a server-owned field from PUT requests clearing it and is refused.
     let cleared = check_owned(&current, &doc(2, None, Some("lab")), fields)
         .expect_err("a dropped server-owned field is a cleared one");
     assert_eq!(cleared.message(), "spec.nodeName is set by the scheduler");
@@ -478,11 +461,8 @@ fn a_path_that_leads_nowhere_reads_as_nothing() {
     assert!(at(&doc, "status.phase").is_null());
 }
 
-/// The pair, exercised through the one function that maintains it.
-///
-/// `carry_generation` runs at the END of an update handler — after the
-/// server has put its own fields back — so what these cases are really
-/// asking is "did the CLIENT leave a different spec behind".
+/// Generation advances only when an admitted update leaves a changed spec
+/// after restoring server-owned fields.
 #[test]
 fn a_write_counts_when_it_leaves_a_different_spec_and_not_otherwise() {
     #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
@@ -522,11 +502,8 @@ fn a_write_counts_when_it_leaves_a_different_spec_and_not_otherwise() {
     carry_generation(&current, &mut next).unwrap();
     assert_eq!(next.metadata.generation, 2);
 
-    // The scheduler's binding travels in the spec and is the SERVER's
-    // decision. It reaches the store through `mutate`, which never comes
-    // through here — so a binding cannot tick the count, and the proof is
-    // that the count follows the spec the handler hands over, whatever a
-    // client tried to put in the field.
+    // Restoring a client-edited binding leaves generation unchanged.
+    // Controller binding mutations bypass client generation accounting.
     let mut next = current.clone();
     next.spec.node = Some("cala".into());
     next.spec.node = current.spec.node.clone(); // what the handler does
@@ -545,10 +522,7 @@ fn a_write_counts_when_it_leaves_a_different_spec_and_not_otherwise() {
     assert_eq!(next.metadata.generation, 1);
 }
 
-/// The Node and Cluster PUT path counts too, and through the same
-/// function: `apply_spec_update` is where those two land, and a cordon is
-/// exactly the kind of intent the pair is for — the cluster reconciler
-/// stops placing on this node, and until it has, the two numbers differ.
+/// Spec-only Node and Cluster updates use the same generation accounting.
 #[test]
 fn a_spec_only_put_counts_the_same_way() {
     let mut current: crate::resources::Node = Object::new(
@@ -610,13 +584,8 @@ impl RacyStore {
     }
 }
 
-/// A cordon that lands in the heartbeat's window is not the client's
-/// problem when the client stated no condition.
-///
-/// `PATCH /nodes/x {"spec":{"schedulable":false}}` names no
-/// `resourceVersion`, so the version in the store's compare-and-swap is
-/// this server's own bookkeeping and losing to the agent's three-second
-/// status write is this server's race to run again.
+/// An unconditional patch retries a CAS race against concurrent status writes;
+/// an explicitly versioned patch retains the client's condition.
 #[tokio::test]
 async fn an_unconditional_patch_runs_the_race_again_and_a_conditional_one_is_told() {
     let unconditional = serde_json::json!({ "spec": { "schedulable": false } });
@@ -629,10 +598,7 @@ async fn an_unconditional_patch_runs_the_race_again_and_a_conditional_one_is_tol
     );
     assert_eq!(store.passes.get(), 2, "read, merged and wrote twice");
 
-    // The same patch WITH a version is a client that stated a condition,
-    // and the condition failed. Retrying would merge its patch onto a
-    // document it has never seen — which is the thing it asked not to
-    // happen.
+    // Do not rebase a patch whose explicit resourceVersion failed.
     let conditional = serde_json::json!({
         "metadata": { "resourceVersion": "41" },
         "spec": { "schedulable": false },
@@ -790,15 +756,8 @@ fn a_row_can_carry_what_is_coming_without_changing_the_refusal() {
     );
 }
 
-/// A third word, because the second one became a lie.
-///
-/// `spec.vm` is immutable in everything except `volumes[]` from its
-/// second entry on, and a form that greyed the whole document out on the
-/// strength of "immutable" would be greying out the one part a tenant may
-/// use. So the row says `structural`, and — the part that matters more —
-/// it is enforced HERE, through the same loop every other row goes
-/// through, rather than by a check beside the table that a third update
-/// handler forgets to call.
+/// Structural VM mutability is enforced through the common table while
+/// allowing referenced-volume changes after the boot entry.
 #[test]
 fn a_structural_row_is_published_as_one_and_enforced_through_the_same_loop() {
     /// Everything but the last element of `list` is frozen — a toy stand
@@ -921,15 +880,7 @@ fn a_discovery_row_names_the_verbs_and_asks_auth_whose_the_objects_are() {
     );
 }
 
-/// A client has to be able to ask what is here BEFORE it knows how to
-/// identify itself. `classify` finds no resource segment in the
-/// group-version path, so the guard hands it straight on — the same pass
-/// /healthz gets, and for a related reason.
-///
-/// `/schemas` is beside it now, which is what the comment over
-/// `SCHEMAS_PATH` always said and what the code did not do: it answered
-/// 401, so a build-time generator needed a credential for a document that
-/// holds nothing but field names. The shape of an object is not a secret.
+/// Discovery and schemas remain readable before authentication.
 #[tokio::test]
 async fn the_discovery_route_answers_a_caller_that_has_no_credential() {
     use tower::ServiceExt;
@@ -976,10 +927,7 @@ async fn the_discovery_route_answers_a_caller_that_has_no_credential() {
     }
 }
 
-/// What the document says under `auth` is what is STANDING, not what the
-/// config named: the default chain names three links and builds none of
-/// them without a CA or a token file, and telling a client otherwise
-/// would send it looking for a certificate nothing would check.
+/// Authentication discovery names built links, excluding unconfigured defaults.
 #[test]
 fn a_chain_names_the_links_it_actually_built() {
     assert_eq!(
@@ -1009,19 +957,8 @@ fn a_chain_names_the_links_it_actually_built() {
     assert_eq!(chain.describe(), "bearer");
 }
 
-/// D11: a link that is configured and cannot authenticate anybody yet says
-/// so, and stops saying so the moment it can.
-///
-/// The lab's cloud offered `auth: "mtls,oidc"` for hours while the provider
-/// was unreachable and no signing key had ever been fetched — every token
-/// would have been refused, and the discovery document promised otherwise.
-/// A client that reads it gets a promise that does not hold and finds out at
-/// the far end.
-///
-/// `:degraded` rather than dropping the word: "this deployment has no
-/// identity provider" and "the identity provider is unreachable" are
-/// different sentences for different people, and one of them is an operator
-/// who has to go and look at Keycloak.
+/// Discovery reflects authentication readiness changes without dropping
+/// the configured authenticator name.
 #[test]
 fn a_link_that_cannot_authenticate_anybody_yet_says_degraded() {
     /// A link whose readiness is not its construction — the shape the oidc
@@ -1057,10 +994,7 @@ fn a_link_that_cannot_authenticate_anybody_yet_says_degraded() {
         "configured is not ready, and the document has to tell them apart"
     );
 
-    // The keys land. Nothing was rebuilt, and the answer changes — which is
-    // the half a snapshot at start-up would have got wrong in the other
-    // direction: at boot nothing has loaded, so a cached string would read
-    // `degraded` for ever.
+    // Readiness changes dynamically after keys load, without rebuilding the chain.
     loading.0.store(true, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(chain.describe(), "mtls,oidc");
 
@@ -1072,11 +1006,8 @@ fn a_link_that_cannot_authenticate_anybody_yet_says_degraded() {
     );
 }
 
-/// One error vocabulary for both tiers' handlers. The row that is a
-/// decision rather than a spelling is the last one: an etcd that did not
-/// ANSWER is a 503 the caller should retry, not a 500 saying the store
-/// broke — and both endpoints have to say it the same way, because one
-/// CLI reads both.
+/// Both tiers map store unavailability to retryable 503 and share the same
+/// error vocabulary.
 #[test]
 fn a_store_error_carries_the_status_both_tiers_agreed_on() {
     let cases = [
@@ -1168,16 +1099,7 @@ fn naming_an_authenticator_that_cannot_be_built_is_an_error() {
     assert!(err.to_string().contains("auth.oidc"), "{err}");
 }
 
-/// The configuration two separate briefs handed a client author, and the
-/// one that cost both of them a day: `chain = ["bearer"]` locks the
-/// control plane out of itself. The chain is per CONTROLLER, the session
-/// ports authenticate by certificate only, and nothing dials one with a
-/// token — so the cloud gets no clusters, the cluster gets no nodes, and
-/// every VM stays Pending while the REST edge answers 200 to everything.
-///
-/// A startup error, because there is nothing to degrade to. The one
-/// exception is a process listening on no session port: it has no peers
-/// to admit, so nothing is locked out.
+/// Configured peer sessions require mTLS; REST-only endpoints are exempt.
 #[test]
 fn a_chain_without_mtls_is_a_startup_error_where_there_are_peers() {
     // As above — and this one never cleaned up at all.
@@ -1223,11 +1145,8 @@ fn oidc_chain(chain: &str, extra: &str) -> AuthConfig {
     ))
 }
 
-/// The tier split, which is not a policy choice but an arithmetic one:
-/// authorization needs a role, a role needs the directory, and the
-/// cluster has no directory. A token there would authenticate somebody
-/// the tier could then permit nothing, which is worse than refusing the
-/// configuration.
+/// Reject OIDC configuration at the cluster tier, which has no user directory
+/// for role resolution.
 #[tokio::test]
 async fn the_cluster_tier_refuses_an_oidc_link_because_it_has_no_directory() {
     let err = build_chain(&oidc_cfg(""), None, None, Tier::Cluster, false).unwrap_err();
@@ -1237,10 +1156,8 @@ async fn the_cluster_tier_refuses_an_oidc_link_because_it_has_no_directory() {
     assert_eq!(chain.len(), 1);
 }
 
-/// Both bearer links read the same header and the chain stops at the
-/// first hard no, so a static-token link in front of the oidc link does
-/// not deprioritise it — it makes it unreachable. The default order has
-/// oidc first for exactly this reason.
+/// Reject bearer-before-OIDC ordering because static-token rejection would
+/// prevent JWT validation.
 #[tokio::test]
 async fn a_static_token_link_in_front_of_the_oidc_link_is_refused() {
     let err = build_chain(
@@ -1316,10 +1233,7 @@ async fn first_login_provisioning_refuses_to_guess_a_tenant() {
     );
 }
 
-/// The default has to do nothing, and "nothing" here has three
-/// independent reasons — so all three are asserted rather than one
-/// standing in for the others. Each of them returns before the store is
-/// ever reached, which is why this can be tested without an etcd.
+/// Each missing first-login prerequisite returns before accessing etcd.
 #[tokio::test]
 async fn first_login_provisioning_does_nothing_unless_everything_asks_for_it() {
     let oidc_user = Identity::new(
@@ -1378,12 +1292,8 @@ fn the_markers_an_oidc_identity_carries_decide_nothing() {
     ));
 }
 
-/// A tier that keeps no user directory authorizes no person at all.
-///
-/// This used to answer with the role the CERTIFICATE claimed, and that is
-/// precisely what made the group in a certificate a permission: a demoted
-/// admin went on being an admin here for the rest of the credential's
-/// life. One directory, and it is the cloud's.
+/// A tier without a directory cannot authorize people from certificate role
+/// labels; machine identities follow separate policy.
 #[tokio::test]
 async fn a_tier_without_a_directory_refuses_a_person_and_lets_the_machines_past() {
     let st = AuthState::anonymous();
@@ -1439,11 +1349,8 @@ fn a_member_may_ask_for_its_own_certificate_and_nobody_elses() {
     assert_eq!(Caller::default().name(), "anonymous");
 }
 
-/// A demoted admin still carries `O=meister:admins` until the
-/// certificate is re-issued. What decides is the directory, or the
-/// demotion would not take effect where it matters most — with
-/// `csr_auto_approve`, requesting somebody else's certificate IS
-/// becoming them.
+/// Directory demotion overrides stale certificate admin labels when checking
+/// permission to request another user's certificate.
 #[test]
 fn a_demoted_admin_stops_being_able_to_ask_for_other_peoples_certificates() {
     let demoted = Caller(Some(Identity::new(
@@ -1464,10 +1371,8 @@ fn a_demoted_admin_stops_being_able_to_ask_for_other_peoples_certificates() {
     );
 }
 
-/// The spec-only PUT, as the two draining routes use it: spec is taken,
-/// server-owned metadata survives, the client's resourceVersion is what
-/// the store will compare against, and a status that differs from the one
-/// held is refused rather than dropped on the floor.
+/// Spec-only PUT preserves server metadata and the client's version condition,
+/// while rejecting altered runtime status.
 #[test]
 fn a_spec_only_put_takes_the_spec_and_refuses_a_written_status() {
     use crate::resources::{Node, NodeSpec, NodeStatus};
@@ -1520,11 +1425,8 @@ fn a_spec_only_put_takes_the_spec_and_refuses_a_written_status() {
     let echoed = serde_json::to_value(&current.status).unwrap();
     assert!(apply_spec_update(put(Some(echoed), "41"), "manacor", current.clone()).is_ok());
 
-    // Echoed back with the heartbeat a GET joins in from the lease, which is
-    // never the instant etcd still holds under that key: still a round trip.
-    // The night D-C7's lease shipped, this was a 422 on every `node label`
-    // and every cordon (S1, S11), because the join moved a field the store
-    // does not.
+    // An echoed heartbeat may differ because GET joins it from the lease;
+    // that difference must not invalidate a spec-only round trip.
     let mut moved = serde_json::to_value(&current.status).unwrap();
     moved["lastHeartbeat"] = serde_json::json!("2027-01-15T08:00:00Z");
     assert!(apply_spec_update(put(Some(moved), "41"), "manacor", current.clone()).is_ok());
@@ -1677,10 +1579,8 @@ fn patching_one_label_leaves_the_others_where_they_were() {
     assert_eq!(body.spec.labels["zone"], "a", "and the rest stayed");
 }
 
-/// The four refusals, and the one that is a decision rather than a
-/// spelling: the type check runs AFTER the merge, so a patch that puts a
-/// string where a bool belongs is a 422 about the object and not a 500
-/// about us.
+/// Malformed values introduced by merging a patch return client validation
+/// errors rather than internal server failures.
 #[test]
 fn a_patch_is_refused_for_the_reason_it_is_wrong() {
     use crate::resources::{Node, NodeSpec};
@@ -1784,14 +1684,8 @@ fn half_a_tls_config_is_refused_rather_than_downgraded() {
     assert!(server_tls(None, None, Some(some), None, None).is_err());
 }
 
-/// The route that saves every client the probe run. Before it, a console
-/// asked `GET /tenants` and `GET /clusters` at startup for no other
-/// reason than to find out what it was allowed to see.
-///
-/// Three shapes, and each says something different: what the directory
-/// established (cloud), what a tier without a directory can honestly say
-/// (cluster: name, groups, tier — and no role), and what a server with no
-/// chain at all believes (anonymous).
+/// Whoami returns directory grants at cloud scope, available identity fields
+/// without a directory, and anonymous state when no chain is configured.
 #[tokio::test]
 async fn whoami_answers_with_the_directory_and_not_with_the_credential() {
     use axum::body::Body;
@@ -1848,14 +1742,8 @@ async fn whoami_answers_with_the_directory_and_not_with_the_credential() {
     assert!(nobody.get("role").is_none());
 }
 
-/// A tier that mints no tickets is a tier where `?ticket=` is not a
-/// credential at all, rather than one where it is a weaker one.
-///
-/// The half of the ticket story that can still be told in process. The other
-/// half — a ticket minted, spent once, and refused at the second replica —
-/// moved to `tests/tickets_etcd.rs` when the tickets moved into etcd: a
-/// redeem is a round trip to the store now, because that is the only place
-/// "once" is true for more than one replica (Fremdsicht 6).
+/// A ticket query parameter is not a credential when ticket auth is disabled.
+/// Cross-replica single-use behavior is covered by the etcd ticket tests.
 #[tokio::test]
 async fn a_ticket_parameter_is_no_credential_at_a_tier_that_mints_none() {
     use axum::body::Body;
@@ -1887,18 +1775,7 @@ async fn a_ticket_parameter_is_no_credential_at_a_tier_that_mints_none() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// One body behind one verb.
-///
-/// There were four shapes before this: the object itself, `{"deleted": name}`,
-/// the same with a resource's extra key, and `{"releasing": …, "attachedTo":
-/// …}`. A client had to know per resource which one a DELETE was about to
-/// hand it — the tofu provider wrote the workaround down and this is the
-/// thing it worked around.
-///
-/// It is the same envelope every refusal wears, so the one rule a client
-/// learns — read `kind` — holds for the whole verb. `202` is the only
-/// difference that means anything: the object is marked and somebody else has
-/// a teardown to run, so it still answers a GET.
+/// DELETE uses the common Status envelope; 202 indicates pending cleanup.
 #[test]
 fn a_delete_answers_one_shape_whatever_the_resource() {
     let gone = removed("Tenant", "acme", Removal::Gone).body();
@@ -1928,13 +1805,8 @@ fn a_delete_answers_one_shape_whatever_the_resource() {
     assert!(held["message"].as_str().unwrap().contains("web-1"));
 }
 
-/// Which kinds a declarative client may wait on, in a form it can read.
-///
-/// "Write, then wait for `observedGeneration >= generation`" needs to know
-/// which kinds carry the field, and there was no way to ask: it arrived on
-/// four kinds and the reference said so in prose, in a document that is
-/// behind the server by construction (tofu). The list is derived from the
-/// same schema `/schemas` publishes, so it cannot drift from it.
+/// Derive observedGeneration support from the published schemas so clients
+/// can identify resource kinds supporting that observation field.
 #[test]
 fn the_discovery_names_the_kinds_that_carry_observed_generation() {
     let doc = discovery_document(Tier::Cloud, "none", PROBE_RESOURCES, &[]);
@@ -1966,12 +1838,7 @@ const PROBE_RESOURCES: &[ApiResource] = &[
         .shaped(schema_of::<crate::resources::Event>),
 ];
 
-/// The five source directories this construction site owns.
-///
-/// Rooted at the workspace and not at this crate: the two controllers, the
-/// CLI and the wire they speak are as much this site's as `controller-api`
-/// is, and a rule that only held for one of them would be a rule the next
-/// brief breaks in the other four.
+/// Workspace source directories covered by the cross-component contract checks.
 #[cfg(test)]
 const SITE: [&str; 5] = [
     "components/cloud-controller/src",
@@ -1981,20 +1848,8 @@ const SITE: [&str; 5] = [
     "shared/proto/src",
 ];
 
-/// Nothing on this construction site writes where somebody else writes, or
-/// binds a port somebody else could be holding.
-///
-/// A run on `main` failed once while another stack was up on this machine —
-/// one failure out of a hundred and twenty-nine, green on the second run —
-/// and a flake nobody can reproduce is a flake everybody learns to re-run
-/// past. Two rules, kept by reading the sources rather than by everybody
-/// remembering: a directory a test writes in comes from `tempfile`, which is
-/// unique and survives a panic; a listener asks for port `0` and reads back
-/// what it was given.
-///
-/// Scoped to the controller half of the tree by name. The agent half has the
-/// same rule and its own copy of this question to answer — the numbers above
-/// are its test binary, not this one.
+/// Check controller test sources for unique temporary paths and dynamic
+/// listener ports. This is a source-pattern guard, not execution isolation.
 #[test]
 fn no_source_of_this_construction_site_names_a_fixed_temp_path_or_port() {
     // Split so that this test's own source does not match itself.
@@ -2064,27 +1919,9 @@ fn bound_address(line: &str) -> Option<&str> {
     addr.contains(':').then_some(addr)
 }
 
-/// No sentence printed from here has a hole in the middle of it.
-///
-/// A message that runs over two source lines needs a backslash at the break;
-/// without it, the indentation of the second line lands inside the sentence
-/// and the operator reads "…the binding was let go while the phase was
-/// Unknown;                  the vm may still be running". Six of these have
-/// been found one at a time, by reading, over four briefs — the fifth and
-/// sixth in `lifecycle.rs`, in a file an earlier brief had already fixed one
-/// in.
-///
-/// The agent half of this construction site keeps the same rule with its own
-/// copy of the question (`no_sentence_of_this_construction_site_is_broken_by_
-/// a_missing_backslash` in `meister-agent`), for the same reason the temp-path
-/// rule above is kept twice: each half must be able to fail on its own.
-///
-/// The shape is exact: a run of four or more spaces inside a string literal,
-/// with the end of a word or a punctuation mark before it and the start of a
-/// lowercase word after it. That is a broken continuation and it is not
-/// anything else — a padded table column and a captured command line both
-/// have runs of spaces in them, and neither has a sentence running through
-/// it.
+/// Look for likely missing string continuations: four or more spaces
+/// between a word/punctuation and a lowercase word. This heuristic guards
+/// operator messages without treating all aligned output as prose.
 #[test]
 fn no_sentence_of_this_construction_site_is_broken_by_a_missing_backslash() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
