@@ -2,36 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Is this host what the fleet says it should be — as data, not as output.
-//!
-//! One pure function over one host: what the manifest declares, what the
-//! snapshot found, and (when there is one) what the release says it should
-//! run. Out come [`CheckResult`]s, which are the same objects a release
-//! records, a receipt carries and a report prints. A check that only
-//! existed as a printed line could be none of those.
-//!
-//! Three rules hold everywhere in here.
-//!
-//! **A host nobody could reach gets `unknown`, never `pass` and never
-//! `fail`.** "It is broken" and "I could not look" are different answers,
-//! and a required `unknown` blocks exactly like a required failure
-//! ([`crate::checks::acceptance`]) — so nothing is lost by being honest, and
-//! an operator can tell a down host from a broken one.
-//!
-//! **`required` comes from the inventory, with three exceptions.**
-//! `checks.required` is the operator's list. `identity`, `enrolled` and
-//! `system` are required whatever it says, and each for its own reason: a
-//! machine whose host key is not the enrolled one is not the machine this
-//! release is about; a host without a service identity is `unenrolled`,
-//! which is a state and never "healthy"; and `check --release` asks whether
-//! the fleet runs that release, so it cannot answer yes about a host that
-//! does not. The three are marked in their `reason`.
-//!
-//! **Nothing here changes anything.** No test VM, no etcd key — the pre-v1
-//! `deploy/check.sh` wrote one (`etcdctl put meister-check`) and that is
-//! exactly the sort of write a read-only verb must not make. The one effect
-//! that remains is honest and unavoidable: an ssh login leaves lines in the
-//! target's journal. That is the probe's footprint, and it is not state.
+//! Pure readiness evaluation from manifest, observation, and optional release. Required
+//! identity, enrolled, and system checks cannot be disabled; other checks follow the
+//! inventory. Unknown observations do not count as passes. Session checks cover units and the
+//! agent socket, not authenticated connectivity between tiers.
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -79,11 +53,8 @@ impl StatusReport {
     }
 }
 
-/// Every check for one host.
-///
-/// Pure: no command, no file, no clock. `duration_ms` is 0 for all of them
-/// because none of them does anything — the time was spent in the probe, and
-/// claiming a duration here would be claiming work.
+/// Evaluate one host without I/O. Durations are zero because probe timing belongs to
+/// observation collection.
 pub fn readiness(
     id: &str,
     host: &ResolvedHost,
@@ -509,14 +480,8 @@ impl Ctx<'_> {
         vec![current, next_boot, booted]
     }
 
-    /// Whether the unit that carries a session upwards is up — and, for an
-    /// agent, whether its own socket answered.
-    ///
-    /// The limit, and it is the honest one: this is a unit and a socket, not
-    /// a session. A controller that accepts connections and rejects this
-    /// node's certificate leaves both of these green. The positive proof
-    /// that a node can do work is `verify --suite vm-lifecycle`, which is
-    /// M4B; what is here is what a read-only probe can say.
+    /// Check the session-bearing unit and, for agents, its local socket. This does not prove
+    /// that a controller accepted the certificate or established an upstream session.
     fn session(&self) -> Option<CheckResult> {
         let unit = session_unit(&self.host.roles)?;
         let is_agent = self.host.roles.iter().any(|r| r == "agent");
@@ -569,8 +534,8 @@ impl Ctx<'_> {
         ))
     }
 
-    /// Every secret the manifest names is there — and a private key is not
-    /// readable by anybody but its owner.
+    /// Check credential presence and reject observed group/other permission bits.
+    /// Missing mode metadata and ownership are not validated.
     fn credentials(&self) -> Option<CheckResult> {
         if self.host.secret_refs.is_empty() {
             return None;
@@ -595,9 +560,7 @@ impl Ctx<'_> {
                 None => unknown.push(&secret.id),
                 Some(None) => missing.push(&secret.id),
                 Some(Some(value)) => {
-                    // A private key whose group or others can read it is a
-                    // key every loader in this codebase refuses (M0 probe
-                    // S11), so the unit that needs it would not start.
+                    // Private-key loaders reject group/other permissions.
                     if !is_certificate(&secret.target_path)
                         && let Some(mode) = mode_of(value)
                         && mode & 0o077 != 0
@@ -761,21 +724,8 @@ pub fn declares_identity(host: &ResolvedHost) -> bool {
         .any(|s| s.kind == SecretKind::IdentityKey)
 }
 
-// --- lane 5B: what is not (or no longer) this fleet's --------------------
-
-/// The verdict about a host that is in a release but not in the inventory
-/// any more.
-///
-/// `not_applicable` and not `unknown`: nobody failed to look at this
-/// machine, and nobody is going to. The inventory is the list of what this
-/// fleet IS, and a host that has left it is outside the question `check`
-/// asks — so it may not block a run, whatever the inventory's `required`
-/// list says about hosts that are still on it.
-///
-/// What the sentence has to carry is WHY the gap is there, because there are
-/// two reasons and they are very different: somebody retired the machine, or
-/// somebody deleted a line. The retirement record is the only thing that can
-/// tell them apart.
+/// Report a host absent from current inventory as unmanaged and NotApplicable. A retirement
+/// record distinguishes explicit retirement from an unexplained inventory removal.
 pub fn unmanaged(id: &str, retired: Option<&crate::state::Retired>) -> CheckResult {
     let reason = match retired {
         Some(record) => format!(
@@ -810,21 +760,8 @@ pub fn unmanaged(id: &str, retired: Option<&crate::state::Retired>) -> CheckResu
     }
 }
 
-/// What a service of the inventory that this fleet does NOT deploy answers,
-/// given what an attempt to reach it found.
-///
-/// `reached` is `None` for a service nobody asked (offline, no endpoint, no
-/// curl) and `Some(sentence)` for one that was asked — the sentence being
-/// what the attempt said. A service this fleet DOES deploy is
-/// `not_applicable` here on purpose: its units are on a host of this fleet
-/// and the host's own checks are the answer; a second verdict over the same
-/// fact would be a second answer to one question.
-///
-/// A `required = false` service that does not answer is a note. A
-/// `required = true` one is `unknown`, and `checks::acceptance` blocks on
-/// it — which is the whole of V25's second half: an external observability
-/// stack that is down stops a run only if the operator said it must be
-/// there.
+/// Evaluate external-service reachability. Managed services use host checks instead. Missing
+/// evidence produces Unknown; only required external services block acceptance.
 pub fn service(
     id: &str,
     service: &crate::manifest::Service,
@@ -896,8 +833,6 @@ pub enum Reached {
     Answered { endpoint: String, detail: String },
     Silent { endpoint: String, detail: String },
 }
-
-// --- end lane 5B ---------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1069,7 +1004,7 @@ mod tests {
     fn a_key_the_group_can_read_is_a_key_no_loader_takes() {
         let (fleet, release) = fleet_and_release();
         let mut observation = observed(&release, at("2026-09-21T12:00:00Z"));
-        // What `LoadCredential` produces, and what M0's probe S11 measured:
+        // The group-readable mode used by LoadCredential is rejected:
         // root:root 0440. Every loader in this codebase refuses it.
         observation
             .hosts

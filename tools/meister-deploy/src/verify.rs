@@ -2,46 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Verification: make the fleet do the thing it exists for, then take it
-//! back out again.
+//! Functional verification through the operator CLI and SSH.
 //!
-//! `check` reads. It asks whether a unit is active and whether a socket is
-//! there, and that is genuinely all it can say — measured in lane 2A and
-//! written down there: a controller that accepts connections and refuses
-//! THIS node's certificate leaves every readiness check green. The positive
-//! proof that a fleet works is a guest that was created through the
-//! operator's own control plane, ran, said something only a booted guest can
-//! say, and was deleted again. That is this module.
+//! VM suites record normal create intent in a persistent ownership ledger,
+//! check running state and console output, then verify removal by listing.
+//! The GPU refusal probe is an exception: accepted creates are recorded only
+//! after the response. RDMA background servers are outside the VM ledger.
 //!
-//! Three properties decide whether such a thing may be run against a fleet
-//! somebody depends on:
-//!
-//! * **The ledger is ahead of the world.** Every resource is written down
-//!   before it is asked for, the way the journal writes `action.irreversible`
-//!   before the step. A run that is killed between the write and the create
-//!   leaves a ledger entry for a guest that may or may not exist, and the
-//!   cleanup then looks — which is the only order in which a crash cannot
-//!   leak something nobody knows about. The other order leaks silently.
-//! * **Cleanup takes only what this run made.** A resource is removed only
-//!   when its ledger entry belongs to this run AND its name carries this
-//!   run's tag. A guest that somebody else called `meister-verify-other-1`
-//!   is not this run's, and a verification that tidies up somebody's estate
-//!   is a verification nobody will run twice.
-//! * **A cleanup that worked proves nothing.** Removing the guests is not a
-//!   result; it is the cost of having had them. The verdict comes from the
-//!   [`CheckResult`]s, and a resource that could not be removed becomes one
-//!   MORE check — `unknown`, with the name in it — rather than a silent
-//!   success.
-//!
-//! And one property decides whether the result is worth anything:
-//! **`hardware` evidence is measured, never declared.** An inventory that
-//! says a host has a GPU is an inventory; the snapshot that says
-//! `/dev/vfio/vfio` is there is a measurement. So every piece of evidence
-//! this module emits is [`EvidenceKind::Vm`] or [`EvidenceKind::Command`]
-//! unless the snapshot of the machine the guest actually ran on says the
-//! capability was there, and a run whose guests were answered by a
-//! [`crate::run::StrictFake`] is [`EvidenceKind::Mock`] throughout. A CPU
-//! mock is not evidence that a GPU works, and `report` prints the two apart.
+//! Checks determine acceptance separately from cleanup. Evidence classification
+//! uses observed capabilities, reported placement and an explicit mock flag;
+//! missing placement falls back to the requested host. These observations do
+//! not prove GPU computation or complete coverage of selected hosts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -65,53 +36,37 @@ use crate::state::StateDir;
 pub const LEDGER_SCHEMA: &str = "meister-deploy/verify-ledger/1";
 pub const VERIFY_SCHEMA: &str = "meister-deploy/verify/1";
 
-/// How long one call of the operator's cli may take.
-///
-/// A `vm create` is one POST and the answer is "it is recorded", so this is
-/// generous rather than tight; what a guest then takes to boot is
-/// [`Options::settle`] and is counted in polls, not in this.
+/// Deadline for one operator CLI command; guest startup has a separate settle window.
 pub const CLI_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long a guest gets to reach a phase, and how often it is asked.
 pub const SETTLE: Duration = Duration::from_secs(120);
 pub const POLL: Duration = Duration::from_secs(2);
 
-/// The whole run, when nobody said otherwise.
+/// Default run deadline.
 pub const DEADLINE: Duration = Duration::from_secs(1800);
 
 /// How long ONE fabric measurement may take.
 pub const FABRIC_DEADLINE: Duration = Duration::from_secs(120);
 
-/// How many round trips `rping` is asked for. Ten, because one proves a
-/// connection and ten prove it keeps working — and because a hundred would
-/// make a failure take a hundred times as long to find.
+/// Number of round trips requested from `rping`.
 pub const RPING_ROUNDS: usize = 10;
 
-/// How long each perftest measurement runs, in seconds. Five: long enough
-/// that a link settles, short enough that a fleet of pairs is minutes and
-/// not an afternoon.
+/// Duration of each perftest measurement, in seconds.
 pub const FABRIC_SECONDS: u32 = 5;
 
-/// How many guests may be alive at once when nobody said otherwise.
-///
-/// Two, so that the default run makes three guests per host: one on its own
-/// first — a canary, because a suite that starts its whole budget and then
-/// finds the image is wrong has made the same mistake three times — and then
-/// a batch of `budget`. The count of create/delete pairs per host is
-/// therefore `1 + budget`.
+/// Default VM lifecycle batch size. Each selected host requests one canary
+/// and then this many guests; retained or lost guests can exceed the batch size.
 pub const BUDGET: usize = 2;
 
-/// The line `nix/packages/guest-tiny.nix` writes on the serial console as
-/// its first act. One string, in one place, and the package writes the same
-/// one into `$out/marker`.
+/// Serial marker emitted by `nix/packages/guest-tiny.nix` and stored in `$out/marker`.
 pub const TINY_MARKER: &str = "MS-S0-TINY-OK";
 
 // ---------------------------------------------------------------------------
 // the contract
 // ---------------------------------------------------------------------------
 
-/// Which suite. Not a free string: a typo in a suite name must be a sentence
-/// and not an empty run that reports nothing and exits 0.
+/// Supported functional suites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Suite {
@@ -158,14 +113,11 @@ pub enum ResourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceState {
-    /// Written down before it was asked for. A resource in this state at the
-    /// end of a run is one the cleanup has not reached yet.
+    /// Create intent recorded; existence or removal has not yet been resolved.
     Created,
-    /// Gone, and that was checked rather than assumed: the delete returned
-    /// and the name is no longer in the listing.
+    /// Removal verified by absence from the control-plane listing.
     Deleted,
-    /// It could not be removed, or the listing still has it. The run says so
-    /// with a check of its own, and somebody has to go and look.
+    /// Removal or its verification failed; the resource may still exist.
     Lost,
 }
 
@@ -185,24 +137,17 @@ impl std::fmt::Display for ResourceState {
     }
 }
 
-/// One thing this run made, and what became of it.
-///
-/// `host` is where it RAN, not where it was asked for: the operator's cli
-/// has no way to name a node (`components/cli` has `vm create <name> -f`,
-/// and placement is the scheduler's), so the suite reads the binding back
-/// out of the created object. That is also what decides whether the
-/// evidence may be called `hardware`, because the capability that matters is
-/// the one on the machine that actually ran the guest.
+/// Resource owned by this verification run.
+/// `host` starts as the selected host and is updated from scheduler placement
+/// when available. VM specifications do not request placement on that host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Resource {
     pub kind: ResourceKind,
-    /// The control plane's own id, once it has answered with one. `null`
-    /// between the ledger write and the create, which is the window this
-    /// order exists for.
+    /// Control-plane UID, when returned by create or get.
     pub id: Option<String>,
     pub name: String,
-    /// Empty until the guest is placed — see the type's own note.
+    /// Selected host initially; replaced by reported placement when available.
     pub host: String,
     pub created_at: DateTime<Utc>,
     pub state: ResourceState,
@@ -216,8 +161,7 @@ pub struct Ledger {
     pub run_id: String,
     pub release_id: String,
     pub suite: Suite,
-    /// `meister-verify-<run_id>`. Every name this run makes starts with it,
-    /// and nothing without it is ever deleted.
+    /// Run-specific name prefix required by cleanup.
     pub tag: String,
     pub started_at: DateTime<Utc>,
     pub resources: Vec<Resource>,
@@ -247,8 +191,7 @@ impl Ledger {
         Ok(bytes)
     }
 
-    /// What this run still holds, as far as the ledger knows: everything
-    /// that is not known to be gone, `lost` included.
+    /// Resources not verified deleted, including failed cleanup attempts.
     pub fn outstanding(&self) -> Vec<&Resource> {
         self.resources
             .iter()
@@ -256,10 +199,7 @@ impl Ledger {
             .collect()
     }
 
-    /// What nobody has tried to remove yet. `lost` is deliberately not here:
-    /// it has been tried, it has its own check, and a second attempt in the
-    /// same breath would only produce a second sentence about the same
-    /// thing.
+    /// Resources not yet processed by cleanup. Lost resources are not retried in this pass.
     pub fn untried(&self) -> Vec<&Resource> {
         self.resources
             .iter()
@@ -288,8 +228,7 @@ pub struct VerifyRun {
     /// The hosts the suite was asked about, frozen at the start.
     pub hosts: Vec<String>,
     pub checks: Vec<CheckResult>,
-    /// The ledger as it stood when the run ended. The file beside it is the
-    /// live one; this is the copy the receipt argues from.
+    /// Ledger snapshot at completion; the adjacent ledger file remains the live record.
     pub ledger: Ledger,
     pub ledger_path: String,
 }
@@ -306,12 +245,7 @@ impl VerifyRun {
         Ok(bytes)
     }
 
-    /// The checks whose evidence came off real hardware, and the rest.
-    ///
-    /// The split `report` prints, kept here so that the rule lives with the
-    /// contract rather than in a formatter: evidence of kind `hardware` is
-    /// the only kind that says a device was there, and a reader who cannot
-    /// see the boundary will read a mock as a measurement.
+    /// Separate checks with `hardware` evidence from all other evidence kinds.
     pub fn hardware_evidence(&self) -> (Vec<&CheckResult>, Vec<&CheckResult>) {
         self.checks
             .iter()
@@ -328,32 +262,22 @@ impl VerifyRun {
 pub struct Options {
     pub run_id: String,
     pub suite: Suite,
-    /// The most guests that may be alive at once. It is a count of LIVING
-    /// guests and not a count of threads: the commands themselves go out one
-    /// after another, because the only runner the tests are allowed to use
-    /// is a strict sequence and untestable concurrency in the code that
-    /// creates virtual machines on somebody's fleet is worth less than a
-    /// slower suite.
+    /// VM lifecycle batch size, normalized to at least one.
+    /// This does not cap all live resources across hosts, retained guests or the GPU suite.
     pub budget: usize,
-    /// The whole run. When it passes, whatever is running is cleaned up and
-    /// the outcome is `aborted`.
+    /// Run deadline checked between work steps; cleanup runs after expiry.
     pub deadline: Duration,
-    /// Leave the guests where they are and say so. For somebody who wants to
-    /// look at one that misbehaved.
+    /// Retain guests for inspection; required cleanup checks remain skipped.
     pub keep: bool,
-    /// `[operator] cli_config` / `cli_profile` (D7). Without it there is no
-    /// control plane to ask, and every host is `blocked`.
+    /// Operator CLI configuration and optional profile required for control-plane commands.
     pub control: Option<WorkloadControl>,
     /// How long a guest gets to reach a phase.
     pub settle: Duration,
     pub poll: Duration,
     pub cli_deadline: Duration,
-    /// `--pairs <a>:<b>`, for the rdma suite. Empty means every pair the
-    /// inventory declares among the selected hosts.
+    /// Explicit RDMA pairs. Empty selects pairs sharing the first three storage-address octets.
     pub pairs: Vec<(String, String)>,
-    /// How long ONE fabric measurement may take. Longer than a cli call,
-    /// because `ib_write_bw -D 10` is ten seconds of work by construction
-    /// and a fabric that is being set up takes longer than one that is.
+    /// Deadline for one fabric command.
     pub fabric: Duration,
 }
 
@@ -382,23 +306,15 @@ pub struct Step {
     pub what: String,
 }
 
-/// The driver.
-///
-/// It owns the ledger and writes it through [`Files`], asks the world
-/// through [`Runner`], and reads the clock through [`Clock`] — so the whole
-/// of it, including the deadline and the waits, is a test with a fake clock
-/// rather than a test that sleeps.
+/// Verification coordinator with injected command, file and clock effects.
 pub struct Verifier<'a> {
     runner: &'a dyn Runner,
     files: &'a dyn Files,
     clock: &'a dyn Clock,
     cancel: Cancel,
-    /// The runner the cleanup uses. `None` falls back to the one above,
-    /// which is right for a test and wrong for an interrupted run: see
-    /// [`crate::run::Real::stoppable`].
+    /// Optional runner for final cleanup, typically unaffected by the run cancellation token.
     cleanup_runner: Option<&'a dyn Runner>,
-    /// Whether the cleanup is what is running. It decides which runner the
-    /// next command goes through and nothing else.
+    /// Selects the cleanup runner during the final cleanup phase.
     cleaning_up: bool,
     state: StateDir,
     release: &'a ReleaseManifest,
@@ -414,9 +330,7 @@ pub struct Verifier<'a> {
     started_at: DateTime<Utc>,
     /// Guest numbers within this run, so a name is unique across hosts.
     made: usize,
-    /// Whether anything this run did was answered by a real program. A run
-    /// whose runner is a fake says `mock` on every piece of evidence, and
-    /// that is decided here rather than guessed by a reader.
+    /// Explicit mock-evidence flag. The runner type is not detected automatically.
     mock: bool,
 }
 
@@ -461,17 +375,13 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// The token that ends a run early. `apply` and `verify` share the
-    /// process-wide SIGINT handler; this is how a test interrupts one.
+    /// Cancellation token shared with the CLI interrupt handler.
     pub fn with_cancel(mut self, cancel: Cancel) -> Verifier<'a> {
         self.cancel = cancel;
         self
     }
 
-    /// The runner the cleanup is to use, which is the one the operator's
-    /// interrupt does not reach: taking the guests back is the work an
-    /// interrupt ASKS for, and a runner that honoured it would kill the
-    /// delete it had just started.
+    /// Use a separate runner for final cleanup so cancellation does not stop its deletes.
     pub fn with_cleanup_runner(mut self, runner: &'a dyn Runner) -> Verifier<'a> {
         self.cleanup_runner = Some(runner);
         self
@@ -485,15 +395,13 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// Say that every answer in this run came from a fake, so no evidence may
-    /// claim to be more than a mock.
+    /// Mark all results as mock evidence.
     pub fn as_mock(mut self) -> Verifier<'a> {
         self.mock = true;
         self
     }
 
-    /// How to reach both ends of a fabric pair. Only the rdma suite needs
-    /// it; the guest suites talk to a control plane and never to a host.
+    /// SSH transport for RDMA pairs; VM suites use the operator control plane.
     pub fn over_ssh(
         mut self,
         ssh: &'a crate::transport::Ssh,
@@ -578,11 +486,8 @@ impl<'a> Verifier<'a> {
 
     // --- the ledger -------------------------------------------------------
 
-    /// Write the ledger down, whole, atomically.
-    ///
-    /// Called before every create and after every state change. It is a
-    /// small file and it is written often on purpose: the value of it is
-    /// entirely that it is on the disk when this process stops existing.
+    /// Persist the whole ledger atomically. Normal creates call this before issuing commands;
+    /// the GPU refusal probe records an accepted create after its response.
     fn save_ledger(&self) -> Result<()> {
         self.files
             .write_atomic(&self.ledger_path(), &self.ledger.to_json()?, 0o644)
@@ -629,14 +534,8 @@ impl<'a> Verifier<'a> {
 
     // --- the operator's cli ----------------------------------------------
 
-    /// `meister --config <cli_config> [-p <profile>] -o json …`, on the
-    /// WORKSTATION.
-    ///
-    /// The same door D7 opens for `node cordon`: a verification asks the
-    /// control plane for a guest, because that is what an operator does and
-    /// because it is the only path that exercises the session between the
-    /// tiers. A guest made at the node's own socket would prove the
-    /// hypervisor works and say nothing about the fleet.
+    /// Build workstation `meister --config … [-p …] -o json` commands.
+    /// Using the operator control plane exercises controller sessions and scheduling.
     fn cli(&self, effect: Effect) -> Result<Cmd> {
         let control = self.options.control.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -661,12 +560,8 @@ impl<'a> Verifier<'a> {
 
     // --- the run ----------------------------------------------------------
 
-    /// Run the suite, clean up whatever it made, and say what it found.
-    ///
-    /// It returns `Ok` for a suite that failed: a failing check is an answer
-    /// and the exit code is the caller's to derive from
-    /// [`crate::checks::acceptance`]. `Err` is for the run itself not being
-    /// possible — no cli reference, a ledger that cannot be written.
+    /// Run checks, attempt cleanup and persist the receipt.
+    /// Failed checks are returned in the receipt; setup or persistence errors may return `Err`.
     pub fn run(&mut self) -> Result<VerifyRun> {
         self.state
             .begin_run(self.files, &self.options.run_id.clone())?;
@@ -678,9 +573,7 @@ impl<'a> Verifier<'a> {
             Suite::Rdma => self.rdma(),
         };
 
-        // Whatever happened above, what this run made is this run's to take
-        // back. A suite that failed halfway is exactly the run whose guests
-        // would otherwise stay.
+        // Attempt cleanup even when a suite returns an error.
         let interrupted = match outcome {
             Ok(()) => self.cancel.is_cancelled() || self.out_of_time(),
             Err(ref e) => {
@@ -739,7 +632,7 @@ impl<'a> Verifier<'a> {
             .unwrap_or(false)
     }
 
-    /// The deadline and the interrupt, as one question with one sentence.
+    /// Check cancellation and the run deadline.
     fn keep_going(&self) -> Result<()> {
         if self.cancel.is_cancelled() {
             bail!(
@@ -762,20 +655,9 @@ impl<'a> Verifier<'a> {
         self.checks.push(check);
     }
 
-    /// The evidence kind a guest on this node earns.
-    ///
-    /// Three conditions, and all three have to hold:
-    ///
-    /// * the answer came from a real program and not from a fake;
-    /// * the SNAPSHOT of the machine the guest RAN ON says the capability
-    ///   was there — not the inventory, which is a declaration;
-    /// * the step actually happened. A `vm create` the control plane refused
-    ///   produced no guest, so it is evidence about a control plane and not
-    ///   about hardware, and printing it under "hardware evidence" would put
-    ///   a failure nobody measured on a machine beside the ones somebody
-    ///   did. Measured: the first real run of this suite refused every
-    ///   create (a 422 from the cluster tier) and the report still listed
-    ///   six checks as hardware evidence.
+    /// Classify evidence using the mock flag, a capability in the supplied node's
+    /// observation and whether the step happened. Callers may supply the selected
+    /// host when placement is unavailable.
     fn evidence_kind(&self, node: &str, capability: &str, happened: bool) -> EvidenceKind {
         if self.mock {
             return EvidenceKind::Mock;
@@ -789,14 +671,8 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// Whether this suite's verdict for this host decides the run.
-    ///
-    /// From `checks.functional` in the inventory, which is the field the
-    /// operator already has for exactly this: "these functional checks must
-    /// pass on this host". A host that does not name the suite is still
-    /// verified and still reported — it simply does not block, which is what
-    /// makes `verify --suite gpu` over a mixed fleet useful rather than a
-    /// wall of refusals.
+    /// Whether `checks.functional` requires this suite on the host.
+    /// Optional checks are reported without blocking acceptance.
     fn required_for(&self, id: &str) -> bool {
         self.fleet()
             .hosts
@@ -828,8 +704,8 @@ impl<'a> Verifier<'a> {
 
     // --- suite: vm-lifecycle ---------------------------------------------
 
-    /// Guests, through the operator's control plane, on every host that runs
-    /// them.
+    /// Request lifecycle guests for each applicable selected host.
+    /// The scheduler chooses their actual placement.
     fn vm_lifecycle(&mut self) -> Result<()> {
         let hosts = self.hosts.clone();
         for id in hosts {
@@ -869,8 +745,7 @@ impl<'a> Verifier<'a> {
             let kernel = self.guest_tiny()?;
             let total = self.guests_per_host();
             let mut all_good = true;
-            // One alone, then the rest together: the canary, and then as
-            // many at once as the budget allows.
+            // Run one canary, then the configured batch.
             let mut done = 0usize;
             while done < total {
                 self.keep_going()?;
@@ -903,8 +778,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// One round: create `n` guests, let them all be alive at once, read
-    /// each one, then delete them all.
+    /// Create a batch, check each guest, then attempt deletion of each resource.
     fn lifecycle_batch(&mut self, id: &str, kernel: &GuestTiny, n: usize) -> Result<bool> {
         let mut names = Vec::new();
         let mut good = true;
@@ -920,9 +794,7 @@ impl<'a> Verifier<'a> {
             good &= self.read_console(id, name)?;
         }
         for name in &names {
-            // NOT `keep_going`: a deadline that stopped the deletes would
-            // leave the guests behind, and the cleanup below is what an
-            // interrupted run relies on. The deletes are the cheap half.
+            // Attempt deletes even after the run deadline. These still use the current phase runner.
             good &= self.delete_guest(id, name)?;
         }
         Ok(good)
@@ -992,9 +864,7 @@ impl<'a> Verifier<'a> {
                 check.observed = "it was refused".to_string();
                 check.reason = format!("{e:#}");
                 self.record(check);
-                // The ledger entry stays `created`: a create that returned
-                // an error may still have made the object, and the cleanup
-                // is what finds out.
+                // A failed response may follow a successful create; leave intent for cleanup.
                 Ok(false)
             }
         }
@@ -1003,10 +873,7 @@ impl<'a> Verifier<'a> {
     /// Poll until the object says `Running`, or say what it did say.
     fn await_running(&mut self, id: &str, name: &str) -> Result<bool> {
         let started = self.clock.now();
-        // The initial value is the one a run that was interrupted before it
-        // could ask anything ends up reporting, which is why the interrupt
-        // is looked at FIRST: a guest nobody got to look at is `unknown` and
-        // not a guest that failed to start.
+        // Until observed, startup remains unknown, including cancellation before the first poll.
         let mut last = "nothing was asked: the run was interrupted".to_string();
         let mut node = None;
         let mut status = Status::Unknown;
@@ -1031,8 +898,7 @@ impl<'a> Verifier<'a> {
                         status = Status::Pass;
                         break;
                     }
-                    // A guest that came to rest somewhere else is not going
-                    // to move on its own, so there is nothing to wait for.
+                    // Stop polling terminal failure phases.
                     if last == "Failed" || last == "Quarantined" {
                         break;
                     }
@@ -1082,17 +948,8 @@ impl<'a> Verifier<'a> {
         Ok(pass)
     }
 
-    /// Read what the guest printed, and look for the one line only a booted
-    /// guest-tiny prints.
-    ///
-    /// Polled and not asked once, and the reason is a measurement: the
-    /// node's serial line is a SOCKET, and the file `vm logs` reads exists
-    /// only once the agent's reconcile pass has attached a recorder to it.
-    /// That pass runs every thirty seconds, so a guest that booted in 0.8 s
-    /// has an empty console for up to half a minute — and cloud-hypervisor
-    /// holds a 1 MiB ring in the meantime and replays it, so nothing is
-    /// lost, it is only late. Asking once would have called every healthy
-    /// guest a guest that never booted.
+    /// Poll console output for the guest marker.
+    /// Recording can attach after the guest boots, so one empty read is inconclusive.
     fn read_console(&mut self, id: &str, name: &str) -> Result<bool> {
         let started = self.clock.now();
         let cmd = self
@@ -1102,8 +959,7 @@ impl<'a> Verifier<'a> {
             .arg(name)
             .arg("--lines")
             .arg("200");
-        // The verdict a run that was interrupted before it could ask even
-        // once ends up with: nobody looked, so nobody knows.
+        // No console observation leaves an unknown verdict.
         let mut status = Status::Unknown;
         let mut observed = "nothing was recorded".to_string();
         let mut reason = String::new();
@@ -1201,11 +1057,7 @@ impl<'a> Verifier<'a> {
     fn delete_guest(&mut self, id: &str, name: &str) -> Result<bool> {
         let started = self.clock.now();
         if self.options.keep {
-            // `--keep` is for somebody who wants to look at a guest that
-            // misbehaved, so the guest stays — and the step that was not
-            // taken is `skipped` rather than absent. A required suite is
-            // therefore BLOCKED by `--keep`, which is right: a lifecycle
-            // that never deleted anything has not shown a lifecycle.
+            // Retained guests produce skipped cleanup checks, blocking required suites.
             let mut check = self.check("vm.delete", id, Subject::resource(name), Status::Skipped);
             check.expected = format!("{name} is gone from the control plane");
             check.observed = "--keep: it was left standing".to_string();
@@ -1250,15 +1102,8 @@ impl<'a> Verifier<'a> {
 
     // --- suite: gpu -------------------------------------------------------
 
-    /// Passthrough, repeated, and a refusal that has to be a refusal.
-    ///
-    /// The guests here carry one PCI device each, out of the host's declared
-    /// `hardware.gpus`. What this suite deliberately does NOT do is claim a
-    /// computation: `guest-tiny` is busybox and a kernel, there is no CUDA
-    /// or nvrm userland in this repository, and a suite that reported "the
-    /// GPU works" on the strength of a PCI id in `/sys` would be the exact
-    /// sort of green line this tool exists to refuse. That half is
-    /// `not_applicable` with the sentence saying what would have to exist.
+    /// Repeat VFIO guest creation for up to two declared GPUs, then probe invalid-device refusal.
+    /// The current guest cannot prove in-guest PCI visibility or GPU computation.
     fn gpu(&mut self) -> Result<()> {
         let hosts = self.hosts.clone();
         for id in hosts {
@@ -1287,9 +1132,7 @@ impl<'a> Verifier<'a> {
                 self.record(check);
                 continue;
             }
-            // Declared AND reachable, and the machine does not have the
-            // device node the driver needs: that is a measurement, and it is
-            // a failure of the host rather than a reason to skip.
+            // A reachable host missing the declared VFIO capability fails the check.
             if !self.measured(&id, "vfio") {
                 let mut check = self.check("gpu", &id, Subject::host(&id), Status::Fail);
                 check.expected = "/dev/vfio/vfio on a host that declares a GPU".to_string();
@@ -1310,9 +1153,7 @@ impl<'a> Verifier<'a> {
             let kernel = self.guest_tiny()?;
             let gpus: Vec<String> = host.hardware.gpus.iter().map(|g| g.pci.clone()).collect();
             let mut good = true;
-            // Two guests with a device each, five rounds: a passthrough that
-            // works once and leaks the device on teardown is the failure
-            // this repeats for.
+            // Five rounds exercise repeated attachment and teardown for up to two devices.
             for _ in 0..GPU_ROUNDS {
                 self.keep_going()?;
                 let mut names = Vec::new();
@@ -1405,13 +1246,7 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// Whether the guest can see the device it was given.
-    ///
-    /// `guest-tiny` is busybox without `lspci` and without `/usr/share/pci.ids`,
-    /// so what can be read is `/sys/bus/pci/devices` — and that is only
-    /// reachable through the console, which this guest does not offer a shell
-    /// on. So the answer here is `unknown` with the sentence saying so, and
-    /// not a pass: an image with PCI tooling is what would turn it into one.
+    /// Return unknown: guest-tiny has no console shell or PCI inspection interface.
     fn gpu_seen(&mut self, id: &str, name: &str) -> Result<bool> {
         let ran_on = self.node_of(name).unwrap_or_else(|| id.to_string());
         let mut check = self.check("gpu.in-guest", id, Subject::resource(name), Status::Unknown);
@@ -1430,8 +1265,7 @@ impl<'a> Verifier<'a> {
         Ok(true)
     }
 
-    /// A device that is not there has to be refused, and the refusal is the
-    /// pass.
+    /// Request an invalid PCI address. Any nonzero CLI exit currently counts as refusal.
     fn gpu_refusal(&mut self, id: &str, kernel: &GuestTiny) -> Result<bool> {
         let dir = self.state.run_dir(&self.options.run_id).join("specs");
         self.files.create_dir_all(&dir)?;
@@ -1472,8 +1306,7 @@ impl<'a> Verifier<'a> {
                 Ok(true)
             }
             Ok(_) => {
-                // It was accepted. Whatever that made is ours, so it goes in
-                // the ledger and the cleanup takes it.
+                // Only accepted responses are recorded here; failed or lost responses have no ledger entry.
                 self.made += 1;
                 self.ledger.resources.push(Resource {
                     kind: ResourceKind::Vm,
@@ -1501,7 +1334,7 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// The half of the GPU suite this repository cannot honestly run.
+    /// Report GPU computation as not applicable for the current guest image.
     fn gpu_compute_not_applicable(&mut self, id: &str) {
         let mut check = self.check("gpu.compute", id, Subject::host(id), Status::NotApplicable);
         check.expected =
@@ -1517,21 +1350,12 @@ impl<'a> Verifier<'a> {
 
     // --- suite: rdma ------------------------------------------------------
 
-    /// Three measurements between two hosts that DECLARE a fabric to each
-    /// other, and nothing between any other two.
-    ///
-    /// A round trip, a latency and a bandwidth, each server-on-A and
-    /// client-on-B over ssh, each its own [`CheckResult`]. The declaration
-    /// is what makes a pair: two hosts with `hardware.nics[].rdma = true` on
-    /// the same `networks.storage`. This suite never guesses a peer — a
-    /// bandwidth test invents neither of its two ends — and it never reads a
-    /// number off a machine whose snapshot has no fabric device.
+    /// Run ping, latency and bandwidth measurements over SSH for each selected RDMA pair.
+    /// Default pairing uses storage-address text, not the configured network prefix.
     fn rdma(&mut self) -> Result<()> {
         let hosts = self.hosts.clone();
         let pairs = self.pairs()?;
-        // Every host of the selection gets a verdict, even the ones that
-        // are in no pair: a suite that silently covered two of seventy
-        // hosts is a suite whose green line means nothing.
+        // Report hosts with no applicable RDMA pair before starting measurements.
         for id in &hosts {
             self.keep_going()?;
             let Some(host) = self.fleet().hosts.get(id).cloned() else {
@@ -1569,9 +1393,7 @@ impl<'a> Verifier<'a> {
                 .unreachable(&server)
                 .or_else(|| self.unreachable(&client))
             {
-                // Declared and unreachable: `skipped`, and a required
-                // `skipped` blocks (V22). Never `not_applicable`, which is
-                // the one non-pass that lets a run through.
+                // Required skipped checks block acceptance.
                 let mut check = self.check("rdma.pair", &server, subject, Status::Skipped);
                 check.expected = format!("{server} and {client} both answering");
                 check.observed = reason.clone();
@@ -1608,8 +1430,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// The pairs to measure: what `--pairs` named, or every declared pair of
-    /// the selection, each one once.
+    /// Use explicit pairs, or enumerate selected peers with matching storage-address prefixes.
     fn pairs(&self) -> Result<Vec<(String, String)>> {
         if !self.options.pairs.is_empty() {
             for (a, b) in &self.options.pairs {
@@ -1636,9 +1457,7 @@ impl<'a> Verifier<'a> {
         let mut out: Vec<(String, String)> = Vec::new();
         for (id, others) in &peers {
             for other in others {
-                // Each unordered pair once: which end is the server is this
-                // suite's decision and the lower id takes it, so two runs
-                // of the same fleet measure the same direction.
+                // Visit unordered pairs once, with the lexicographically smaller ID as server.
                 if id < other {
                     out.push((id.clone(), other.clone()));
                 }
@@ -1647,15 +1466,8 @@ impl<'a> Verifier<'a> {
         Ok(out)
     }
 
-    /// A server that does not block this run.
-    ///
-    /// The three tools are all server-on-one-end, client-on-the-other, and
-    /// every server of them BLOCKS until a client has been and gone. The
-    /// only runner these tests may use is a strict sequence, so a server in
-    /// the foreground would hold the run for ever — and a second thread
-    /// would be concurrency no test could fix. So the server is started in
-    /// the background ON THE TARGET, its pid comes back on stdout, and it is
-    /// killed afterwards whatever the client did.
+    /// Start the remote server in the background and return its PID.
+    /// The caller stops it after the client command; it is not recorded in the VM ledger.
     fn start_server(&self, host: &str, argv: &[String], log: &str) -> Result<(Cmd, String)> {
         let target = self.target(host)?;
         let script = format!(
@@ -1675,9 +1487,7 @@ impl<'a> Verifier<'a> {
         Ok((cmd, out.trimmed().to_string()))
     }
 
-    /// Take the server down, and say nothing if it had already gone: these
-    /// servers exit on their own when their client disconnects, and a kill
-    /// of a pid that is not there is the normal case rather than an error.
+    /// Best-effort remote kill; an already-exited process is accepted.
     fn stop_server(&self, host: &str, pid: &str, log: &str) -> Result<String> {
         let target = self.target(host)?;
         let script = format!("kill {pid} 2>/dev/null; cat {log} 2>/dev/null; true");
@@ -1885,9 +1695,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// The address on the fabric, which is `networks.storage` and never the
-    /// management address: a measurement over the wrong wire is a number
-    /// that looks like an answer.
+    /// Read the server storage-network address; do not substitute its management endpoint.
     fn storage_address(&self, id: &str) -> Result<String> {
         let host = self
             .fleet()
@@ -1921,21 +1729,15 @@ impl<'a> Verifier<'a> {
         Ok(crate::transport::Target::from_endpoint(id, endpoint))
     }
 
-    /// `hardware` only where the SNAPSHOT of that machine found a fabric
-    /// device — the same rule the guest suites follow, for the same reason.
+    /// Classify fabric evidence from the observed RDMA capability and mock flag.
     fn fabric_evidence(&self, id: &str) -> EvidenceKind {
         self.evidence_kind(id, "rdma", true)
     }
 
     // --- cleanup ----------------------------------------------------------
 
-    /// Take back what this run made, and say what could not be taken back.
-    ///
-    /// Only entries of THIS ledger, and only names carrying THIS run's tag.
-    /// The second condition is redundant while the ledger is written by this
-    /// process and is not redundant at all when a `--resume` of somebody
-    /// else's ledger is added later, so it is enforced now, with a sentence
-    /// and a check when it fires.
+    /// Clean up ledger entries whose names carry this run's tag.
+    /// Lost resources are reported but not retried by this pass.
     pub fn cleanup(&mut self) -> Result<()> {
         self.cleaning_up = true;
         if self.options.keep {
@@ -1991,11 +1793,7 @@ impl<'a> Verifier<'a> {
                 self.set_state(&name, ResourceState::Lost)?;
                 continue;
             }
-            // A removal that could not even be ASKED for — no cli reference,
-            // a runner that refuses the class — is the same outcome as one
-            // that was refused: the resource is still there and somebody has
-            // to be told. It must not end the cleanup, because the next
-            // resource may still be removable.
+            // Record failed removal as lost and continue cleaning up the remaining resources.
             let outcome = match self.remove(&name) {
                 Ok(outcome) => outcome,
                 Err(e) => {
@@ -2030,8 +1828,7 @@ impl<'a> Verifier<'a> {
             .map(|r| r.name.clone())
             .collect();
         if !lost.is_empty() {
-            // Said once, at the top level, so a reader does not have to
-            // count the individual lines.
+            // Report the aggregate cleanup result.
             let mut check = self.check(
                 "verify.leftovers",
                 self.hosts.first().map(String::as_str).unwrap_or(""),
@@ -2051,14 +1848,8 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// Delete one guest and then LOOK, rather than believe the delete.
-    ///
-    /// A `vm rm` that failed because the object is already gone and a
-    /// `vm rm` that failed because the control plane is down are the same
-    /// exit code and different worlds, so the listing decides. The listing
-    /// is also what makes a `Terminating` guest — which is what `vm rm`
-    /// leaves behind for as long as the node takes — into a wait rather than
-    /// a leak.
+    /// Request deletion, then poll the listing until the name disappears.
+    /// The listing resolves failed deletes, asynchronous teardown and already-absent objects.
     fn remove(&mut self, name: &str) -> Result<Removal> {
         let cmd = self
             .cli_yes(Effect::TargetWrite)?
@@ -2142,8 +1933,7 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// What the SNAPSHOT says the machine has, as opposed to what the
-    /// inventory declares.
+    /// Read capability presence from the observation snapshot.
     fn measured(&self, id: &str, capability: &str) -> bool {
         self.observation
             .host(id)
@@ -2183,12 +1973,11 @@ pub struct GuestTiny {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applicability {
     Yes,
-    /// With the sentence that goes in `reason`.
+    /// Reason for non-applicability.
     No(String),
 }
 
-/// Pure, so that "this host has no GPU, so the GPU suite is not applicable"
-/// is a test rather than a path through a run that creates things.
+/// Determine applicability from manifest roles and declared hardware.
 pub fn applicability(
     suite: Suite,
     fleet: &ResolvedFleet,
@@ -2240,9 +2029,7 @@ pub fn applicability(
     }
 }
 
-/// Which hosts share a storage network with which, among those that declare
-/// an RDMA nic. Pure, and the only thing that decides who this suite talks
-/// to: a peer is declared or it does not exist.
+/// Group selected hosts with declared RDMA NICs by the first three storage-address octets.
 pub fn rdma_peers(fleet: &ResolvedFleet, hosts: &[String]) -> BTreeMap<String, Vec<String>> {
     let declared: Vec<(&String, &str)> = hosts
         .iter()
@@ -2268,17 +2055,14 @@ pub fn rdma_peers(fleet: &ResolvedFleet, hosts: &[String]) -> BTreeMap<String, V
     out
 }
 
-/// The first three octets of a dotted address. Crude on purpose: what makes
-/// two hosts peers here is that the INVENTORY put them on one storage
-/// network, and the prefix is how that is spelled.
+/// Textual first-three-octet key. This ignores the configured network prefix and IPv6.
 fn network_prefix(address: &str) -> String {
     address.split('.').take(3).collect::<Vec<_>>().join(".")
 }
 
 const GPU_ROUNDS: usize = 5;
 
-/// A PCI address in a domain nothing uses, so a node that answers to it is a
-/// node that answers to anything.
+/// Synthetic PCI address used to test device refusal; absence is not independently probed.
 const NO_SUCH_PCI: &str = "ffff:ff:1f.7";
 
 const GPU_PLAN: &str = "two guests with one PCI device each, five times over, then a \
@@ -2288,16 +2072,8 @@ const RDMA_PLAN: &str = "a round trip (rping), a latency (ib_send_lat) and a ban
                          (ib_write_bw) between each declared pair, server on one end and \
                          client on the other";
 
-// --- the four command lines, in one place --------------------------------
-//
-// One function per end of each tool, so that the server line and the client
-// line of a measurement cannot drift apart — and so that a test can pin all
-// four without reaching into the driver.
-//
-// No `-d <device>`: the tools take the first fabric device, and which one a
-// machine calls `mlx5_0` is a fact this tool has no business guessing. An
-// estate with two cards names the address it wants in `networks.storage`,
-// which is what these lines carry.
+// Fabric command builders. Perftest uses its default device because no `-d`
+// argument is supplied; the client receives the server storage address.
 
 /// `rping -s`: listen on the fabric address of the server end.
 pub fn rping_server(address: &str) -> Vec<String> {
@@ -2325,9 +2101,7 @@ pub fn rping_client(address: &str) -> Vec<String> {
     ]
 }
 
-/// `ib_send_lat`, listening. `-F` because these machines do not have their
-/// cpu frequency pinned and the tool otherwise refuses to start rather than
-/// report a slightly noisy number.
+/// `ib_send_lat` server; `-F` allows measurements without fixed CPU frequency.
 pub fn ib_send_lat_server() -> Vec<String> {
     vec![
         "ib_send_lat".to_string(),
@@ -2366,16 +2140,9 @@ pub fn ib_write_bw_client(address: &str) -> Vec<String> {
     ]
 }
 
-// --- what the three tools say --------------------------------------------
-//
-// All three print a table with a header and one row of numbers, and the row
-// is read BY POSITION with the column count checked. Reading it by header
-// name is what one would want and is not possible: perftest's headers hold
-// spaces (`BW average[MB/sec]`), so a split on white space does not line up
-// with the columns. So: the row is the last line whose every token is a
-// number, its length says which tool's row it is, and a row of the wrong
-// length is `None` — an `unknown` check with the raw output in it, never a
-// number read out of the wrong column.
+// Parse the last all-numeric perftest row by column position.
+// Bandwidth requires five columns; latency accepts at least five.
+// The parsers do not validate headers or measurement thresholds.
 
 /// How many round trips `rping -v` reported.
 pub fn rping_rounds(text: &str) -> usize {
@@ -2428,8 +2195,7 @@ pub fn latency_of(text: &str) -> Option<Latency> {
 /// `#bytes #iterations BW_peak BW_average MsgRate`
 pub fn bandwidth_of(text: &str) -> Option<Bandwidth> {
     let row = numeric_row(text)?;
-    // Exactly five: a latency row has nine, and reading its `t_typical` as a
-    // bandwidth would print a plausible number that means nothing.
+    // Require five bandwidth columns to reject the usual nine-column latency row.
     if row.len() != 5 {
         return None;
     }
@@ -2443,33 +2209,13 @@ pub fn bandwidth_of(text: &str) -> Option<Bandwidth> {
 // the guest, and what the control plane answers
 // ---------------------------------------------------------------------------
 
-/// How big the one ephemeral disk of a verification guest is.
-///
-/// Sixteen mebibytes: the guest never writes to it. It exists because the
-/// cluster tier refuses a VM without one — "a vm needs at least one volume
-/// as boot disk", measured against the throwaway control plane of
-/// deploy/chaos/selftest.sh — and a disk that is made and unmade with every
-/// guest of every round is a disk worth keeping small.
+/// Ephemeral verification disk size: 16 MiB.
+/// The control plane requires a boot volume even when kernel and initrd boot directly.
 pub const GUEST_DISK_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The `NewVmSpec` for one guest-tiny.
-///
-/// Three decisions, each of them measured rather than reasoned about:
-///
-/// * **The serial console and nothing else.** `nix/packages/guest-tiny.nix`
-///   explains why: 8250 is built into the pinned kernel and virtio_console
-///   is a module, so a guest that talked over virtio would have to insmod
-///   before it could say anything — and the marker line this suite reads is
-///   the first thing that guest prints.
-/// * **No nic.** A lifecycle suite that needed a bridge would be testing
-///   the network driver, which is somebody else's suite — and it would make
-///   this one unrunnable on a node without `CAP_NET_ADMIN`.
-/// * **One ephemeral disk, and no `desired`.** The cluster tier refuses a
-///   VM with neither: `spec.vm.desired is controller-owned; use
-///   spec.runStrategy` (422) and `a vm needs at least one volume as boot
-///   disk` (422). Both were found by running this against a real control
-///   plane and not by reading the type, which is what this whole suite is
-///   for.
+/// Guest-tiny specification: serial console, no NIC, one ephemeral disk.
+/// The pinned kernel has built-in 8250 support. Leave controller-owned `desired`
+/// unset and request running behavior through `runStrategy`.
 pub fn tiny_spec(kernel: &GuestTiny) -> Result<Vec<u8>> {
     let spec = serde_json::json!({
         "vcpus": 1,
@@ -2510,11 +2256,7 @@ pub fn gpu_spec(kernel: &GuestTiny, pci: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// `status.phase` out of whatever `meister vm get -o json` printed.
-///
-/// Tolerant on purpose: a cli that printed a note before the document, or a
-/// document this tool does not fully know, must not turn into a panic in the
-/// middle of a run that is holding guests.
+/// Read `status.phase` from CLI JSON; return unknown for invalid or unsupported output.
 pub fn phase_of(text: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
     value
@@ -2544,21 +2286,8 @@ pub fn placement_of(text: &str) -> (Option<String>, Option<String>) {
     (node, uid)
 }
 
-/// Whether `meister vm ls -o json` still has this name.
-///
-/// An answer that is not a list is an error, never an answer: the caller
-/// uses this to decide that a guest is gone, and guessing "gone" from a
-/// broken answer is how a leak becomes a green line.
-///
-/// Astra finding MD08, 2026-09-25: it used to guess in one direction only.
-/// Text that was not json counted as "still there" — and an EMPTY answer
-/// counted as "gone", on the reasoning that an empty listing is a listing
-/// without this name. It is not: `meister -o json` prints whatever bytes
-/// the server sent when they do not parse, and a process that exited 0
-/// with nothing on stdout has said nothing about what exists. So the only
-/// "gone" is a json document with an `items` list that does not carry the
-/// name; everything else is "nobody knows", which `remove` turns into a
-/// `lost` resource rather than a `deleted` one.
+/// Test name presence in a JSON object's `items` array.
+/// Malformed, empty or unsupported output is an error, never proof of deletion.
 pub fn lists_name(text: &str, name: &str) -> Result<bool> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -2604,20 +2333,13 @@ pub fn console_says(text: &str, marker: &str) -> bool {
     console_text(text).contains(marker)
 }
 
-/// What a console record looks like, when it does not hold the line that was
-/// being looked for.
-///
-/// The distinction is the difference between `fail` and `unknown`, and it is
-/// the whole reason [`crate::checks::Status`] has five values: a guest that
-/// printed something else did not boot the way it was supposed to, and a
-/// record that stops in the middle of a line says nothing about the guest at
-/// all.
+/// Classify console output without the marker.
+/// A trailing newline is the completeness heuristic used to distinguish fail from unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
     /// Nobody recorded anything.
     Empty,
-    /// It ends mid-line, so what is missing is the recording and not the
-    /// output: a guest writes whole lines.
+    /// Nonempty output without a trailing newline; treated as incomplete.
     Truncated,
     /// Whole, as far as anything here can tell.
     Whole,
@@ -2715,13 +2437,8 @@ mod tests;
 
 pub const REPORT_SCHEMA: &str = "meister-deploy/verify-report/1";
 
-/// What a verification is worth, with the one line drawn that matters.
-///
-/// `hardware` evidence and everything else are printed apart, in the text
-/// and in the json, because a reader who cannot see the boundary will read
-/// a mock as a measurement — and `verify --suite gpu` against a strict fake
-/// produces exactly the shape of a green GPU report without a GPU having
-/// been anywhere near it.
+/// Render hardware-classified checks separately from other evidence.
+/// Classification alone does not mean the check passed or covered the intended host.
 pub fn report_text(run: &VerifyRun) -> String {
     let (hardware, other) = run.hardware_evidence();
     let mut out = String::new();
@@ -2825,8 +2542,7 @@ pub fn report_json(run: &VerifyRun) -> serde_json::Value {
     })
 }
 
-/// The required checks that did not pass, each as the sentence `acceptance`
-/// makes of it. Empty is a verification somebody may quote.
+/// Acceptance reasons for required checks that did not pass.
 pub fn blocking(run: &VerifyRun) -> Vec<String> {
     match crate::checks::acceptance(&run.checks) {
         crate::checks::Acceptance::Accepted => Vec::new(),

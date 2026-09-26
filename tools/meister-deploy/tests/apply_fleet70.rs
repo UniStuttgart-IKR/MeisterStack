@@ -2,25 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Seventy hosts through the reading half of `apply`, in the strict fake.
+//! Seventy-host observation and revalidation with a strict subprocess fake.
 //!
-//! `tests/plan_fleet70.rs` measures the planner, which does no i/o at all.
-//! This measures the two things a rollout over seventy hosts actually
-//! spends its wall clock on before it touches anything: asking every host
-//! (one ssh-keygen and one ssh each, in a bounded pool) and re-deciding
-//! whether the plan still matches what came back. Those two are exactly
-//! what `apply --dry-run` is.
-//!
-//! The runner is the strict fake, so "it only reads" is not a claim: an
-//! unexpected command is an error and an expectation nobody used is an
-//! error, and the test says how many commands there were and what they
-//! were.
-//!
-//! The numbers this prints are the ones in the lane report. They are CPU
-//! and parsing only — the fake answers at once, and a real fleet answers
-//! over a network. That is said in the report too, because it is the half
-//! that decides whether seventy hosts need parallelism, and it is not this
-//! test that can measure it.
+//! Measures command count, CPU work and parsing. Instant fake replies and a
+//! single-worker pool do not measure SSH latency or production concurrency.
 
 mod support;
 
@@ -45,10 +30,7 @@ const TAKEN: &str = "2026-09-21T11:59:00Z";
 const NOW: &str = "2026-09-21T12:00:00Z";
 const KNOWN_HOSTS: &str = "/repo/known_hosts";
 
-/// One line of a `known_hosts` file, as `ssh-keygen -F` prints it. The blob
-/// is not a real key and does not have to be: what is measured here is that
-/// the fingerprint the fleet enrolled and the fingerprint that answers are
-/// computed by the same function from the same bytes.
+/// Synthetic key blob used consistently by enrollment and observation hashing.
 const KEY_LINE: &str =
     "host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEr0hJk1vDqf9L0ZQ2cWv7c8rHcYxr0kTfQnpS3bJmQx";
 
@@ -130,13 +112,8 @@ fn seventy_hosts_are_asked_once_each_and_nothing_else_is_run() {
         })
         .collect();
 
-    // A pool of ONE, and that is a property of the fake and not of the
-    // tool: `StrictFake` is a SEQUENCE — the expectation at the front has
-    // to be the command that comes — so eight threads asking at once would
-    // make this test about thread scheduling. The tool asks
-    // `DEFAULT_CONCURRENCY` ({DEFAULT_CONCURRENCY}) at a time, and what the
-    // pool buys is latency, which a fake that answers instantly cannot
-    // show. So this number is the PARSING cost of seventy answers.
+    // Use one worker for deterministic StrictFake ordering. Timings measure
+    // parsing and validation, not network latency or concurrent observation.
     let started = Instant::now();
     let fresh = observe_fleet(&prober, &probes, at(TAKEN), 1).expect("seventy hosts answer");
     let observing = started.elapsed();
@@ -190,9 +167,7 @@ fn seventy_hosts_are_asked_once_each_and_nothing_else_is_run() {
 
 #[test]
 fn a_fleet_that_moved_under_the_plan_is_stopped_and_not_rolled() {
-    // The other half of what `--dry-run` answers, over seventy hosts: it
-    // re-decides against what came back, so a fleet that moved says so
-    // before a lock is taken rather than in the middle of wave nine.
+    // Revalidate the seventy-host plan against the fresh observations.
     let base = enrolled();
     let running = release_of(base.clone());
     let observation: Observations = observed(&running, at(TAKEN));

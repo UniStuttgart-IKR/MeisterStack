@@ -2,29 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a host IS, as of a moment — and the second, providerless way of
-//! learning where to reach it.
+//! Host observations and provider-neutral endpoint binding.
 //!
-//! Everything the planner decides, it decides from a [`ReleaseManifest`] (the
-//! intent) and an [`Observations`] snapshot (the fact). The snapshot is a
-//! file: `plan --observation snap.json` reads one, lane 2A writes one from
-//! `meister-activate status --json` and a shell probe, and a test writes one
-//! by hand. That is deliberate — a planner that gathers its own facts can
-//! only be tested against a fleet, and the rules in [`crate::plan`] are
-//! exactly the rules nobody wants to first exercise on seventy machines.
-//!
-//! Three things this module refuses to do:
-//!
-//! * **Guess.** Every field that could not be read is `null` and never a
-//!   default. A `current_system` of `""` would plan an upgrade for a host
-//!   nobody could talk to.
-//! * **Let a target file change the fleet.** [`Targets`] says where a host
-//!   answers today — a lab VM gets a fresh address on every instantiation —
-//!   and nothing else. Roles, endpoints and settings come from the manifest,
-//!   and [`bind_targets`] proves it leaves the manifest untouched.
-//! * **Interpret `provider_ref`.** It is whatever the adapter wants to find
-//!   its own resource again with. This tool carries it into the receipt and
-//!   never reads it, which is what keeps the provider interface honest.
+//! The planner consumes a release and a saved snapshot without probing hosts.
+//! Unavailable scalar values remain null; collection fields may be empty.
+//! Target files may change endpoints, but not fleet membership or roles.
+//! Provider references are opaque metadata carried into receipts.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,13 +21,8 @@ use crate::manifest::ResolvedFleet;
 pub const OBSERVATION_SCHEMA: &str = "meister-deploy/observation/1";
 pub const TARGETS_SCHEMA: &str = "meister-deploy/targets/1";
 
-/// Who a host says it is.
-///
-/// Three answers to three different questions, and a rollout needs all three:
-/// the host key is who ssh is talking to, the machine id is whether this is
-/// the same installation as yesterday, and the hostname is what the host
-/// believes about itself. Two hosts cloned from one disk image share a
-/// machine id, which is exactly the failure L04 exists to catch.
+/// Host identity: SSH fingerprint, installation machine ID and hostname.
+/// Machine IDs also detect cloned installations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -64,12 +42,8 @@ impl Identity {
     }
 }
 
-/// What the generation a host BOOTED says it boots.
-///
-/// Read from `/run/booted-system`, not from the running kernel: the three
-/// fields are the ones a release promises, so they compare directly, and a
-/// comparison against `uname -r` alone would miss a changed initrd and a
-/// changed command line entirely.
+/// Kernel, initrd and command-line identity from `/run/booted-system`.
+/// All three are compared with the release; `uname -r` alone is insufficient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BootedKernel {
@@ -86,26 +60,15 @@ pub enum TxnState {
     Staged,
     /// Activated, waiting for a `confirm` before the revert timer fires.
     Pending,
-    // --- Astra finding F07, 2026-09-23 ---
-    /// A decision is in flight: a `confirm` has begun and has not finished.
-    ///
-    /// It is written BEFORE the revert timer is stopped, so that a process
-    /// which dies in between leaves a record saying that a decision was
-    /// being made rather than one saying `pending` beside a timer that is
-    /// gone. Every reader is told the same thing by it: this machine runs
-    /// the new system and somebody meant to keep it.
+    /// Confirmation intent persisted before disarming the revert timer.
     Confirming,
-    /// The same window on the other side: a `revert` has begun and has not
-    /// finished. It is written before the profile moves back, so a machine
-    /// in this state may be on either system — which is why nothing
-    /// confirms it and only another `revert` finishes it.
+    /// Rollback intent persisted before restoring the profile.
+    /// The host may still run either system until rollback completes.
     Reverting,
-    // --- end Astra finding F07 ---
+
     Confirmed,
     Reverted,
-    /// The record is there and does not say a coherent thing — a half-written
-    /// file, a state this tool does not know. Never treated as any of the
-    /// six above.
+    /// Unreadable transaction state, including malformed or unsupported records.
     Inconsistent,
 }
 
@@ -115,8 +78,7 @@ pub enum TxnState {
 pub struct Txn {
     pub id: String,
     pub state: TxnState,
-    /// The system this transaction was about, so that a resume can tell "the
-    /// one I started" from "one somebody else left behind".
+    /// Desired system, used to associate a transaction with a resumed run.
     pub target_system: Option<String>,
     /// When the revert timer fires, for a `pending` one.
     pub deadline: Option<DateTime<Utc>>,
@@ -124,7 +86,7 @@ pub struct Txn {
     pub run_id: Option<String>,
 }
 
-/// A lock somebody holds on this host.
+/// Host lock ownership view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Lock {
@@ -153,19 +115,12 @@ pub struct EtcdView {
     /// This host's own member id, or null when it could not be told apart.
     pub member_id: Option<String>,
     pub healthy: bool,
-    /// Every member this host can see, not only the healthy ones: a member
-    /// that has vanished from the list is a membership change, and that is a
-    /// different and worse thing than a member that is down.
+    /// All reported members, including unhealthy ones; missing membership is a topology change.
     pub members: Vec<EtcdMember>,
 }
 
-/// A mount point that is there.
-///
-/// The planner only asks whether a required path is IN this list. That is
-/// the whole check and the limit is documented on purpose: a path that is
-/// not a mount point is a path on the root disk, which is the failure V19 is
-/// about. Whether the right disk is behind it is a question for the
-/// `mounts` readiness check, which can compare the device.
+/// Observed mount point and source.
+/// The planner checks path presence; the mounts readiness check can compare sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
@@ -175,30 +130,15 @@ pub struct Mount {
     pub fstype: String,
 }
 
-// --- lane 4A: what the machine under the closure is ------------------------
-//
-// Three facts a release cannot be talked out of and an inventory can only
-// CLAIM: how much room the store has, which cards are in the slots, which
-// interfaces answer. They are read for the preflight of §6 — a closure that
-// does not fit, a GPU that is not in the machine the fleet says it is in, a
-// NIC the inventory names and nobody can see.
-//
-// Addresses, ids and MACs, and nothing else. The vendor:device pair is what
-// tells one card from another; the rest of `lspci` — revisions, subsystem
-// ids, kernel drivers — would be a second inventory this tool would then
-// have to keep in step with the first.
+
 
 /// One PCI device, as the machine lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PciDevice {
-    /// The full domain address, `0000:41:00.0` — the spelling
-    /// `hardware.gpus[].pci` uses. `lspci -n` leaves the domain off on a
-    /// machine that has only domain 0, so the probe puts it back.
+    /// Full PCI domain address, for example `0000:41:00.0`, matching inventory syntax.
     pub address: String,
-    /// `10de:2684`, lower case, as `lspci -n` prints it and as
-    /// `/sys/bus/pci/devices/*/{vendor,device}` spell it once the `0x` is
-    /// gone.
+    /// Lowercase vendor/device pair, for example `10de:2684`.
     pub vendor_device: String,
 }
 
@@ -206,104 +146,71 @@ pub struct PciDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkInterface {
-    /// The kernel's name for it. NOT what `hardware.nics[].name` has to
-    /// match: a name is handed out at boot and a MAC is burned in, so the
-    /// MAC is what the preflight compares and the name is what it prints so
-    /// that a person can find the card.
+    /// Kernel interface name for diagnostics; preflight matches interfaces by MAC.
     pub name: String,
     /// Lower case, colon separated, as `/sys/class/net/*/address` writes it.
     pub mac: String,
 }
 
-// --- end lane 4A ---
+
 
 /// One host, as of `Observations::taken_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostObservation {
-    /// Whether the host answered at all. Everything below is null or empty
-    /// when it did not — and `false` here never means "not asked", which is
-    /// what `unknown_reason` is for.
+    /// Whether the host answered. Unreachable hosts have empty or null observations;
+    /// `unknown_reason` records why an answer is unavailable or incomplete.
     pub reachable: bool,
     pub identity: Identity,
     /// `/run/current-system`: what is active right now.
     pub current_system: Option<String>,
     /// `/run/booted-system`: what was active when the machine came up.
     pub booted_system: Option<String>,
-    /// `/proc/sys/kernel/random/boot_id`: a name for THIS boot, new on every
-    /// one. Null when it could not be read.
-    ///
-    /// Astra finding MD04, 2026-09-25: `booted_system` says which system
-    /// came up and nothing about whether it came up again since a step
-    /// began. A resume that finds a reboot in the journal without its end
-    /// has to tell "the machine went round and the run died before writing
-    /// it down" from "the run died before the machine went round", and
-    /// only a name for the boot can.
+    /// Kernel boot ID from `/proc/sys/kernel/random/boot_id`, if readable.
+    /// Resume uses it to distinguish a completed reboot from an unchanged boot.
     #[serde(default)]
     pub boot_id: Option<String>,
-    /// Where the boot loader's default points — the next boot, which is a
-    /// third fact and not the same as either of the two above.
+    /// Resolved system profile target. This does not inspect boot-loader defaults or one-shot entries.
     pub next_boot_system: Option<String>,
     /// The system profile's generation number.
     pub generation: Option<u64>,
     /// `uname -r` — the kernel that is executing.
     pub kernel_running: Option<String>,
-    /// What the booted generation says it boots. Null when it could not be
-    /// read, which the planner treats as "a reboot may be needed" rather
-    /// than as "no reboot needed".
+    /// Booted kernel identity, if all three fields were read. Missing identity may require a reboot.
     pub kernel_booted: Option<BootedKernel>,
     /// Unit name to `systemctl is-active` answer.
     pub units: BTreeMap<String, String>,
     pub mounts: Vec<Mount>,
-    /// Secret id to a fingerprint of what is on the host, or null when the
-    /// file is not there. The fingerprint is whatever the deliverer can
-    /// compare without reading the secret out — a certificate serial, a
-    /// public key's digest.
+    /// Secret reference to observed digest or file metadata; null when unavailable.
+    /// Public files are hashed; private files are described by mode and owner.
     pub credentials: BTreeMap<String, Option<String>>,
     /// Null for a host that is not an etcd member.
     pub etcd: Option<EtcdView>,
-    /// How many guests are running, for a host with the agent role. Null
-    /// when it was not asked, which is not the same as zero.
+    /// Number of entries returned by the agent VM listing, if available; no phase filtering.
     pub vms_running: Option<u32>,
     pub open_txns: Vec<Txn>,
     pub lock: Option<Lock>,
-    /// What the host actually has: `kvm`, `vfio`, `rdma`. A capability the
-    /// manifest declares and this list does not carry is a capability that
-    /// was not found — a prober that could not decide says so in
-    /// `unknown_reason` instead of leaving it out quietly.
+    /// Detected device capabilities: `kvm`, `vfio` and `rdma`.
+    /// Missing capabilities and failed individual probes can both leave entries absent.
     pub capabilities: Vec<String>,
-    /// Whether this host has an identity and a known host key — installed
-    /// but not enrolled is a state of its own and never "healthy".
+    /// Whether all manifest identity keys and companion certificates were found.
+    /// This does not report SSH host-key enrollment.
     pub enrolled: bool,
-    // --- lane 4A: the machine under the closure ---
-    /// Free bytes on the filesystem that carries `/nix`, as `df -B1` gives
-    /// them. Null when nobody could read it, which is not zero: zero would
-    /// block every host whose probe lost a line.
+    /// Free bytes on the filesystem containing `/nix`; null when unreadable.
     pub disk_free_nix_bytes: Option<u64>,
-    /// Every PCI device the machine lists. EMPTY means the probe found no
-    /// way to ask (no `lspci`, no `/sys/bus/pci`), and the preflight reads
-    /// it that way: an empty list is not "this machine has no cards".
+    /// Reported PCI devices. Empty does not distinguish an empty inventory from a failed probe.
     pub pci: Vec<PciDevice>,
-    /// Every network interface with a MAC. Empty has the same meaning as
-    /// for `pci`.
+    /// Interfaces with nonzero MAC addresses. Empty can also mean probing failed.
     pub nics: Vec<NetworkInterface>,
-    /// The units the RUNNING generation carries, by name, as they are listed
-    /// in `/run/current-system/etc/systemd/system`. The manifest's
-    /// `hosts.<id>.units[]` is the same question about the generation a
-    /// release would put there, and the difference between the two is what
-    /// the planner calls an unknown.
-    ///
-    /// Empty means nobody could list the directory — never "this generation
-    /// has no units".
+    /// Unit names in `/run/current-system/etc/systemd/system`.
+    /// Empty can mean an empty directory or an unavailable listing.
     pub generation_units: Vec<String>,
-    // --- end lane 4A ---
-    /// Why this observation is not to be trusted, in one sentence. Any value
-    /// here blocks the host: it is the probe saying it does not know.
+    /// Reason the host observation cannot be trusted for planning.
     pub unknown_reason: Option<String>,
 }
 
 impl HostObservation {
-    /// A host nobody could reach, and why.
+    /// Unreachable observation with a reason.
     pub fn unreachable(reason: impl Into<String>) -> HostObservation {
         HostObservation {
             reachable: false,
@@ -312,7 +219,7 @@ impl HostObservation {
         }
     }
 
-    /// Nothing known. Every "not asked" is null rather than a zero value.
+    /// Empty observation with nullable fields left unknown.
     pub fn empty() -> HostObservation {
         HostObservation {
             reachable: false,
@@ -333,12 +240,12 @@ impl HostObservation {
             lock: None,
             capabilities: Vec::new(),
             enrolled: false,
-            // --- lane 4A ---
+
             disk_free_nix_bytes: None,
             pci: Vec::new(),
             nics: Vec::new(),
             generation_units: Vec::new(),
-            // --- end lane 4A ---
+
             unknown_reason: None,
         }
     }
@@ -351,12 +258,9 @@ impl HostObservation {
         self.capabilities.iter().any(|c| c == name)
     }
 
-    // --- lane 4A ---
 
-    /// Whether a PCI address the inventory names is in the machine.
-    ///
-    /// Case-insensitive on the hex, because `lspci` prints lower case and an
-    /// operator writing `0000:41:00.0` by hand from a datasheet may not.
+
+    /// Case-insensitive match for a full PCI domain address.
     pub fn has_pci(&self, address: &str) -> bool {
         self.pci
             .iter()
@@ -368,30 +272,24 @@ impl HostObservation {
         self.nics.iter().any(|n| n.mac.eq_ignore_ascii_case(mac))
     }
 
-    // --- end lane 4A ---
+
 }
 
-/// A snapshot of a fleet, or of the part of it somebody looked at.
-///
-/// This is both the `--observation` input file and, later, lane 2A's cache
-/// under `.meister-deploy/observations/`. One type for both, because a plan
-/// embeds the snapshot it was made from and a reader has to be able to take
-/// that embedded thing and hand it back to the tool.
+/// Fleet snapshot used as plan input and saved under `observations/`.
+/// Plans embed this same representation for replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Observations {
     pub schema: String,
     pub taken_at: DateTime<Utc>,
-    /// Whether this snapshot is too thin to decide anything on: an `--offline`
-    /// plan, or a run where the probe itself could not be trusted. A
-    /// provisional snapshot makes every interrupting action `blocked`.
+    /// Marks insufficient evidence, such as an offline snapshot.
+    /// Interrupting actions are blocked for provisional snapshots.
     pub provisional: bool,
     pub hosts: BTreeMap<String, HostObservation>,
 }
 
 impl Observations {
-    /// The empty snapshot an `--offline` plan is made from: nothing was
-    /// asked, and it says so rather than pretending every host is fine.
+    /// Empty, provisional snapshot for offline planning.
     pub fn provisional(taken_at: DateTime<Utc>) -> Observations {
         Observations {
             schema: OBSERVATION_SCHEMA.to_string(),
@@ -424,9 +322,7 @@ pub struct Target {
     pub address: String,
     pub port: u16,
     pub ssh_user: String,
-    /// What the adapter saw. Compared against the manifest, never written
-    /// into it: a target file that could change an enrolled host's key would
-    /// be a target file that can impersonate a host.
+    /// Adapter fingerprint, checked against any fingerprint recorded in the manifest.
     pub host_key_fingerprint: Option<String>,
     /// Opaque. Carried into the receipt and never interpreted here.
     pub provider_ref: String,
@@ -445,8 +341,7 @@ pub struct TargetObserved {
 #[serde(deny_unknown_fields)]
 pub struct Targets {
     pub schema: String,
-    /// The adapter's own run reference. Carried into the receipt so that a
-    /// green run can be pointed back at the resources it used.
+    /// Opaque adapter run reference carried into the receipt.
     pub run_ref: String,
     /// Keyed by host id — the fleet's ids, not the provider's.
     pub targets: BTreeMap<String, Target>,
@@ -465,13 +360,7 @@ impl Targets {
     }
 }
 
-/// Where this tool reaches one host, after the manifest and the target file
-/// have been reconciled.
-///
-/// This is what lane 2A's transport builds its ssh options from, and it is
-/// frozen into the plan: a selection is only frozen if the addresses are
-/// frozen with it, or a second `apply` of the same plan could talk to a
-/// machine that has since taken over the name.
+/// Endpoint bound to a selected host and frozen into the plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
@@ -483,12 +372,8 @@ pub struct Endpoint {
     pub provider_ref: Option<String>,
 }
 
-/// Reconcile a target file with the manifest for the hosts a run will touch.
-///
-/// Returns one [`Endpoint`] per selected host. Every refusal below is a
-/// sentence and stops the run (L08): a target set that does not line up with
-/// the fleet is the one situation where carrying on means talking to a
-/// machine nobody identified.
+/// Validate target membership, endpoint uniqueness and enrolled fingerprints.
+/// Return an endpoint for every selected host, or reject the target set.
 pub fn bind_targets(
     resolved: &ResolvedFleet,
     targets: &Targets,
@@ -501,9 +386,7 @@ pub fn bind_targets(
         );
     }
 
-    // A host id that is not in the fleet: either the adapter and the
-    // inventory disagree about a name, or this file belongs to another
-    // fleet. Both are the operator's to fix and neither is guessable.
+    // Reject host IDs absent from the manifest.
     let strangers: Vec<&str> = targets
         .targets
         .keys()
@@ -519,9 +402,7 @@ pub fn bind_targets(
         );
     }
 
-    // Two hosts at one address is either a copy-paste in the adapter or two
-    // VMs that got the same lease. Either way the second `apply` would
-    // change a machine that is already somebody else's.
+    // Reject duplicate address/port pairs, including targets outside the selection.
     let mut seen: BTreeMap<(&str, u16), &str> = BTreeMap::new();
     for (id, target) in &targets.targets {
         if let Some(other) = seen.insert((&target.address, target.port), id) {
@@ -538,8 +419,7 @@ pub fn bind_targets(
     for id in selected {
         let host = match resolved.hosts.get(id) {
             Some(host) => host,
-            // The caller selected from the fleet, so this cannot happen from
-            // `plan`; it can from a caller that built its own list.
+            // Validate selections supplied by callers other than the planner.
             None => bail!("the fleet {:?} has no host {id}.", resolved.fleet.name),
         };
         let Some(target) = targets.targets.get(id) else {
@@ -549,10 +429,7 @@ pub fn bind_targets(
                 targets.run_ref
             );
         };
-        // The manifest's fingerprint is what `keys enroll` recorded after
-        // somebody read it off a console. A provider that reports a
-        // different one is reporting a different machine, and the answer to
-        // that is never "use the new one".
+        // An adapter cannot replace a fingerprint already recorded in the manifest.
         if let (Some(declared), Some(seen)) =
             (&host.ssh.host_key_fingerprint, &target.host_key_fingerprint)
             && declared != seen
@@ -570,9 +447,7 @@ pub fn bind_targets(
                 address: target.address.clone(),
                 port: target.port,
                 ssh_user: target.ssh_user.clone(),
-                // The enrolled fingerprint wins where there is one: it is the
-                // one a human read off a console, and it is what ssh will be
-                // told to expect.
+                // Prefer the manifest fingerprint when present.
                 host_key_fingerprint: host
                     .ssh
                     .host_key_fingerprint
@@ -705,8 +580,7 @@ mod tests {
         ] {
             assert!(value[field].is_null(), "{field} should be null");
         }
-        // `vms_running` in particular: a host nobody asked is not a host
-        // with no guests on it.
+        // Unknown guest count must remain distinct from zero.
         assert!(!empty.reachable);
     }
 
@@ -792,9 +666,7 @@ mod tests {
 
     #[test]
     fn an_unenrolled_host_takes_the_fingerprint_the_adapter_saw() {
-        // n2 has no fingerprint in the fixture: nothing to contradict, and
-        // the adapter's answer is all there is. It is still not "enrolled" —
-        // that is `keys enroll`'s word and this only carries it.
+        // Without a manifest fingerprint, carry the adapter value without enrolling it.
         let resolved = onebox();
         assert!(resolved.hosts["n2"].ssh.host_key_fingerprint.is_none());
         let targets = targets_for(&[("n2", target("192.168.122.33", Some("SHA256:fresh")))]);

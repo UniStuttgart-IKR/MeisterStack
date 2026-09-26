@@ -2,39 +2,19 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The repository a deployment starts from, embedded in this binary.
-//!
-//! `meister-deploy init <dir>` writes these files and nothing else. They are
-//! `include_str!`d rather than fetched, for three reasons: the verb works
-//! offline, the files are the ones THIS binary was built with (so a manifest
-//! and a template cannot be two versions apart), and `templates/operator/` in
-//! the repository stays a real flake that `nix flake new -t` can also use.
-//!
-//! The list below and that directory have to stay the same set, and
-//! `tests/template_files.rs` compares them — a file added to the directory
-//! and forgotten here would be a template that is missing a file only when
-//! somebody uses the tool rather than the flake.
-//!
-//! **No secrets, and no example keys.** A template that ships a certificate,
-//! a private key or a plausible-looking public one is a template somebody
-//! deploys by accident. `keys/` and `.meister-deploy/` are in its
-//! `.gitignore`, `known_hosts` is empty, and the one key a fleet needs — the
-//! public half of its signing key — is named by a sentence in
-//! `profiles/base.nix` and created by the operator.
+//! Local files embedded from templates/operator. After writing them, init separately attempts
+//! `nix flake lock`. Template tests compare the embedded and on-disk file sets and contents.
+//! The operator supplies credentials; the embedded files contain no keys.
 
-/// A file of the template: where it goes, what is in it, and how it is
-/// written. Modes are explicit because a file this tool writes is a file
-/// somebody else reads.
+/// Embedded file contents, relative destination, and creation mode.
 pub struct File {
     pub path: &'static str,
     pub body: &'static str,
     pub mode: u32,
 }
 
-/// Where the `meisterstack` input points unless `--meisterstack` says
-/// otherwise. The line in the template names a branch; a deployment that is
-/// made twice pins a revision, which the template says in the comment above
-/// it and `init --meisterstack` writes for you.
+/// Default MeisterStack flake input, replaceable through `init --meisterstack`. Pin the
+/// deployment through its flake lock.
 pub const DEFAULT_FLAKE_REF: &str = "github:UniStuttgart-IKR/MeisterStack";
 
 macro_rules! file {
@@ -65,13 +45,7 @@ pub const FILES: &[File] = &[
     file!(".gitignore"),
 ];
 
-/// The `meisterstack` input, pointed somewhere else.
-///
-/// A whole-line replacement and not a `{{placeholder}}`: the template has to
-/// stay a flake that evaluates on its own (it is also `templates.operator`),
-/// so what is in the file is a real flake reference and this function swaps
-/// the value while leaving the comment above it — which is where the reason
-/// for pinning a revision is written — untouched.
+/// Replace the default input declaration while retaining the surrounding template comments.
 pub fn with_flake_ref(body: &str, flake_ref: &str) -> String {
     let needle = format!("meisterstack.url = \"{DEFAULT_FLAKE_REF}\";");
     let replacement = format!("meisterstack.url = \"{flake_ref}\";");
@@ -102,9 +76,7 @@ mod tests {
     fn no_file_of_the_template_is_empty_and_none_carries_a_key() {
         for file in FILES {
             assert!(!file.body.is_empty(), "{} is empty", file.path);
-            // A template that ships key material is a template somebody
-            // deploys by accident. `known_hosts` is public by definition and
-            // is empty of keys; nothing else may look like one either.
+            // Reject private material, certificates, and populated SSH-key examples.
             for marker in ["PRIVATE KEY", "BEGIN CERTIFICATE", "ssh-ed25519 AAAA"] {
                 assert!(
                     !file.body.contains(marker),

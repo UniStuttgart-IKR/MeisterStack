@@ -2,30 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Which tree this manifest came out of, said precisely enough to come back.
+//! Describe the Git revision, tree and locked inputs used by a manifest.
 //!
-//! A receipt that says "deployed from the operator repository" is worth
-//! nothing six months later. What is worth something is a revision and a tree
-//! hash, and the honest admission when there is neither.
-//!
-//! The hard case is a dirty working tree, and it is hard for a reason that is
-//! easy to miss: `nix` reading a `git+file://` flake sees only what git
-//! tracks. An untracked `profiles/new.nix` is invisible to the evaluation and
-//! present in the operator's editor, so the two disagree in silence. This
-//! module therefore refuses a dirty tree outright, and `--dev` is the way to
-//! say "yes, I know" — at the price of a content snapshot, a secret scan and
-//! a `dev:` fingerprint that cannot be mistaken for a revision.
-//!
-//! The snapshot is MATERIALIZED, and that is not an optimization. Pointing
-//! nix at the working tree with `path:` would copy the whole directory into
-//! the store — including everything `.gitignore` excludes, which in the
-//! operator template is `keys/`, `.meister-deploy/runs/` and `result*`. A
-//! signing key would land world-readable in `/nix/store` and stay there, and
-//! an ignored-but-imported `local.nix` would change the evaluation without
-//! changing the fingerprint. So exactly the listed and scanned file set is
-//! copied to `.meister-deploy/snapshots/<content hash>/`, and nix evaluates
-//! that: what was hashed, what was scanned and what was evaluated are one
-//! set of bytes.
+//! Dirty trees require `--dev`: tracked and unignored files are scanned and
+//! copied into a content-addressed snapshot before evaluation. State files are
+//! excluded; likely private keys are refused. Copying rechecks file hashes.
+//! Completed snapshots are reused by marker and must remain locally trusted.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,13 +21,10 @@ use crate::ids::{hex, sha256_hex};
 use crate::manifest::{DevMode, FlakeInput, SecretScan, Source};
 use crate::run::{Cmd, Effect, Runner};
 
-/// Git answers in milliseconds on any tree this tool will meet; a minute is
-/// there for the case where it is answering from a cold network filesystem.
+/// Allow slow Git reads on network filesystems.
 const GIT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Where a snapshot of a dirty tree is kept, under the operator's repository
-/// so that it shares a filesystem with it and is covered by the template's
-/// `.gitignore`.
+/// Developer snapshots inside the repository, excluded by the template ignore rules.
 pub const SNAPSHOT_DIR: &str = ".meister-deploy/snapshots";
 
 /// Where nix would evaluate a tree with this content hash.
@@ -53,16 +32,13 @@ pub fn snapshot_dir(repo: &Path, content_hash: &str) -> PathBuf {
     repo.join(SNAPSHOT_DIR).join(content_hash)
 }
 
-/// The marker that says a snapshot directory is complete. Kept BESIDE the
-/// directory rather than inside it, so that what nix evaluates is exactly the
-/// file set that was hashed and nothing else.
+/// Keep the completion marker outside the hashed evaluation tree.
 fn snapshot_marker(repo: &Path, content_hash: &str) -> PathBuf {
     repo.join(SNAPSHOT_DIR)
         .join(format!("{content_hash}.complete"))
 }
 
-/// What `resolve` needs to know about a tree: how to name it in a manifest,
-/// and which directory nix is to be pointed at.
+/// Manifest source identity and the directory to evaluate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     pub source: Source,
@@ -84,11 +60,7 @@ impl Worktree {
     }
 }
 
-/// Read the repository and say where the manifest comes from.
-///
-/// `repo` is absolute — a relative one would make `repo_path` in the manifest
-/// depend on the directory somebody happened to stand in. `inventory` is
-/// relative to it.
+/// Describe an absolute repository path and its repository-relative inventory.
 pub fn describe(
     runner: &dyn Runner,
     files: &dyn Files,
@@ -103,13 +75,11 @@ pub fn describe(
             repo.display()
         );
     }
-    // Checked before a single command runs: a bad argument should not cost a
-    // git invocation, and the test for it should not have to expect one.
+    // Reject invalid inventory paths before invoking Git.
     let inventory_path = inventory_relative_to(repo, inventory)?;
 
     let rev = git(runner, repo, &["rev-parse", "HEAD"])?;
-    // `HEAD^{tree}` and not HEAD: two commits with different messages and the
-    // same content build the same system, and the tree hash is what says so.
+    // Record both revision identity and content identity.
     let tree = git(runner, repo, &["rev-parse", "HEAD^{tree}"])?;
     let worktree = status(runner, repo)?;
 
@@ -129,9 +99,7 @@ pub fn describe(
                 flake_lock,
                 inventory_path,
                 inventory_sha256,
-                // This function describes a TREE. Whether the evaluation of
-                // it happened here is the caller's to say, and `resolve
-                // --from` is the one caller that fills this in.
+                // The caller records externally supplied evaluation provenance.
                 provided_evaluation: None,
             },
             eval_dir: repo.to_path_buf(),
@@ -162,9 +130,7 @@ pub fn describe(
             git_rev: Some(rev),
             tree_hash: Some(tree),
             dirty: true,
-            // A different namespace on purpose: `dev:` in a receipt means
-            // nobody can check this tree out again, and that has to be
-            // unmissable.
+            // Separate developer snapshots from checkoutable Git revisions.
             fingerprint: format!("dev:{}", snapshot.content_hash),
             dev_mode: Some(snapshot),
             flake_lock,
@@ -176,13 +142,8 @@ pub fn describe(
     })
 }
 
-/// The inventory as a path INSIDE the repository.
-///
-/// It goes into the manifest and therefore into its id, so it has to say
-/// which file rather than where that file happened to be mounted: the same
-/// repository checked out twice must name the same inventory. An absolute
-/// path under the repository is made relative; one outside it is refused,
-/// because nix could not read it either.
+/// Normalize inventory paths relative to the repository for stable manifest IDs.
+/// Reject paths outside it.
 fn inventory_relative_to(repo: &Path, inventory: &Path) -> Result<String> {
     let relative = if inventory.is_absolute() {
         inventory.strip_prefix(repo).map_err(|_| {
@@ -242,12 +203,7 @@ fn git(runner: &dyn Runner, repo: &Path, args: &[&str]) -> Result<String> {
     Ok(out.trimmed().to_string())
 }
 
-/// Every command line a [`describe`] would run, in order.
-///
-/// This is what `--dry-run` prints: the argv itself, not a sentence about it,
-/// so that an operator can paste any of these lines and see the same answer
-/// this tool would have seen. `a_dry_run_lists_exactly_what_a_real_one_runs`
-/// keeps the list and the code from drifting.
+/// Commands printed by source inspection dry-runs, in execution order.
 pub fn commands(repo: &Path, dev: bool) -> Vec<Cmd> {
     let mut out = vec![
         git_cmd(repo, &["rev-parse", "HEAD"]),
@@ -264,9 +220,7 @@ pub fn commands(repo: &Path, dev: bool) -> Vec<Cmd> {
     out
 }
 
-/// `--porcelain=v1 -z`: a stable format, and NUL-separated because a path may
-/// contain a newline and the non-`-z` form would quote it into something this
-/// parser would have to unquote.
+/// NUL separation preserves paths containing newlines without unquoting.
 fn status(runner: &dyn Runner, repo: &Path) -> Result<Worktree> {
     let out = runner.run(&git_cmd(repo, &["status", "--porcelain=v1", "-z"]))?;
     let mut worktree = Worktree::default();
@@ -277,9 +231,7 @@ fn status(runner: &dyn Runner, repo: &Path) -> Result<Worktree> {
         }
         let code = &entry[..2];
         let path = entry[3..].to_string();
-        // A rename or a copy is two NUL-terminated paths; the second one
-        // carries no status code and would otherwise be read as a file
-        // called "/old/path".
+        // Renames and copies include a second path without a status code.
         if code.starts_with('R') || code.starts_with('C') {
             let _ = entries.next();
         }
@@ -294,12 +246,8 @@ fn status(runner: &dyn Runner, repo: &Path) -> Result<Worktree> {
     Ok(worktree)
 }
 
-/// Everything git would show plus everything it would not: `-c` is cached,
-/// `-o` is other, `--exclude-standard` drops what `.gitignore` drops.
-///
-/// The hash covers path, KIND and content, so moving a file, turning it into
-/// a link, or giving it the execute bit are each a different snapshot — all
-/// three change what nix would build.
+/// Scan tracked and unignored files. Hash paths, entry kinds, execute bits,
+/// file bytes and symlink targets because each can affect evaluation.
 fn scan(
     runner: &dyn Runner,
     files: &dyn Files,
@@ -313,9 +261,7 @@ fn scan(
         .stdout
         .split('\0')
         .filter(|e| !e.is_empty())
-        // Always, whatever the repository's .gitignore says: the snapshots
-        // live under here, and a snapshot that contained the snapshot
-        // directory would contain itself.
+        // Exclude state even when ignore rules omit it, preventing recursive snapshots.
         .filter(|path| !is_state_path(path))
         .map(str::to_string)
         .collect();
@@ -327,12 +273,7 @@ fn scan(
     let mut entries = Vec::new();
     for path in &paths {
         let full = repo.join(path);
-        // Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
-        // reads the index, and still lists a file deleted in the working
-        // tree but not staged — `entry` would then fail with a bare "looking
-        // at ... failed", which is git's own answer read back as if this
-        // program had never asked it. Naming the exact, common cause first
-        // is worth a check `entry` cannot make for itself.
+        // The index can still list unstaged deletions; report that cause explicitly.
         if !files.is_present(&full) {
             bail!(
                 "{path} is tracked by git but not in the working tree — most likely deleted \
@@ -352,9 +293,7 @@ fn scan(
                 }
             }
             Entry::Symlink { .. } => {
-                // The link is hashed and copied as a link. Following it would
-                // be how a link to ~/.ssh/id_ed25519 becomes a key in the
-                // store; as a link it stays a dangling name.
+                // Hash and copy the link itself; never read its target during the scan.
                 hash_entry(&mut hasher, path, &entry, &[]);
                 if named_like_a_secret(path) {
                     hits.push(path.clone());
@@ -391,16 +330,8 @@ fn is_state_path(path: &str) -> bool {
     path == ".meister-deploy" || path.starts_with(".meister-deploy/")
 }
 
-/// Feed one entry's path, kind and content into a running hash, in the exact
-/// shape `scan` always hashed it in: length-prefixed and NUL-separated, so
-/// that "ab" + "c" and "a" + "bc" cannot hash to the same snapshot. `bytes`
-/// is a file's content, or empty for a symlink (its target is already inside
-/// `entry`).
-///
-/// Astra finding F15, 2026-09-23: shared between `scan`, which hashes what
-/// it just read, and `materialize`, which hashes what it is about to copy —
-/// one scheme, so the two cannot drift apart and silently stop checking the
-/// same thing.
+/// Hash entry path, kind and content with length and NUL boundaries.
+/// Used by both scanning and copying; symlink targets come from `entry`.
 fn hash_entry(hasher: &mut Sha256, path: &str, entry: &Entry, bytes: &[u8]) {
     hasher.update(path.as_bytes());
     hasher.update(b"\0");
@@ -424,21 +355,9 @@ fn hash_entry(hasher: &mut Sha256, path: &str, entry: &Entry, bytes: &[u8]) {
     }
 }
 
-/// Copy exactly the scanned file set to `.meister-deploy/snapshots/<hash>/`
-/// and return that directory.
-///
-/// The directory is named after its own content, so an existing complete one
-/// holds exactly these bytes and is reused. The completion marker sits beside
-/// the directory rather than in it: a run that died half way leaves no marker,
-/// and the next run rewrites every file over what is there — each write is
-/// atomic, and the set is the same set.
-///
-/// Astra finding F15, 2026-09-23: `scan` hashed the bytes it read once, and
-/// this used to re-read the same files later, trusting that they still held
-/// what was hashed. They are hashed again HERE, as they are copied, with the
-/// same scheme (`hash_entry`) — a file that changed in between no longer
-/// gets published silently under the old hash; the marker is written only
-/// once the fresh hash still matches it.
+/// Materialize the scanned file set and publish its adjacent completion marker.
+/// New copies are rehashed before publication to detect changes since scanning.
+/// An existing marker bypasses verification; incomplete directories are reused.
 fn materialize(
     files: &dyn Files,
     repo: &Path,
@@ -487,15 +406,12 @@ fn materialize(
     Ok(dir)
 }
 
-/// Two rules, and the second one is the one that catches the file nobody
-/// named `.key`: anything whose bytes carry a PEM private key header.
+/// Detect secret-like names and PEM private-key headers.
 fn looks_like_a_secret(path: &str, bytes: &[u8]) -> bool {
     if named_like_a_secret(path) {
         return true;
     }
-    // Only text files are searched, and only the first part of them: a
-    // private key header is at the top of a PEM file, and a multi-megabyte
-    // binary is not a PEM file.
+    // Inspect at most 64 KiB, and only when that prefix is valid UTF-8.
     let head = &bytes[..bytes.len().min(64 * 1024)];
     let Ok(text) = std::str::from_utf8(head) else {
         return false;
@@ -503,16 +419,13 @@ fn looks_like_a_secret(path: &str, bytes: &[u8]) -> bool {
     text.lines().any(|line| line.contains("PRIVATE KEY"))
 }
 
-/// The name rule on its own — all a symbolic link can be judged by, since
-/// its bytes are a path and not a key.
+/// Name-only secret check, also used for symlinks.
 fn named_like_a_secret(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.ends_with(".key") || name == "secrets.key"
 }
 
-/// The inputs as the lock file pins them. Not the tool's own dependencies —
-/// the operator's, because a changed nixpkgs is a changed fleet and the
-/// manifest has to say which one it meant.
+/// Read the operator flake inputs pinned by `flake.lock`.
 fn read_flake_lock(files: &dyn Files, repo: &Path) -> Result<BTreeMap<String, FlakeInput>> {
     let path = repo.join("flake.lock");
     if !files.exists(&path) {
@@ -549,13 +462,7 @@ fn read_flake_lock(files: &dyn Files, repo: &Path) -> Result<BTreeMap<String, Fl
 
     let mut out = BTreeMap::new();
     for (name, target) in root {
-        // Either a node key, or a `follows` path — an array of input names,
-        // relative to the root node, as nix writes it for
-        // `disko.follows = "meisterstack/disko"`. A followed input is not a
-        // different input: it is the SAME locked node, and that is what the
-        // manifest has to name. The operator template uses exactly this to
-        // keep one disko in a repository instead of two, so refusing it
-        // would have refused the template this tool writes itself.
+        // Inputs name either a locked node or a root-relative `follows` path.
         let key = match target {
             serde_json::Value::String(key) => key.clone(),
             serde_json::Value::Array(_) => follow(nodes, root_name, name, target, &path)?,
@@ -591,13 +498,8 @@ fn read_flake_lock(files: &dyn Files, repo: &Path) -> Result<BTreeMap<String, Fl
     Ok(out)
 }
 
-/// Resolve a `follows` path to the node it ends at.
-///
-/// A follows path is written from the ROOT of the lock file — `["meisterstack",
-/// "disko"]` means "the `disko` input of the root's `meisterstack` input" —
-/// and each step may itself be a follows, so this walks. The depth is bounded
-/// because a lock file is data from outside this process: a cycle in it must
-/// be a sentence and not a stack overflow.
+/// Resolve root-relative `follows` paths, including nested follows.
+/// Bound recursion so cyclic lock-file data fails without overflowing the stack.
 fn follow(
     nodes: &serde_json::Map<String, serde_json::Value>,
     root_name: &str,
@@ -675,10 +577,8 @@ fn follow(
     Ok(current)
 }
 
-/// The locked input as a flake reference a person can paste. Where the shape
-/// is not one of the known ones, the locked node is written out canonically
-/// rather than guessed at: an invented url in a manifest is worse than an
-/// ugly one.
+/// Render known locked inputs as flake references; preserve unknown shapes
+/// as canonical JSON.
 fn flake_url(locked: &serde_json::Value) -> String {
     let field = |name: &str| {
         locked
@@ -984,10 +884,7 @@ mod tests {
         assert_eq!(dev.content_hash.len(), 64);
     }
 
-    /// Astra finding F15, 2026-09-23: `scan` hashes the bytes it reads;
-    /// `materialize` used to re-read the same files later and trust that
-    /// they still held what was hashed. A write landing in that gap must
-    /// not be published silently under the old hash.
+    /// Reject files changed between scanning and snapshot copying.
     #[test]
     fn materialize_refuses_bytes_that_changed_since_the_scan() {
         let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
@@ -1003,8 +900,7 @@ mod tests {
         let (snapshot, entries) = scan(&runner, &files, &repo()).unwrap();
         runner.verify().unwrap();
 
-        // The file changes after the scan hashed it and before materialize
-        // copies it — the exact race F15 named.
+        // Change the file after scanning and before copying.
         files
             .write_atomic(&repo().join("profiles/new.nix"), b"{ changed }\n", 0o644)
             .unwrap();
@@ -1050,14 +946,10 @@ mod tests {
         assert_ne!(a.fingerprint, b.fingerprint, "the path is part of the hash");
     }
 
-    /// Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
-    /// reads the index, and still lists a file that was deleted in the
-    /// working tree but not staged. `scan` must name that rather than let
-    /// `entry`'s bare "looking at ... failed" stand in for it.
+    /// Name unstaged tracked deletions explicitly.
     #[test]
     fn a_tracked_file_deleted_but_not_staged_is_a_named_refusal() {
-        // "gone.nix" is in the `ls-files` listing but was never `given` to
-        // this test filesystem — the same shape a real deletion leaves.
+        // The index lists a file absent from the test filesystem.
         let files = base_files();
         let err = dirty_dev(files, "fleet.toml\0gone.nix\0")
             .unwrap_err()
@@ -1128,10 +1020,8 @@ mod tests {
 
     #[test]
     fn an_ignored_secret_reaches_neither_the_snapshot_nor_the_scan() {
-        // `keys/cache.sec` is in the working tree and NOT in the listing,
-        // which is exactly what `--exclude-standard` does to a .gitignore'd
-        // path. Pointing nix at the repository would have copied it into the
-        // store anyway; pointing it at the snapshot cannot.
+        // Ignored keys are absent from the materialized snapshot even when they
+        // remain in the working tree.
         let files = base_files()
             .given(repo().join("profiles/new.nix"), "{ }\n")
             .given(

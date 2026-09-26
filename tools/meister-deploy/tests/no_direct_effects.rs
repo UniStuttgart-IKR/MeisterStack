@@ -2,31 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The two doors are only doors if nobody walks past them.
-//!
-//! `--dry-run writes nothing` and `--offline touches no network` are claims
-//! about EVERY path through this binary, and a unit test can only ever pin
-//! the paths it calls. So this test reads the source instead: new code spawns
-//! no process of its own, opens no file of its own, and asks no clock of its
-//! own. Two files are exempt, because they are the doors themselves.
-//! `legacy/` was exempt as well until M5B removed it; the exemption went
-//! with the directory.
-//!
-//! A source-reading test is a blunt instrument, and it is chosen on purpose:
-//! the alternative is a promise in a comment.
+//! Source-string guard for process, filesystem and clock operations outside
+//! the designated effect modules. This is a bounded spelling check, not a
+//! complete static proof that all effects pass through policy admission.
 
 use std::path::{Path, PathBuf};
 
 /// The doors.
 const EXEMPT: &[&str] = &["effects.rs", "run.rs"];
 
-/// What new code must not say, and what to say instead.
-///
-/// `std::process::ExitCode` and `std::process::id` are deliberately NOT here:
-/// neither reaches outside this process — one is how a binary returns its
-/// verdict, the other names the process itself — and forbidding the whole
-/// `std::process::` path would only teach people to write `use std::process`
-/// on its own line. What is forbidden is spawning.
+/// Forbidden direct-effect spellings and suggested interfaces. ExitCode and
+/// process IDs are allowed because they do not spawn subprocesses.
 const FORBIDDEN: &[(&str, &str)] = &[
     ("std::fs::", "use the Files trait from effects.rs"),
     ("use std::fs;", "use the Files trait from effects.rs"),
@@ -60,8 +46,7 @@ fn new_code_goes_through_the_two_doors() {
         checked.push(relative.clone());
         let text = std::fs::read_to_string(&file).expect("the file we just walked to");
         for (line_no, line) in text.lines().enumerate() {
-            // A rule needs a way to be discussed rather than worked around:
-            // a line that says why it is an exception is one somebody read.
+            // Allow explicitly annotated exceptions to the source-string check.
             if line.contains("no-direct-effects: ok") {
                 continue;
             }

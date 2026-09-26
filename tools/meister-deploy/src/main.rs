@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-deploy` — the plan, the order, and the evidence.
+//! Fleet deployment CLI: resolve, build, plan, apply and inspect evidence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -43,23 +43,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
-    /// Print the JSON Schema of a contract object, so that whatever produces
-    /// one — a Nix derivation, another tool, a person — can be held to it.
+    /// Print the JSON Schema for a deployment contract.
     Schema {
-        /// `nix-manifest`, `resolved-fleet`, `release`, `observation`,
-        /// `activate-status`, `targets`, `plan`, `status`, `receipt`,
-        /// `journal-event` or `check-result`
+        /// Contract name: nix-manifest, resolved-fleet, release, observation,
+        /// activate-status, targets, plan, status, receipt, journal-event,
+        /// check-result, verify or verify-ledger.
         kind: String,
     },
 
-    /// Write a deployment repository: the inventory, the profiles, the
-    /// per-host files, the disk layout and the checks. Writes only into an
-    /// empty or absent directory, and never touches a MeisterStack checkout.
+    /// Write the embedded template into an empty directory; attempt nix flake lock.
     Init {
         /// Where the repository goes
         dir: PathBuf,
-        /// The `meisterstack` input to write into its flake.nix — a revision
-        /// for a deployment that is made twice, a local checkout for a test
+        /// MeisterStack flake reference. Pin a revision for repeatable deployments.
         #[arg(long)]
         meisterstack: Option<String>,
         /// List the files and write nothing
@@ -67,8 +63,7 @@ enum Verb {
         dry_run: bool,
     },
 
-    /// What the inventory says: the hosts, their groups, and what each one
-    /// inherited. Reads one file and asks nobody anything.
+    /// List inventory hosts, groups and inherited settings without probing hosts.
     Inventory {
         /// The inventory
         #[arg(short = 'f', long, default_value = "fleet.toml")]
@@ -78,8 +73,7 @@ enum Verb {
         json: bool,
     },
 
-    /// Check the inventory, or a contract file, against the types. Reads
-    /// nothing else and asks nobody anything.
+    /// Validate an inventory or contract file; optionally compare Nix inventory.
     Validate {
         /// The inventory
         #[arg(short = 'f', long, default_value = "fleet.toml")]
@@ -93,8 +87,7 @@ enum Verb {
         nix: bool,
     },
 
-    /// Evaluate the operator's flake and write the manifest: which host is
-    /// what, which system each one will run, and which tree that came from.
+    /// Resolve the operator flake into a source-bound fleet manifest.
     Resolve {
         /// The operator's repository
         #[arg(long, default_value = ".")]
@@ -105,19 +98,14 @@ enum Verb {
         /// The inventory, relative to the repository
         #[arg(short = 'f', long, default_value = "fleet.toml")]
         fleet: PathBuf,
-        /// Take the evaluation from this `nix-manifest/1` file instead of
-        /// running `nix eval` here. For a workstation that cannot evaluate
-        /// the flake — a build machine did it, or a test VM was handed the
-        /// answer. The SOURCE is still read from the repository below, so
-        /// the fingerprint is this tree's and not the file's.
+        /// Read a nix-manifest/1 file instead of evaluating Nix. Source identity
+        /// still comes from --repo; the supplied evaluation is recorded separately.
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Resolve a dirty tree, recording a content snapshot instead of a
-        /// revision. The whole working tree is copied into the nix store.
+        /// Resolve a dirty tree through a content-addressed source snapshot.
         #[arg(long)]
         dev: bool,
-        /// Only these hosts, comma-separated. The result describes that
-        /// sub-fleet and nothing else.
+        /// Resolve only these comma-separated hosts; mark the manifest partial.
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
         /// Print the command lines that would run, and write nothing
@@ -128,52 +116,33 @@ enum Verb {
         offline: bool,
     },
 
-    /// Realise the derivations the manifest names, sign them, measure them,
-    /// and write the release that binds them. Builds no image and asks no
-    /// host anything.
+    /// Build and measure manifest derivations, sign closures, and write a release.
     Build(BuildArgs),
 
-    // --- lane 3A: media -------------------------------------------------
-    /// Build one medium of one host out of a release: the installer ISO, a
-    /// prebuilt disk, or the bundle a hypervisor is handed. Evaluates
-    /// nothing and asks no host anything.
+    /// Build one host's installer ISO, disk image or direct-boot bundle from a release.
     Image(ImageArgs),
 
-    /// Prepare the first installation of a host: build its medium, keep it
-    /// where the collector cannot take it, and print the sheet somebody
-    /// carries to the machine. Destroys nothing — the disk is formatted at
-    /// the target, by a person, with `meister-install confirm`.
+    /// Build and retain installer media for an approved installation plan.
+    /// Disk formatting requires meister-install confirm on the target.
     Install(InstallArgs),
-    // --- end lane 3A ----------------------------------------------------
-    /// Work out which hosts may be taken forward, in which order, and what
-    /// has to still be true when it happens. Reads a release and a snapshot
-    /// of the fleet; asks no host anything of its own.
+    /// Plan rollout actions and waves from a release and host observations.
     Plan(PlanArgs),
 
-    /// Drop the garbage-collector roots of all but the newest N releases,
-    /// and optionally trim the snapshots and the finished runs. Removes no
-    /// store path: whether an unprotected closure goes is `nix store gc`'s
-    /// decision.
+    /// Remove old release roots and optionally observations or completed runs.
+    /// Does not run Nix store garbage collection.
     Gc {
         /// How many releases keep their roots
         #[arg(long, default_value_t = state::DEFAULT_KEEP_RELEASES)]
         keep: usize,
-        // --- lane 4C: the other two things that pile up -----------------
-        /// A second guard: nothing younger than this many days is removed,
-        /// however far down the list it is. The recommended retention is
-        /// `--keep 3 --older-than 14`.
+        /// Minimum age in days before removal, in addition to retention counts.
         #[arg(long, value_name = "DAYS")]
         older_than: Option<i64>,
-        /// Also keep only the newest N snapshots under `observations/`.
-        /// Without it they are left alone; `latest.json` is never removed.
+        /// Keep the newest N observations; always retain latest.json.
         #[arg(long, value_name = "N")]
         observations: Option<usize>,
-        /// Also remove finished run directories. Never a run that did not
-        /// end `success`, and never one that wrote no receipt: those are
-        /// the ones somebody has to read.
+        /// Remove eligible successful runs with receipts; retain incomplete evidence.
         #[arg(long)]
         runs: bool,
-        // --- end lane 4C ------------------------------------------------
         /// The operator's repository, which is where the state directory is
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -182,30 +151,22 @@ enum Verb {
         dry_run: bool,
     },
 
-    /// What the fleet looks like right now: one read-only round trip per
-    /// host, and the readiness checks drawn from it. Changes nothing.
+    /// Probe hosts and report readiness; save the observation locally.
     Status(LookArgs),
 
-    /// The readiness checks as a verdict: exit 0 when every required check
-    /// passed, 2 when one of them did not. Creates no test VM and writes no
-    /// etcd key.
+    /// Run readiness checks: exit 0 when required checks pass, otherwise 2.
     Check {
         #[command(flatten)]
         look: LookArgs,
-        /// Which suite. `readiness` is the one that reads; `vm-lifecycle`,
-        /// `gpu` and `rdma` do work on the fleet and arrive with `verify`
-        /// in M4.
+        /// Readiness only. Workload and hardware suites use verify.
         #[arg(long, default_value = "readiness")]
         suite: String,
     },
 
-    /// Carry out a plan: stage the closures, take the hosts through the
-    /// machine of §6 one wave at a time, and write the journal and the
-    /// receipt that say what happened.
+    /// Execute an approved plan, recording actions in a journal and receipt.
     Apply(ApplyArgs),
 
-    /// What a run did: its journal, folded, and its receipt once it has one.
-    /// Reads the state directory and asks no host anything.
+    /// Read a run's receipt, verification result or folded journal.
     Report {
         /// The run id, as `apply` printed it
         #[arg(long)]
@@ -218,56 +179,26 @@ enum Verb {
         json: bool,
     },
 
-    // --- lane 4B: verification ------------------------------------------
-    /// Make the fleet do the thing it exists for: create guests through the
-    /// operator's own control plane, read what they printed, and delete
-    /// them again. Writes a ledger before every create, and takes back only
-    /// what it made.
+    /// Run workload or fabric verification with a cleanup ledger.
     Verify(VerifyArgs),
-    // --- end lane 4B ----------------------------------------------------
-    // --- lane 3B: enrolment and certificates (one block, one verb) -----
-    /// Host keys and certificates: enrol a machine against a fingerprint
-    /// somebody read off its console, ask it for a certificate request, and
-    /// have `tools/meister-ca` sign one. Puts nothing on a host — that is
-    /// the plan's `deliver-secret`, and `apply` carries it out.
+    /// Enroll SSH host keys and prepare certificates. Apply delivers public credentials.
     Keys {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
-    // --- end lane 3B ---------------------------------------------------
 
-    // --- lane 5B: taking a host out of service --------------------------
-    /// Take a host out of service: take its certificates back, tell the
-    /// fleet, and write down that it happened.
-    ///
-    /// What it does NOT do is as much the point as what it does. No data is
-    /// deleted, no file on the machine is touched, no disk is wiped and the
-    /// `known_hosts` line stays where it is — a retirement is a statement
-    /// this fleet makes about a machine, not something it does to one. The
-    /// machine may be off, may be stolen, may be on somebody's desk; none of
-    /// that changes what has to be true here, which is that nothing it
-    /// presents is believed any more.
-    ///
-    /// The host leaves the inventory when the OPERATOR deletes its lines.
-    /// This verb never edits `fleet.toml`: an inventory a tool rewrites is
-    /// an inventory whose diff says nothing.
+    /// Revoke recorded active credentials and plan CRL delivery to remaining hosts.
+    /// Retains target data, known_hosts entries and inventory; remove inventory entries manually.
     Retire {
         /// The host id, as the inventory and the release spell it
         host: String,
         /// The release the delivery plan is made from
         #[arg(long)]
         release: PathBuf,
-        /// Why — it lands in the record and above the `known_hosts` line.
-        /// Free text, for a person to read; not the CRL reason (see
-        /// `--crl-reason`). Astra finding F21, 2026-09-23: this used to be
-        /// forwarded to the CA as the CRL reason too, and openssl's fixed
-        /// vocabulary rejects ordinary prose.
+        /// Retirement note for the record and known_hosts; separate from --crl-reason.
         #[arg(long)]
         reason: Option<String>,
-        /// The reason the revocation itself carries, from openssl's fixed
-        /// list: keyCompromise | superseded | cessationOfOperation | … .
-        /// Default: cessationOfOperation, since a retirement is usually
-        /// exactly that.
+        /// OpenSSL revocation reason; defaults to cessationOfOperation.
         #[arg(long)]
         crl_reason: Option<String>,
         /// The operator's repository
@@ -292,20 +223,13 @@ enum Verb {
         #[arg(long)]
         json: bool,
     },
-    // --- end lane 5B ----------------------------------------------------
 }
 
-// --- lane 3B: the `keys` verbs ------------------------------------------
 
 #[derive(Subcommand)]
 enum KeysCmd {
-    /// Write a host's key into `<repo>/known_hosts`, after checking it
-    /// against the fingerprint you typed.
-    ///
-    /// The fingerprint comes from the machine's console, its BMC or the
-    /// installer's own output — never from this command. That is the whole
-    /// point: `ssh-keyscan` reports whatever answers on the address, and
-    /// believing it would make an impersonating host self-certifying.
+    /// Enroll an SSH key after matching a fingerprint verified through the host console
+    /// or another trusted channel. ssh-keyscan alone does not authenticate the host.
     Enroll {
         /// The host id, as the inventory spells it
         host: String,
@@ -318,17 +242,13 @@ enum KeysCmd {
         /// Why — written into `known_hosts` above the new line
         #[arg(long)]
         reason: Option<String>,
-        /// The operator's repository: its `known_hosts` is the file that is
-        /// written, and its inventory says where the host is
+        /// Repository containing known_hosts and the host inventory.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         /// The inventory, relative to the repository or absolute
         #[arg(short = 'f', long, default_value = "fleet.toml")]
         fleet: PathBuf,
-        /// A manifest from `resolve`, when there is one. A host that was
-        /// never resolved is read out of the inventory instead — which is
-        /// the normal case, because enrolment comes before the first
-        /// `resolve` of a fresh machine.
+        /// Optional resolved manifest; otherwise read the host from the inventory.
         #[arg(long)]
         manifest: Option<PathBuf>,
         /// Ask the host, and write nothing
@@ -342,12 +262,8 @@ enum KeysCmd {
         json: bool,
     },
 
-    /// Ask a host for a certificate request over a key it makes itself.
-    ///
-    /// The private half is generated on the target and stays there; what
-    /// comes back is the request, which lands under `<repo>/pki/csr/`.
-    /// Running it twice does not make a second identity — the host keeps
-    /// its key and answers with another request over it.
+    /// Generate or reuse a target-local key and save its CSR under pki/csr/.
+    /// The private key remains on the target.
     Csr {
         /// The host id
         #[arg(long)]
@@ -356,21 +272,18 @@ enum KeysCmd {
         /// (what a client checks its address against)
         #[arg(long, default_value = "identity")]
         kind: String,
-        /// Which identity, for a host that carries more than one tier:
-        /// node, cluster or cloud. One role means one answer and this can
-        /// be left out.
+        /// Identity role for a multi-role host: node, cluster or cloud.
+        /// Selects one identity; does not provision separate per-role keys.
         #[arg(long = "as", value_name = "KIND")]
         as_kind: Option<String>,
-        /// Make a NEW key on the target although one is there. A rotation
-        /// or a reinstall, never a repair.
+        /// Replace the target key for an intentional rotation or reinstall.
         #[arg(long)]
         replace: bool,
         /// The manifest from `resolve`: it says where the host is and what
         /// its subject would be
         #[arg(long)]
         manifest: PathBuf,
-        /// The operator's repository: its `known_hosts` is what the
-        /// connection is checked against, and the request lands under it
+        /// Repository for SSH trust and saved certificate requests.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         /// The ssh key to offer
@@ -384,14 +297,8 @@ enum KeysCmd {
         json: bool,
     },
 
-    /// Sign a request with the fleet's CA, on this machine alone.
-    ///
-    /// The subject is this tool's decision and not the request's: a request
-    /// is a public key and a wish. The CA key stays in `[operator] ca_dir`
-    /// and never reaches a host.
-    ///
-    /// No network and therefore no `--offline`: signing needs nothing but
-    /// this computer, so there is nothing for that flag to refuse.
+    /// Sign a CSR locally using the fleet-derived subject.
+    /// The CA key stays outside the repository and is never delivered to hosts.
     Issue {
         /// The host the certificate is for
         #[arg(long)]
@@ -399,13 +306,11 @@ enum KeysCmd {
         /// node | cluster | cloud | serving
         #[arg(long)]
         kind: String,
-        /// The request. `-` reads it from standard input; without it, the
-        /// one `keys csr` left under `<repo>/pki/csr/`.
+        /// CSR file, or - for stdin. Defaults to the request saved by keys csr.
         #[arg(long)]
         csr: Option<String>,
-        /// Extra subject alternative names for `--kind serving`, comma
-        /// separated. The host name and its management address are always
-        /// in.
+        /// Extra serving-certificate SANs, comma-separated; host name and management address
+        /// are included automatically.
         #[arg(long)]
         san: Vec<String>,
         /// How long the certificate is good for
@@ -429,52 +334,27 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
-    // --- end lane 3B ----------------------------------------------------
 
-    // --- lane 5A: taking one back ---------------------------------------
-    /// Take a certificate back, and plan the delivery of the list that says
-    /// so.
-    ///
-    /// Two halves, and they are separate on purpose. The CA writes the
-    /// revocation into its own index and publishes a list — that happens
-    /// here, offline, on this machine. Getting the list to the hosts is a
-    /// PLAN, like every other thing this tool does to a machine, so it goes
-    /// through `apply`, the locks and the journal.
-    ///
-    /// The list takes effect without restarting anything: a controller looks
-    /// at its file again within half a minute, refuses the serials on it,
-    /// and ends the sessions that are already running on one.
+    /// Revoke locally, publish the CRL, and plan delivery. Apply is required
+    /// for hosts to receive the new revocation list.
     Revoke {
-        /// The serial to take back, in any of its spellings: `6435C9…` as
-        /// openssl prints it, `64:35:c9:…` as a controller's log does.
+        /// Certificate serial in OpenSSL or colon-separated form.
         #[arg(long)]
         serial: Option<String>,
-        /// Every ACTIVE certificate this repository holds for that host --
-        /// its identity and its serving certificate are the same machine's
-        /// two credentials. This is what a reinstall needs. A `.prev` or
-        /// `.next` certificate left over from an in-progress rotation is
-        /// not included; take that one back by `--serial` (Astra finding
-        /// F11, 2026-09-23).
+        /// Revoke recorded active identity and serving certificates.
+        /// Revoke .prev/.next rotation certificates separately by --serial.
         #[arg(long)]
         host: Option<String>,
-        /// Take nothing back: write the list again. A CRL has a lifetime
-        /// (30 days), and one that has run out is a list a verifier may
-        /// refuse; this is how it is renewed.
+        /// Refresh the CRL without revoking another certificate.
         #[arg(long)]
         refresh: bool,
-        /// The reason the revocation itself carries, from openssl's fixed
-        /// list: keyCompromise | superseded | cessationOfOperation | … .
-        /// Default: unspecified. Named `--crl-reason` rather than
-        /// `--reason` (Astra finding F21, 2026-09-23) for the same reason
-        /// `retire` carries both: this one is the fixed vocabulary the CA
-        /// writes into the CRL, not free text.
+        /// OpenSSL revocation reason; defaults to unspecified.
         #[arg(long)]
         crl_reason: Option<String>,
         /// The release the delivery plan is made from
         #[arg(long)]
         release: PathBuf,
-        /// Which hosts the list goes to. Every host that reads one, by
-        /// default — a revocation nobody was told about is not one.
+        /// Hosts receiving the CRL; defaults to all.
         #[arg(long, default_value = "all")]
         select: String,
         /// The operator's repository
@@ -499,15 +379,8 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Rotate a key: make a new one on the host, have it signed here, and
-    /// write the plan that puts it in.
-    ///
-    /// Nothing is put anywhere by this verb. What it does is the half that
-    /// cannot be planned — the key is made on the machine that will use it,
-    /// and the certificate is issued on the machine that holds the CA — and
-    /// then it writes a plan of five steps: prepare, overlap, switch,
-    /// verify, remove. `apply` carries them out, one at a time, and a run
-    /// that is interrupted picks up at the phase the host is actually at.
+    /// Prepare a new target key and locally signed certificate, then write a rotation plan.
+    /// Apply performs the switch and cleanup; preparation already changes key files.
     Rotate {
         /// The host id
         #[arg(long)]
@@ -516,8 +389,8 @@ enum KeysCmd {
         /// (what a client checks its address against)
         #[arg(long, default_value = "identity")]
         kind: String,
-        /// Which identity, for a host that carries more than one tier:
-        /// node, cluster or cloud
+        /// Identity role for a multi-role host: node, cluster or cloud.
+        /// Selects one identity; does not provision separate per-role keys.
         #[arg(long = "as", value_name = "KIND")]
         as_kind: Option<String>,
         /// How long the new certificate is good for
@@ -548,37 +421,17 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
-    // --- end lane 5A ----------------------------------------------------
 
-    // --- lane 5B: certificates that are already there -------------------
-    /// Take certificates a CA of this fleet already issued into this
-    /// repository, so that they can be planned, compared and taken back.
-    ///
-    /// For a fleet that existed before this tool did. The certificates are
-    /// under whatever fixed names the old road gave them
-    /// (`system-node-<host>.crt`, `system-cluster-<group>.crt`), and this
-    /// verb is the mapping from those names to host ids — typed by a person,
-    /// because a file name is not an identity and guessing which machine a
-    /// certificate belongs to is exactly the mistake that ends in a host
-    /// presenting somebody else's name.
-    ///
-    /// The PRIVATE half is never copied, never read and never delivered. A
-    /// key that is already on a machine stays on that machine; what arrives
-    /// here is the public certificate, and `secret_refs` calls its source
-    /// `target-generated` — which is the truth: this workstation did not
-    /// make it and cannot make it again.
-    ///
-    /// No network, and therefore no `--offline`.
+    /// Import explicitly mapped public certificates for deployment and revocation.
+    /// Private keys are not read or copied.
     Import {
         /// The directory the certificates are in
         #[arg(long)]
         from: PathBuf,
-        /// `<host id>=<file stem>`, once per certificate. The stem is the
-        /// file name without `.crt`.
+        /// Host ID and certificate filename without .crt, as HOST=STEM.
         #[arg(long = "map", value_name = "HOST=STEM")]
         map: Vec<String>,
-        /// The manifest from `resolve`: it says what each host's subject
-        /// would be, which is what an imported certificate is held to
+        /// Resolved manifest used to check imported certificate subjects.
         #[arg(long)]
         manifest: PathBuf,
         /// The operator's repository, where the certificates land
@@ -597,19 +450,16 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
-    // --- end lane 5B ----------------------------------------------------
 }
 
-/// What `status` and `check` both need: which fleet, which hosts, where
-/// they answer, and whether to ask at all.
+/// Shared host selection and observation options for status and check.
 #[derive(Args)]
 struct LookArgs {
     /// The release to compare against, from `build`
     #[arg(long)]
     release: Option<PathBuf>,
 
-    /// A manifest from `resolve`, when there is no release yet. Then
-    /// nothing is compared against a desired system.
+    /// Inspect a resolved fleet without comparing it against a built release.
     #[arg(long)]
     manifest: Option<PathBuf>,
 
@@ -622,10 +472,7 @@ struct LookArgs {
     #[arg(long)]
     targets: Option<PathBuf>,
 
-    /// The operator's repository: its `known_hosts` is what every
-    /// connection is checked against, and its state directory is where the
-    /// snapshot is kept. Defaults to the one the manifest was resolved
-    /// from.
+    /// Repository for SSH trust and saved observations; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -634,22 +481,14 @@ struct LookArgs {
     #[arg(long)]
     identity: Option<PathBuf>,
 
-    // --- lanes 5B + 5C: one flag, two readers ---
-    /// The inventory. Two things are read out of it: the `[operator]
-    /// cli_config` reference (D7, lane 5C) and the list of hosts the fleet
-    /// still has, so that a host in the release but not in the inventory
-    /// is `unmanaged` (V25, lane 5B). Defaults to the file the manifest was
-    /// resolved from. `plan` and `apply` take the same flag and mean the
-    /// same thing by it.
+    /// Inventory used to identify hosts no longer managed and locate operator references.
     #[arg(long)]
     inventory: Option<PathBuf>,
-    // --- end lanes 5B + 5C ---
     /// How many hosts to ask at once
     #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
     at_once: usize,
 
-    /// Do not ask anybody: answer from the last snapshot in the state
-    /// directory
+    /// Read the last saved observation without probing hosts.
     #[arg(long)]
     offline: bool,
 
@@ -658,7 +497,6 @@ struct LookArgs {
     json: bool,
 }
 
-// --- lane 4B: verification ------------------------------------------------
 
 #[derive(Args)]
 struct VerifyArgs {
@@ -679,9 +517,7 @@ struct VerifyArgs {
     #[arg(long)]
     host: Vec<String>,
 
-    /// `<a>:<b>`, for the rdma suite: measure between exactly these two,
-    /// with the server end first. Repeatable. Without it, every pair the
-    /// inventory declares among the selected hosts is measured.
+    /// RDMA server:client host pair, repeatable. Defaults to declared selected pairs.
     #[arg(long)]
     pairs: Vec<String>,
 
@@ -689,26 +525,19 @@ struct VerifyArgs {
     #[arg(long, default_value_t = meister_deploy::verify::FABRIC_DEADLINE.as_secs())]
     fabric_deadline: u64,
 
-    /// `verify=<release_id>`. The approval names the RELEASE and not a
-    /// plan: this verb rolls nothing out, so there is no plan for an
-    /// approval to hang on, and what somebody is saying yes to is guests
-    /// being created against the fleet running THIS release.
+    /// Approve test workload creation with verify=<release_id>, bound to this release.
     #[arg(long)]
     approve: Vec<String>,
 
-    /// The most guests that may be alive at once. One is created on its own
-    /// first, so a host sees `1 + budget` of them.
+    /// Concurrent batch size; an initial guest is also retained, giving 1 + budget per host.
     #[arg(long, default_value_t = meister_deploy::verify::BUDGET)]
     budget: usize,
 
-    /// The whole run, in seconds. When it passes, the guests are deleted
-    /// and the outcome is `aborted`.
+    /// Run deadline in seconds; expiry aborts and attempts cleanup.
     #[arg(long, default_value_t = meister_deploy::verify::DEADLINE.as_secs())]
     deadline: u64,
 
-    /// How long ONE guest gets to reach a phase, in seconds. A guest that
-    /// boots in a second still needs a control plane that answers, so this
-    /// is a wait on the answer rather than on the guest.
+    /// Per-guest phase deadline in seconds, including control-plane response time.
     #[arg(long, default_value_t = meister_deploy::verify::SETTLE.as_secs())]
     settle: u64,
 
@@ -716,9 +545,7 @@ struct VerifyArgs {
     #[arg(long, default_value_t = meister_deploy::verify::POLL.as_secs())]
     poll: u64,
 
-    /// Leave the guests standing instead of deleting them, and say which.
-    /// A suite that deleted nothing has not shown a lifecycle, so every
-    /// delete is then `skipped` and a required suite is blocked.
+    /// Retain test guests. Skipped deletion prevents required lifecycle checks from passing.
     #[arg(long)]
     keep: bool,
 
@@ -730,9 +557,7 @@ struct VerifyArgs {
     #[arg(long)]
     observation: Option<PathBuf>,
 
-    /// The operator's repository: its `known_hosts` is what every
-    /// connection is checked against, and its state directory is where the
-    /// ledger goes. Defaults to the one the manifest was resolved from.
+    /// Repository for SSH trust and verification evidence; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -762,7 +587,6 @@ struct VerifyArgs {
     json: bool,
 }
 
-// --- end lane 4B ----------------------------------------------------------
 
 #[derive(Args)]
 struct BuildArgs {
@@ -774,13 +598,11 @@ struct BuildArgs {
     #[arg(short = 'o', long)]
     out: Option<PathBuf>,
 
-    /// Only these hosts, comma-separated. A build of part of a fleet is for
-    /// looking at: a release covers every host of its manifest.
+    /// Build only selected hosts. A complete release still requires every manifest host.
     #[arg(long, value_delimiter = ',')]
     host: Vec<String>,
 
-    /// The nix signing key to sign the release with. Without it, the
-    /// inventory's `[operator] signing_key` is used.
+    /// Closure signing key; otherwise use [operator] signing_key.
     #[arg(long)]
     sign_key: Option<PathBuf>,
 
@@ -792,9 +614,7 @@ struct BuildArgs {
     #[arg(long)]
     substituters: Vec<String>,
 
-    // --- lane 4C: what nix is handed and where the result goes ----------
-    /// How many derivations nix may build at once: a number, or `auto`.
-    /// Passed on unread and recorded in the release.
+    /// Nix max-jobs value, e.g. a number or auto; recorded in the release.
     #[arg(long)]
     max_jobs: Option<String>,
 
@@ -803,29 +623,20 @@ struct BuildArgs {
     #[arg(long, num_args = 2, value_names = ["NAME", "VALUE"])]
     option: Vec<String>,
 
-    /// Push the signed closures into this nix store once they are built:
-    /// `file:///srv/cache`, `s3://bucket`, `ssh-ng://host`. Recorded in the
-    /// release as `build_env.cache_url`. A host fetches from it only if its
-    /// own `meisterstack.managed.substituters` names it.
+    /// Push signed closures to this Nix store URL. Hosts must separately configure
+    /// the URL in meisterstack.managed.substituters.
     #[arg(long)]
     cache: Option<String>,
 
-    /// Build every host's system a SECOND time and let nix compare, so that
-    /// the release's `bit_identical_verified` is a measurement. Expensive
-    /// by construction — it is the whole fleet, twice — and without it the
-    /// release says `false` with `method: null`, which is "nobody checked".
+    /// Rebuild systems with Nix reproducibility checks; record the measured result.
     #[arg(long)]
     verify_reproducible: bool,
-    // --- end lane 4C ----------------------------------------------------
     /// The inventory the `[operator] signing_key` reference is read from.
     /// Defaults to the one the manifest was resolved from.
     #[arg(long)]
     inventory: Option<PathBuf>,
 
-    /// The operator's repository, whose state directory keeps the release's
-    /// garbage-collector roots. Defaults to the one the manifest was
-    /// resolved from — which is a path from ANOTHER machine when the
-    /// manifest came from one, and then this is the flag to pass.
+    /// Repository for release roots; override source.repo_path when using another workstation.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -838,7 +649,6 @@ struct BuildArgs {
     offline: bool,
 }
 
-// --- lane 3A: media -------------------------------------------------------
 #[derive(Args)]
 struct ImageArgs {
     /// The release from `build`
@@ -853,14 +663,11 @@ struct ImageArgs {
     #[arg(long)]
     kind: String,
 
-    /// Link the result into this directory, under a name that says which
-    /// host it belongs to
+    /// Link the host-specific image into this directory.
     #[arg(short = 'o', long)]
     out: Option<PathBuf>,
 
-    /// The operator's repository, whose state directory keeps the
-    /// garbage-collector root. Defaults to the one the manifest was resolved
-    /// from.
+    /// Repository for media roots; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -882,9 +689,7 @@ struct InstallArgs {
     #[arg(long)]
     plan: PathBuf,
 
-    /// The release the plan was made for. Required and checked, like
-    /// `apply`: the medium is built out of the derivation the RELEASE
-    /// names, and another build is another release.
+    /// Release matching the installation plan; determines the media derivation.
     #[arg(long)]
     release: PathBuf,
 
@@ -892,8 +697,7 @@ struct InstallArgs {
     #[arg(long)]
     host: String,
 
-    /// `--approve destructive=<plan_id>`. The plan's own id, so an approval
-    /// cannot be carried over from a plan somebody read yesterday.
+    /// Approve installation media creation with destructive=<plan_id>.
     #[arg(long = "approve")]
     approve: Vec<String>,
 
@@ -901,9 +705,7 @@ struct InstallArgs {
     #[arg(short = 'o', long)]
     out: Option<PathBuf>,
 
-    /// The operator's repository, whose state directory keeps the medium
-    /// and its collector root. Defaults to the one the manifest was
-    /// resolved from.
+    /// Repository for media records and roots; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -919,40 +721,30 @@ struct InstallArgs {
     #[arg(long)]
     json: bool,
 }
-// --- end lane 3A ----------------------------------------------------------
 
 #[derive(Args)]
 struct ApplyArgs {
-    /// The plan from `plan`. Optional with `--resume`, which reads the
-    /// copy the run itself wrote.
+    /// Plan file; --resume can use the run's saved copy.
     #[arg(long)]
     plan: Option<PathBuf>,
 
-    /// The release the plan was made for. Checked: a plan names the bytes
-    /// it is about, and another build is another plan. Optional with
-    /// `--resume`, for the same reason as `--plan`.
+    /// Matching release file; --resume can use the run's saved copy.
     #[arg(long)]
     release: Option<PathBuf>,
 
-    /// `--approve <class>=<plan_id>`, once per class the plan asks for.
-    /// The id is the plan's own, so an approval cannot be carried over
-    /// from one somebody read yesterday.
+    /// Approval bound to this plan ID; repeat for each required class.
     #[arg(long = "approve")]
     approve: Vec<String>,
 
-    /// Continue the run with this id: its journal is folded and every host
-    /// is asked where it got to. Nothing irreversible is ever repeated.
+    /// Resume from the journal and fresh host observations. Preserve the run's saved plan and release.
     #[arg(long)]
     resume: Option<String>,
 
-    /// Take over the per-host locks of this run — after a fresh
-    /// observation and a re-validation, and never because time has passed.
+    /// Explicitly take over the named run's locks; elapsed time alone is not ownership evidence.
     #[arg(long)]
     takeover: Option<String>,
 
-    /// The operator's repository: its `known_hosts` is what every
-    /// connection is checked against and its state directory is where the
-    /// journal goes. Defaults to the one the manifest was resolved from.
+    /// Repository for SSH trust and run evidence; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -960,8 +752,7 @@ struct ApplyArgs {
     #[arg(long)]
     identity: Option<PathBuf>,
 
-    /// The inventory the `[operator] cli_config` reference is read from
-    /// (D7). Defaults to the one the manifest was resolved from.
+    /// Inventory containing the operator CLI configuration reference.
     #[arg(long)]
     inventory: Option<PathBuf>,
 
@@ -973,14 +764,11 @@ struct ApplyArgs {
     #[arg(long, default_value_t = 600)]
     reboot_wait: u64,
 
-    /// Look at the fleet, check the plan against it, print the steps — and
-    /// take no lock, copy nothing, write no journal
+    /// Reprobe and validate the plan without locks, copies or a run journal.
     #[arg(long)]
     dry_run: bool,
 
-    /// Print the receipt as json instead of as a table: one json document
-    /// on stdout and nothing else there (the run id is in it as `run_id`,
-    /// a halt for a provider as `waiting`, a stop as `stopped`)
+    /// Print one receipt JSON document, including run_id and any waiting/stopped state.
     #[arg(long)]
     json: bool,
 }
@@ -997,40 +785,31 @@ struct PlanArgs {
     #[arg(long)]
     select: String,
 
-    /// `upgrade`, `bootstrap` or `install`
+    /// Plan kind: upgrade, bootstrap, install, keys-revoke or retire.
     #[arg(long, default_value = "upgrade")]
     kind: String,
 
-    // --- lane 3A: first installation ---
-    /// With `--kind install`: plan an installation over a host that already
-    /// answers and runs a system. It destroys that machine's data, its host
-    /// key and its machine id, and it is part of the plan id — so an
-    /// approval for a plan without it can never be used for one with it.
+    /// Permit an install plan for an existing host. The reinstall decision is
+    /// bound into the plan ID and authorizes loss of target data and identity.
     #[arg(long)]
     reinstall: bool,
-    // --- end lane 3A ---
     /// A `targets/1` file from a provider adapter: where each host answers
     #[arg(long)]
     targets: Option<PathBuf>,
 
-    /// An `observation/1` snapshot of the fleet to plan from. Without it,
-    /// the frozen target set is asked — and nothing else is.
+    /// Read an observation/1 snapshot instead of probing selected hosts.
     #[arg(long)]
     observation: Option<PathBuf>,
 
-    /// Plan without a snapshot and without writing anything: the result is
-    /// provisional and every interrupting step in it is blocked
+    /// Use no live probes and write no plan file; without --observation, use provisional evidence.
     #[arg(long)]
     offline: bool,
 
-    /// Ask the hosts, and write nothing at all: no plan file and no
-    /// snapshot in the state directory
+    /// Compute and print the plan without saving it or its observation; may probe hosts.
     #[arg(long)]
     dry_run: bool,
 
-    /// The operator's repository: its `known_hosts` is what the connections
-    /// are checked against. Defaults to the one the manifest was resolved
-    /// from.
+    /// Repository containing SSH trust; defaults to source.repo_path.
     #[arg(long)]
     repo: Option<PathBuf>,
 
@@ -1052,12 +831,7 @@ struct PlanArgs {
     out: Option<PathBuf>,
 }
 
-/// What a verb came to, and what the shell is told.
-///
-/// Three codes and not two: a plan that refuses to interrupt a fleet did not
-/// FAIL — it worked, and the answer is no. A script that reads exit 1 for
-/// both cannot tell "this tool broke" from "this rollout is not safe right
-/// now", and the second one is the answer a rollout exists to give.
+/// Command result: success, failure or a completed decision that blocks execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
     /// 0
@@ -1124,20 +898,16 @@ fn run() -> Result<Answer> {
         )
         .map(Answer::from),
         Verb::Build(args) => build(args).map(Answer::from),
-        // --- lane 3A: media ---
         Verb::Image(args) => image(args).map(Answer::from),
         Verb::Install(args) => install(args),
-        // --- end lane 3A ---
         Verb::Status(look) => status(look),
         Verb::Check { look, suite } => check(look, suite),
         Verb::Plan(args) => make_plan(args),
         Verb::Gc {
             keep,
-            // --- lane 4C ---
             older_than,
             observations,
             runs,
-            // --- end lane 4C ---
             repo,
             dry_run,
         } => gc(
@@ -1153,13 +923,8 @@ fn run() -> Result<Answer> {
         .map(Answer::from),
         Verb::Apply(args) => apply(args),
         Verb::Report { run, repo, json } => report(run, repo, *json),
-        // --- lane 4B ---------------------------------------------------
         Verb::Verify(args) => verify(args),
-        // --- end lane 4B -----------------------------------------------
-        // --- lane 3B ---------------------------------------------------
         Verb::Keys { cmd } => keys(cmd),
-        // --- end lane 3B -----------------------------------------------
-        // --- lane 5B ---------------------------------------------------
         Verb::Retire {
             host,
             release,
@@ -1185,13 +950,10 @@ fn run() -> Result<Answer> {
             dry_run: *dry_run,
             json: *json,
         }),
-        // --- end lane 5B -----------------------------------------------
     }
 }
 
-/// The contract objects that have a schema today. The rest — plan, receipt —
-/// arrive later in M2, and asking for one now says so rather than printing an
-/// empty object.
+/// Print the schema of a supported versioned contract.
 fn print_schema(kind: &str) -> Result<bool> {
     let schema = match kind {
         "nix-manifest" => schemars::schema_for!(manifest::NixManifest),
@@ -1207,10 +969,8 @@ fn print_schema(kind: &str) -> Result<bool> {
         // The contract lane 2C's `meister-activate status --json` answers
         // with, and the second source `observe` merges into an observation.
         "activate-status" => schemars::schema_for!(observe::ActivateStatus),
-        // --- lane 4B ---
         "verify-ledger" => schemars::schema_for!(meister_deploy::verify::Ledger),
         "verify" => schemars::schema_for!(meister_deploy::verify::VerifyRun),
-        // --- end lane 4B ---
         other => anyhow::bail!(
             "there is no schema called {other:?}; this tool knows nix-manifest, \
              resolved-fleet, release, observation, activate-status, targets, plan, \
@@ -1221,9 +981,7 @@ fn print_schema(kind: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Which binary wrote a manifest. `git_rev` is null unless the build set it —
-/// the nix package does, a `cargo build` on somebody's laptop does not, and
-/// claiming a revision that was not checked would be worse than saying so.
+/// Identify the producing binary; git_rev is present only when set at build time.
 fn tool() -> Tool {
     Tool {
         name: "meister-deploy".to_string(),
@@ -1250,8 +1008,7 @@ fn resolve(
              evaluation."
         );
     }
-    // Absolute, because `source.repo_path` in the manifest has to mean the
-    // same thing to whoever reads it later.
+    // Persist an absolute source path for later manifest consumers.
     let repo = std::path::absolute(repo)
         .with_context(|| format!("{} could not be made absolute", repo.display()))?;
     let selection = if hosts.is_empty() { None } else { Some(hosts) };
@@ -1264,11 +1021,7 @@ fn resolve(
             println!("# would write {}", out.display());
             return Ok(true);
         }
-        // A dev run evaluates a snapshot directory named after its own
-        // content, and a clean run pins the flake ref to the rev it read —
-        // neither can be known without reading the tree, which a dry run
-        // does not do. So the line is printed with the one segment that is
-        // not yet decided spelled out as what it is.
+        // The snapshot hash or captured revision is unknown until source inspection.
         let (eval_dir, rev) = if dev {
             println!(
                 "# would then copy exactly those files to {}",
@@ -1287,28 +1040,19 @@ fn resolve(
     }
 
     let policy = Policy::real();
-    // From here on something can take minutes, and a Ctrl-C has to reach the
-    // child rather than leave a `nix eval` behind.
+    // Propagate cancellation to the external evaluator.
     Cancel::on_sigint()?;
     let runner = Real::new(policy);
     let files = RealFiles::new(policy);
 
     let mut tree = source::describe(&runner, &files, &repo, fleet, dev)?;
-    // Where the evaluation comes from. Two roads, one result: the flake is
-    // evaluated here, or an evaluation of it was handed over. What is NOT
-    // handed over is the SOURCE — `tree` above is this repository, read
-    // with git, so a manifest still names the tree it came from and a dirty
-    // one is still refused. What the manifest then says about the
-    // difference is `source.provided_evaluation`, because it is the one
-    // thing a later reader could not work out.
+    // A supplied evaluation keeps this repository's source identity and records
+    // its own origin/hash separately; it is not proof of evaluation equivalence.
     let (evaluated, origin) = match from {
         Some(path) => {
             let text = files.read_to_string(path)?;
             let origin = path.display().to_string();
-            // The same door `validate --manifest` opens, so that a file
-            // handed to this flag is read by the same parser and refused
-            // with the same sentence — including a file that is a manifest
-            // of the WRONG kind, which is the likely mistake.
+            // Accept only a Nix evaluation, not an already-resolved fleet.
             let evaluated = match manifest::parse_contract(&text, &origin)? {
                 Contract::NixManifest(evaluated) => *evaluated,
                 other => anyhow::bail!(
@@ -1326,29 +1070,15 @@ fn resolve(
             (evaluated, origin)
         }
         None => {
-            // Astra finding F15, 2026-09-23: a clean tree used to be
-            // addressed as `git+file://{path}` with no `?rev=`, so nix read
-            // whatever HEAD happened to be at the moment it ran rather than
-            // the rev `describe` had just captured — a commit or a checkout
-            // landing in that gap would be evaluated silently, under the
-            // OLDER rev's name. Pinning to the captured rev closes the gap.
+            // Pin evaluation to the revision captured during source inspection.
             let flake_ref = nix::flake_ref(&tree.eval_dir, dev, tree.source.git_rev.as_deref());
             let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
             let origin = format!("{flake_ref}#{}", nix::MANIFEST_ATTR);
             (NixManifest::from_json(&text, &origin)?, origin)
         }
     };
-    // --- lab finding W3 ---
-    // The evaluation names the inventory it read by content; this command
-    // read the file `-f` names. If they differ, `source.inventory_path` would
-    // point at a file nobody evaluated, and everything that reads the
-    // inventory back through the manifest (`keys issue` and its `[operator]
-    // ca_dir`, `plan`'s cli_config, `apply`) would read the wrong one.
-    // Measured in the lab on 2026-09-23: the flake evaluated `lab.toml`, the
-    // default `fleet.toml` went into the manifest, and `keys issue` created a
-    // CA under that file's `ca_dir`. An evaluation that was handed over
-    // (`--from`) is allowed to be older than the file — the placeholder host
-    // keys of a VM test are exactly that — so there it is a warning.
+    // Require the evaluated inventory to match the source inventory.
+    // For --from, retain the mismatch as a warning about supplied evidence.
     if evaluated.inventory_sha256 != tree.source.inventory_sha256 {
         let what = format!(
             "the evaluation read an inventory with sha256 {} and this command read {} \
@@ -1369,12 +1099,10 @@ fn resolve(
             );
         }
     }
-    // --- end lab finding W3 ---
     let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now(), selection)?;
 
     files.write_atomic(out, &resolved.to_json()?, 0o644)?;
-    // The id on stdout and nothing else, so that it can be captured; where
-    // it went goes to stderr like every other diagnostic.
+    // Write the ID to stdout and diagnostics to stderr.
     println!("{}", resolved.manifest_id);
     eprintln!("==> {}", out.display());
     if from.is_some() {
@@ -1409,8 +1137,7 @@ fn resolve(
 // status and check
 // ---------------------------------------------------------------------------
 
-/// The fleet, the hosts, the snapshot and the verdicts — what both
-/// read-only verbs work from.
+/// Fleet context and observations shared by status and check.
 struct Looked {
     fleet: manifest::ResolvedFleet,
     release: Option<ReleaseManifest>,
@@ -1419,11 +1146,8 @@ struct Looked {
     checks: Vec<meister_deploy::checks::CheckResult>,
     /// Where the snapshot was written, for a run that asked.
     written: Option<PathBuf>,
-    // --- lane 5B ---
-    /// Selected hosts that the inventory does not have any more. They are
-    /// listed, not probed and not judged (V25).
+    /// Hosts missing from the current inventory; listed without probing.
     unmanaged: BTreeSet<String>,
-    // --- end lane 5B ---
 }
 
 /// Look at the fleet: one round trip per host, or the last snapshot on disk.
@@ -1435,8 +1159,7 @@ fn look(args: &LookArgs) -> Result<Looked> {
     };
     let files = RealFiles::new(policy);
 
-    // A release is the better answer where there is one: it says what each
-    // host SHOULD run, and without that a status can only say what is.
+    // A release supplies the desired system for comparison.
     let (fleet, release) = match (&args.release, &args.manifest) {
         (Some(path), _) => {
             let text = files.read_to_string(path)?;
@@ -1463,27 +1186,13 @@ fn look(args: &LookArgs) -> Result<Looked> {
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
     let state = StateDir::in_repo(&repo);
 
-    // --- lane 5B: which of these hosts the fleet still has --------------
-    //
-    // A release is a photograph of an inventory at a moment. When a host
-    // leaves the inventory, every release that was built before the edit
-    // still names it — so `status --release r.json` would go on asking a
-    // machine that is nobody's any more, and a `check` would go on
-    // requiring it. Reading the inventory beside the release is what closes
-    // that gap, and it is READ-ONLY: what the release says about a host
-    // stays what it says.
+    // Exclude hosts removed from the current inventory without changing the release.
     let inventory_file = match &args.inventory {
         Some(path) => inventory_path(&repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
     let unmanaged: BTreeSet<String> = match Inventory::load(&files, &inventory_file) {
-        // The name first, and it is not a formality. The default path comes
-        // out of the manifest (`source.repo_path`), which is where `resolve`
-        // RAN — on another machine, or after somebody moved a directory,
-        // that path can point at a different fleet's inventory, and reading
-        // one would declare every host of this release `unmanaged` on the
-        // strength of a file about something else. So: same fleet, or no
-        // answer.
+        // A different fleet cannot establish that these hosts are unmanaged.
         Ok(inventory) if inventory.fleet.name != fleet.fleet.name => {
             eprintln!(
                 "note: {} is the inventory of the fleet {:?} and this release is of {:?}, so                  it says nothing about which of these hosts are still managed. Pass                  --inventory <file> to point at the right one.",
@@ -1499,9 +1208,7 @@ fn look(args: &LookArgs) -> Result<Looked> {
             .cloned()
             .collect(),
         Err(e) => {
-            // Not a failure: a status of a fleet whose inventory is not
-            // here (a release handed to somebody else, a build machine) is
-            // still a status. What it cannot say is which hosts left.
+            // Missing inventory prevents unmanaged-host classification but not inspection.
             eprintln!(
                 "note: {} could not be read ({e}), so nobody can say which of these hosts                  the inventory still has. Pass --inventory <file> for that half.",
                 inventory_file.display()
@@ -1521,7 +1228,6 @@ fn look(args: &LookArgs) -> Result<Looked> {
             inventory_file.display()
         );
     }
-    // --- end lane 5B ----------------------------------------------------
 
     let (observation, written) = if args.offline {
         let snapshot = state.load_latest_observation(&files)?;
@@ -1559,7 +1265,6 @@ fn look(args: &LookArgs) -> Result<Looked> {
     };
 
     let mut checks = readiness::readiness_of(&fleet, &asked, &observation, release.as_ref());
-    // --- lane 5B ---
     for id in &unmanaged {
         checks.push(readiness::unmanaged(
             id,
@@ -1567,7 +1272,6 @@ fn look(args: &LookArgs) -> Result<Looked> {
         ));
     }
     checks.extend(service_checks(&Real::new(policy), &fleet, args.offline));
-    // --- end lane 5B ---
     Ok(Looked {
         fleet,
         release,
@@ -1579,19 +1283,12 @@ fn look(args: &LookArgs) -> Result<Looked> {
     })
 }
 
-// --- lane 5B: the services this fleet does not deploy ---------------------
 
 /// How long one service endpoint has to answer.
 const SERVICE_DEADLINE_SECS: u64 = 5;
 
-/// Ask every unmanaged service of the inventory whether it is there.
-///
-/// One `curl` per declared endpoint, effect `read`, five seconds each. Not
-/// an HTTP client in this crate: a tool that only ever has to know "did
-/// something answer at this address" does not need to learn HTTP, and the
-/// one command it shells out to is on every machine that can reach the
-/// fleet anyway. When it is not, or when the run is offline, the verdict is
-/// `unknown` and says which of the two it was.
+/// Probe external service endpoints with bounded curl requests.
+/// Offline or failed probes yield unknown/unreachable evidence, not service health.
 fn service_checks(
     runner: &dyn meister_deploy::run::Runner,
     fleet: &manifest::ResolvedFleet,
@@ -1612,9 +1309,7 @@ fn service_checks(
             out.push(readiness::service(id, service, None));
             continue;
         }
-        // Every declared endpoint, and the first silence wins: a service
-        // whose push address answers and whose query address does not is
-        // not a service that is there.
+        // Require every declared endpoint to answer.
         let mut verdict: Option<readiness::Reached> = None;
         for (name, url) in endpoints {
             let cmd = meister_deploy::run::Cmd::new(
@@ -1634,11 +1329,8 @@ fn service_checks(
                 url,
             ]);
             match runner.run(&cmd) {
-                // Any status code is an answer: a Loki push endpoint says
-                // 405 to a GET, and 405 means somebody is there. What this
-                // check is about is reachability, and claiming to know what
-                // a foreign service's 200 would mean would be a claim about
-                // somebody else's software.
+                // Any HTTP response establishes reachability, including 4xx/5xx;
+                // this check does not establish application health.
                 Ok(done) => {
                     verdict = Some(readiness::Reached::Answered {
                         endpoint: format!("{name}={url}"),
@@ -1663,7 +1355,6 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
-// --- end lane 5B ----------------------------------------------------------
 
 fn status(args: &LookArgs) -> Result<Answer> {
     let looked = look(args)?;
@@ -1675,26 +1366,12 @@ fn status(args: &LookArgs) -> Result<Answer> {
     if let Some(path) = &looked.written {
         eprintln!("==> {}", path.display());
     }
-    // `status` reports; it does not judge. A fleet with a failing check is
-    // not this verb failing, and `check` is the verb that says so with an
-    // exit code.
+    // Status exits successfully when it produces a report, even if checks fail.
     Ok(Answer::Yes)
 }
 
-// --- lane 5C ---
-/// What `check` does NOT look at, said out loud.
-///
-/// Two lab findings in one sentence (L2 §10, 4 and 14). `check` did not
-/// take `--inventory` at all — `error: unexpected argument` — and it does
-/// not read `[operator] cli_config`, so a fleet that is green here may
-/// still be a fleet no rollout can drain: an agent with guests on it is
-/// `blocked` in every plan until that reference exists (D7). An operator
-/// who reads "every required check passed" after a bootstrap has not been
-/// told that.
-///
-/// A note on stderr and never a verdict: this verb reports readiness, and
-/// whether the operator's own cli is reachable is not a property of the
-/// fleet.
+/// Explain missing workload-control configuration separately from host readiness.
+/// Readiness can pass while an interrupting rollout remains blocked.
 fn note_about_the_workload_reference(args: &LookArgs, looked: &Looked) {
     let Some(release) = &looked.release else {
         return;
@@ -1730,12 +1407,10 @@ fn note_about_the_workload_reference(args: &LookArgs, looked: &Looked) {
         agents.join(", ")
     );
 }
-// --- end lane 5C ---
 
 fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
     if suite != "readiness" {
         anyhow::bail!(
-            // --- lane 4B: the verb it points at now exists ---
             "the suite {suite:?} does work on the fleet — it starts guests, it uses \
              hardware — so it is not something `check` does. `check --suite readiness` is \
              what reads; `verify --suite {suite}` is the one that does the work, and it \
@@ -1751,9 +1426,7 @@ fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
     if let Some(path) = &looked.written {
         eprintln!("==> {}", path.display());
     }
-    // --- lane 5C ---
     note_about_the_workload_reference(args, &looked);
-    // --- end lane 5C ---
     match meister_deploy::checks::acceptance(&looked.checks) {
         meister_deploy::checks::Acceptance::Accepted => {
             eprintln!(
@@ -1797,9 +1470,7 @@ fn status_table(looked: &Looked) -> String {
         looked.fleet.fleet.name,
         looked.observation.taken_at.format("%Y-%m-%dT%H:%M:%SZ")
     ));
-    // The store path last, and not padded: it is the one column whose
-    // width is not this tool's to choose, and a padded one would push
-    // every other column out of line.
+    // Keep variable-length store paths in the last column.
     out.push_str(&format!(
         "    {:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
         "HOST", "REACHABLE", "ENROLL", "GEN", "CHECKS", "SYSTEM"
@@ -1820,7 +1491,6 @@ fn status_table(looked: &Looked) -> String {
         );
         out.push_str(&format!(
             "    {id:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
-            // --- lane 5B: three answers, not two ---
             match obs {
                 _ if looked.unmanaged.contains(id) => "unmanaged",
                 Some(obs) if obs.reachable => "yes",
@@ -1841,19 +1511,14 @@ fn status_table(looked: &Looked) -> String {
                 .unwrap_or("-"),
         ));
     }
-    // Then the ones that matter, once each, with what they expected.
+    // Print nonpassing checks after the host summary.
     for check in &looked.checks {
-        // --- lane 5B ---
-        // `managed` is the one `not_applicable` that is printed: it does not
-        // block anything (that is the point of the class) and its sentence
-        // is the only place a reader learns why a host in this release is
-        // not being asked anything.
+        // Keep the unmanaged-host explanation visible even though it is not a blocker.
         if check.status == Status::Pass
             || (check.status == Status::NotApplicable && check.id != "managed")
         {
             continue;
         }
-        // --- end lane 5B ---
         out.push_str(&format!(
             "    {} {} on {}: {}\n",
             if check.required {
@@ -1896,8 +1561,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
     };
 
     if args.dry_run {
-        // The list, and nothing else. It is the same list a real run walks,
-        // from the same function.
+        // Use the same derivation selection as a real build.
         let selected = hosts
             .clone()
             .unwrap_or_else(|| resolved.evaluated_hosts.clone());
@@ -1907,7 +1571,6 @@ fn build(args: &BuildArgs) -> Result<bool> {
         eprintln!(
             "note: nothing was built and no release was written. A real run realises these \
              derivations in ONE `nix build`, signs them{} and writes --out.",
-            // --- lane 4C ---
             match &args.cache {
                 Some(cache) => format!(", pushes them into {cache}"),
                 None => String::new(),
@@ -1916,9 +1579,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
         return Ok(true);
     }
 
-    // The signing key: `--sign-key` first, then the inventory's reference.
-    // Which one it came from is said out loud, because a release signed
-    // with the wrong key is a release no host of the fleet takes.
+    // Prefer --sign-key, then the inventory reference; report the selected source.
     let (sign_key, note) = match &args.sign_key {
         Some(path) => (Some(path.clone()), None),
         None => signing_key(&files, &resolved, args.inventory.as_deref()),
@@ -1927,8 +1588,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
         eprintln!("note: {note}");
     }
 
-    // From here on something can take hours, and a Ctrl-C has to reach the
-    // build rather than leave it running.
+    // Propagate cancellation to Nix builds.
     Cancel::on_sigint()?;
     let runner = Real::new(policy).verbose(true);
     let repo = args.repo.clone().unwrap_or_else(|| repo_of(&resolved));
@@ -1941,12 +1601,10 @@ fn build(args: &BuildArgs) -> Result<bool> {
             sign_key,
             builders: args.builders.clone(),
             substituters: args.substituters.clone(),
-            // --- lane 4C ---
             max_jobs: args.max_jobs.clone(),
             options: nix_options(&args.option)?,
             cache: args.cache.clone(),
             verify_reproducible: args.verify_reproducible,
-            // --- end lane 4C ---
             hosts,
         },
         state: Some(state),
@@ -1959,8 +1617,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
             println!("{}", built.release.release_id);
             eprintln!("==> {}", path.display());
         }
-        // No file: the release itself is the answer, whole, on stdout —
-        // the same shape `plan` has.
+        // Without --out, stdout contains the release document.
         None => print!("{}", String::from_utf8(built.release.to_json()?)?),
     }
     for (host, artifacts) in &built.release.artifacts {
@@ -1983,7 +1640,6 @@ fn build(args: &BuildArgs) -> Result<bool> {
                 .unwrap_or_default()
         );
     }
-    // --- lane 4C ---
     if let Some(cache) = &built.release.build_env.cache_url {
         eprintln!(
             "    {} path(s) pushed into {cache}, signed by {}",
@@ -2001,7 +1657,6 @@ fn build(args: &BuildArgs) -> Result<bool> {
              closures went and instructs nobody."
         );
     }
-    // --- end lane 4C ---
     Ok(true)
 }
 
@@ -2010,20 +1665,12 @@ fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
 
-// --- lane 4C --------------------------------------------------------------
 
-/// `--option <name> <value>`, repeated, as the pairs nix is handed.
-///
-/// A map and not a list: nix takes the last value for a repeated setting,
-/// so two `--option cores` on one command line are one setting, and a
-/// release that recorded both would be recording a question rather than an
-/// answer. The same name twice with different values is therefore refused
-/// here rather than silently narrowed.
+/// Normalize Nix options; reject conflicting values for the same setting.
 fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for pair in flat.chunks(2) {
-        // clap's `num_args = 2` guarantees the pairing; the match is here
-        // because a slice does not carry that guarantee into the types.
+        // Clap enforces pairs; retain validation for direct callers.
         let [name, value] = pair else {
             anyhow::bail!(
                 "--option takes a name and a value; {:?} is half of one.",
@@ -2042,16 +1689,9 @@ fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, Str
     Ok(out)
 }
 
-// --- end lane 4C ----------------------------------------------------------
 
-// --- lane 3A: media -------------------------------------------------------
 
-/// `image --release r.json --host <id> --kind installer|disk|direct-boot`.
-///
-/// One derivation out of the release, built, measured, rooted. It evaluates
-/// nothing: the derivation path IS the evaluation the release was made from,
-/// so a medium built here belongs to that release and not to whatever the
-/// operator's flake says today.
+/// Build, measure and root a media derivation already bound into the release.
 fn image(args: &ImageArgs) -> Result<bool> {
     if args.offline {
         anyhow::bail!(
@@ -2084,7 +1724,7 @@ fn image(args: &ImageArgs) -> Result<bool> {
         return Ok(true);
     }
 
-    // A medium can take an hour to build, and a Ctrl-C has to reach it.
+    // Propagate cancellation to media builds.
     Cancel::on_sigint()?;
     let runner = Real::new(policy).verbose(true);
     let repo = args
@@ -2118,18 +1758,8 @@ fn image(args: &ImageArgs) -> Result<bool> {
     Ok(true)
 }
 
-/// `install --plan p.json --release r.json --host <id> --approve destructive=<plan_id>`.
-///
-/// It prepares an installation and carries none out. What it does is build
-/// the medium, put it where a collector cannot take it, write down what it
-/// is, and print the sheet somebody reads standing in front of the machine.
-/// The disk is destroyed there, by a person, by `meister-install confirm` —
-/// which is why `apply` refuses an `install` action and this verb exists
-/// beside it.
-///
-/// The approval is asked for all the same, and it is the plan's own id:
-/// somebody has said "yes, this machine, this disk" before a medium that
-/// will format it is written anywhere.
+/// Prepare media for an approved installation plan. Target-side
+/// meister-install confirm performs disk changes separately.
 fn install(args: &InstallArgs) -> Result<Answer> {
     if args.offline {
         anyhow::bail!(
@@ -2192,7 +1822,7 @@ fn install(args: &InstallArgs) -> Result<Answer> {
     }
     let _ = host_plan;
 
-    // The approval, and it is the plan's own id.
+    // Require approval bound to this exact plan.
     let granted = parse_approvals(&args.approve)?;
     let missing = plan::approvals_missing(&the_plan, &granted);
     if !missing.is_empty() {
@@ -2275,8 +1905,7 @@ fn install(args: &InstallArgs) -> Result<Answer> {
         anyhow::anyhow!("the installer build of {} produced no iso file", args.host)
     })?;
 
-    // Beside the link, so that the next `install` — and whoever picks this
-    // up tomorrow — can say which plan and which release this medium is.
+    // Record which plan, release and bytes the media link represents.
     let record = meister_deploy::install::MediaRecord {
         schema: meister_deploy::install::MEDIA_SCHEMA.to_string(),
         host: args.host.clone(),
@@ -2311,13 +1940,9 @@ fn install(args: &InstallArgs) -> Result<Answer> {
     Ok(Answer::Yes)
 }
 
-// --- end lane 3A ----------------------------------------------------------
 
-/// The `[operator] signing_key` reference, from the inventory the manifest
-/// was resolved from.
-///
-/// Missing is not an error here: `build` itself refuses a managed host
-/// without a key, with the sentence that says what to do. This only looks.
+/// Resolve the inventory's signing-key reference; missing configuration is
+/// left for build validation to diagnose.
 fn signing_key(
     files: &dyn Files,
     resolved: &manifest::ResolvedFleet,
@@ -2340,9 +1965,7 @@ fn signing_key(
         .and_then(|operator| operator.signing_key.clone())
     {
         Some(key) => {
-            // Relative to the inventory, which is relative to the
-            // repository: a key path that only worked from one directory
-            // would be a key path that works on one afternoon.
+            // Resolve relative key paths against the inventory directory.
             let path = if Path::new(&key).is_absolute() {
                 PathBuf::from(&key)
             } else {
@@ -2363,14 +1986,9 @@ fn signing_key(
     }
 }
 
-// --- lane 4C --------------------------------------------------------------
 
-/// Stop keeping what this state directory no longer has a reason to keep.
-///
-/// Three kinds of thing and three rules — releases by count and age,
-/// snapshots by count and age, runs only when asked and never one that is
-/// evidence. The decision is made whole before anything is removed
-/// (`state::sweep`), so `--dry-run` prints exactly what a real run does.
+/// Compute retention decisions before removing local roots and evidence.
+/// Dry-run prints the same decisions without applying them.
 fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> {
     let policy = if dry_run {
         Policy::dry_run()
@@ -2406,9 +2024,7 @@ fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> 
             if dry_run { "would go" } else { "removed" }
         );
     }
-    // Why each thing stayed, because "nothing happened" is the answer an
-    // operator most often has to act on — a run that is still there is a
-    // run that failed, and that is worth reading rather than guessing at.
+    // Explain retained entries, including incomplete or unrecognized evidence.
     for kept in &sweep.keep {
         eprintln!("    kept {} {}: {}", kept.kind, kept.what, kept.why);
     }
@@ -2439,7 +2055,6 @@ fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> 
     Ok(true)
 }
 
-// --- end lane 4C ----------------------------------------------------------
 
 fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if args.offline && args.out.is_some() {
@@ -2469,18 +2084,14 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     };
 
     let observation = match (&args.observation, args.offline) {
-        // A snapshot somebody else took — `status`, an earlier `plan`, a
-        // test. It travels into the plan unchanged.
+        // Use the supplied snapshot without refreshing it.
         (Some(path), _) => {
             let text = files.read_to_string(path)?;
             Observations::from_json(&text, &path.display().to_string())?
         }
-        // Nothing was asked, and the plan says so: every interrupting step
-        // in it is blocked, because nothing is known about any host.
+        // Without observations, mark evidence provisional and block interruption.
         (None, true) => Observations::provisional(RealClock.now()),
-        // Ask — and ask exactly the hosts this plan is about. A plan over
-        // three hosts that probed seventy would be a plan that touched
-        // sixty-seven machines nobody asked it to look at.
+        // Probe only selected hosts.
         (None, false) => {
             let fleet = &release.resolved_fleet;
             let selected = plan::select(fleet, &args.select)?;
@@ -2506,10 +2117,8 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
                 })
                 .collect();
             let snapshot = observe::observe_fleet(&prober, &probes, RealClock.now(), args.at_once)?;
-            // Kept before the plan is made, not after: a snapshot is
-            // evidence about a moment, and a planner that then refuses
-            // (a cycle, a group that cannot afford it) must not take the
-            // evidence with it. A dry run keeps nothing.
+            // Save evidence before planning so a planning failure does not discard it.
+            // Dry-run retains nothing.
             if !args.dry_run {
                 let state = StateDir::in_repo(&repo);
                 let path = state.save_observation(&files, &snapshot, None)?;
@@ -2522,22 +2131,11 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     let kind = match args.kind.as_str() {
         "upgrade" => PlanKind::Upgrade,
         "bootstrap" => PlanKind::Bootstrap,
-        // --- lane 3A: first installation ---
         "install" => PlanKind::Install,
-        // --- end lane 3A ---
-        // --- lane 5A ---
-        // The delivery half of a revocation. `keys revoke` builds one after
-        // it has written the list; this door is for the other order — a
-        // certificate somebody took back with `meister-ca` by hand, and a
-        // fleet that has to be told.
+        // Allow planning delivery of an already-published CRL.
         "keys-revoke" => PlanKind::KeysRevoke,
-        // --- end lane 5A ---
-        // --- lane 5B ---
-        // The delivery half of a retirement, for the same reason
-        // `keys-revoke` has a door here: `retire <host>` builds one after it
-        // has taken the certificates back, and this is the other order.
+        // Allow planning delivery after a separately recorded retirement.
         "retire" => PlanKind::Retire,
-        // --- end lane 5B ---
         "keys-rotate" => anyhow::bail!(
             "the plan kind \"keys-rotate\" is not built here. A rotation is made by \
              `keys rotate`, which prepares the key on the host and issues the certificate \
@@ -2548,7 +2146,6 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
              `install`, `keys-revoke` and `retire`."
         ),
     };
-    // --- lane 3A ---
     if args.reinstall && kind != PlanKind::Install {
         anyhow::bail!(
             "--reinstall belongs to `plan --kind install`: it says that a disk which already \
@@ -2556,13 +2153,11 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
              table."
         );
     }
-    // --- end lane 3A ---
 
     let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
     if let Some(note) = note {
         eprintln!("note: {note}");
     }
-    // --- lane 3B: what this workstation has for the hosts ---------------
     let (expected, note) = expected_credentials(
         &files,
         &release,
@@ -2573,7 +2168,6 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if let Some(note) = note {
         eprintln!("note: {note}");
     }
-    // --- end lane 3B ----------------------------------------------------
     let plan = plan::plan(
         &release,
         &args.select,
@@ -2593,15 +2187,14 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
             eprintln!("==> {}", path.display());
         }
         (Some(path), true) => {
-            // The hosts were asked and nothing was written, which is what a
-            // dry run of this verb is: the plan is on stdout instead.
+            // Dry-run prints the plan instead of writing --out.
             print!("{}", String::from_utf8(plan.to_json()?)?);
             eprintln!(
                 "note: {} was not written, and no snapshot was kept.",
                 path.display()
             );
         }
-        // No file: the plan itself is the answer, whole, on stdout.
+        // Without --out, stdout contains the plan document.
         (None, _) => print!("{}", String::from_utf8(plan.to_json()?)?),
     }
     eprint!("{}", plan_summary(&plan));
@@ -2612,12 +2205,8 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     })
 }
 
-/// The `[operator] cli_config` reference D7 needs, from the inventory the
-/// manifest was resolved from.
-///
-/// Missing is an answer and not a failure: without it every interrupting
-/// step on an agent is blocked with a sentence that says what to set, which
-/// is more useful than refusing to make a plan at all.
+/// Read workload-control configuration. Missing configuration becomes a
+/// planning blocker for interrupting agent actions.
 fn workload_control(
     files: &dyn Files,
     release: &ReleaseManifest,
@@ -2669,18 +2258,8 @@ fn workload_control(
     }
 }
 
-/// What this workstation holds for each selected host's secrets (lane 3B).
-///
-/// The certificates `keys issue` wrote under `<repo>/pki/issued/`, and the
-/// operator files under `[operator] ca_dir`. Hashed where they may be
-/// hashed and named `present` where they may not — the asymmetry is
-/// `crate::pki::expected_for_host`, and the read-only probe of 2A fills the
-/// other side of the comparison the same way round.
-///
-/// A file that is not there is simply absent from the answer, and so is a
-/// whole fleet whose inventory could not be read: the planner turns the
-/// absence into a blocked host with the verb to run in the sentence, which
-/// is more useful than refusing to make a plan.
+/// Collect public credential digests and private-key presence evidence.
+/// Missing files remain absent so the planner can report delivery blockers.
 fn expected_credentials(
     files: &dyn Files,
     release: &ReleaseManifest,
@@ -2693,8 +2272,7 @@ fn expected_credentials(
 ) {
     let fleet = &release.resolved_fleet;
     let Ok(selected) = plan::select(fleet, select) else {
-        // An unusable selector is the planner's sentence to make, not this
-        // function's.
+        // Leave selector diagnostics to the planner.
         return (BTreeMap::new(), None);
     };
     let repo = repo
@@ -2721,12 +2299,7 @@ fn expected_credentials(
     )
 }
 
-/// `[operator] ca_dir`, resolved against the inventory that named it.
-///
-/// `None` when there is no inventory to read or it names none. That is an
-/// answer and not a failure: a plan whose host is missing a file it cannot
-/// find is blocked with a sentence, which is more useful than a verb that
-/// refuses to run.
+/// Resolve the inventory's CA directory, or return None when unavailable.
 fn ca_directory(
     files: &dyn Files,
     release: &ReleaseManifest,
@@ -2737,9 +2310,7 @@ fn ca_directory(
     let repo = repo
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
-    // A relative `--inventory` hangs off the repository, the same rule
-    // `--fleet` follows everywhere else; without one, the file the manifest
-    // was resolved from.
+    // Resolve explicit relative inventory paths against --repo.
     let inventory_file = match inventory {
         Some(path) => inventory_path(&repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
@@ -2795,9 +2366,7 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
             out.push_str(&format!("    group {id}: {why}\n"));
         }
     }
-    // One sentence, however many steps it stopped. A quorum that is gone
-    // stops six steps on three hosts, and printing it eighteen times is how
-    // the one line that matters gets lost.
+    // Group repeated blocker reasons while retaining affected hosts and actions.
     let mut by_reason: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
     for action in &plan.actions {
         if let Some(why) = &action.blocked {
@@ -2845,21 +2414,8 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
 // apply
 // ---------------------------------------------------------------------------
 
-/// Carry out a plan.
-///
-/// Four things happen here and the fifth is deliberately absent:
-///
-/// 1. the plan and the release are read and checked against each other —
-///    a plan names the bytes it is about;
-/// 2. the state directory's lock is taken for this run, which is the
-///    single-writer contract of D6 for this WORKSTATION (the fleet's own
-///    anchor is the per-host lock the executor takes);
-/// 3. [`meister_deploy::execute`] walks the plan;
-/// 4. the receipt is written and printed, and the exit code says what it
-///    came to.
-///
-/// What is absent: a `--force`. There is `--approve <class>=<plan_id>`, and
-/// an approval names the plan it is for.
+/// Validate the plan/release pair, acquire the repository lock, run the
+/// executor, and report its receipt and command outcome.
 fn apply(args: &ApplyArgs) -> Result<Answer> {
     let policy = if args.dry_run {
         Policy::dry_run()
@@ -2868,14 +2424,8 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     };
     let files = RealFiles::new(policy);
 
-    // --- lane 5C ---
-    // Where the two documents come from. Named on the command line, or —
-    // with `--resume` and nothing named — out of the run's own directory,
-    // where `apply` put them when the run began.
-    //
-    // The lab needed this (finding N10): a run stopped, the operator built
-    // again over the same `--out` file, and the release the run had acted
-    // on was gone. There was no supported way to continue it.
+    // Resume can load the plan and release saved with the run.
+    // Legacy runs without a release copy need explicit files.
     let (plan_path, release_path) = match (&args.plan, &args.release, &args.resume) {
         (Some(plan), Some(release), _) => (plan.clone(), release.clone()),
         (None, None, Some(run)) => {
@@ -2910,7 +2460,6 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
             }
         ),
     };
-    // --- end lane 5C ---
 
     let text = files.read_to_string(&plan_path)?;
     let the_plan = plan::DeploymentPlan::from_json(&text, &plan_path.display().to_string())?;
@@ -2939,9 +2488,7 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         None => meister_deploy::ids::run_id(RealClock.now()).to_string(),
     };
 
-    // Ctrl-C has to reach the child: a `nix copy` of a nine-gigabyte closure
-    // or a `switch-to-configuration` on the other side of an ssh is what is
-    // running when somebody presses it.
+    // Propagate cancellation to active copy and activation commands.
     Cancel::on_sigint()?;
     let cancel = Cancel::new();
     let mut runner = Real::new(policy);
@@ -2954,15 +2501,7 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         return dry_run(&the_plan, &release, &look, &state);
     }
 
-    // --- lane 4A: an approval nobody granted is blocked, not broken ------
-    //
-    // `Executor::run` refuses the same thing and goes on refusing it; this
-    // is the door in front of it and it exists only for the EXIT CODE. §5
-    // says 2 is "blocked", and a rollout waiting for a person to say yes is
-    // the plainest case of it there is. Read as 1 it cannot be told from
-    // "this tool fell over", which is the distinction the third exit code
-    // was introduced for (2B). Nothing is taken and nothing is written on
-    // this path: the lock below is not reached.
+    // Missing approvals return blocked before acquiring a lock or creating a run.
     let missing = plan::approvals_missing(&the_plan, &approvals);
     if !missing.is_empty() {
         eprintln!(
@@ -2982,10 +2521,8 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         );
         return Ok(Answer::Blocked);
     }
-    // --- end lane 4A -----------------------------------------------------
 
-    // The workstation's door. Taken before anything is looked at, given back
-    // whatever happens below.
+    // Acquire local run ownership before invoking the executor.
     let held = match &args.takeover {
         Some(of_run) => {
             state::take_over_lock(&files, &state, of_run, &run_id, &operator, RealClock.now())?
@@ -2996,13 +2533,7 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         "==> run {run_id}  plan {}  release {}",
         the_plan.plan_id, the_plan.release_id
     );
-    // The id on stdout and nothing else, so that a script can capture it and
-    // `report --run` it afterwards.
-    //
-    // Astra finding MD09, 2026-09-25: not under `--json`. There stdout is
-    // the one document the flag promises, and a bare line in front of it is
-    // what makes `apply --json | jq` fail; the id is in the receipt as
-    // `run_id` and on stderr in the line above.
+    // Plain output starts with the run ID; JSON output carries it in the receipt.
     if !args.json {
         println!("{run_id}");
     }
@@ -3018,10 +2549,8 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     options.workload = control;
     options.drain_wait = std::time::Duration::from_secs(args.drain_wait);
     options.reboot_wait = std::time::Duration::from_secs(args.reboot_wait);
-    // --- lane 3B: where the files this run may have to deliver are ------
     options.repo = repo.clone();
     options.ca_dir = ca_directory(&files, &release, Some(&repo), args.inventory.as_deref());
-    // --- end lane 3B ----------------------------------------------------
 
     let executor = execute::Executor {
         runner: &runner,
@@ -3041,9 +2570,7 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     };
     let applied = executor.run();
 
-    // The lock goes back whatever happened, and a failure to give it back is
-    // a note rather than the error somebody reads: the run's own outcome is
-    // the interesting one.
+    // Attempt lock release after execution; retain the execution result if release fails.
     if let Err(e) = state::release_lock(&files, &state, &held.run_id) {
         eprintln!(
             "note: the lock on {} was not released: {e:#}",
@@ -3067,17 +2594,10 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     if let Some(why) = &applied.stopped {
         eprintln!("==> {why}");
     }
-    // --- lane 3-integration: the halt ------------------------------------
-    //
-    // On stdout and on one line, whatever `--json` says: the thing that
-    // reads this is the launcher that will do the loading and the
-    // rebooting, and it must not have to parse a table or a sentence for
-    // three store paths. (stdout already carries the run id on a line of
-    // its own, so a second line is the shape this verb already has.)
+    // A provider handoff pauses execution and returns blocked.
+    // JSON output carries waiting state in the receipt; plain output adds the handoff object.
     if let Some(wait) = &applied.waiting {
-        // Astra finding MD09, 2026-09-25: under `--json` this object is the
-        // receipt's `waiting`, printed above, and a second document on
-        // stdout would make the first one unparseable.
+        // Avoid a second JSON document after the receipt.
         if !args.json {
             println!("{}", serde_json::to_string(&wait.to_json())?);
         }
@@ -3085,16 +2605,12 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
             "==> {} is waiting for its provider. Nothing else was started.",
             wait.host
         );
-        // An answer, not a failure: exit 2 is what this tool says when it
-        // worked and the fleet is not where the plan wants it yet.
+        // A pending provider action returns blocked.
         return Ok(Answer::Blocked);
     }
-    // --- end lane 3-integration -------------------------------------------
-    // --- lane 5C: what a run that did not come through leaves behind ------
     if applied.receipt.outcome != receipt::Outcome::Success {
         eprint!("{}", what_is_left(&applied.receipt, &state, &run_id));
     }
-    // --- end lane 5C ------------------------------------------------------
     Ok(answer_for(
         applied.receipt.outcome,
         applied.blocked.is_empty(),
@@ -3102,42 +2618,19 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     ))
 }
 
-/// What a finished `apply` exits with.
-///
-/// Astra finding F06, 2026-09-23: the stop reason was not in this. A run
-/// over ONE host that confirmed the activation and then failed its
-/// `uncordon` leaves that host `committed`, and a receipt whose every host
-/// is forward is a `success` — so the run printed the failure on stderr,
-/// wrote a receipt that says success, and exited 0. A script could not tell
-/// it from a rollout that came through, and the host was left cordoned with
-/// an open transaction record on it.
-///
-/// The receipt is about the HOSTS and stays that way; the exit code is
-/// about the RUN, and a run that stopped did not come through.
+/// Map the run outcome to an exit code. A stopped run fails even when
+/// all host activations committed; cleanup may still be incomplete.
 fn answer_for(outcome: receipt::Outcome, nothing_blocked: bool, stopped: bool) -> Answer {
     match (outcome, nothing_blocked, stopped) {
         (_, _, true) => Answer::No,
         (receipt::Outcome::Success, true, false) => Answer::Yes,
-        // It worked, and the plan refused to touch something. Exit 2 is
-        // "blocked", which a script can tell from "this tool broke".
+        // A completed run with blocked hosts returns 2.
         (receipt::Outcome::Success, false, false) => Answer::Blocked,
         _ => Answer::No,
     }
 }
 
-// --- lane 5C ---
-/// The three things a run that did not come through leaves in three
-/// places, and the one sentence that was missing: how to get out.
-///
-/// From the lab (L2 §10, finding 8): "Ein gescheiterter Lauf hinterlaesst
-/// drei Dinge an drei Orten: die Operator-Sperre im Repo, einen
-/// Txn-Record auf dem Ziel und eine halbe Zeile im Journal. Die Meldungen
-/// erklaeren jede einzeln gut; was fehlt, ist der eine Satz 'so kommst du
-/// hier raus'." Each of those messages arrives when somebody runs into the
-/// thing; none of them is printed by the run that made it.
-///
-/// Pure, so the wording is a test rather than a thing somebody reads once
-/// on a bad evening.
+/// Describe retained local evidence and target transactions after a failed run.
 fn what_is_left(receipt: &receipt::DeploymentReceipt, state: &StateDir, run_id: &str) -> String {
     let mut out = String::new();
     out.push_str("==> what this run left behind, and the way out:\n");
@@ -3178,13 +2671,8 @@ fn what_is_left(receipt: &receipt::DeploymentReceipt, state: &StateDir, run_id: 
     }
     out
 }
-// --- end lane 5C ---
 
-/// Look, check, and say what would be done.
-///
-/// No lock, no journal, no receipt — and the runner's policy refuses every
-/// command that is not a read, so this is a property of the program rather
-/// than a promise made here.
+/// Reobserve and validate without repository locks, journals or target writes.
 fn dry_run(
     the_plan: &plan::DeploymentPlan,
     release: &ReleaseManifest,
@@ -3259,18 +2747,8 @@ fn parse_approvals(given: &[String]) -> Result<Vec<(plan::ApprovalClass, String)
     Ok(out)
 }
 
-/// What a run did.
-///
-/// The journal is the evidence and the receipt is the summary of it, so this
-/// prefers the receipt when there is one and folds the journal when there is
-/// not — a run that was interrupted has no receipt, and that is exactly the
-/// run somebody wants to read. Whatever the journal does not add up to
-/// (`breaks`) and a last line that was torn off by a power cut are printed
-/// rather than swallowed.
-///
-/// Exit 0 means a report was produced, whatever it says: a rollout that
-/// failed is not this verb failing. Exit 1 means there is nothing here to
-/// report.
+/// Report a saved receipt or fold the journal when no receipt exists.
+/// Verification reports additionally return blocked for failed required checks.
 fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
     let files = RealFiles::new(Policy::real());
     let state = StateDir::in_repo(repo);
@@ -3297,13 +2775,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
         );
     }
 
-    // --- lane 4B: a run may be a verification rather than a rollout ---
-    //
-    // The two write into the same run directory and are read by the same
-    // verb, because they are the same question — what did this run do and
-    // what did it find. A verification has no journal and no receipt; it has
-    // a ledger and a set of checks, and its report draws the one line that
-    // matters: what came off hardware, and what did not.
+    // Verification runs use a ledger and checks instead of a deployment receipt.
     if files.exists(&state.verify_path(run)) {
         let text = files.read_to_string(&state.verify_path(run))?;
         let verification = meister_deploy::verify::VerifyRun::from_json(
@@ -3337,7 +2809,6 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
         );
         return Ok(Answer::Blocked);
     }
-    // --- end lane 4B --------------------------------------------------
 
     let journal_path = state.journal_path(run);
     let read = if files.exists(&journal_path) {
@@ -3346,9 +2817,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
         None
     };
 
-    // The receipt, either as it was written or as it would be written right
-    // now. The second one is marked: a receipt this verb folded is a report
-    // about a run that has not ended.
+    // Prefer the saved receipt; otherwise derive an explicitly unfinished view.
     let (receipt, finished) = if files.exists(&state.receipt_path(run)) {
         (Some(state.read_receipt(&files, run)?), true)
     } else {
@@ -3380,9 +2849,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
         (Some(receipt), false) => {
             print!("{}", receipt_table(receipt));
             if !finished {
-                // On stderr, like every other diagnostic: stdout is the
-                // report, and a note about how it was made is not part of
-                // it.
+                // Keep receipt provenance on stderr.
                 eprintln!(
                     "note: run {run} wrote no receipt of its own, so this one was folded from \
                      its journal just now. The run has not ended."
@@ -3390,8 +2857,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
             }
         }
         (None, _) => {
-            // No plan copy, so no receipt can be folded. The journal is
-            // still evidence, and printing it is more use than a refusal.
+            // Without the saved plan, show folded journal state instead of a receipt.
             let Some(read) = &read else {
                 anyhow::bail!(
                     "run {run} has neither a journal nor a receipt in {}; there is nothing \
@@ -3421,13 +2887,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
 // lane 4B: verification
 // ---------------------------------------------------------------------------
 
-/// `verify --release r.json --suite <s> --approve verify=<release_id>`.
-///
-/// The one verb of this tool that makes something on the fleet which is not
-/// part of the fleet: guests, so that the answer to "does this work" is a
-/// guest that booted rather than a unit that is active. Everything it makes
-/// it writes down first and takes back afterwards, and what it could not take
-/// back is a check rather than a silence.
+/// Run release-bound workload/fabric checks with recorded cleanup obligations.
 fn verify(args: &VerifyArgs) -> Result<Answer> {
     use meister_deploy::verify::{self, Options, Suite, Verifier};
 
@@ -3449,9 +2909,7 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     let text = files.read_to_string(&args.release)?;
     let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
 
-    // The approval names the release, because that is what is being verified.
-    // A dry run creates nothing, so it needs none — and saying so is more
-    // use than making somebody paste an id to read a listing.
+    // Real verification needs release-bound approval; a dry-run needs none.
     if !args.dry_run {
         match verify_approval(&args.approve)? {
             Some(id) if id == release.release_id => {}
@@ -3486,11 +2944,8 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     Cancel::on_sigint()?;
     let runner = Real::new(policy);
 
-    // What the machines ARE, as opposed to what the inventory says they are.
-    // It decides three things: whether a host can be asked anything at all,
-    // whether a declared capability is actually there, and — the one that
-    // keeps a report honest — whether a guest that ran counts as hardware
-    // evidence.
+    // Use observations to establish reachability, detected capabilities and
+    // whether results qualify as hardware evidence.
     let observation = match &args.observation {
         Some(path) => {
             let text = files.read_to_string(path)?;
@@ -3550,14 +3005,9 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     options.pairs = parse_pairs(&args.pairs)?;
 
     let clock = RealClock;
-    // The one runner an interrupt does not reach, for the one piece of work
-    // an interrupt ASKS for: taking the guests back. Everything else in this
-    // verb goes through `runner` and stops when the operator says stop.
+    // Cleanup attempts continue after cancellation.
     let cleanup_runner = Real::new(policy).unstoppable();
-    // The rdma suite is the one that reaches the hosts themselves: it runs a
-    // server on one end and a client on the other. The guest suites talk to
-    // a control plane and to nothing else, and are given no transport at all
-    // so that they cannot.
+    // Only RDMA measurements receive direct SSH transport; guest suites use the control plane.
     let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
     let mut verifier = Verifier::new(
         &runner,
@@ -3584,8 +3034,7 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
         return Ok(Answer::Yes);
     }
 
-    // The run id first and on its own line, like `apply`: a script that has
-    // to read the ledger afterwards needs it even when the run went badly.
+    // Print the run ID before execution so interrupted runs remain identifiable.
     println!("{run_id}");
     let run = verifier.run()?;
 
@@ -3648,12 +3097,7 @@ fn parse_pairs(given: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// `--approve verify=<release_id>`, as the operator typed it.
-///
-/// Its own parser and not [`parse_approvals`]: the classes of that one are a
-/// plan's, and a `verify` approval names a release. Spelling it `verify=` on
-/// purpose, so that a person who has both commands in their shell history
-/// cannot paste one into the other and have it taken.
+/// Parse release-bound verification approval separately from plan approvals.
 fn verify_approval(given: &[String]) -> Result<Option<String>> {
     let mut found = None;
     for text in given {
@@ -3677,7 +3121,6 @@ fn verify_approval(given: &[String]) -> Result<Option<String>> {
     Ok(found)
 }
 
-// --- end lane 4B ----------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // lane 3B: keys
@@ -3757,7 +3200,6 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             *json,
         )
         .map(Answer::from),
-        // --- lane 5A ---
         KeysCmd::Revoke {
             serial,
             host,
@@ -3814,8 +3256,6 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             dry_run: *dry_run,
             json: *json,
         }),
-        // --- end lane 5A ---
-        // --- lane 5B ---
         KeysCmd::Import {
             from,
             map,
@@ -3835,11 +3275,9 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             dry_run: *dry_run,
             json: *json,
         }),
-        // --- end lane 5B ---
     }
 }
 
-// --- lane 5B: certificates that are already there -------------------------
 
 /// Everything `keys import` was told.
 struct KeysImportArgs<'a> {
@@ -3863,19 +3301,12 @@ struct Imported {
     serial: Option<String>,
     not_after: Option<String>,
     to: String,
-    /// What was found beside the certificate, and what was done about it —
-    /// which is nothing, in every case.
+    /// Sibling private-key metadata; key contents are not imported.
     private_key: String,
 }
 
-/// Take certificates this fleet's CA already issued into the repository.
-///
-/// Every refusal happens before anything is written, and they are all the
-/// same refusal in different clothes: a certificate is an identity, and one
-/// that lands under the wrong host id is a machine that can speak as
-/// another. So the subject on the file has to be the subject this fleet
-/// would have issued for the host it is being mapped to, and if it is not,
-/// the mapping is wrong and nothing is copied.
+/// Check mappings and certificate subjects, then copy public certificates.
+/// CA-directory validation and index rebuild occur after these copies.
 fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
     use meister_deploy::effects::Entry;
     use meister_deploy::pki;
@@ -3977,10 +3408,7 @@ fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
             );
         }
 
-        // The private half. It is LOOKED AT and nothing else: not read, not
-        // copied, not delivered. A key that is already on a machine belongs
-        // on that machine, and a key that travelled through a workstation
-        // is a key somebody has to assume is on the workstation.
+        // Inspect sibling key permissions without reading or copying the key.
         let key = args.from.join(format!("{stem}.key"));
         let private_key = match files.entry(&key) {
             Ok(Entry::File { mode }) if mode & 0o077 == 0 => {
@@ -4043,9 +3471,7 @@ fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
         eprintln!("==> {}", what.to);
     }
 
-    // The CA's own certificate, if this directory has one and the CA
-    // directory does not. Not overwritten: a CA that already has one is a
-    // CA whose trust anchor is not this import's business.
+    // Copy a supplied CA certificate only when the configured CA has none.
     let inventory_file = match args.inventory {
         Some(path) => inventory_path(repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
@@ -4073,10 +3499,7 @@ fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
         eprintln!("==> {}", ca.join("ca.crt").display());
     }
 
-    // And the index. Without it `meister-ca --revoke` has nothing to write
-    // into, so an imported certificate would be one this fleet can check
-    // and never take back. The rebuild is additive (M0 finding 7): a
-    // revocation that is already recorded stays recorded.
+    // Rebuild the configured CA index after import; existing revocations are retained.
     let rebuild = pki::index_rebuild_cmd(args.meister_ca, &ca);
     runner.run(&rebuild)?;
     eprintln!("==> {} (index rebuilt)", ca.display());
@@ -4106,9 +3529,7 @@ fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
     Ok(Answer::Yes)
 }
 
-// --- end lane 5B ----------------------------------------------------------
 
-// --- lane 5B: retiring a host ---------------------------------------------
 
 /// Everything `retire` was told.
 struct RetireArgs<'a> {
@@ -4125,27 +3546,8 @@ struct RetireArgs<'a> {
     json: bool,
 }
 
-/// Take a host out of service.
-///
-/// Three things happen here and they are in this order on purpose:
-///
-/// 1. the active certificates this repository holds for the host are taken
-///    back and a new list is written and published (offline, on this
-///    machine) -- a `.prev`/`.next` certificate mid-rotation is not one of
-///    them; see `issued_certs` (Astra finding F11, 2026-09-23);
-/// 2. the record and the `known_hosts` mark are written, so that the
-///    retirement survives everything else;
-/// 3. a plan is made that carries the new list to the REST of the fleet.
-///
-/// The host itself is not in that plan (`all,!host=<id>`) and nothing is
-/// sent to it. A machine that is being retired may be off, may be broken,
-/// may be somebody else's problem already — and a verb that needed it to
-/// answer would be a verb that cannot retire the one host you most want to.
-///
-/// Nothing is deleted: not a partition, not a data directory, not the
-/// certificate files on the machine, not the `known_hosts` line, not the
-/// lines in `fleet.toml`. The last of those is the operator's edit, and
-/// `status` says `unmanaged` about the gap until it is made.
+/// Revoke recorded active certificates, save retirement evidence, then plan
+/// CRL delivery to other hosts. Target data and inventory are not removed.
 fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     use meister_deploy::pki;
 
@@ -4157,13 +3559,7 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     let files = RealFiles::new(policy);
     let runner = Real::new(policy);
 
-    // Astra finding F21, 2026-09-23: `--reason` is free text for the record
-    // and `known_hosts` (used further down, unchanged); this is the fixed
-    // vocabulary openssl writes into the CRL, checked here so a mistyped
-    // one is a sentence from this tool before anything else runs, not a
-    // `die` from the CA several layers down. A retirement that names no
-    // reason of its own is recorded as `cessationOfOperation`, since that
-    // is what retiring a host usually is.
+    // Validate the fixed CRL reason separately from the free-text retirement note.
     let crl_reason = args.crl_reason.unwrap_or("cessationOfOperation");
     pki::validate_crl_reason(crl_reason)?;
 
@@ -4189,11 +3585,7 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
 
-    // --- 1. the certificates ------------------------------------------
-    // Astra finding F11, 2026-09-23: this used to swallow a real listing
-    // failure into "no certificates", which let a retirement proceed and
-    // report success while nothing was revoked. `?` here means a directory
-    // that cannot be read is an error, not an empty answer.
+    // Revoke the recorded active certificates; propagate listing failures.
     let certs = pki::issued_certs(&files, repo, args.host)?;
     let mut serials: Vec<String> = Vec::new();
     let mut ran: Vec<String> = Vec::new();
@@ -4222,8 +3614,7 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
         pki::refuse_ca_in_repo(repo, &ca)?;
         for cert in &certs {
             let what = cert.display().to_string();
-            // The serial before the revocation, because afterwards the file
-            // is still there and the record has to name what was taken back.
+            // Capture serials for the retirement record before revoking.
             if let Ok(out) = runner.run(&pki::describe_cmd("openssl", cert))
                 && let Some(serial) = pki::parse_describe(&out.stdout, &what).serial
             {
@@ -4341,7 +3732,6 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     Ok(answer)
 }
 
-// --- end lane 5B ----------------------------------------------------------
 
 /// The manifest, read through the same parser `validate --manifest` uses.
 fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFleet> {
@@ -4349,14 +3739,8 @@ fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFle
     manifest::ResolvedFleet::from_json(&text, &path.display().to_string())
 }
 
-/// Which certificate a host's `identity.key` is for.
-///
-/// A host with one tier has one answer. A host that carries two — a cloud
-/// and a cluster, or a controller and an agent — has one `identity.key`
-/// (every rendered configuration of this fleet names the same path) and
-/// therefore ONE service identity, so the operator says which. Guessing
-/// would put the wrong tier's name on the key a controller dials with, and
-/// the far end would reject the Hello with a name nobody typed.
+/// Choose the identity role. Multi-role hosts require explicit selection
+/// and separate per-role paths for simultaneous authenticated tier identities.
 fn identity_kind_of(
     host_id: &str,
     host: &manifest::ResolvedHost,
@@ -4457,10 +3841,7 @@ fn keys_csr(
         return Ok(true);
     }
 
-    // Before the first connection: a host this fleet has not enrolled is a
-    // host ssh would refuse with "Host key verification failed", and the
-    // operator would then go looking for a broken machine instead of for
-    // the step that never happened.
+    // Check enrollment before invoking target key generation.
     ssh.require_enrolled(&runner, &target)?;
     Cancel::on_sigint()?;
     let out = runner.run(&cmd)?;
@@ -4529,9 +3910,7 @@ fn keys_issue(
     let runner = Real::new(policy);
 
     let ca_kind = pki::CaKind::parse(kind)?;
-    // Absolute, because the refusal below compares the CA directory with
-    // the repository, and `.` compared with `pki/ca` would say they have
-    // nothing to do with each other.
+    // Normalize the repository path before checking CA placement.
     let repo = &std::path::absolute(repo)
         .with_context(|| format!("{} could not be made absolute", repo.display()))?;
     let fleet = read_manifest(&files, manifest_path)?;
@@ -4572,9 +3951,7 @@ fn keys_issue(
     let ca = pki::ca_dir(&inventory_file, &named);
     pki::refuse_ca_in_repo(repo, &ca)?;
 
-    // The request. Read before anything is decided about it, and checked:
-    // `requested_name` verifies that the key inside signed it, which is what
-    // tells a request from a form.
+    // Verify the CSR signature before checking its requested subject.
     let source = csr.map(str::to_string).unwrap_or_else(|| {
         pki::csr_path(repo, host_id, ca_kind.file_stem())
             .display()
@@ -4608,14 +3985,7 @@ fn keys_issue(
     }
 
     let out_path = pki::issued_path(repo, host_id, &format!("{}.crt", ca_kind.file_stem()));
-    // --- lane 5A: one name, one certificate ---------------------------
-    //
-    // A second certificate for a name whose first one is still good is a
-    // second machine that can BE that name — which is exactly what a
-    // revocation exists to stop. The order is therefore enforced here: take
-    // the old one back, then issue the new one. It is the reinstall case
-    // (V24) and it is the only case in which this refusal fires, because a
-    // host that has never been issued anything has nothing to take back.
+    // Require revocation of an existing active certificate before issuing its replacement.
     if files.exists(&out_path) {
         let described = runner.run(&pki::describe_cmd("openssl", &out_path))?;
         let old = pki::parse_describe(&described.stdout, &out_path.display().to_string());
@@ -4642,12 +4012,8 @@ fn keys_issue(
             );
         }
     }
-    // --- end lane 5A --------------------------------------------------
     let csr_on_disk = if source == "-" {
-        // The CA is a program and it reads a FILE. A request that arrived on
-        // standard input is put where `keys csr` would have put it, so that
-        // what was signed is still there afterwards — a certificate whose
-        // request nobody kept is a certificate nobody can check.
+        // Persist stdin requests at the normal CSR path before invoking the CA.
         let kept = pki::csr_path(repo, host_id, ca_kind.file_stem());
         files.create_dir_all(kept.parent().unwrap_or(repo))?;
         files.write_atomic(&kept, csr_text.as_bytes(), 0o644)?;
@@ -4694,9 +4060,7 @@ fn keys_issue(
     Ok(true)
 }
 
-/// Where the inventory is: the path as given when it is absolute, and under
-/// the repository when it is not — the same rule every other verb applies to
-/// `--fleet`.
+/// Resolve relative inventory paths against the repository.
 fn inventory_path(repo: &Path, fleet: &Path) -> PathBuf {
     if fleet.is_absolute() {
         fleet.to_path_buf()
@@ -4733,10 +4097,7 @@ fn keys_enroll(
     let files = RealFiles::new(policy);
     let runner = Real::new(policy);
 
-    // The manifest when there is one, the inventory otherwise. A fresh host
-    // has no manifest yet — it cannot be reached, so nothing that reaches it
-    // can have run — and the inventory is the file that exists at that
-    // point.
+    // Use the manifest endpoint when supplied; initial enrollment can use the inventory.
     let target = match manifest {
         Some(path) => {
             let text = files.read_to_string(path)?;
@@ -4803,9 +4164,7 @@ fn keys_enroll(
         done.fingerprint,
         known_hosts.display()
     );
-    // The inventory is Silas' file: comments, order and all. This tool
-    // prints the line and does not edit it — a tool that rewrites the file
-    // it is configured by is a tool whose diffs nobody reads.
+    // Print the fingerprint update for the operator; do not rewrite the inventory.
     eprintln!(
         "note: put this into the `[[host]]` block of {} for {}:\n    {}\nThen run `resolve` \
          again — the manifest carries the fingerprint the planner compares against, and it \
@@ -4818,12 +4177,9 @@ fn keys_enroll(
     Ok(true)
 }
 
-// --- end lane 3B ------------------------------------------------------------
 
-// --- lane 5A: taking a certificate back --------------------------------------
 
-/// Everything `keys revoke` was told. A struct because it is twelve things
-/// and a function of twelve arguments is a function nobody calls correctly.
+/// Arguments for revocation and CRL delivery planning.
 struct KeysRevokeArgs<'a> {
     serial: Option<&'a str>,
     host: Option<&'a str>,
@@ -4840,12 +4196,7 @@ struct KeysRevokeArgs<'a> {
     json: bool,
 }
 
-/// Revoke, publish, and plan the delivery.
-///
-/// The order is the whole of it: the CA first, on this machine and offline,
-/// and the fleet second, through a plan. A verb that put the file on the
-/// hosts itself would be a second road past the locks and the journal — the
-/// same reason there is no `keys deliver` (3B).
+/// Revoke locally and publish the CRL before planning its delivery.
 fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
     use meister_deploy::pki;
 
@@ -4870,9 +4221,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
         );
     }
 
-    // Astra finding F21, 2026-09-23: validated here so a mistyped
-    // `--crl-reason` is a sentence from this tool, not a `die` from the CA
-    // several layers down. Unset means unspecified, openssl's own default.
+    // Validate the CRL reason before invoking the CA.
     let crl_reason = args.crl_reason.unwrap_or("unspecified");
     pki::validate_crl_reason(crl_reason)?;
 
@@ -4882,9 +4231,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
     let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
     let fleet = &release.resolved_fleet;
 
-    // The CA directory, from the inventory the manifest names — the same
-    // rule `keys issue` follows, and the same refusal if it is inside the
-    // committed tree.
+    // Resolve the configured CA and reject placement inside the repository.
     let inventory_file = match args.inventory {
         Some(path) => inventory_path(repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
@@ -4904,8 +4251,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
     let ca = pki::ca_dir(&inventory_file, &named);
     pki::refuse_ca_in_repo(repo, &ca)?;
 
-    // What is being taken back, in the CA's own terms: a file where this
-    // repository has one, a serial where it does not.
+    // Use certificate paths for recorded hosts, or an explicitly supplied serial.
     let mut targets: Vec<String> = Vec::new();
     if let Some(serial) = args.serial {
         targets.push(serial.to_string());
@@ -4918,8 +4264,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
                 fleet.evaluated_hosts.join(", ")
             );
         }
-        // Astra finding F11, 2026-09-23: propagated rather than swallowed --
-        // see the matching comment in `retire`.
+        // Propagate listing failures instead of treating them as no certificates.
         let certs = pki::issued_certs(&files, repo, host_id)?;
         if certs.is_empty() {
             anyhow::bail!(
@@ -4957,8 +4302,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
     }
     runner.run(&gencrl)?;
 
-    // Into the repository, where the delivery reads it from. Public and
-    // committed: a list of serials is what everybody has to be able to check.
+    // Publish the public CRL in the repository for planned delivery.
     let published = ca.join("crl.pem");
     let bytes = files.read(&published)?;
     let here = pki::crl_path(repo);
@@ -4980,9 +4324,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
         targets.len()
     );
 
-    // And now the fleet. The same planner, the same observation, the same
-    // locks: a revocation is a plan like any other, and `apply` is what
-    // carries it out.
+    // Build a delivery plan; apply performs the host changes.
     let answer = make_plan(&PlanArgs {
         release: args.release.to_path_buf(),
         select: args.select.to_string(),
@@ -5036,15 +4378,8 @@ struct KeysRotateArgs<'a> {
     json: bool,
 }
 
-/// Prepare a rotation, and plan it.
-///
-/// Two things happen here that cannot happen inside a plan, and they are the
-/// reason this verb exists: the new key is made ON THE HOST (the private
-/// half never travels, D10) and the certificate for it is issued HERE (the
-/// CA key never travels either). Both are done before the plan is written,
-/// so the plan can name exactly which key and which certificate it is about
-/// — and a plan made for one prepared key cannot be applied against
-/// another.
+/// Prepare a target-local replacement key and locally signed certificate
+/// before creating the plan that binds them.
 fn keys_rotate(args: KeysRotateArgs<'_>) -> Result<Answer> {
     use meister_deploy::activate::KeyKind;
     use meister_deploy::pki;
@@ -5099,10 +4434,7 @@ fn keys_rotate(args: KeysRotateArgs<'_>) -> Result<Answer> {
 
     let target = pki::target_from_host(args.host, host);
     let ssh = transport::Ssh::for_repo(repo).with_identity(args.identity.clone());
-    // `--replace`: a rotation wants a NEW key. An abandoned `.next` from a
-    // rotation nobody applied is exactly what may be thrown away — it never
-    // served a connection — and keeping it would issue a second certificate
-    // over a key that was already refused once.
+    // Replace any staged .next key while leaving the active key in place.
     let keygen =
         pki::keygen_beside_cmd(&ssh, &target, &subject.cn, file_kind.as_str(), true, "next");
     let csr_at = pki::next_csr_path(repo, args.host, file_kind.as_str());
@@ -5151,9 +4483,7 @@ fn keys_rotate(args: KeysRotateArgs<'_>) -> Result<Answer> {
         },
     )?;
 
-    // And now the plan. One host, because a rotation is about one key on
-    // one machine: the preparation happened on THIS host and the
-    // certificate is for THIS key.
+    // Bind the prepared credential to a single-host rotation plan.
     let select = format!("host={}", args.host);
     let endpoints = observation::manifest_endpoints(fleet, &[args.host.to_string()])?;
     let prober = observe::SshProber::new(&runner, &ssh);
@@ -5217,7 +4547,6 @@ fn keys_rotate(args: KeysRotateArgs<'_>) -> Result<Answer> {
         Answer::Yes
     })
 }
-// --- end lane 5A -------------------------------------------------------------
 
 /// The receipt as a person reads it.
 fn receipt_table(receipt: &receipt::DeploymentReceipt) -> String {
@@ -5314,15 +4643,13 @@ fn run_state_table(run: &str, state: &receipt::RunState) -> String {
     out
 }
 
-/// A timestamp as every other line of this tool spells one: UTC, seconds,
-/// and a `Z` rather than a `+00:00` that a reader has to translate.
+/// Format timestamps in UTC to second precision.
 fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
     at.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// The last two segments of a store path: a table of full ones is a table
-/// nobody can read, and the hash is in the name.
+/// Return the final store-path component for display.
 fn short(store_path: &str) -> &str {
     store_path
         .rsplit_once('/')
@@ -5376,19 +4703,12 @@ fn validate(fleet: &Path, manifest: Option<&str>, nix: bool) -> Result<bool> {
     }
 }
 
-/// `validate --nix`: what the inventory says, and what the flake makes of it.
-///
-/// Two readers, one file (D2). This verb asks the expensive reader — Nix —
-/// for the CHEAP half of its answer (`meisterDeployment.inventory`, derived
-/// without evaluating a single module) and compares the fleet it describes
-/// with the fleet this binary read out of the TOML. What it cannot see is
-/// whether a host's system builds; that is `resolve` and then `build`.
+/// Compare parsed TOML and Nix inventory host sets and fleet name.
+/// This does not evaluate or build host systems.
 fn validate_with_nix(fleet: &Path) -> Result<bool> {
     let fleet = std::path::absolute(fleet)
         .with_context(|| format!("{} could not be made absolute", fleet.display()))?;
-    // The repository is the directory the inventory lives in, because that is
-    // where its flake is. An inventory somewhere else is a fleet whose
-    // deployment repository nobody named.
+    // Use the inventory directory as the operator flake root.
     let repo = fleet
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no directory to evaluate", fleet.display()))?;
@@ -5399,14 +4719,8 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
 
     Cancel::on_sigint()?;
     let runner = Real::new(policy);
-    // `git+file://` and never a bare path or `path:`: what is evaluated is
-    // what git tracks, so this verb cannot copy an ignored `keys/` into the
-    // store on the way (the fix N1 of lane 1C). The price is that
-    // uncommitted changes are not in the answer, and the note below says so.
-    // No rev to pin here (Astra finding F15 pinned `resolve`'s clean-tree
-    // read; this verb reads no rev at all, by the same design the comment
-    // above already names — it always compares against whatever HEAD is
-    // now).
+    // Evaluate the Git-backed flake to exclude ignored files from the source.
+    // This check does not capture a revision as resolve does.
     let flake_ref = nix::flake_ref(repo, false, None);
     let text = nix::eval_inventory(&runner, &flake_ref)?;
 
@@ -5472,30 +4786,21 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Where a fleet's signing key lives, relative to the operator's
-/// repository. In the template's `.gitignore`; the PUBLIC half
-/// (`signing.pub`) is beside it and is committed.
+/// Default ignored directory for private signing keys; commit signing.pub separately.
 const KEYS_DIR: &str = "keys";
 
-/// `init <dir>`: the repository a deployment starts from.
-///
-/// Writes once, into an empty or absent directory, and never into a
-/// MeisterStack checkout: the files come out of this binary
-/// (`crate::template`), so the verb works offline and the template is the one
-/// this version was built with.
+/// Write the embedded template into a new directory and attempt nix flake lock.
 fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
     let dir = std::path::absolute(dir)
         .with_context(|| format!("{} could not be made absolute", dir.display()))?;
 
     if dry_run {
-        // The list, and not a word about having written anything.
+        // Preview paths without creating them.
         for file in template::FILES {
             println!("{}", dir.join(file.path).display());
         }
         println!("{}", dir.join(".meister-deploy").display());
-        // --- lane 4C ---
         println!("{}", dir.join(KEYS_DIR).display());
-        // --- end lane 4C ---
         eprintln!(
             "note: --dry-run wrote nothing. {} file(s) and two directories would be \
              created; `nix flake lock` would then be run in {}.",
@@ -5508,9 +4813,7 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
     let policy = Policy::real();
     let files = RealFiles::new(policy);
 
-    // An empty or absent directory, and nothing else. A repository somebody
-    // already has is a repository this verb must not write into — there is
-    // no merge here, and the files it writes are the ones an operator edits.
+    // Refuse existing content; init does not merge repositories.
     if files.exists(&dir) {
         let existing = files.list_dir(&dir)?;
         if !existing.is_empty() {
@@ -5532,8 +4835,7 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
         }
     }
 
-    // The one file that is not copied verbatim: the flake reference of the
-    // `meisterstack` input.
+    // Override only the MeisterStack flake reference.
     let reference = flake_ref.unwrap_or(template::DEFAULT_FLAKE_REF);
     for file in template::FILES {
         let path = dir.join(file.path);
@@ -5548,31 +4850,17 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
         files.write_atomic(&path, body.as_bytes(), file.mode)?;
         println!("{}", path.display());
     }
-    // The state directory, so that the first `resolve` has somewhere to put
-    // its snapshot and its journal. It is in the template's .gitignore.
+    // Create ignored local deployment state.
     let state = dir.join(".meister-deploy");
     files.create_dir_all(&state)?;
     println!("{}", state.display());
 
-    // --- lane 4C: N6 --------------------------------------------------
-    //
-    // And `keys/`, because step 1 of the sentence below is
-    // `nix-store --generate-binary-cache-key <fleet> keys/signing.sec
-    // signing.pub` and nix does not make the directory: without this the
-    // very first thing an operator types fails with "No such file or
-    // directory" (gate M1, finding N6; lane L1 hit it again as B1).
-    //
-    // No `.gitkeep`: `keys/` is in the template's .gitignore, so a file in
-    // it to keep it in git would be a file git ignores. What this verb
-    // leaves behind is a directory on the disk, which is what the command
-    // needs.
-    // --- end lane 4C ---
+    // Create the ignored private-key directory required by the signing-key command.
     let keys = dir.join(KEYS_DIR);
     files.create_dir_all(&keys)?;
     println!("{}", keys.display());
 
-    // The lock file, and ONLY through nix. Writing one by hand would be
-    // claiming a set of revisions nobody resolved.
+    // Let Nix create flake.lock; report failure without inventing a lock file.
     let runner = Real::new(policy);
     match runner.run(&nix::flake_lock_cmd(&dir)) {
         Ok(_) => println!("{}", dir.join("flake.lock").display()),
@@ -5601,9 +4889,7 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
 
 fn validate_manifest(from: &str) -> Result<bool> {
     let (text, origin) = if from == "-" {
-        // Standard input is not a file, so it does not go through `Files`;
-        // it is also the only way a Nix check can hand a manifest over
-        // without writing it into the store first.
+        // Read piped contract JSON without requiring a temporary file.
         let mut text = String::new();
         std::io::stdin()
             .read_to_string(&mut text)
@@ -5619,8 +4905,7 @@ fn validate_manifest(from: &str) -> Result<bool> {
         Ok(contract) => {
             println!("ok: {origin} is a {}", contract.describe());
             if let Contract::NixManifest(_) = contract {
-                // Saying what was NOT checked is part of the answer: these
-                // types are a shape, and a shape is not a fleet.
+                // Schema validation does not inspect store paths or hosts.
                 eprintln!(
                     "note: the shape was checked, not the fleet. Store paths were not \
                      looked up and no host was asked anything."
@@ -5639,18 +4924,14 @@ fn validate_manifest(from: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
-    // Astra finding F06, 2026-09-23.
     #[test]
     fn a_run_that_stopped_does_not_exit_zero() {
         use receipt::Outcome;
-        // The measured shape: one host, its activation confirmed, and the
-        // `uncordon` after it failed. Every host of the receipt is forward,
-        // so the receipt says success — and the run did not come through.
+        // A committed activation followed by failed uncordon must fail the run.
         assert_eq!(answer_for(Outcome::Success, true, true), Answer::No);
-        // A run that stopped is a failure even where the plan also refused
-        // something: "it stopped" is the louder of the two.
+        // A stopped run remains a failure even if other hosts were blocked.
         assert_eq!(answer_for(Outcome::Success, false, true), Answer::No);
-        // And the three answers a run that did not stop still gives.
+        // Completed runs distinguish success, blockers and partial failure.
         assert_eq!(answer_for(Outcome::Success, true, false), Answer::Yes);
         assert_eq!(answer_for(Outcome::Success, false, false), Answer::Blocked);
         assert_eq!(answer_for(Outcome::Partial, true, false), Answer::No);

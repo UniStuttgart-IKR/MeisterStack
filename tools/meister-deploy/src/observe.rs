@@ -2,46 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a host IS, asked once and written down.
+//! Collect host observations with one bounded SSH probe per host.
 //!
-//! [`crate::observation`] is the TYPE a snapshot has; this module is how one
-//! comes about. The shape is deliberate in four ways.
+//! The POSIX shell probe prints framed `key=value` records. Missing scalar
+//! answers remain unknown; incomplete framing sets `unknown_reason`.
+//! A compatible `meister-activate status --json` response supplies system,
+//! transaction and lock information. Raw transaction-file fallback currently
+//! cannot decode the helper writer's `TxnRecord` schema.
 //!
-//! **One round trip per host.** `plan`, `status` and `check` want the same
-//! two dozen facts, and asking for them one `ssh` at a time turns seventy
-//! hosts into a thousand connections — which is slow, and which is also
-//! twenty different moments pretending to be one snapshot. So there is one
-//! POSIX-sh script per host, it prints `key=value` lines, and every verb
-//! reads the same answer. `tests/probe_reads_only.rs` reads the generated
-//! script and fails if it contains a command that could write, start or
-//! stop anything: the script is the part of this tool that runs on somebody
-//! else's machine, so "read-only" has to be a property of its text and not
-//! a claim in a comment.
-//!
-//! **Two sources, one type.** A managed host has `meister-activate` in its
-//! closure, and `meister-activate status --json` is the authority on the
-//! three system facts, the open transactions and the lock, because it is
-//! what wrote them. A host that does not have it yet — one that is
-//! installed and not enrolled, one still served by the context push — can
-//! still be read with `readlink` and `systemctl`. Both land in the same
-//! [`HostObservation`], the activate answer wins where it speaks, and
-//! nothing about the fleet's verdicts depends on which of the two answered.
-//! [`ActivateStatus`] is therefore a contract lane 2C implements, not an
-//! internal detail: `meister-deploy schema activate-status` prints it.
-//!
-//! **Null is an answer and zero is not.** Every field that could not be read
-//! stays `None`. `vms_running: None` means nobody was able to ask, and
-//! `Some(0)` means the node said it runs none — the planner's maintenance
-//! step turns on exactly that difference, and a probe that reported `0` for
-//! "the socket did not answer" would drain a host that is running guests.
-//!
-//! **A host that hangs does not hold the fleet.** Each host has its own
-//! deadline (the `Cmd` carries it, so `Real` kills the process group when it
-//! passes), the hosts are asked in parallel with a bounded pool, and a host
-//! that could not be reached becomes `reachable: false` with a sentence
-//! rather than an error that ends the run. Nothing is retried here: a
-//! retry is a decision about how long an operator waits, and it belongs to
-//! the verb.
+//! Hosts without an enrolled SSH fingerprint are recorded as unreachable
+//! without connecting. Probe failures remain per-host observations; there are
+//! no retries. The default worker pool has eight threads.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -63,43 +34,23 @@ use crate::transport::{PROBE_DEADLINE, Ssh, Target};
 
 pub const ACTIVATE_STATUS_SCHEMA: &str = "meister-deploy/activate-status/1";
 
-/// How many hosts are asked at once by default.
-///
-/// Eight, because a probe is one ssh and a sleeping fleet answers in well
-/// under a second, while seventy connections at once is a number that
-/// depends on the workstation's file descriptors and on how many of them
-/// the operator's ssh agent is willing to sign for. A bounded pool is also
-/// what keeps the wall clock of a snapshot close to the deadline of its
-/// slowest host rather than to the sum of all of them.
+/// Default maximum number of concurrent host probes.
 pub const DEFAULT_CONCURRENCY: usize = 8;
 
 /// Where a managed host keeps what `meister-activate` owns.
 pub const DEPLOY_DIR: &str = "/var/lib/meisterstack/deploy";
 
-/// The etcd client url every member of this fleet serves on.
-///
-/// Loopback on purpose and not a guess: `nix/etcd.nix` binds
-/// `listenClientUrls` to `127.0.0.1:2379` in both its shapes, so that a
-/// replica which has lost quorum stalls on its own member instead of
-/// quietly writing through a healthy neighbour. Only peer traffic leaves
-/// the host. A fleet that ever changes that renders `client_url` into
-/// `effective_settings.etcd`, and [`ProbeSpec::for_host`] reads it.
+/// Default local etcd client URL, matching `nix/etcd.nix`.
+/// `effective_settings.etcd.client_url` may override it.
 pub const DEFAULT_ETCD_CLIENT_URL: &str = "http://127.0.0.1:2379";
 
-/// Which unit carries which role.
-///
-/// The names are the ones the modules define (`nix/agent.nix`,
-/// `nix/controllers.nix`, `nix/addons.nix`): a role is a claim about what a
-/// host runs, and this is where that claim becomes something
-/// `systemctl is-active` can answer.
+/// Map roles to the unit names rendered by the NixOS modules.
 pub fn units_for_role(role: &str) -> &'static [&'static str] {
     match role {
         "agent" => &["meister-agent.service"],
         "cluster" => &["meister-cluster-controller.service"],
         "cloud" => &["meister-cloud-controller.service"],
-        // Six services behind one role. They are what an operator means by
-        // "the addons are up", and a role that answered for one of them
-        // would be a role that hides the other five.
+        // All six addon services must be observed.
         "addons" => &[
             "kanidm.service",
             "garage.service",
@@ -112,11 +63,7 @@ pub fn units_for_role(role: &str) -> &'static [&'static str] {
     }
 }
 
-/// Which of a host's units carries a session to the tier above it, if any.
-///
-/// The agent's session to its cluster controller, the cluster's to the
-/// cloud. Used by the `session` readiness check, which is the one check
-/// that is about a connection rather than about a process.
+/// Unit carrying the agent-to-cluster or cluster-to-cloud session, if applicable.
 pub fn session_unit(roles: &[String]) -> Option<&'static str> {
     if roles.iter().any(|r| r == "agent") {
         Some("meister-agent.service")
@@ -134,33 +81,20 @@ pub struct CredentialProbe {
     /// `HostObservation::credentials`.
     pub id: String,
     pub path: String,
-    /// Whether the content may be hashed.
-    ///
-    /// A certificate, a CA bundle and a CRL are public: their sha256 is a
-    /// version somebody can compare, and printing it costs nothing. A
-    /// private key is not, and the digest of a private key is a digest of a
-    /// private key — it would be in a journal, in a receipt and in whatever
-    /// ticket the receipt is attached to. So a key is described by its mode
-    /// and its owner, which is what a loader refuses it for (M0 probe S11),
-    /// and never by its content.
+    /// Hash content only for public file extensions.
+    /// Other files are described by mode and owner so private-key digests do not enter reports.
     pub public: bool,
 }
 
-/// What to ask ONE host. Everything host-specific comes from the manifest:
-/// the probe has no list of paths of its own, because a path this tool
-/// invented would be a path the fleet does not use.
+/// Host-specific probe inputs derived from the manifest, with helper/socket defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeSpec {
     pub units: Vec<String>,
-    /// The `persistence[].path` entries. Asked with `findmnt -M`, which
-    /// answers only for a real mount point — `--target` would answer `/`
-    /// for a path that is a directory on the root disk, which is exactly
-    /// the failure V19 is about.
+    /// Persistence paths checked with `findmnt -M` for exact mount points.
+    /// `--target` would also match an ancestor filesystem.
     pub mounts: Vec<String>,
     pub credentials: Vec<CredentialProbe>,
-    /// The certificate beside each identity key. `enrolled` is about a
-    /// service identity: a key without a certificate is a key nobody
-    /// countersigned.
+    /// Companion certificates required alongside identity keys for service enrollment.
     pub identity_certs: Vec<String>,
     /// Ask etcd when this host is supposed to be a member.
     pub etcd: Option<EtcdProbe>,
@@ -220,21 +154,10 @@ impl ProbeSpec {
             credentials.push(CredentialProbe {
                 id: secret.id.clone(),
                 path: secret.target_path.clone(),
-                // The path decides, not the kind: a `ca_bundle` is public
-                // and so is a `crl`, and both are named `*.crt`/`*.pem` by
-                // the one derivation — but a `serving_key` is a key however
-                // it is spelled, and hashing it because its kind sounded
-                // public would be the one mistake that cannot be taken
-                // back.
+                // Public-file classification follows the filename extension used by readiness checks.
                 public: is_certificate(&secret.target_path),
             });
-            // The certificate beside a KEY. An identity is two files and
-            // the one derivation names both of them `identity_key` (the
-            // certificate is part of the identity), so a ref that already
-            // IS a certificate must not have another one derived from it —
-            // that would be `identity.crt.crt`, a file nobody writes, and
-            // every managed host would be `unenrolled` for ever. Measured
-            // in nix/tests/update.nix, where exactly that happened.
+            // Certificate refs may share `identity_key` with key refs; do not append `.crt` twice.
             if secret.kind == SecretKind::IdentityKey && !is_certificate(&secret.target_path) {
                 let beside = certificate_beside(&secret.target_path);
                 if !identity_certs.contains(&beside) {
@@ -258,34 +181,23 @@ impl ProbeSpec {
         }
     }
 
-    /// The script, as it is sent. One string, POSIX sh, and every line of it
-    /// only reads.
-    ///
-    /// Written with `printf '<key>=%s\n' "$(…)"` rather than `echo`: a value
-    /// that came out empty is then an empty value rather than a line that
-    /// disappeared, and nothing is word-split on the way out. Every
-    /// substitution sends its diagnostics to `/dev/null`, because a missing
-    /// tool is a missing answer and not a broken probe — these hosts run
-    /// four different role sets and two different generations of image.
+    /// Generate a read-only POSIX shell probe with framed `key=value` output.
+    /// `printf` and quoted substitutions preserve empty values without word splitting.
+    /// Individual command errors are suppressed and leave missing answers.
     pub fn script(&self) -> String {
         let mut s = String::new();
         s.push_str("printf 'probe=%s\\n' start\n");
-        // Who it is. `/proc/sys/kernel/hostname` rather than the `hostname`
-        // program, which an appliance image may not have.
+        // Read the kernel hostname without requiring the `hostname` utility.
         s.push_str("printf 'hostname=%s\\n' \"$(cat /proc/sys/kernel/hostname 2>/dev/null)\"\n");
         s.push_str("printf 'machine_id=%s\\n' \"$(cat /etc/machine-id 2>/dev/null)\"\n");
-        // The three system facts, as three separate questions. `readlink -f`
-        // because the profile is a symlink to a symlink and the store path
-        // is what a release names.
+        // Resolve current, booted and profile links independently to store paths.
         s.push_str(
             "printf 'current_system=%s\\n' \"$(readlink -f /run/current-system 2>/dev/null)\"\n",
         );
         s.push_str(
             "printf 'booted_system=%s\\n' \"$(readlink -f /run/booted-system 2>/dev/null)\"\n",
         );
-        // A name for this boot (Astra finding MD04): what a resume compares
-        // against the one the reboot step wrote down before it sent the
-        // reboot.
+        // Resume compares this boot ID with the value recorded before reboot.
         s.push_str(
             "printf 'boot_id=%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"\n",
         );
@@ -300,11 +212,7 @@ impl ProbeSpec {
              | sed -n 's/.*system-\\([0-9][0-9]*\\)-link$/\\1/p')\"\n",
         );
         s.push_str("printf 'kernel_running=%s\\n' \"$(uname -r 2>/dev/null)\"\n");
-        // What the BOOTED generation says it boots: three fields, compared
-        // straight against the release's `boot`. The digest is over the
-        // bytes of `kernel-params`, which is the file NixOS writes the
-        // command line into without a trailing newline — so the same sha256
-        // the one derivation computes over `boot.kernelParams`.
+        // Hash the booted generation's kernel-params bytes to match the release boot identity.
         s.push_str(
             "printf 'kernel_booted=%s\\n' \
              \"$(readlink -f /run/booted-system/kernel 2>/dev/null)\"\n",
@@ -324,8 +232,7 @@ impl ProbeSpec {
                 s.push_str(&shell_quote(unit));
                 s.push(' ');
             }
-            // `is-active` exits non-zero for an inactive unit and still
-            // prints its answer, which is the answer this asks for.
+            // Inactive units still print a useful state despite a nonzero exit status.
             s.push_str(
                 "; do printf 'unit=%s\\t%s\\n' \"$u\" \
                  \"$(systemctl is-active \"$u\" 2>/dev/null)\"; done\n",
@@ -354,8 +261,7 @@ impl ProbeSpec {
                      else printf 'cred_missing=%s\\n' {id}; fi\n"
                 ));
             } else {
-                // A private key is described and never read: the mode and
-                // the owner are what its loader refuses it for.
+                // Describe private-file permissions and ownership without hashing content.
                 s.push_str(&format!(
                     "if [ -f {path} ]; then printf 'cred=%s\\tmode:%s owner:%s\\n' {id} \
                      \"$(stat -c %a {path} 2>/dev/null)\" \
@@ -373,39 +279,23 @@ impl ProbeSpec {
             ));
         }
 
-        // `-c` and not `-e`: both of these are character devices, and a
-        // regular file somebody left at that path is not a hypervisor.
+        // Require character devices; ordinary files do not establish capability.
         s.push_str("if [ -c /dev/kvm ]; then printf 'cap=%s\\n' kvm; fi\n");
         s.push_str("if [ -c /dev/vfio/vfio ]; then printf 'cap=%s\\n' vfio; fi\n");
-        // The directory exists as soon as the ib core module is loaded, so
-        // the question is whether it has a device in it.
+        // An empty infiniband directory only establishes that the core module loaded.
         s.push_str(
             "if [ -n \"$(ls -A /sys/class/infiniband 2>/dev/null)\" ]; then \
              printf 'cap=%s\\n' rdma; fi\n",
         );
 
-        // --- lane 4A: the machine under the closure ---
-        //
-        // How much room the store has. `df` on `/nix` and not on `/`,
-        // because the two are the same filesystem on most hosts and are not
-        // on the ones where it matters. A `df` that does not know
-        // `--output` prints nothing and the answer is null, which is what
-        // "nobody could read it" has to look like — zero would block every
-        // host whose probe lost a line.
+        // Measure the filesystem containing `/nix`; an unreadable result remains null.
         s.push_str(
             "printf 'disk_free_nix=%s\\n' \
              \"$(df -B1 --output=avail /nix 2>/dev/null | tail -n 1 | tr -d ' ')\"\n",
         );
 
-        // Which cards are in the slots. sysfs first and `lspci` second, the
-        // other way round from what the lane brief says, and for a reason
-        // that is worth a line: `/sys/bus/pci/devices` is the kernel's own
-        // list, it is on every Linux host, and it needs no package in the
-        // closure — while `pciutils` is not in a managed host's closure at
-        // all, so the `lspci` road would be the road that is never taken on
-        // exactly the machines this tool manages. The vendor and device
-        // files hold `0x10de`, so the `0x` comes off; the directory name is
-        // already the full domain address the inventory spells.
+        // Prefer sysfs, which needs no pciutils package. Strip vendor/device `0x` prefixes;
+        // directory names already contain full PCI domain addresses.
         s.push_str("if [ -d /sys/bus/pci/devices ]; then\n");
         s.push_str("  for d in /sys/bus/pci/devices/*; do\n");
         s.push_str(
@@ -415,46 +305,31 @@ impl ProbeSpec {
         );
         s.push_str("  done\n");
         s.push_str("elif command -v lspci >/dev/null 2>/dev/null; then\n");
-        // `-D` and not plain `-n`: a machine with one PCI domain has its
-        // domain left off, and `41:00.0` is not the string an inventory
-        // holds. The columns of `lspci -Dn` are address, class, id.
+        // Use `-D` to preserve the PCI domain; columns are address, class and vendor/device ID.
         s.push_str(
             "  lspci -Dn 2>/dev/null | while read -r a c v r; do \
                     printf 'pci=%s\\t%s\\n' \"$a\" \"$v\"; done\n",
         );
         s.push_str("fi\n");
 
-        // Which interfaces answer, by the name the kernel gave them and the
-        // MAC that is burned in. The MAC is what the preflight compares:
-        // `eth0` is a name handed out at boot.
+        // Report kernel interface names and MACs; preflight matches MACs.
         s.push_str(
             "for n in /sys/class/net/*; do \
                     if [ -r \"$n/address\" ]; then printf 'nic=%s\\t%s\\n' \"${n##*/}\" \
                     \"$(cat \"$n/address\" 2>/dev/null)\"; fi; done\n",
         );
 
-        // The unit names the RUNNING generation carries. One line and not
-        // one per unit, because a NixOS system has some hundreds of them
-        // and seventy hosts would be twenty thousand lines of answer.
-        // `cd` in the substitution is a subshell, so nothing after this
-        // sees a different directory.
+        // Pack generation unit names into one record. The substitution isolates `cd`.
         s.push_str(
             "printf 'gen_units=%s\\n' \
              \"$(cd /run/current-system/etc/systemd/system 2>/dev/null && printf '%s ' *)\"\n",
         );
-        // --- end lane 4A ---
+
 
         if let Some(etcd) = &self.etcd {
             let url = shell_quote(&etcd.client_url);
-            // Only when the unit is actually running: `etcdctl` against a
-            // stopped member waits for its own timeout to tell us what
-            // `systemctl` already said. The command timeout is etcd's own,
-            // and `timeout` is the one that also covers an etcdctl which
-            // ignores it.
-            // Both descriptors to /dev/null separately rather than `2>&1`:
-            // this script is read by a test that allows exactly one
-            // redirection target, and a duplicated descriptor is a
-            // redirection whose target that reader has to work out.
+            // Skip stopped etcd members. Bound running-member queries with both etcd and shell timeouts.
+            // Keep stderr and stdout redirections explicit for the read-only script checks.
             s.push_str("if systemctl is-active etcd.service >/dev/null 2>/dev/null; then\n");
             s.push_str(&format!(
                 "  printf 'etcd_members=%s\\n' \"$(timeout 20 etcdctl --endpoints={url} \
@@ -469,10 +344,7 @@ impl ProbeSpec {
 
         if let Some(socket) = &self.agent_socket {
             let socket = shell_quote(socket);
-            // The node's own socket, over the node's own cli, with the
-            // endpoint named explicitly: a target host has no operator
-            // profile, and a count that came from `ps` would count a
-            // hypervisor that is exiting.
+            // Query the agent socket explicitly; target hosts need no operator CLI profile.
             s.push_str(&format!(
                 "if [ -S {socket} ]; then printf 'vms=%s\\n' \
                  \"$(timeout 20 meister --endpoint unix://{socket} agent vm ls -o json \
@@ -481,17 +353,14 @@ impl ProbeSpec {
             ));
         }
 
-        // What `meister-activate` holds, if it is there. One line, compact
-        // json, and it is the authority on the transactions and the lock
-        // because it is what wrote them.
+        // Prefer a compatible helper response for system, transaction and lock state.
         s.push_str(
             "if command -v meister-activate >/dev/null 2>/dev/null; then \
              printf 'activate=%s\\n' \"$(timeout 30 meister-activate status --json 2>/dev/null \
              | tr -d '\\n')\"; fi\n",
         );
-        // And the records themselves, for a host whose helper is not there
-        // or could not answer — a resume must not depend on the program
-        // whose crash it is recovering from.
+        // Read raw records as fallback. The transaction parser currently expects the
+        // observation view schema, which differs from the helper's on-disk schema.
         let deploy = shell_quote(&self.deploy_dir);
         s.push_str(&format!(
             "if [ -f {deploy}/lock/owner.json ]; then printf 'lock_file=%s\\n' \
@@ -502,9 +371,7 @@ impl ProbeSpec {
              printf 'txn_file=%s\\n' \"$(cat \"$t\" 2>/dev/null | tr -d '\\n')\"; fi; done\n"
         ));
 
-        // Always the last line, and it always succeeds: the exit code of
-        // the whole script is then the exit code of this echo and not of
-        // whatever question happened to be asked last.
+        // End framing also gives the script a successful final command.
         s.push_str("printf 'probe=%s\\n' end\n");
         s
     }
@@ -515,11 +382,7 @@ impl ProbeSpec {
     }
 }
 
-/// Whether a path holds public material this tool may hash.
-///
-/// Public, because the readiness check that judges a key's mode has to make
-/// the same distinction from the same rule: a certificate is described by
-/// its digest, a key by its mode.
+/// Classify public file extensions consistently with credential readiness checks.
 pub fn is_certificate(path: &str) -> bool {
     path.ends_with(".crt") || path.ends_with(".pem") || path.ends_with(".crl")
 }
@@ -532,23 +395,8 @@ fn certificate_beside(key_path: &str) -> String {
     }
 }
 
-/// Where the node socket is, as the host's own configuration names it.
-///
-/// Out of `paths.run_dir`, because that is the key an agent's configuration
-/// actually has: the agent opens `<run_dir>/agent.sock`
-/// (`components/agent/src/lib.rs`), and `paths.socket` is not a field of
-/// `PathsConfig` at all — `--check-config` would refuse a file that named
-/// one.
-///
-/// This line used to read `paths.socket` and fall back to
-/// `/run/meisterstack/agent.sock`, which is one directory above the socket
-/// of every host this fleet renders. The cost was not a wrong answer but a
-/// SILENT one: `[ -S … ]` was false, the probe wrote no `vms=` line,
-/// `vms_running` stayed `None`, and every drain of a real agent waited ten
-/// minutes and then refused the step it was protecting
-/// ("n1 still carries an unknown number of guests after 600s"). Measured in
-/// `checks.vm-bootstrap-fleet`, on the first drain this project ever ran
-/// against a machine.
+/// Agent socket: `<paths.run_dir>/agent.sock`, matching the agent configuration.
+/// Default to the run directory rendered by `nix/agent.nix`.
 fn agent_socket_of(host: &ResolvedHost) -> String {
     host.effective_settings
         .agent
@@ -557,9 +405,7 @@ fn agent_socket_of(host: &ResolvedHost) -> String {
         .and_then(|p| p.get("run_dir"))
         .and_then(|s| s.as_str())
         .map(|dir| format!("{}/agent.sock", dir.trim_end_matches('/')))
-        // The run directory the fleet's own derivation gives every agent
-        // (nix/agent.nix). A manifest without it is one this tool did not
-        // make, and guessing the other spelling would guess the bug above.
+        // Default used by the fleet derivation.
         .unwrap_or_else(|| "/run/meisterstack/agent/agent.sock".to_string())
 }
 
@@ -567,32 +413,19 @@ fn agent_socket_of(host: &ResolvedHost) -> String {
 // What `meister-activate status --json` says
 // ---------------------------------------------------------------------------
 
-/// The answer of the target-side helper — **a contract, implemented by lane
-/// 2C's `meister-activate`.**
-///
-/// It carries what only the target knows: which transaction is open, what
-/// state it is in, who holds the lock. It also repeats the three system
-/// facts, because it can read them without a second round trip and because
-/// it is the program that moved the profile.
-///
-/// Every field is optional except the schema: a helper that could not read
-/// something says null, exactly like the shell probe does.
+/// Target helper status contract. Nullable fields retain shell observations when absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActivateStatus {
     pub schema: String,
     pub current_system: Option<String>,
     pub booted_system: Option<String>,
-    /// Where the boot loader's default points. The helper knows this
-    /// better than a `readlink` does once a `--mode boot` activation has
-    /// set a one-shot entry.
+    /// Resolved system profile target; this field does not inspect boot-loader entries.
     pub next_boot_system: Option<String>,
     pub generation: Option<u64>,
     pub kernel_running: Option<String>,
     pub kernel_booted: Option<BootedKernel>,
-    /// At most one, by `meister-activate`'s own rule. Two is a state this
-    /// tool has no rule for and [`crate::receipt::TxnView`] calls
-    /// inconsistent.
+    /// Open transaction views. More than one is inconsistent for receipt interpretation.
     pub open_txns: Vec<Txn>,
     pub lock: Option<Lock>,
 }
@@ -607,13 +440,8 @@ impl ActivateStatus {
 // Reading the answer
 // ---------------------------------------------------------------------------
 
-/// Turn one host's answer into one host's observation.
-///
-/// Pure, and every failure to understand something is a null rather than an
-/// error: a probe that answered half way is a half answer about a host that
-/// is up, and throwing it away would turn a slow disk into an unreachable
-/// machine. What IS an error — the host never answered — is decided by the
-/// caller, which is the only one that knows whether the command ran.
+/// Parse a host's probe output without effects. Unparseable fields stay unknown or empty;
+/// missing framing sets `unknown_reason`. The caller decides reachability.
 pub fn parse_probe(
     text: &str,
     spec: &ProbeSpec,
@@ -675,10 +503,7 @@ pub fn parse_probe(
             "mount" => {
                 if let Some((path, rest)) = value.split_once('\t') {
                     let mut fields = rest.split_whitespace();
-                    // findmnt answered: this path IS a mount point. It
-                    // answered nothing: the path is a directory on the root
-                    // disk, and being ABSENT from `mounts` is how that is
-                    // said — the planner reads exactly that (V19).
+                    // A nonempty exact-mount query adds this path; an absent answer adds nothing.
                     if let (Some(device), Some(fstype)) = (fields.next(), fields.next()) {
                         obs.mounts.push(Mount {
                             path: path.to_string(),
@@ -710,7 +535,7 @@ pub fn parse_probe(
                     obs.capabilities.push(cap);
                 }
             }
-            // --- lane 4A ---
+
             "disk_free_nix" => {
                 obs.disk_free_nix_bytes = some(value).and_then(|v| v.parse().ok());
             }
@@ -727,9 +552,7 @@ pub fn parse_probe(
             "nic" => {
                 if let Some((name, mac)) = value.split_once('\t')
                     && let (Some(name), Some(mac)) = (some(name), some(mac))
-                    // Not an identity: `lo` and every other interface
-                    // without hardware behind it reports all zeroes, and a
-                    // fleet that declared that MAC would match all of them.
+                    // Exclude all-zero MAC addresses, which cannot identify a host interface.
                     && mac != "00:00:00:00:00:00"
                 {
                     obs.nics.push(crate::observation::NetworkInterface {
@@ -741,16 +564,14 @@ pub fn parse_probe(
             "gen_units" => {
                 obs.generation_units = value
                     .split_whitespace()
-                    // What an empty directory leaves behind: the glob
-                    // itself. It is not a unit and it is not a host that
-                    // has none — it is a directory with nothing in it.
+                    // Ignore the literal glob left by an empty directory.
                     .filter(|name| *name != "*")
                     .map(str::to_string)
                     .collect();
                 obs.generation_units.sort();
                 obs.generation_units.dedup();
             }
-            // --- end lane 4A ---
+
             "etcd_members" => etcd_members = some(value),
             "etcd_health" => etcd_health = some(value),
             "vms" => obs.vms_running = some(value).and_then(|v| count_vms(&v)),
@@ -765,10 +586,7 @@ pub fn parse_probe(
         }
     }
 
-    // The booted kernel is a triple or it is nothing: a reboot class
-    // decided from two of the three fields would be a reboot class decided
-    // from a guess, and null is the answer the planner reads
-    // conservatively.
+    // Require the complete boot identity triple for reboot classification.
     if let (Some(kernel), Some(initrd), Some(digest)) =
         (kernel_booted, initrd_booted, kernel_params)
     {
@@ -788,9 +606,7 @@ pub fn parse_probe(
         );
     }
 
-    // A service identity is a key AND the certificate somebody signed for
-    // it. A host with neither is `unenrolled`, which is a state and never a
-    // failure — it is what a bootstrap is for.
+    // Service enrollment requires the manifest's keys and companion certificates.
     obs.enrolled = identity_is_complete(spec, &obs.credentials, &identity_certs);
 
     for line in &txn_lines {
@@ -802,19 +618,14 @@ pub fn parse_probe(
         obs.lock = serde_json::from_str::<Lock>(line).ok();
     }
 
-    // The helper wins where it speaks: it wrote the transaction records and
-    // it moved the profile, so its answer about either is the better one.
-    // Where it says null, the shell probe's answer stands.
+    // Overlay non-null helper fields and nonempty transaction lists on shell observations.
     if let Some(text) = &activate
         && let Ok(status) = ActivateStatus::from_json(text, "meister-activate status --json")
     {
         merge_activate(&mut obs, status);
     }
 
-    // A probe whose first and last line are both there answered whole.
-    // Anything else is an answer this tool will not plan on: the host is
-    // reachable and what it said cannot be trusted to be complete, which is
-    // precisely what `unknown_reason` means.
+    // Missing start or end framing makes the reachable host's observation incomplete.
     if !saw_start || !saw_end {
         obs.unknown_reason = Some(format!(
             "the probe of this host did not answer whole ({}); it was reached and what it \
@@ -849,9 +660,7 @@ fn merge_activate(obs: &mut HostObservation, status: ActivateStatus) {
     if status.kernel_booted.is_some() {
         obs.kernel_booted = status.kernel_booted;
     }
-    // The records: the helper's list REPLACES what the files said, because
-    // the helper is what keeps them and it can tell a half-written one from
-    // a finished one.
+    // Only a nonempty helper transaction list replaces raw-file observations.
     if !status.open_txns.is_empty() {
         obs.open_txns = status.open_txns;
     }
@@ -860,10 +669,8 @@ fn merge_activate(obs: &mut HostObservation, status: ActivateStatus) {
     }
 }
 
-/// How many guests the node says it runs, out of `agent vm ls -o json`.
-///
-/// `None` when the answer is not a list of objects: the socket was there and
-/// something else came back, and "I could not tell" is not "none running".
+/// Count entries in an array or an object's `items` array; return `None` for other shapes.
+/// Entries are not filtered by VM phase.
 fn count_vms(text: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     match value {
@@ -877,16 +684,13 @@ fn count_vms(text: &str) -> Option<u32> {
     }
 }
 
-/// Whether every identity this host's manifest names is there, key and
-/// certificate both.
+/// Whether the required identity key metadata and companion certificates were observed.
 fn identity_is_complete(
     spec: &ProbeSpec,
     credentials: &BTreeMap<String, Option<String>>,
     certs: &[(String, bool)],
 ) -> bool {
-    // A host whose manifest names no identity has nothing to be enrolled
-    // with. It is not "not enrolled" — there is no certificate it is
-    // missing — and a rollout of such a host is not waiting for one.
+    // A manifest without identity certificates has no enrollment requirement here.
     if spec.identity_certs.is_empty() {
         return true;
     }
@@ -902,23 +706,16 @@ fn identity_is_complete(
     keys_present && certs_present
 }
 
-/// What one member says about its raft group.
-///
-/// `healthy` is this host's OWN member, from its own loopback endpoint —
-/// which is the field the planner counts (D8), and it counts it once per
-/// member because every member is probed. `members[].healthy` is only
-/// `true` where a health answer said so; for a peer this host cannot ask,
-/// the type's documented meaning of `false` is "unknown is not healthy",
-/// and the peer's own observation carries the truth about it.
+/// Etcd topology and health from this host's local member.
+/// Only explicit endpoint-health answers mark members healthy; local health is
+/// counted separately for each host by readiness checks.
 fn etcd_view(
     probe: &EtcdProbe,
     members_json: Option<&str>,
     health_json: Option<&str>,
     unit_state: Option<&str>,
 ) -> Option<EtcdView> {
-    // A member whose unit is not running is a member that is down, and that
-    // is a view rather than an absence: `None` here would be read as "this
-    // host is not an etcd member at all".
+    // A stopped member remains present in the observation with unhealthy status.
     let active = unit_state == Some("active");
     let healthy = health_json.is_some_and(endpoint_is_healthy);
     let members = members_json.map(parse_members).unwrap_or_default();
@@ -950,10 +747,7 @@ fn etcd_view(
     })
 }
 
-/// `etcdctl member list -w json`: `{"members":[{"ID":…,"name":…,"peerURLs":[…]}]}`.
-///
-/// The ID is a 64-bit number in json and hex everywhere a person sees it
-/// (`etcdctl` prints hex, the type holds hex), so it is converted once here.
+/// Parse etcd member-list JSON, converting numeric IDs to hexadecimal strings.
 fn parse_members(text: &str) -> Vec<EtcdMember> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
@@ -970,8 +764,7 @@ fn parse_members(text: &str) -> Vec<EtcdMember> {
             }?;
             Some(EtcdMember {
                 id,
-                // A member that has not started yet has no name. It is still
-                // a member, and the topology check is about exactly that.
+                // Retain unnamed members that have not started.
                 name: m
                     .get("name")
                     .and_then(|n| n.as_str())
@@ -1012,18 +805,9 @@ fn endpoint_is_healthy(text: &str) -> bool {
 // Asking
 // ---------------------------------------------------------------------------
 
-/// Who can ask a host something.
-///
-/// A trait rather than a function so that the fan-out below can be tested
-/// without an ssh: the one implementation that matters is [`SshProber`], and
-/// a test's implementation answers from a table and can be made to block,
-/// which is how "a hanging host does not hold the others" becomes a
-/// measurement.
-///
-/// `Sync`, because the hosts are asked in parallel.
+/// Thread-safe host-probe interface for SSH and controlled test implementations.
 pub trait Prober: Sync {
-    /// The fingerprint the operator's `known_hosts` holds for this host, or
-    /// `None` for a host nobody enrolled.
+    /// Fingerprint in the operator's known-hosts file, or `None` when unenrolled.
     fn enrolled_fingerprint(&self, target: &Target) -> Result<Option<String>>;
 
     /// One round trip. `Err` means the host did not answer.
@@ -1078,17 +862,9 @@ impl HostProbe {
     }
 }
 
-/// Ask one host, and turn every way of failing into an observation.
-///
-/// Three outcomes and all three are data:
-///
-/// * The fleet has no host key for it — nothing is even attempted, and the
-///   sentence says to enrol it. This is where `keys enroll` is enforced on
-///   the read path; `StrictHostKeyChecking=yes` would also refuse, with a
-///   message about a broken host rather than about a step nobody ran.
-/// * It did not answer: `reachable: false` and why.
-/// * It answered: whatever it said, with `unknown_reason` when the answer
-///   was not whole.
+/// Observe one host. Missing enrollment skips SSH; lookup or probe errors become
+/// unreachable observations. Successful but incomplete output remains reachable
+/// with `unknown_reason` set.
 pub fn observe_host(prober: &dyn Prober, probe: &HostProbe) -> HostObservation {
     let fingerprint = match prober.enrolled_fingerprint(&probe.target) {
         Ok(Some(fingerprint)) => fingerprint,
@@ -1115,24 +891,15 @@ pub fn observe_host(prober: &dyn Prober, probe: &HostProbe) -> HostObservation {
                 "host {} did not answer: {e:#}",
                 probe.target.host_id
             ));
-            // What IS known stays known: the fleet enrolled this key, and a
-            // host that did not answer has not lost its identity.
+            // Retain the enrolled fingerprint when the connection fails.
             obs.identity.host_key_fingerprint = Some(fingerprint);
             obs
         }
     }
 }
 
-/// Ask a whole fleet, in a bounded pool, and write down the moment.
-///
-/// `taken_at` is a value rather than a clock reading, like everywhere else
-/// in this crate: a snapshot is a fact about a moment, and which moment is
-/// the caller's to decide (and a test's to pin).
-///
-/// One host cannot hold the others: each `ask` carries its own deadline, and
-/// the pool moves on to the next host as soon as a thread is free. The whole
-/// call therefore takes as long as the slowest host in the worst wave, not
-/// the sum of the fleet.
+/// Probe hosts in a bounded pool with caller-supplied snapshot time.
+/// Each prober call must enforce its own deadline; queued hosts run in later waves.
 pub fn observe_fleet(
     prober: &dyn Prober,
     probes: &[HostProbe],
@@ -1233,14 +1000,14 @@ mod tests {
             s.push_str(&format!("identity_cert={cert}\tpresent\n"));
         }
         s.push_str("cap=kvm\n");
-        // --- lane 4A ---
+
         s.push_str("disk_free_nix=41231765504\n");
         s.push_str("pci=0000:00:01.0\t8086:1237\n");
         s.push_str("pci=0000:41:00.0\t10de:2684\n");
         s.push_str("nic=lo\t00:00:00:00:00:00\n");
         s.push_str("nic=eno1\tB8:CE:F6:00:00:01\n");
         s.push_str("gen_units=-.slice basic.target meister-agent.service sshd.service\n");
-        // --- end lane 4A ---
+
         s.push_str(
             "etcd_members={\"header\":{},\"members\":[{\"ID\":1234605616436508552,\
              \"name\":\"box\",\"peerURLs\":[\"https://10.0.0.10:2380\"],\
@@ -1254,16 +1021,13 @@ mod tests {
         s
     }
 
-    /// What the VM test found: an identity is TWO files, and the one
-    /// derivation names both of them `identity_key`.
+    /// Managed manifests use `identity_key` for both key and certificate refs.
     #[test]
     fn a_certificate_that_is_itself_an_identity_ref_needs_no_certificate_beside_it() {
         use crate::manifest::{Delivery, SecretKind, SecretRef, SecretSource};
         let mut fleet = onebox_enrolled();
         let host = fleet.hosts.get_mut("n1").expect("n1 is in the fixture");
-        // Exactly what nix/lib/manifest.nix writes for a managed host: one
-        // ref per file AND per unit, with the certificate carrying the same
-        // kind as the key, because it is part of the same identity.
+        // Mirror per-file, per-unit identity refs from `nix/lib/manifest.nix`.
         host.secret_refs.push(SecretRef {
             id: "identity-crt-agent".to_string(),
             kind: SecretKind::IdentityKey,
@@ -1283,9 +1047,7 @@ mod tests {
             vec!["/var/lib/meisterstack/pki/identity.crt".to_string()],
             "a certificate had a certificate derived from it"
         );
-        // And a host that has both files IS enrolled, which is the whole
-        // point: before this, every managed host was `unenrolled` for ever
-        // because nobody writes `identity.crt.crt`.
+        // A companion certificate must not be expanded into `identity.crt.crt`.
         let answer = healthy_answer(&spec);
         let obs = parse_probe(&answer, &spec, Some("SHA256:enrolled-n1".to_string()));
         assert!(obs.enrolled, "{:?}", obs.credentials);
@@ -1405,7 +1167,7 @@ mod tests {
         );
     }
 
-    // --- lane 4A: the machine under the closure ---
+
 
     #[test]
     fn the_hardware_of_a_healthy_host_is_read() {
@@ -1414,18 +1176,15 @@ mod tests {
 
         assert_eq!(obs.disk_free_nix_bytes, Some(41_231_765_504));
 
-        // Both devices, with the domain and in lower case, which is the
-        // spelling `hardware.gpus[].pci` uses.
+        // PCI addresses include the domain and use lowercase inventory syntax.
         assert_eq!(obs.pci.len(), 2, "{:?}", obs.pci);
         assert!(obs.has_pci("0000:41:00.0"));
         assert_eq!(obs.pci[1].vendor_device, "10de:2684");
-        // And an operator who typed the address in capitals still gets an
-        // answer about the same slot.
+        // Matching is case-insensitive.
         assert!(obs.has_pci("0000:41:00.0".to_uppercase().as_str()));
         assert!(!obs.has_pci("0000:42:00.0"));
 
-        // The loopback MAC is not an identity, so it is not carried: a
-        // fleet that declared it would otherwise match every host.
+        // Exclude the all-zero loopback MAC from identity matching.
         assert_eq!(obs.nics.len(), 1, "{:?}", obs.nics);
         assert_eq!(obs.nics[0].name, "eno1");
         assert_eq!(obs.nics[0].mac, "b8:ce:f6:00:00:01", "lower case, always");
@@ -1447,9 +1206,7 @@ mod tests {
 
     #[test]
     fn a_machine_that_could_not_be_asked_about_its_hardware_says_nothing_about_it() {
-        // Not zero, not an empty list that means "there is none": a probe
-        // whose `df` was not understood and whose sysfs was not there has
-        // NOT found a full disk and NOT found a machine without cards.
+        // Unavailable disk and PCI answers remain unknown, rather than reporting zero capacity.
         let spec = spec_for("box");
         let answer = healthy_answer(&spec)
             .replace("disk_free_nix=41231765504\n", "disk_free_nix=\n")
@@ -1457,8 +1214,7 @@ mod tests {
             .replace("pci=0000:41:00.0\t10de:2684\n", "")
             .replace("nic=lo\t00:00:00:00:00:00\n", "")
             .replace("nic=eno1\tB8:CE:F6:00:00:01\n", "")
-            // An empty directory leaves the glob behind, and that is not a
-            // unit.
+            // Ignore unmatched unit globs.
             .replace(
                 "gen_units=-.slice basic.target meister-agent.service sshd.service\n",
                 "gen_units=*\n",
@@ -1468,16 +1224,13 @@ mod tests {
         assert!(obs.pci.is_empty());
         assert!(obs.nics.is_empty());
         assert!(obs.generation_units.is_empty());
-        // And it is still a whole answer: not knowing a fact is not the
-        // same as a torn reply.
+        // Complete framing does not imply every field was available.
         assert_eq!(obs.unknown_reason, None);
     }
 
     #[test]
     fn the_probe_asks_the_kernel_before_it_asks_a_package() {
-        // sysfs is on every Linux host and needs nothing in the closure;
-        // `lspci` is the fallback and is spelled `-Dn`, because an address
-        // without its domain is not the string an inventory holds.
+        // Prefer sysfs; `lspci -Dn` preserves full PCI domains in fallback output.
         let script = spec_for("box").script();
         assert!(
             script.contains("/sys/bus/pci/devices"),
@@ -1497,7 +1250,7 @@ mod tests {
         );
     }
 
-    // --- end lane 4A ---
+
 
     #[test]
     fn a_path_that_is_not_a_mount_point_is_absent_and_not_a_mount() {
@@ -1550,10 +1303,7 @@ mod tests {
     #[test]
     fn a_degraded_raft_group_is_read_as_two_of_three() {
         let spec = spec_for("box");
-        // What the probe of a member of a three-member group looks like when
-        // one member is down: the membership still has three entries — a
-        // member that vanished would be a membership change and a different,
-        // worse thing — and this host's own endpoint is healthy.
+        // Retain all three members when one is unhealthy; local health is reported separately.
         let members = "etcd_members={\"members\":[\
              {\"ID\":1,\"name\":\"cloud-a\",\"peerURLs\":[\"https://10.0.1.10:2380\"]},\
              {\"ID\":2,\"name\":\"cloud-b\",\"peerURLs\":[\"https://10.0.1.11:2380\"]},\
@@ -1569,9 +1319,7 @@ mod tests {
         assert_eq!(etcd.members.len(), 3);
         assert_eq!(etcd.members[0].id, "1");
         assert!(etcd.healthy, "this host answered healthy about itself");
-        // This host is `box`, which is not in that membership: the topology
-        // check in the planner is what that is for, and the probe reports
-        // what etcd said rather than repairing it.
+        // Report the returned membership even when the local host is absent from it.
         assert_eq!(etcd.member_id, None);
         assert!(
             etcd.members.iter().all(|m| !m.healthy),
@@ -1630,7 +1378,7 @@ mod tests {
             "{:?}",
             obs.unknown_reason
         );
-        // And what it did say is still there, because it was said.
+        // Retain fields parsed before the truncated response.
         assert_eq!(obs.identity.hostname.as_deref(), Some("meister-box"));
     }
 
@@ -1702,14 +1450,10 @@ mod tests {
         assert_eq!(obs.unknown_reason, None);
     }
 
-    // Astra finding F07, 2026-09-23.
+
     #[test]
     fn a_decision_in_flight_comes_across_the_wire_as_the_word_it_is() {
-        // The target writes `confirming` and `reverting`, and the fleet
-        // reads them here. A word this side could not parse would drop the
-        // record out of `open_txns` altogether — a host with a decision in
-        // flight would look like a host with nothing open, which is the one
-        // reading that lets the next plan start over on top of it.
+        // Observation views must preserve in-flight decision states.
         for word in ["confirming", "reverting"] {
             let spec = spec_for("box");
             let txn = serde_json::json!({
@@ -1725,9 +1469,7 @@ mod tests {
             let obs = parse_probe(&answer, &spec, None);
             assert_eq!(obs.open_txns.len(), 1, "{word}");
             assert_eq!(obs.open_txns[0].id, "txn-8", "{word}");
-            // And back out again in the same spelling: this is the type
-            // `meister-activate status --json` serialises on the other
-            // side, so the round trip is the contract.
+            // Preserve the helper status-view state spelling on serialization.
             assert_eq!(
                 serde_json::to_value(obs.open_txns[0].state).unwrap(),
                 serde_json::Value::String(word.to_string()),
@@ -1832,23 +1574,17 @@ mod tests {
             "{:?}",
             obs.unknown_reason
         );
-        // Nothing was invented about it.
+        // Leave unavailable facts unknown.
         assert_eq!(obs.current_system, None);
         assert!(obs.units.is_empty());
         assert_eq!(obs.vms_running, None);
     }
 
-    /// A prober that can be told to hold a host, and that counts how many
-    /// hosts are being asked at the same moment.
-    ///
-    /// No sleeping: the blocking hosts wait on a condition variable until
-    /// the expected number of them are in flight, so a SEQUENTIAL
-    /// implementation of `observe_fleet` would sit on the timeout below and
-    /// the test would say so. The timeout is the only real time in here.
+    /// Concurrency probe with a condition-variable barrier.
+    /// A sequential implementation times out before the expected probes meet.
     struct CountingProber {
         answers: BTreeMap<String, Result<String, String>>,
-        /// How many probes must be in flight at once before any of them is
-        /// allowed to finish.
+        /// Number of simultaneous probes required to release the barrier.
         expected: usize,
         state: Mutex<Concurrency>,
         gate: std::sync::Condvar,
@@ -1858,9 +1594,7 @@ mod tests {
     struct Concurrency {
         in_flight: usize,
         max_in_flight: usize,
-        /// Set once `expected` probes have met. Sticky, because the point
-        /// is that they DID meet once; a later wave that finds the gate
-        /// open has already been counted.
+        /// Sticky barrier state; later waves need not meet again.
         released: bool,
         timed_out: bool,
     }
@@ -1909,8 +1643,7 @@ mod tests {
         let ids = ["h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"];
         let mut answers = BTreeMap::new();
         for id in ids {
-            // Two of the eight are gone, and their failure is the message a
-            // real ssh deadline produces.
+            // Simulate two SSH deadline failures.
             let answer = if id == "h3" || id == "h7" {
                 Err("ssh did not finish within 60s and its process group was killed".to_string())
             } else {
@@ -1976,8 +1709,7 @@ mod tests {
             .iter()
             .map(|id| ((*id).to_string(), Ok(whole.clone())))
             .collect();
-        // Two at a time, and each pair has to meet before it may finish:
-        // two waves, and every host answered.
+        // A concurrency limit of two processes four hosts in two waves.
         let prober = CountingProber {
             answers,
             expected: 2,

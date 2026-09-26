@@ -2,18 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Nix is the single derivation (D2), and this is how that stays true.
-//!
-//! The pre-v1 tool derived a fleet twice — ten rules in `fleet.rs`, twelve in
-//! `nix/fleet.nix` — and kept them in step with a shell script that nobody
-//! ran in CI, because there is no CI. The failure mode was not that the two
-//! disagreed loudly; it was that they disagreed about one host, once.
-//!
-//! So `inventory.rs` reads the file and applies precedence, and that is all.
-//! The moment somebody writes a port, an environment variable name or a peer
-//! list into it, the second derivation is back. A test cannot prove the
-//! absence of a derivation, but it can name the shapes the old one had and
-//! refuse them, which is enough to make the next person stop and think.
+//! Static guard against introducing deployment derivation into inventory.rs. The reader
+//! applies inventory precedence; Nix renders deployment settings. Forbidden source fragments
+//! catch known duplication patterns but do not prove semantic equivalence.
 
 use std::path::PathBuf;
 

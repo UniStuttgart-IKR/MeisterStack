@@ -2,21 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The second door: files and the clock.
+//! Policy-controlled filesystem access and injectable clocks.
 //!
-//! The pre-v1 tool had one narrow door for commands and none for anything
-//! else, so a `--dry-run` that ran no command still wrote files
-//! (`fleet.rs`, `main.rs`, `ops.rs` all called `std::fs` directly) and a
-//! rollout slept on the real clock, which made "wait for the replica to be
-//! healthy" a test that takes two minutes or a test that does not exist.
-//!
-//! Both doors answer to the same [`Policy`]: a write is an
-//! [`Effect::LocalWrite`], so a dry run refuses it for the same reason and
-//! with the same kind of sentence it refuses a `nix build`. There is no
-//! second rule table to keep in step with the first.
-//!
-//! New code does not call `std::fs`, `std::thread::sleep` or `Utc::now`
-//! directly; `tests/no_direct_effects.rs` is what keeps that true.
+//! Mutations use `Effect::LocalWrite`, which both offline and dry-run policies
+//! refuse. Real and in-memory implementations share the filesystem interface;
+//! clock injection allows polling tests without wall-clock delays.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,11 +21,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::run::{Effect, Policy};
 
-/// What a path in a working tree is, WITHOUT following a symbolic link.
-///
-/// The distinction is the whole point of `--dev`: a link that points at
-/// `~/.ssh/id_ed25519` is copied as a link and stays dangling in the nix
-/// store; the same path followed would copy the key itself.
+/// Working-tree entry type, inspected without following symlinks.
+/// Snapshot copying preserves links instead of copying their targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     /// A regular file, and the low nine bits of its mode. The execute bit is
@@ -47,36 +34,20 @@ pub enum Entry {
     Other,
 }
 
-/// Every file this tool reads or writes goes through here.
-///
-/// `write_atomic` is the only way to create a file, because every file this
-/// tool writes is a file somebody else reads: a manifest a build consumes, a
-/// `known_hosts` an ssh reads, a receipt an operator attaches to a ticket. A
-/// half-written one of those is worse than a missing one.
+/// Filesystem access used by deployment operations. Atomic replacement and
+/// exclusive publication prevent readers from observing partially written files.
 pub trait Files {
     fn read(&self, path: &Path) -> Result<Vec<u8>>;
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn exists(&self, path: &Path) -> bool;
 
-    /// The file's text, `None` when there is no file at this path — and an
-    /// error for everything else.
-    ///
-    /// Astra finding MD06, 2026-09-25: a caller that asks "is there an
-    /// installation mark on this disk" has three answers to tell apart, not
-    /// two. "No such file" is the one that means "not installed"; a file
-    /// that is there and cannot be read (an I/O error, bytes that are not
-    /// utf-8, a directory where a file was expected) is a disk whose
-    /// history this program does not know, and a guard that folds that
-    /// into "not installed" is a guard that does not guard. `exists` cannot
-    /// carry the distinction either: it answers `false` for a path it is
-    /// not allowed to look at.
+    /// Read UTF-8 text, returning `None` only for a missing path.
+    /// Unreadable, invalid-text and non-file entries are errors; callers must not
+    /// interpret those as evidence that installation state is absent.
     fn read_if_present(&self, path: &Path) -> Result<Option<String>>;
 
-    /// Write the whole file or none of it: a temporary in the same directory,
-    /// `fsync`, `rename`, then `fsync` of the directory. Same directory
-    /// because `rename` is only atomic within a filesystem, and the directory
-    /// `fsync` because a rename that is not durable is a file that exists
-    /// until the machine loses power.
+    /// Replace through a same-directory temporary: write, fsync, rename, then
+    /// fsync the parent directory.
     fn write_atomic(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()>;
 
     fn create_dir_all(&self, path: &Path) -> Result<()>;
@@ -84,20 +55,11 @@ pub trait Files {
     /// What is at this path, without following a link.
     fn entry(&self, path: &Path) -> Result<Entry>;
 
-    /// Whether anything at all is at this exact path — file, symlink or
-    /// other — without following a symlink to ask whether ITS target is
-    /// there too. `exists` follows; this does not.
-    ///
-    /// Astra finding F16, 2026-09-23: a caller that has to tell "this path
-    /// was deleted" apart from "this path is a dangling symlink, which is
-    /// allowed and stays dangling" cannot use `exists` for that — a dangling
-    /// symlink IS present and `exists` says it is not, because it followed
-    /// the link to a target that is not there.
+    /// Check the entry without following symlinks; dangling links are present.
+    /// Like `exists`, this boolean cannot distinguish absence from lookup errors.
     fn is_present(&self, path: &Path) -> bool;
 
-    /// Make `link` point at `target`, replacing whatever is there. Atomic for
-    /// the same reason `write_atomic` is: a snapshot with half a link in it
-    /// is a snapshot nix would evaluate.
+    /// Atomically replace a symlink within its parent directory.
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()>;
 
     /// Append one line and make it durable before returning. The journal's
@@ -105,14 +67,8 @@ pub trait Files {
     /// on the disk when the machine that was writing it goes away.
     fn append_fsync(&self, path: &Path, line: &str) -> Result<()>;
 
-    /// Create this file, or fail because somebody else already did.
-    ///
-    /// The other half of [`Files::write_atomic`]: that one replaces what is
-    /// there, and this one refuses to. It is what a lock is — `O_EXCL` is
-    /// the only thing on a POSIX filesystem that two processes can race for
-    /// and have exactly one of them win — so it is a door of its own rather
-    /// than a flag on the other, which somebody would eventually pass the
-    /// wrong way round.
+    /// Publish complete file contents only if the destination is absent.
+    /// Unlike replacement, competing publishers cannot overwrite the winner.
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()>;
 
     /// Remove a file. `Ok(())` when it was not there: this is used to
@@ -125,33 +81,16 @@ pub trait Files {
     /// nobody has written to yet holds no runs, and that is an answer.
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
 
-    /// Remove an EMPTY directory. Not a recursive delete: the only
-    /// directories this tool removes are ones it has just emptied itself
-    /// (a release's garbage-collector roots), and a recursive delete in a
-    /// deployment tool is a foot-gun waiting for a wrong path.
+    /// Remove an empty directory without recursively deleting its contents.
     fn remove_dir(&self, path: &Path) -> Result<()>;
 
-    // --- lane 5A ---
-    /// Move a file that is ALREADY THERE, replacing whatever is at `to`.
-    ///
-    /// Its own door rather than a read and a write, because what is wanted
-    /// is the one thing a rename gives and a copy does not: a reader either
-    /// sees the old file or the new one, never a half of either. That is
-    /// what makes a key rotation survivable — the pair a service opens is
-    /// always a pair somebody wrote whole. The directory is made durable
-    /// afterwards for the reason `write_atomic` does it: a rename that is
-    /// not on the disk is a rename that did not happen.
+    /// Rename an existing file, replacing the destination, then fsync its parent.
+    /// The rename is atomic within a filesystem; this does not atomically swap a pair.
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
-    // --- end lane 5A ---
 }
 
-/// The directory a file lives in, as something that can be opened.
-///
-/// `Path::new("plan.json").parent()` is `Some("")` and not `None`, and an
-/// empty path opens nothing: the temporary lands beside the file either way,
-/// the rename works, and only the directory `fsync` fails — so a bare
-/// relative `--out` used to write the file and then report an error about
-/// it. Both spellings of "the current directory" become `.` here.
+/// Normalize an empty parent path to `.` so bare relative filenames support
+/// parent-directory fsync.
 fn parent_of(path: &Path) -> &Path {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -171,14 +110,7 @@ impl RealFiles {
         RealFiles { policy }
     }
 
-    /// A write is a `local-write`, and the policy that decides about
-    /// `nix build` decides about this too.
-    ///
-    /// Note for M2: there is no exception to this for `plan --offline`. The
-    /// offline contract is "no nix, no network, no file written", so an
-    /// offline plan is provisional and goes to stdout; `--out` together with
-    /// `--offline` is refused with a sentence rather than given a policy of
-    /// its own.
+    /// Apply LocalWrite policy uniformly, including offline output requests.
     fn may_write(&self, path: &Path) -> Result<()> {
         match self.policy.admits(Effect::LocalWrite) {
             Ok(()) => Ok(()),
@@ -215,9 +147,8 @@ impl Files for RealFiles {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "out".to_string());
-        // The pid in the name so that two operators on one NFS state
-        // directory cannot land on the same temporary, and `create_new` so
-        // that the loser of such a race is an error rather than a corruption.
+        // Use a PID-suffixed temporary with exclusive creation; collisions fail.
+        // PIDs are not globally unique across hosts sharing a filesystem.
         let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
 
         let write = || -> Result<()> {
@@ -310,9 +241,8 @@ impl Files for RealFiles {
             .mode(0o600)
             .open(path)
             .with_context(|| format!("opening {} to append failed", path.display()))?;
-        // One `write_all` rather than two: a single write of a short line to
-        // a file opened O_APPEND is what keeps two writers from interleaving
-        // halves of a line.
+        // Append each event through one write_all call before fsync. Concurrent
+        // writers still require external serialization.
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
         file.write_all(&bytes)
@@ -323,19 +253,9 @@ impl Files for RealFiles {
 
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         self.may_write(path)?;
-        // Astra finding MD03, 2026-09-25: this used to open `path` itself
-        // with `O_EXCL` and write the bytes into it afterwards — so the NAME
-        // was there before the contents were, and a process that lost the
-        // race and read the file in that window read nothing. For a lock
-        // that names its holder, nothing looked like nobody, and the reader
-        // removed the name and took the lock for itself.
-        //
-        // So the bytes go into a private temporary first, whole and fsynced,
-        // and the name is published with `link(2)`: it fails with `EEXIST`
-        // when the name is taken, as exclusively as `O_EXCL` does, and when
-        // it succeeds the file behind the name is already complete. Not a
-        // rename: a rename REPLACES, and the whole point here is to lose the
-        // race rather than win it silently.
+        // Write and fsync a private temporary before publishing it with `link(2)`.
+        // The link fails if another publisher won, while successful readers see complete
+        // contents. Publishing an empty destination first would expose incomplete locks.
         let dir = parent_of(path);
         let name = path
             .file_name()
@@ -390,7 +310,6 @@ impl Files for RealFiles {
             .with_context(|| format!("making the removal of {} durable failed", path.display()))
     }
 
-    // --- lane 5A ---
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.may_write(from)?;
         self.may_write(to)?;
@@ -400,7 +319,6 @@ impl Files for RealFiles {
             .and_then(|d| d.sync_all())
             .with_context(|| format!("making the move to {} durable failed", to.display()))
     }
-    // --- end lane 5A ---
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         self.may_write(path)?;
@@ -432,9 +350,7 @@ impl Files for RealFiles {
     }
 }
 
-/// What a test writes into and reads back. It records every write ATTEMPT,
-/// including the ones the policy refused, so a test can say "this run wrote
-/// nothing" and mean it rather than mean "no file happened to appear".
+/// In-memory filesystem recording attempted writes, including policy refusals.
 #[derive(Debug, Default)]
 pub struct MemFiles {
     policy: Policy,
@@ -530,10 +446,7 @@ impl Files for MemFiles {
     }
 
     fn read_if_present(&self, path: &Path) -> Result<Option<String>> {
-        // Only a path nothing at all is at is "not there": a directory, a
-        // link or an `other` at this path is something this test put there
-        // to be found and not read, which is the case `read_to_string`
-        // reports.
+        // Only a missing entry returns None; other entry types produce read errors.
         if !self.exists(path) {
             return Ok(None);
         }
@@ -581,10 +494,8 @@ impl Files for MemFiles {
     }
 
     fn is_present(&self, path: &Path) -> bool {
-        // The same membership check `entry` makes: nothing here follows a
-        // link to ask whether its target is there too, so this and `exists`
-        // happen to agree in this fake filesystem (unlike `RealFiles`,
-        // where a dangling symlink tells them apart).
+        // The fake checks membership without following links; unlike RealFiles, its
+        // `exists` and `is_present` therefore agree for dangling symlinks.
         self.exists(path)
     }
 
@@ -628,7 +539,6 @@ impl Files for MemFiles {
         Ok(())
     }
 
-    // --- lane 5A ---
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.may_write("rename", from)?;
         self.may_write("rename", to)?;
@@ -645,7 +555,6 @@ impl Files for MemFiles {
         }
         Ok(())
     }
-    // --- end lane 5A ---
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         self.may_write("rmdir", path)?;
@@ -685,11 +594,7 @@ impl Files for MemFiles {
     }
 }
 
-/// Time, as something a test can hold still.
-///
-/// `now` is UTC and nothing else: every timestamp this tool writes ends up in
-/// a manifest or a journal that two machines compare, and a local time zone
-/// in either of those is a bug waiting for a flight to Stuttgart.
+/// Injectable UTC timestamps and sleep, with a controllable test clock.
 pub trait Clock {
     fn now(&self) -> DateTime<Utc>;
     fn sleep(&self, d: Duration);
@@ -800,7 +705,6 @@ mod tests {
         assert_eq!(left, vec!["manifest.json"], "no temporary was left behind");
     }
 
-    // Astra finding MD03, 2026-09-25.
     #[test]
     fn an_exclusive_create_publishes_a_whole_file_and_refuses_a_second() {
         let dir = tempfile::tempdir().unwrap();

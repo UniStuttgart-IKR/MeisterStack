@@ -2,20 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-deploy keys` through the real binary.
+//! Key-management CLI wiring with isolated subprocess shims and temporary state.
 //!
-//! The unit tests pin the comparison, the subjects and the command lines.
-//! This pins the PROGRAM: `PATH` holds nothing but a directory of shims, so
-//! whatever the verbs run is in a log and whatever the log does not have
-//! they did not run. Three shims answer rather than fail —
-//! `ssh-keyscan` hands back a host key, `ssh` hands back what
-//! `meister-activate keygen` would have printed, and `meister-ca` writes a
-//! file — because what is interesting here is the wiring: which file lands
-//! where, and which refusal comes before which connection.
-//!
-//! No host, no network, no CA key. `scripts/check-sign-csr.sh` is where the
-//! CA meets real openssl, and `nix/tests/keys.nix` is where all of it meets
-//! a real machine.
+//! Fixtures emulate keyscan, target CSR generation and CA output to check paths
+//! and refusal ordering. They do not test live SSH or actual CA signing.
 
 mod support;
 
@@ -149,11 +139,7 @@ impl Sandbox {
         self.answer_keygen(&reply);
     }
 
-    /// Put an answer where the `ssh` shim reads it.
-    ///
-    /// With a trailing newline, and that is not cosmetic: `while read`
-    /// returns non-zero on a last line that has none, so the loop body
-    /// never runs for it and the shim answers with nothing at all.
+    /// Terminate the fixture with a newline so the shim's read loop consumes it.
     fn answer_keygen(&self, reply: &serde_json::Value) {
         std::fs::write(
             self.shims.path().join("keygen.json"),
@@ -664,8 +650,7 @@ fn a_host_that_is_not_in_the_manifest_is_named() {
     }
 }
 
-/// A certificate request that travels through this tool never carries a key,
-/// and the check is in the program rather than in a comment.
+/// Reject private-key material returned in a certificate-request response.
 #[test]
 fn a_helper_that_sends_a_key_is_not_the_helper_this_tool_speaks_to() {
     let sandbox = Sandbox::new();
@@ -777,7 +762,6 @@ fn a_host_that_was_never_resolved_is_read_out_of_the_inventory() {
     );
 }
 
-// --- lane 5A: taking one back ------------------------------------------------
 
 /// The refusals of `keys revoke` come before the CA is touched at all, and
 /// the log is what proves it: nothing ran.
@@ -884,9 +868,7 @@ fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
     );
 }
 
-/// Astra finding F21, 2026-09-23: `keys revoke --crl-reason` is openssl's
-/// fixed vocabulary, not free text, and a value that is not on the list is
-/// refused before the CA is ever invoked.
+/// Reject unsupported CRL reason codes before invoking the CA.
 #[test]
 fn an_unknown_crl_reason_is_refused_before_the_ca_is_asked() {
     let sandbox = Sandbox::new();
@@ -915,11 +897,7 @@ fn an_unknown_crl_reason_is_refused_before_the_ca_is_asked() {
     );
 }
 
-/// Astra finding F21, 2026-09-23: `retire --reason` is free text for the
-/// record and `known_hosts`; it used to be forwarded to the CA as the CRL
-/// reason too, where free text does not fit openssl's fixed vocabulary.
-/// Without `--crl-reason`, the CA gets the default instead of the free
-/// text.
+/// Free-text retirement reasons must not become OpenSSL CRL reason codes.
 #[test]
 fn retiring_forwards_the_default_crl_reason_and_not_the_free_text_one() {
     let sandbox = Sandbox::new();
@@ -947,9 +925,7 @@ fn retiring_forwards_the_default_crl_reason_and_not_the_free_text_one() {
     );
 }
 
-/// V24, the half that is an ORDER: a machine that was reinstalled asks for a
-/// certificate under the name its predecessor still holds one for. The old
-/// one has to be taken back first, or the fleet would accept either.
+/// Refuse a replacement identity certificate until the old one is revoked.
 #[test]
 fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
     let sandbox = Sandbox::new();
@@ -997,7 +973,6 @@ fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
     );
 }
 
-// --- lane 5B: retiring a host ------------------------------------------------
 
 /// A fleet of one host, so that `retire` has nobody left to hand the list to
 /// and the test is about the operator's side alone.
@@ -1006,9 +981,7 @@ fn one_host_release(sandbox: &Sandbox, keep: &str) -> PathBuf {
     fleet.hosts.retain(|id, _| id == keep);
     fleet.evaluated_hosts.retain(|id| id == keep);
     fleet.groups.clear();
-    // The id is over the content, so a fleet that was cut down has a new
-    // one; a manifest whose id does not hash to itself is one `validate`
-    // refuses, and rightly.
+    // Recompute the content ID after narrowing the fixture fleet.
     fleet.manifest_id =
         meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
             .expect("a manifest hashes");
@@ -1176,10 +1149,8 @@ fn retiring_a_host_the_release_does_not_have_is_a_sentence() {
     );
 }
 
-/// Astra finding F11, 2026-09-23: a directory `retire` cannot even list used
-/// to look exactly like a host with no certificates -- the CA was never
-/// asked, no record was written, and the run still exited 0. It has to
-/// refuse instead.
+/// Unreadable certificate directories must fail retirement instead of
+/// being treated as empty.
 #[test]
 fn retiring_refuses_rather_than_pretend_an_unreadable_directory_is_empty() {
     use std::os::unix::fs::PermissionsExt;

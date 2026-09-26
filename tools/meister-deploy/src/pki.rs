@@ -2,29 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Enrolment, and the certificates that come back over a CSR.
+//! SSH enrollment and certificate workflows.
 //!
-//! Two promises live in this file, and everything in it is one of the two:
-//!
-//! * **No host key is ever accepted blind.** `keys enroll` asks the address
-//!   what key it shows, and then compares it against a fingerprint a person
-//!   TYPED — off a console, a BMC screen or the installer's own output.
-//!   A machine that shows a different key is not enrolled and the sentence
-//!   says both fingerprints. `accept-new` would make the first answer the
-//!   truth, which is trust in whoever is faster; the pre-v1 tool did exactly
-//!   that (`remote.rs:25-93`), and D10 is the decision to stop.
-//! * **No private key ever leaves the machine it belongs to.** The key is
-//!   made on the target by `meister-activate keygen`
-//!   ([`crate::activate::Helper::keygen`]); what travels back is a
-//!   certificate REQUEST, which is a public key and a name. `keys issue`
-//!   hands that request to `tools/meister-ca`, which signs it with a CA key
-//!   that never leaves the operator. So the two halves of an identity are
-//!   never in the same place, and this workstation has never held one.
-//!
-//! What is NOT here is a verb that puts a certificate on a host. Delivery is
-//! the plan's action `deliver-secret` and `apply` carries it out — a second
-//! road to a target, past the locks and past the journal, is precisely what
-//! D6 exists to prevent.
+//! Enrollment compares the scanned Ed25519 key with an operator-supplied
+//! fingerprint. Target helpers generate private keys and return public CSRs;
+//! the operator CA signs them locally. Certificate delivery uses planned actions
+//! and the execution journal.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,13 +20,7 @@ use crate::activate::KeygenOutcome;
 use crate::effects::Files;
 use crate::manifest::ResolvedHost;
 
-/// Reading a certificate request — the one piece of X.509 this module does
-/// itself, and it does it through the crate the controllers use.
-///
-/// The signature check is the point: it proves the sender holds the private
-/// half of the key it asks to have certified. Without it, anybody could
-/// submit somebody else's public key under their own name and have this CA
-/// vouch for a key they do not have.
+/// Read and verify a CSR using the shared PKI crate before accepting its subject.
 pub use ::pki::requested_name;
 
 use crate::run::{Cmd, Effect, Expect, Runner};
@@ -64,13 +41,7 @@ pub const ISSUED_DIR: &str = "pki/issued";
 pub const SCAN_TIMEOUT_SECS: u32 = 10;
 pub const SCAN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The key algorithm this fleet enrols.
-///
-/// One and not "whatever the host offers": a host that answers with three
-/// key types gives three fingerprints, and an operator reading one off a
-/// console then has to know which of them to compare. Ed25519 because every
-/// sshd of this decade has one and it is the shortest thing to read out
-/// loud.
+/// Enroll one explicit host-key algorithm to make fingerprint comparison unambiguous.
 pub const KEY_TYPE: &str = "ssh-ed25519";
 
 /// What the address answered with.
@@ -79,8 +50,7 @@ pub struct ScannedKey {
     pub keytype: String,
     /// The base64 blob, exactly as `known_hosts` spells it.
     pub blob: String,
-    /// `SHA256:…`, computed here from the bytes rather than taken from
-    /// anything the host said about itself.
+    /// SHA256 computed from the scanned key wire bytes.
     pub fingerprint: String,
 }
 
@@ -91,11 +61,7 @@ impl ScannedKey {
     }
 }
 
-/// `ssh-keyscan -t ed25519 -p <port> -T <n> <address>`.
-///
-/// [`Effect::Read`]: it opens a connection and asks for a public key. An
-/// `--offline` run refuses it before the spawn, which is right — there is
-/// nothing on this disk that could answer the question.
+/// Read-class keyscan command; offline policy refuses its network connection.
 pub fn keyscan_cmd(target: &Target) -> Cmd {
     Cmd::new(Effect::Read, "ssh-keyscan", SCAN_DEADLINE)
         .arg("-t")
@@ -105,18 +71,11 @@ pub fn keyscan_cmd(target: &Target) -> Cmd {
         .arg("-T")
         .arg(SCAN_TIMEOUT_SECS.to_string())
         .arg(&target.address)
-        // ssh-keyscan exits 0 with EMPTY output for a host that did not
-        // answer, so the exit code is not the answer and the parser below
-        // is. `Codes([0, 1])` keeps a refusal readable instead of turning
-        // "nothing answered" into a runner error with no detail.
+        // Keyscan may return empty output with status 0; validate the parsed key too.
         .expect(Expect::Codes(vec![0, 1]))
 }
 
-/// The one key out of what `ssh-keyscan` printed.
-///
-/// Comment lines (`# 10.0.0.11:22 SSH-2.0-OpenSSH_10.0`) are what keyscan
-/// writes to stdout about the banner, and they are skipped rather than
-/// parsed: what is wanted is the key.
+/// Extract an Ed25519 key, ignoring keyscan banner comments.
 pub fn parse_keyscan(output: &str, host_id: &str) -> Result<ScannedKey> {
     for line in output.lines() {
         let line = line.trim();
@@ -171,16 +130,8 @@ pub struct Enrolment {
     pub toml_line: String,
 }
 
-/// Compare what was typed with what answered, and write `known_hosts`.
-///
-/// `typed` is the fingerprint a PERSON read off the console. It is the whole
-/// security of this step: without it the first machine to answer on the
-/// address becomes the machine this fleet deploys to.
-///
-/// `--replace` is deliberately two flags (`replace` and `reason`): replacing
-/// a host key is either a reinstall or an attack, and which of the two it
-/// is only the operator knows. The reason lands in the file, above the line,
-/// where the next reader of the diff will find it.
+/// Compare the scanned key with the supplied fingerprint before recording it.
+/// Replacement requires an explicit flag and a reason stored in known_hosts.
 #[allow(clippy::too_many_arguments)]
 pub fn enroll(
     runner: &dyn Runner,
@@ -303,20 +254,10 @@ pub fn enroll(
     })
 }
 
-// --- lane 5B: a host that left ------------------------------------------
 
-/// Mark a host's `known_hosts` entry as retired, and keep the entry.
-///
-/// A comment goes in ABOVE the line and the line stays. Deleting it would
-/// be the obvious thing and it is the wrong one: the entry is the record
-/// that this fleet, on some day, decided that this key belongs to this
-/// machine, and a reinstall on the same address has to collide with it
-/// (`keys enroll` refuses, and `--replace --reason` is how somebody says
-/// what happened). A deleted line would make the next machine on that
-/// address enrollable without anybody noticing that there was one before.
-///
-/// Returns false when the file has no entry for this host, which is not an
-/// error: a host that was never enrolled can still be retired.
+/// Add a retirement comment while retaining the enrolled host key.
+/// This preserves replacement history; it does not revoke SSH trust.
+/// Return false if the host has no matching entry.
 pub fn mark_retired(
     files: &dyn Files,
     known_hosts: &Path,
@@ -357,7 +298,6 @@ pub fn mark_retired(
     Ok(true)
 }
 
-// --- end lane 5B --------------------------------------------------------
 
 /// The host a `known_hosts` line is about, past a `@cert-authority` or
 /// `@revoked` marker. `None` for a comment or an empty line.
@@ -375,11 +315,7 @@ fn host_field(line: &str) -> Option<&str> {
     }
 }
 
-/// `SHA256:<base64>` without padding, which is what `ssh-keygen -l` prints.
-///
-/// The padding is trimmed rather than rejected because a person copying a
-/// fingerprint out of a terminal is not the person who should have to know
-/// that openssh omits it.
+/// Normalize SHA256 fingerprints by removing optional base64 padding.
 fn normalise_fingerprint(typed: &str) -> Result<String> {
     let typed = typed.trim();
     let Some(body) = typed.strip_prefix("SHA256:") else {
@@ -400,13 +336,7 @@ fn normalise_fingerprint(typed: &str) -> Result<String> {
 // Where one host is reached, before there is a manifest
 // ---------------------------------------------------------------------------
 
-/// The target of a host that has not been resolved yet.
-///
-/// Enrolment happens BEFORE the first `resolve` of a fresh machine — a host
-/// with no key in `known_hosts` cannot be reached, so nothing that needs to
-/// reach it can have run first. So this reads the inventory, which is the
-/// one file that exists at that point, and applies the same precedence
-/// `validate` does.
+/// Resolve an unenrolled host from inventory, before a manifest is available.
 pub fn target_from_inventory(
     inventory: &crate::inventory::Inventory,
     host_id: &str,
@@ -459,28 +389,16 @@ pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
     repo.join(ISSUED_DIR).join(host_id).join(file)
 }
 
-// --- lane 5A ---------------------------------------------------------------
 
-/// The fleet's revocation list, in the operator's repository.
-///
-/// Public and committed, like `known_hosts` and like every issued
-/// certificate: a list of serials is a statement about what is no longer
-/// valid, and keeping it secret would only keep it from the people who have
-/// to check it.
+/// Repository copy of the fleet CRL, public and suitable for version control.
 pub const CRL_FILE: &str = "pki/crl.pem";
 
 pub fn crl_path(repo: &Path) -> PathBuf {
     repo.join(CRL_FILE)
 }
 
-/// Where the certificate of a rotation waits: beside the one in use, under
-/// the same name with `.next` in it.
-///
-/// A name of its own and not the name the active certificate has, because
-/// the ACTIVE one is what `plan` compares a host against — writing the new
-/// certificate over it would make the next ordinary upgrade deliver it
-/// straight to the host, with no overlap, no verify and no way back. That
-/// is precisely what `keys rotate` exists to avoid.
+/// Keep rotation certificates beside active certificates under a distinct `.next`
+/// name so ordinary planning cannot deliver them before the rotation sequence.
 pub fn next_issued_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
     issued_path(repo, host_id, &format!("{kind}.next.crt"))
 }
@@ -515,14 +433,7 @@ pub fn keygen_beside_cmd(
     ssh.exec(target, argv, Effect::TargetWrite, KEYGEN_DEADLINE)
 }
 
-/// Everything the plan has to say about one rotation, out of what the fleet
-/// renders for that host.
-///
-/// The paths, the owner and the mode are the `secret_refs` of the
-/// certificate this rotation replaces — the same entries `deliver-secret`
-/// reads — and the units are every unit that reads that file. So a rotation
-/// pokes exactly what a delivery would poke, and neither of them knows the
-/// names of any units of its own.
+/// Derive rotation paths, owner, mode and reload units from rendered secret refs.
 pub struct Prepared<'a> {
     pub host_id: &'a str,
     pub kind: &'a str,
@@ -587,17 +498,7 @@ pub fn rotation_of(
 /// files.
 pub const CA_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The CRL reason codes `tools/meister-ca --reason` accepts, spelled
-/// exactly as it spells them.
-///
-/// Astra finding F21, 2026-09-23: `retire --reason` and `keys revoke
-/// --reason` used to forward THIS value straight from a free-text field --
-/// `retire`'s own "why", meant for the record and `known_hosts` -- and
-/// openssl's fixed vocabulary rejects ordinary prose. The two are separate
-/// flags now (`--reason` stays free text where a caller has one at all;
-/// `--crl-reason` is this list), and this is checked before the CA is ever
-/// invoked, so a mistyped one is a sentence from this tool rather than a
-/// `die` from a shell script several layers down.
+/// Accepted OpenSSL CRL reason codes, separate from free-text retirement reasons.
 pub const CRL_REASONS: &[&str] = &[
     "unspecified",
     "keyCompromise",
@@ -611,7 +512,7 @@ pub const CRL_REASONS: &[&str] = &[
     "AACompromise",
 ];
 
-/// Astra finding F21, 2026-09-23: see [`CRL_REASONS`].
+/// Reject unsupported CRL reason codes before invoking the CA.
 pub fn validate_crl_reason(reason: &str) -> Result<()> {
     if CRL_REASONS.contains(&reason) {
         Ok(())
@@ -623,11 +524,7 @@ pub fn validate_crl_reason(reason: &str) -> Result<()> {
     }
 }
 
-/// `meister-ca --dir <ca> --index-rebuild --revoke <what> [--reason <r>]`.
-///
-/// The rebuild travels with every revocation on purpose: it is additive and
-/// cheap, and a revocation against a certificate that has no row in the
-/// index would otherwise be a refusal an operator has to translate.
+/// Rebuild the CA index before revoking an indexed certificate or serial.
 pub fn revoke_cmd(meister_ca: &Path, ca_dir: &Path, what: &str, reason: Option<&str>) -> Cmd {
     let mut cmd = Cmd::new(
         // It uses the CA key to say something and makes no key: the `key`
@@ -647,21 +544,14 @@ pub fn revoke_cmd(meister_ca: &Path, ca_dir: &Path, what: &str, reason: Option<&
     cmd
 }
 
-// --- lane 5B ---
-/// `meister-ca --dir <ca> --index-rebuild`, on its own.
-///
-/// What `keys import` runs after it has put certificates into the
-/// repository: the index is what makes a certificate revocable, and a
-/// certificate this fleet can check but never take back is worse than no
-/// certificate. The rebuild is ADDITIVE — a revocation already in the index
-/// survives it (M0 finding 7) — so running it is never a way to lose one.
+/// Rebuild the CA index from certificates in its own directory. Existing
+/// revocations remain; repository certificates are not copied by this command.
 pub fn index_rebuild_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
     Cmd::new(Effect::Key, meister_ca.display().to_string(), CA_DEADLINE)
         .arg("--dir")
         .arg(ca_dir.display().to_string())
         .arg("--index-rebuild")
 }
-// --- end lane 5B ---
 
 /// `meister-ca --dir <ca> --index-rebuild --gencrl`.
 pub fn gencrl_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
@@ -685,12 +575,7 @@ pub fn crl_describe_cmd(openssl: &str, crl: &Path) -> Cmd {
         .arg("-nextupdate")
 }
 
-/// Is this serial on the list this repository holds?
-///
-/// `None` when there is no list at all, which is a different answer from
-/// "not on it": a fleet that publishes no revocation list has taken nothing
-/// back, and a fleet whose list cannot be read is a fleet nobody should be
-/// issuing second certificates in.
+/// Check the repository CRL. Return None when absent; propagate read errors.
 pub fn revoked_here(files: &dyn Files, repo: &Path, serial: &str) -> Result<Option<bool>> {
     let path = crl_path(repo);
     if !files.exists(&path) {
@@ -705,26 +590,9 @@ pub fn revoked_here(files: &dyn Files, repo: &Path, serial: &str) -> Result<Opti
     ))
 }
 
-/// What a certificate this fleet issued for `host` is called on disk.
-///
-/// `keys issue` writes `<repo>/pki/issued/<host>/<file>.crt`, one per kind.
-/// A revocation of a HOST is a revocation of all of them: an identity and a
-/// serving certificate are the same machine's two credentials.
-///
-/// This is the ACTIVE set, not every certificate under the directory: a
-/// rotation leaves two more files behind -- the one it is about
-/// (`<kind>.next.crt`) and the one it replaced (`<kind>.prev.crt`) -- and
-/// neither is what this host is holding right now. The replaced one is
-/// usually worth taking back as well, and it is taken back by its serial,
-/// deliberately and one at a time. A caller that tells an operator every
-/// certificate was taken back has to say so with that caveat.
-///
-/// Astra finding F11, 2026-09-23: a directory that cannot be listed is not
-/// the same as a host that holds no certificates. `Files::list_dir` already
-/// turns "the directory is not there" into an empty list, so an `Err`
-/// reaching here is a real I/O failure (permissions, a stale mount), and
-/// swallowing it used to make `retire`/`keys revoke --host` report "nothing
-/// to take back" and exit 0. It is propagated instead.
+/// List active issued certificates for a host, excluding `.next` and `.prev`.
+/// Host-wide revocation therefore excludes rotation backups; revoke those by serial.
+/// A missing directory is empty, but other listing errors propagate.
 pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Result<Vec<PathBuf>> {
     let dir = repo.join(ISSUED_DIR).join(host_id);
     let mut out: Vec<PathBuf> = files
@@ -744,16 +612,8 @@ pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Result<Vec
     out.sort();
     Ok(out)
 }
-// --- end lane 5A -----------------------------------------------------------
 
-/// The directory `tools/meister-ca` keeps the CA in, as the inventory names
-/// it.
-///
-/// Relative to the inventory FILE THAT WAS READ — which is what
-/// `[operator] ca_dir = "../labpki"` means, and what every other reference
-/// in that table means. The file and not the repository, because
-/// `--inventory <somewhere else>` is a real flag and a relative reference in
-/// a file hangs off that file.
+/// Resolve the CA directory relative to the inventory file that declared it.
 pub fn ca_dir(inventory_file: &Path, named: &str) -> PathBuf {
     let named = Path::new(named);
     if named.is_absolute() {
@@ -763,12 +623,7 @@ pub fn ca_dir(inventory_file: &Path, named: &str) -> PathBuf {
     normalise(&base.join(named))
 }
 
-/// `a/b/../c` -> `a/c`, without asking the filesystem.
-///
-/// The path is printed in error messages and compared against the
-/// repository below; `..` left in makes both of those unreadable, and
-/// `canonicalize` would be a file system call in a module that has a door
-/// for those.
+/// Normalize dot segments lexically without resolving symlinks.
 fn normalise(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
@@ -785,11 +640,7 @@ fn normalise(path: &Path) -> PathBuf {
     out
 }
 
-/// Refuse a CA directory inside the repository.
-///
-/// The repository is committed; the CA key is the one file of this fleet
-/// that must never be. `.gitignore` would be the other answer and it is one
-/// edit away from being wrong — this is the answer that cannot be forgotten.
+/// Reject a CA path lexically inside the repository. Symlinks are not resolved.
 pub fn refuse_ca_in_repo(repo: &Path, ca: &Path) -> Result<()> {
     if ca.starts_with(repo) {
         bail!(
@@ -808,10 +659,7 @@ pub fn refuse_ca_in_repo(repo: &Path, ca: &Path) -> Result<()> {
 // Subjects
 // ---------------------------------------------------------------------------
 
-/// Which identity the CA is being asked to certify.
-///
-/// The four `tools/meister-ca` knows, and the names are its names: this enum
-/// is what `--kind` is spelled with on both sides.
+/// Certificate kinds accepted by the CA command interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaKind {
     /// `CN=system:node:<host id>`, `O=system:nodes`. An agent.
@@ -879,15 +727,8 @@ pub struct Subject {
     pub sans: Vec<String>,
 }
 
-// --- lane 5B: reading a certificate somebody else issued ----------------
 
-/// Which kind a certificate is, from the common name on it.
-///
-/// The three client kinds name themselves (`system:node:`, `system:cluster:`,
-/// `system:cloud:`) because this fleet's authenticator reads exactly those
-/// prefixes (`controller_api::Identity::may_speak_for`). Anything else is a
-/// SERVING certificate: a name a client typed and checked the address
-/// against, which is the only other thing this stack's CA issues.
+/// Infer client identity kind from reserved CN prefixes; otherwise use Serving.
 pub fn kind_from_cn(cn: &str) -> CaKind {
     match cn {
         _ if cn.starts_with("system:node:") => CaKind::Node,
@@ -897,11 +738,7 @@ pub fn kind_from_cn(cn: &str) -> CaKind {
     }
 }
 
-/// The common name out of what `openssl x509 -subject` printed.
-///
-/// `subject=CN=system:node:n1, O=system:nodes` — the field order is
-/// openssl's and the CN is not always first, so it is searched for rather
-/// than taken from a position.
+/// Extract the CN regardless of its position in OpenSSL subject output.
 pub fn cn_of(subject: &str) -> Option<String> {
     subject
         .trim()
@@ -911,19 +748,10 @@ pub fn cn_of(subject: &str) -> Option<String> {
         .find_map(|field| field.strip_prefix("CN=").map(|cn| cn.trim().to_string()))
 }
 
-// --- end lane 5B --------------------------------------------------------
 
-/// Which identity a host's `identity.key` is for, from its roles.
-///
-/// A host with one of the three roles has one answer. A host that carries
-/// several has several, and the fleet still gives it ONE `identity.key`:
-/// `nix/controllers.nix` names `${pki.dir}/identity.crt` for the cloud tier
-/// AND for the cluster tier, and `nix/agent.nix` names the same file as the
-/// agent's `controller_cert`. So it holds one service identity, and which
-/// one is the operator's decision — this returns the candidates rather than
-/// guessing. Guessing would sign the wrong tier's name onto the key a
-/// controller dials with, and the far end would refuse the Hello with a
-/// name nobody typed.
+/// Return candidate identity kinds from host roles. All tiers use the same
+/// identity key/certificate paths, so mixed-role hosts require an explicit choice;
+/// one selected CN does not provide all role identities.
 pub fn identity_kinds(host: &ResolvedHost) -> Vec<CaKind> {
     let mut out = Vec::new();
     if host.roles.iter().any(|r| r == "cloud") {
@@ -932,22 +760,14 @@ pub fn identity_kinds(host: &ResolvedHost) -> Vec<CaKind> {
     if host.roles.iter().any(|r| r == "cluster") {
         out.push(CaKind::Cluster);
     }
-    // The agent reads the SAME two files (`nix/agent.nix` names
-    // `${pki.dir}/identity.crt` as its `controller_cert`), so a host that
-    // carries an agent beside a controller is a third candidate and not a
-    // fourth file.
+    // Agents share identity paths with controllers and add a Node candidate.
     if host.roles.iter().any(|r| r == "agent") {
         out.push(CaKind::Node);
     }
     out
 }
 
-/// The name of the tier a controller host belongs to.
-///
-/// The same rule `nix/lib/inventory.nix` renders `MEISTER_CLOUD_NAME` and
-/// `MEISTER_CLUSTER_NAME` with: the host's raft group, or the host id when
-/// it is in none. What the fleet actually rendered wins where it is there,
-/// because that is the name the far end will compare against.
+/// Use effective tier configuration, falling back to a matching Raft group or host ID.
 pub fn tier_name(
     fleet: &crate::manifest::ResolvedFleet,
     host_id: &str,
@@ -1049,12 +869,7 @@ pub fn subject_for(
 /// is instant; the deadline is for the connection.
 pub const KEYGEN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// `meister-activate keygen`, over ssh.
-///
-/// [`Effect::TargetWrite`] and not [`Effect::Read`], because a file can come
-/// into existence on the far side. It is the mildest target write there is —
-/// nothing that runs is restarted, and an existing key is left exactly as it
-/// is — but calling it a read would make `--dry-run` do it.
+/// Generate a target key/CSR through a TargetWrite command, refused by dry-run.
 pub fn keygen_cmd(ssh: &Ssh, target: &Target, subject: &str, file: &str, replace: bool) -> Cmd {
     let mut argv = vec![
         "meister-activate".to_string(),
@@ -1071,12 +886,7 @@ pub fn keygen_cmd(ssh: &Ssh, target: &Target, subject: &str, file: &str, replace
     ssh.exec(target, argv, Effect::TargetWrite, KEYGEN_DEADLINE)
 }
 
-/// What the helper answered, read back as the helper's own type.
-///
-/// `meister_deploy::activate::KeygenOutcome` and not a second struct beside
-/// it: the two ends of this pipe are the same crate, and a copy of a
-/// contract is a copy that drifts. The same decision `status --json` was
-/// made under (2A/2C).
+/// Decode the helper KeygenOutcome and reject missing CSR or private-key output.
 pub fn parse_keygen(text: &str, host_id: &str) -> Result<KeygenOutcome> {
     let reply: KeygenOutcome = serde_json::from_str(text.trim()).with_context(|| {
         format!("meister-activate keygen on {host_id} did not answer with the json this tool reads")
@@ -1084,9 +894,7 @@ pub fn parse_keygen(text: &str, host_id: &str) -> Result<KeygenOutcome> {
     if !reply.csr_pem.contains("BEGIN CERTIFICATE REQUEST") {
         bail!("meister-activate keygen on {host_id} answered without a certificate request in it.");
     }
-    // The one thing that must never come back. Checked rather than trusted:
-    // this string is about to be written into a file in a repository
-    // somebody commits.
+    // Reject private-key material before CSR output is stored in the repository.
     if reply.csr_pem.contains("PRIVATE KEY") {
         bail!(
             "meister-activate keygen on {host_id} answered with something that contains a \
@@ -1115,10 +923,7 @@ pub fn sign_cmd(
     days: Option<u32>,
 ) -> Cmd {
     let mut cmd = Cmd::new(
-        // It makes no key and it moves none; what it does is use the CA key
-        // to say something. That is the `key` class, and an `--offline` run
-        // is allowed to do it — signing a request needs nothing but this
-        // machine.
+        // Signing uses Effect::Key; both dry-run and offline policies refuse it.
         Effect::Key,
         meister_ca.display().to_string(),
         SIGN_DEADLINE,
@@ -1194,35 +999,16 @@ pub fn parse_describe(text: &str, path: &str) -> Issued {
 // What should be on a host, so that the planner can compare it with what is
 // ---------------------------------------------------------------------------
 
-/// What `deliver-secret` would put on a host, by `secret_refs[].id`.
-///
-/// A digest for a file that may be hashed — a certificate, a CA bundle, a
-/// CRL — and the word `present` for one that may not. The planner compares
-/// this with [`crate::observation::HostObservation::credentials`], which the
-/// read-only probe fills the same way round (2A): `sha256:<hex>` for the
-/// public files, `mode:… owner:…` for the private ones.
-///
-/// So a public file is compared by CONTENT and a private one only by
-/// existence, and that asymmetry is deliberate: the digest of a private key
-/// is a digest of a private key, and it would travel into a journal, a
-/// receipt and whatever ticket the receipt is attached to.
+/// Expected public-file digests and private-file presence, keyed by secret ID.
+/// Private-key contents and hashes are excluded from observations and receipts.
 pub type ExpectedCredentials = BTreeMap<String, String>;
 
 /// The word for a secret that is there and whose content nobody compares.
 pub const PRESENT: &str = "present";
 
-/// Where the local half of one secret reference lives, or `None` when there
-/// is no local half at all.
-///
-/// Three sources, three answers (`nix/lib/manifest.nix` writes them):
-///
-/// * `operator-file` — the ref IS a path, relative to the inventory file:
-///   `[operator] ca_dir = "../labpki"` makes `ca.crt` into `../labpki/ca.crt`.
-/// * `meister-ca` — what `keys issue` wrote, under the repository, named
-///   after the file it becomes on the target. Named after the FILE and not
-///   after the kind, because a host that carries two controller tiers has
-///   one `identity.crt` and two secret references to it.
-/// * `target-generated` — there is no local half, and there must not be.
+/// Resolve a local delivery source. Target-generated keys have none.
+/// Operator files use an absolute reference or the basename under the resolved CA
+/// directory; CA-issued certificates use repository paths named after target files.
 pub fn local_source(
     repo: &Path,
     ca_dir: &Path,
@@ -1237,31 +1023,18 @@ pub fn local_source(
             Some(if named.is_absolute() {
                 named.to_path_buf()
             } else {
-                // The reference is written relative to the INVENTORY
-                // (`../labpki/ca.crt`), and `ca_dir` was resolved from the
-                // same place — so what is left of it is its file name under
-                // that directory.
-                //
-                // The limit, said where it lives: only the last segment is
-                // kept, so a reference into a SUBDIRECTORY of `ca_dir`
-                // would be read flat. `nix/lib/manifest.nix` renders
-                // exactly `${caDir}/<file>` today, so this is precise; a
-                // deeper layout there needs a line here.
+                // Relative refs retain only their basename under ca_dir; deeper layouts
+                // are unsupported.
                 match named.file_name() {
                     Some(file) => ca_dir.join(file),
                     None => repo.join(named),
                 }
             })
         }
-        // --- lane 5A ---
-        // One list for the whole fleet, and it is not about this host: a
-        // revocation list names certificates, not machines, and a copy per
-        // host would be a directory of files that have to be equal and a
-        // day when one of them is not.
+        // All hosts share one repository CRL.
         SecretSourceKind::MeisterCa if secret.kind == crate::manifest::SecretKind::Crl => {
             Some(crl_path(repo))
         }
-        // --- end lane 5A ---
         SecretSourceKind::MeisterCa => Some(issued_path(
             repo,
             host_id,
@@ -1276,12 +1049,7 @@ pub fn base_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// What every secret of this host should be, read off the operator's disk.
-///
-/// A missing local file is not an error here: the planner turns it into a
-/// blocked host with a sentence that names the verb to run
-/// (`keys csr` / `keys issue`), which is more useful than a plan that
-/// refuses to exist.
+/// Read expected local credentials. Missing files are omitted for planner diagnosis.
 pub fn expected_for_host(
     files: &dyn Files,
     repo: &Path,
@@ -1305,13 +1073,8 @@ pub fn expected_for_host(
                         format!("sha256:{}", crate::ids::sha256_hex(&bytes)),
                     );
                 }
-                // Unreadable is not "absent": leaving it out would make a
-                // bootstrap say that nobody has issued a certificate that
-                // is sitting right there. A word that is not a digest
-                // never equals what the host reports, so the file is
-                // planned for delivery — and the run then stops at the
-                // read, with the path in the sentence. One step later than
-                // a refusal, and about the right file either way.
+                // Retain unreadable files as a non-digest marker so planning does not
+                // misclassify them as absent; delivery will report the read failure.
                 Err(_) => {
                     out.insert(secret.id.clone(), "unreadable".to_string());
                 }
@@ -1345,17 +1108,9 @@ pub fn expected_credentials(
     out
 }
 
-/// When `deliver-secret` is what happens next, per secret.
-///
-/// The rule, and the whole of it:
-///
-/// * a file the target has not got -> deliver it;
-/// * a PUBLIC file whose digest differs -> deliver it;
-/// * a PRIVATE file that is there -> leave it alone, whatever it is. A
-///   `secrets.key` on a cloud is the key its stored secrets were encrypted
-///   with; replacing it does not rotate anything, it makes what is stored
-///   unreadable. Rotation is `keys rotate` (M5) and it is a plan of its own.
-/// * a key the target made itself -> never.
+/// Deliver missing files or changed public-file digests. Never replace an
+/// existing private key or deliver a target-generated key. Replacing a cloud
+/// secrets key would make existing encrypted state unreadable.
 pub fn needs_delivery(
     secret: &crate::manifest::SecretRef,
     expected: Option<&String>,
@@ -1693,8 +1448,7 @@ mod tests {
             crate::fixtures::at("2026-09-22T09:00:00Z"),
         )
         .unwrap_err();
-        // The scan happened — it is a read — and the write is the thing the
-        // policy stopped, at the door rather than at the call site.
+        // Dry-run permits keyscan but refuses the known_hosts write.
         assert!(err.to_string().contains("--dry-run"), "{err}");
         assert!(files.content("/repo/known_hosts").is_none());
     }
@@ -1824,10 +1578,7 @@ mod tests {
         );
     }
 
-    /// The name of a tier is the raft group's, the way
-    /// `nix/lib/inventory.nix` renders `MEISTER_CLUSTER_NAME` — and what
-    /// the fleet ACTUALLY rendered wins where it is there, because that is
-    /// the name the far end compares against.
+    /// Effective tier names override the Raft-group fallback.
     #[test]
     fn a_tier_is_named_after_its_raft_group_unless_the_fleet_said_otherwise() {
         let mut fleet = crate::fixtures::onebox_enrolled();
@@ -1839,8 +1590,7 @@ mod tests {
         assert_eq!(tier_name(&fleet, "n1", CaKind::Cloud).unwrap(), "n1");
     }
 
-    /// A host that carries two tiers has ONE identity.key, so it has one
-    /// identity, and this tool says so rather than picking.
+    /// Mixed-role hosts need an explicit identity choice for their shared key.
     #[test]
     fn which_identity_a_host_can_hold_comes_from_its_roles() {
         let fleet = crate::fixtures::onebox_enrolled();
@@ -1920,8 +1670,7 @@ mod tests {
         );
     }
 
-    /// Signing is a `key` command: it needs no network, so `--offline` may
-    /// do it, and `--dry-run` may not.
+    /// Signing is a Key command and is refused by dry-run and offline policies.
     #[test]
     fn signing_is_a_key_command_and_names_what_it_signs() {
         let subject = Subject {
@@ -1950,11 +1699,7 @@ mod tests {
         assert!(line.contains("--name meister-box"), "{line}");
         assert!(line.contains("--san meister-box,10.0.0.10"), "{line}");
         assert!(line.contains("--days 90"), "{line}");
-        // A dry run may not sign. There is no `--offline` on the verb at
-        // all: signing needs nothing but this machine, so there is nothing
-        // for that flag to refuse — and 1C's policy table, which says
-        // `--offline` runs only `offline` commands, is not loosened for one
-        // verb's convenience.
+        // Dry-run signing must fail admission; the signing verb has no offline flag.
         assert!(Policy::dry_run().admits(Effect::Key).is_err());
 
         // A client certificate has no --san at all.
@@ -2158,8 +1903,7 @@ mod tests {
             vec!["ca-bundle"],
             "{bare:?}"
         );
-        // And when the CA file is not there either, the answer is empty
-        // rather than a guess.
+        // Missing CA source produces no expected credential.
         let nothing = expected_for_host(&MemFiles::new(), repo, ca, "n1", &fleet.hosts["n1"]);
         assert!(nothing.is_empty(), "{nothing:?}");
     }
@@ -2222,8 +1966,7 @@ mod tests {
         assert!(err.to_string().contains("no host \"nobody\""), "{err}");
     }
 
-    /// Astra finding F21, 2026-09-23: the vocabulary openssl's `-crl_reason`
-    /// accepts, checked before the CA ever runs.
+    /// Accept only the CRL reason vocabulary before invoking the CA.
     #[test]
     fn a_crl_reason_is_one_of_the_fixed_openssl_vocabulary() {
         for good in CRL_REASONS {

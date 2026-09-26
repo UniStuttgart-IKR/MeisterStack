@@ -2,19 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Seventy hosts are one build, one signature and one measurement.
-//!
-//! The shape of a build over a fleet is not a detail of its speed. Seventy
-//! `nix build` invocations are seventy build graphs, scheduled one after the
-//! other: `--max-jobs` applies inside one of them, `--builders` distributes
-//! inside one of them, and the kernel that sixty-one agents share is looked
-//! up in the store sixty-one times instead of being a node of one graph.
-//! Seventy `nix store sign` invocations walk overlapping closures seventy
-//! times. So the number of commands is pinned here, in the strict fake,
-//! where it is a statement and not a stopwatch.
-//!
-//! The measurement of what that costs in seconds is in the report; this is
-//! the part that cannot drift.
+//! Seventy-host build test with strict command-count expectations.
+//! Verify one artifact build, one signing command and one measurement batch,
+//! with output association by derivation rather than response order.
 
 mod support;
 
@@ -55,9 +45,7 @@ fn seventy_hosts_are_one_nix_build_one_signature_and_one_measurement() {
     assert_eq!(fleet.hosts.len(), 70, "the fixture is the seventy");
 
     let drvs = derivations(&fleet, &fleet.evaluated_hosts);
-    // Seventy systems and the three packages. No check derivation: the
-    // required checks of this fleet are `units`, `session` and `mounts`,
-    // which are questions about a running host.
+    // Seventy systems plus three packages; this fixture has no derivation-based checks.
     assert_eq!(drvs.len(), 73, "{:?}", drvs.len());
 
     let mut pairs: Vec<(String, String)> = drvs
@@ -154,8 +142,7 @@ fn seventy_hosts_are_one_nix_build_one_signature_and_one_measurement() {
     assert_eq!(signs, 1, "one closure walk, not seventy: {calls:?}");
     assert_eq!(measures, 1, "one measurement: {calls:?}");
 
-    // And every host of the release got the path ITS derivation made — the
-    // mapping came from nix's own `drvPath`, not from the order of a list.
+    // Associate outputs by Nix `drvPath`, independent of response order.
     assert_eq!(built.release.artifacts.len(), 70);
     for (id, artifacts) in &built.release.artifacts {
         let promised = &built.release.resolved_fleet.hosts[id].build.toplevel_out;

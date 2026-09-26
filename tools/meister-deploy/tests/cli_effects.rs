@@ -2,22 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What the binary does to the machine it is run on — measured, not asserted
-//! about.
+//! CLI effect checks using isolated PATH shims and temporary directories.
 //!
-//! The unit tests in `run.rs` pin that a `Policy` refuses a class of command.
-//! That is a statement about a struct. This is the statement about the
-//! PROGRAM: `PATH` is replaced by a directory holding four shims called
-//! `nix`, `ssh`, `git` and `rsync`, each of which writes its whole argv into
-//! a log and exits 97. Whatever the binary runs, the log has it; whatever the
-//! log does not have, the binary did not run. The working directory and the
-//! output directory are hashed before and after, so "wrote nothing" is a
-//! comparison rather than a claim.
-//!
-//! What this cannot show is a syscall that reaches the network without going
-//! through one of those four programs. There is no such call in this code —
-//! there is no socket in the crate at all — and M2 adds `unshare -rn` on top
-//! for the verbs that will have one.
+//! Shims log external commands and fail them; directory digests detect writes.
+//! These tests cover exercised command paths, not every possible syscall.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,8 +13,7 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
 
-/// The programs this tool is allowed to know about. All four are shimmed, so
-/// that a call to any of them is recorded rather than executed.
+/// External programs replaced by logging shims.
 const SHIMS: [&str; 4] = ["nix", "ssh", "git", "rsync"];
 
 struct Sandbox {
@@ -45,13 +32,8 @@ impl Sandbox {
         let log = shims.path().join("calls.log");
         for name in SHIMS {
             let path = shims.path().join(name);
-            // `#!/bin/sh` by absolute path, and only shell builtins in the
-            // body: PATH holds nothing but this directory while the binary
-            // runs, so the shim cannot call anything either.
-            // The whole line in ONE append: several hosts are asked at
-            // once, and three writes per call would interleave into
-            // nonsense exactly when the parallelism is what is being
-            // tested.
+            // Use an absolute shell and builtins only. Append each logged command
+            // in one operation to avoid interleaving concurrent calls.
             std::fs::write(
                 &path,
                 format!(
@@ -83,8 +65,7 @@ impl Sandbox {
             .current_dir(self.cwd.path())
             .env("PATH", self.shims.path())
             .env("MEISTER_SHIM_LOG", &self.log)
-            // A HOME nobody wrote to, so that a tool reaching for a user's
-            // configuration finds nothing rather than the operator's.
+            // Use an empty temporary HOME to exclude operator configuration.
             .env("HOME", self.out.path())
             .output()
             .expect("the binary was just built")
@@ -258,9 +239,7 @@ fn a_real_resolve_asks_git_first_and_stops_when_git_says_no() {
     let out = sandbox.run(&["resolve", "--repo", ".", "--out", target.to_str().unwrap()]);
 
     assert_eq!(out.status.code(), Some(1));
-    // The order matters and is pinned here: the tree is read before nix is
-    // asked anything, so a dirty tree is refused before a ten-minute
-    // evaluation rather than after it.
+    // Reject dirty trees before invoking Nix evaluation.
     let calls = sandbox.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0], "git [rev-parse] [HEAD]");
@@ -311,9 +290,7 @@ fn a_refusal_is_exit_one_and_a_sentence_on_stderr() {
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("broken.toml"), "{}", stderr(&out));
 
-    // And `--nix` really evaluates the flake now (lane 1B): it asks nix for
-    // the inventory half of `meisterDeployment`, once, and a nix that fails
-    // is a refusal with the command line in it — never a silent pass.
+    // Nix validation evaluates inventory once and reports evaluation failure.
     let out = sandbox.run(&["validate", "--nix"]);
     assert_eq!(out.status.code(), Some(1));
     let calls = sandbox.calls();
@@ -332,8 +309,7 @@ fn a_refusal_is_exit_one_and_a_sentence_on_stderr() {
 
 #[test]
 fn the_manifest_contract_can_be_checked_from_a_pipe() {
-    // This is the shape lane 1B's `manifest-json` check has: evaluate, pipe,
-    // exit code. No file, no repository, no nix on PATH that works.
+    // Validate piped evaluation output without creating repository files.
     let sandbox = Sandbox::new();
     let manifest = sandbox.out_path("m.json");
     std::fs::write(&manifest, include_str!("fixtures/nix-manifest-onebox.json")).unwrap();

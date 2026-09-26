@@ -2,16 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `verify`, through the real binary, with `PATH` holding nothing but shims.
-//!
-//! The unit tests of `src/verify.rs` pin what the driver does with a strict
-//! fake. What they cannot pin is the verb: the approval, the refusals, the
-//! exit codes, and the fact that a `--dry-run` writes nothing at all. Those
-//! are properties of the PROGRAM, so they are measured by running it.
-//!
-//! The `meister` shim is the operator's own cli, and it answers from files
-//! the test lays out per verb — which is also how a guest is made to look
-//! like it took, like it never booted, or like it refuses to go away.
+//! CLI verification tests using temporary state and a PATH containing only shims.
+//! Exercise approval, refusals, exit codes, dry-run writes and VM cleanup behavior.
 
 mod support;
 
@@ -27,10 +19,7 @@ use support::{observed, onebox, probe_answer, release_of, with_guest_tiny};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
 
-/// Every program this verb is allowed to know about. `meister` is the
-/// operator's own cli, which is how a guest is asked for (D7); `ssh` and
-/// `ssh-keygen` are the read-only round trip that says what the machines
-/// are.
+/// Programs available to the tested CLI; SSH and key lookup return controlled observations.
 const SHIMS: [&str; 5] = ["nix", "git", "ssh", "ssh-keygen", "meister"];
 
 const STORE: &str = "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny";
@@ -80,22 +69,9 @@ impl Sandbox {
                      fi\n\
                      exit 255\n"
                 ),
-                // The operator's cli, as a very small control plane: it
-                // remembers the guests it was told to create, forgets the
-                // ones it was told to remove, and lists what is left. A
-                // canned answer per verb could not tell "the delete took"
-                // from "the delete was refused", and that difference is
-                // most of what this suite is about.
-                //
-                // Only shell builtins in the body: `PATH` holds this
-                // directory and nothing else while the binary runs, so
-                // there is no `cat`, no `sed` and no `grep` to reach for.
-                //
-                // The noun and the verb after it — `vm create`, `vm ls` —
-                // and not "the first two arguments that are not options":
-                // `--config cli.toml` has a value that looks exactly like a
-                // noun, which is a shim that answers the wrong file and a
-                // test that is green for the wrong reason.
+                // Stateful CLI shim: retain created guests until a successful removal.
+                // Use shell builtins because PATH contains only shims.
+                // Match noun/verb pairs after options and their values.
                 "meister" => format!(
                     "#!/bin/sh\nline=\"{name}\"\n\
                      for a in \"$@\"; do line=\"$line [$a]\"; done\n\
@@ -196,14 +172,8 @@ impl Sandbox {
         std::fs::write(self.answers.path().join(address), text).unwrap();
     }
 
-    /// What `meister <noun> <verb> …` prints. `@NAME@` becomes the guest's
-    /// name.
-    ///
-    /// With a trailing newline, always: the shim reads its templates with
-    /// `while read`, which drops a last line that has none — and a template
-    /// that produced nothing looked exactly like a control plane that
-    /// answered nothing, which is a two-minute wait per guest rather than a
-    /// failure. Measured.
+    /// Set output for a noun/verb pair; replace `@NAME@` with the guest name.
+    /// Terminate templates with a newline because the shim reads them with `while read`.
     fn cli_says(&self, pair: &str, text: &str) {
         std::fs::write(self.cli.path().join(pair), format!("{text}\n")).unwrap();
     }
@@ -309,8 +279,7 @@ fn run_id(out: &Output) -> String {
         .to_string()
 }
 
-/// A control plane that behaves: a guest is created on n1, comes up
-/// Running, printed the marker, and is gone once it is deleted.
+/// Successful CLI responses for a guest placed on n1 through verified deletion.
 fn a_working_control_plane(sandbox: &Sandbox) {
     sandbox.cli_says(
         "vm-create",
@@ -603,9 +572,7 @@ fn a_guest_that_never_printed_the_marker_fails_and_is_still_deleted() {
 fn a_guest_that_will_not_go_away_is_lost_and_named() {
     let sandbox = Sandbox::new();
     a_working_control_plane(&sandbox);
-    // The delete is refused, so the shim keeps the guest in its listing —
-    // which is the only way the tool can tell "it went" from "it was told
-    // to go and did not".
+    // A refused delete retains the guest in the subsequent listing.
     sandbox.cli_exits("vm-rm", 1);
 
     let out = sandbox.run(&[
@@ -634,9 +601,7 @@ fn a_guest_that_will_not_go_away_is_lost_and_named() {
     assert_eq!(code(&out), 2, "{}\n{}", stdout(&out), stderr(&out));
     let run = run_id(&out);
     let ledger = sandbox.ledger_of(&run);
-    // The `vm ls` answers with somebody else's guest and never with ours,
-    // so the delete is honest about not having taken: the name has to stay
-    // in the ledger as lost.
+    // An unsupported listing shape must leave the resource recorded as lost.
     assert!(
         ledger
             .resources
@@ -790,9 +755,7 @@ fn the_contracts_this_verb_writes_have_a_schema_anybody_can_read() {
 // `report --run <id>` over a verification
 // ---------------------------------------------------------------------------
 
-/// A verification written by hand into the state directory, so that what
-/// `report` does with one is measured against bytes a test controls rather
-/// than against whatever a run happened to produce.
+/// Write a controlled verification receipt for report tests.
 fn a_verification(sandbox: &Sandbox, run: &str, checks: serde_json::Value) {
     let dir = sandbox.state().join("runs").join(run);
     std::fs::create_dir_all(&dir).unwrap();
@@ -946,7 +909,7 @@ fn the_json_report_separates_the_two_kinds_as_well() {
 #[test]
 fn a_verification_and_a_rollout_do_not_get_in_each_others_way() {
     let sandbox = Sandbox::new();
-    // A run directory with neither is still the sentence it was.
+    // A directory without either receipt type remains an error.
     let out = sandbox.run(&[
         "report",
         "--run",

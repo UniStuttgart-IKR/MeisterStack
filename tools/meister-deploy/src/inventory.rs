@@ -2,32 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `fleet.toml`, schema 2 — read, and read only.
+//! Schema-2 fleet inventory parsing, validation, inheritance, and presentation. Scalars use
+//! defaults < group < host; conflicting equal-rank groups require an explicit host override.
+//! Lists accumulate in precedence order with duplicates removed.
 //!
-//! The pre-v1 tool read this file twice: once here and once in
-//! `nix/fleet.nix`, and both halves derived addresses, peer sets, cluster
-//! names and tokens from it. Ten rules on one side, twelve on the other, and
-//! a shell script that compared them. That is over (D2): Nix is the single
-//! derivation, and this module does exactly three things.
-//!
-//! 1. Say whether the file has the shape it claims to have — required fields,
-//!    names that are names, ids that are unique, references that resolve.
-//! 2. Apply precedence — defaults < group < host — as a pure function, and
-//!    refuse the case where two groups of equal rank disagree, because
-//!    "whichever the parser saw first" is not an answer an operator can plan
-//!    around.
-//! 3. Print it back, for a person or for `--json`.
-//!
-//! What it does NOT do is derive a single deployment value. No address is
-//! computed from a group, no peer list from a membership, no port from a
-//! role, no token from anything. `tests/inventory_derives_nothing.rs` reads
-//! this file and fails if it starts to.
-//!
-//! Where a spelling differs from the manifest contract, the inventory's is
-//! the operator's and the manifest's is the machine's, and Nix converts
-//! between them: `disk.size_gb` here is `size_bytes` there,
-//! `persistence.device` is `device_ref`, `ssh.host_key` is
-//! `ssh.host_key_fingerprint`.
+//! Nix derives deployment settings and converts inventory spellings such as disk.size_gb,
+//! persistence.device, and ssh.host_key into manifest fields. This reader does not derive
+//! deployment settings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -37,8 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effects::Files;
 
-/// The schema this module reads. Schema 1 is the pre-v1 file and belongs to
-/// nothing at all: the verbs that read it went with M5B.
+/// Supported inventory schema. Earlier schemas require migration before parsing.
 pub const SCHEMA: u32 = 2;
 
 /// Ssh defaults when nobody said otherwise. Not policy, a floor: an
@@ -88,15 +68,9 @@ pub struct HostSsh {
     pub host_key: Option<String>,
 }
 
-/// How a machine of this fleet gets its kernel.
-///
-/// The twin of `knownBootModes` in nix/lib/inventory.nix, and the reason
-/// there are exactly two: a boot this tool cannot take back is a boot this
-/// tool does not arrange. `uefi` has systemd-boot and therefore
-/// `bootctl set-oneshot`; `direct` has a hypervisor holding the kernel and
-/// no loader at all, so it keeps the switch rollback and loses the boot one.
-/// `bios` is refused by name, with the reason, because it is the answer
-/// somebody will try.
+/// Boot mode shared with nix/lib/inventory.nix. UEFI supports automated boot fallback; direct
+/// and GRUB hosts support switch rollback only. The unsupported spelling bios is diagnosed
+/// explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootMode {
@@ -105,20 +79,12 @@ pub enum BootMode {
     Uefi,
     /// Kernel, initrd and command line come from outside the machine.
     Direct,
-    // --- lane 5C ---
-    /// The machine boots itself out of a loader this flake does not
-    /// install and cannot drive: grub on an MBR disk, which is what
-    /// `packages.managed-disk-image` makes and what every VM started from
-    /// such an image is.
-    ///
-    /// It keeps the switch rollback, which is userland and works
-    /// unchanged, and it has no boot rollback: `bootctl set-oneshot` is
-    /// what a boot rollback is made of, and grub has no equivalent. So a
-    /// release that changes the boot half is moved with `--mode switch`
-    /// and then rebooted, and if the machine does not come up the way back
-    /// is grub's own menu and a person at a console.
+
+    /// Use an existing GRUB loader. This flake does not install it; activation switches
+    /// userland and reboots separately. Recovery from an unsuccessful boot requires the
+    /// existing loader or console.
     Grub,
-    // --- end lane 5C ---
+
 }
 
 impl BootMode {
@@ -137,10 +103,8 @@ impl BootMode {
             "uefi" => Ok(BootMode::Uefi),
             "direct" => Ok(BootMode::Direct),
             "grub" => Ok(BootMode::Grub),
-            // --- lane 5C ---
-            // The word somebody will try, and it is not the value: this
-            // flake does not install a BIOS machine, it only deploys to
-            // one that already boots. `grub` says that out loud.
+            // Use grub for a preinstalled loader; bios does not describe an installation mode
+            // supported by this flake.
             "bios" => bail!(
                 "boot = \"bios\": this flake installs uefi or direct, and it deploys to a \
                  machine that already has grub — that value is `grub`. The difference is who \
@@ -149,7 +113,7 @@ impl BootMode {
                  has no boot fallback either way, because `bootctl set-oneshot` is what a \
                  boot fallback is made of."
             ),
-            // --- end lane 5C ---
+
             other => bail!(
                 "boot = {other:?}: a host of this fleet boots uefi (it has an ESP and a boot \
                  menu of its own), direct (a hypervisor hands it kernel, initrd and command \
@@ -215,13 +179,7 @@ pub struct ChecksOverrides {
     pub functional: Vec<String>,
 }
 
-/// What a machine of this fleet is told about being deployed TO.
-///
-/// One key today, and it is a list: the binary caches a host may FETCH a
-/// closure from. It lives in the inventory rather than in an operator's own
-/// profile because the other half of that answer is a flag —
-/// `meister-deploy build --cache <store>` — and "does this fleet use a
-/// cache" should be a question one file answers.
+/// Target binary-cache configuration, shared with the workstation build/cache workflow.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedOverrides {
@@ -262,15 +220,8 @@ pub struct Operator {
     /// Where `tools/meister-ca` keeps its directory, relative to this file.
     #[serde(default)]
     pub ca_dir: Option<String>,
-    /// The nix signing key `build` signs a release with, relative to this
-    /// file.
-    ///
-    /// A PATH and not a key: this file is committed, and the file it points
-    /// at belongs in `.gitignore`. It is named here rather than passed on
-    /// every command because a fleet has one signing key, its public half
-    /// stands in `meisterstack.managed.trustedPublicKeys`, and a release
-    /// signed with a different one is a release no host of this fleet will
-    /// take (M0 probe S12).
+    /// Path to the Nix signing key, relative to the inventory. Keep the private file
+    /// untracked and configure its public key as trusted on targets.
     #[serde(default)]
     pub signing_key: Option<String>,
 }
@@ -329,22 +280,9 @@ pub struct Network {
     pub interface: Option<String>,
     #[serde(default)]
     pub gateway: Option<String>,
-    /// Whether the PLAN configures this interface, or only says where the
-    /// host is.
-    ///
-    /// Added by lane 1B, and the reason is a question nix/lib/inventory.nix
-    /// has to answer for every host: who owns the interface. The pre-v1
-    /// plan answered it for everybody at once (`networking.useDHCP =
-    /// mkForce (!(defaults ? prefix))`, nix/fleet.nix), which meant a fleet
-    /// that wrote down an address took the interface away from the host
-    /// whether it wanted that or not. Now the default is that the host owns
-    /// its network — an address in the inventory is how `meister-deploy`
-    /// reaches it — and `static = true` is the fleet saying otherwise.
-    ///
-    /// It is deliberately NOT in the manifest's `Network`: the manifest
-    /// names the address a host is reached at, and who configured the
-    /// interface is part of the SYSTEM, which the manifest names by its
-    /// derivation.
+    /// Whether Nix configures this interface statically. False leaves configuration to the
+    /// host while retaining the address for transport. The resolved manifest records the
+    /// address; configuration ownership is represented by the evaluated system.
     #[serde(default, rename = "static")]
     pub r#static: bool,
 }
@@ -413,10 +351,8 @@ pub struct Install {
     pub layout: String,
     #[serde(default)]
     pub preserve: Vec<String>,
-    /// PUBLIC ssh keys that may reach the installer MEDIUM. Empty — the
-    /// default — is a medium with no sshd at all, and then the console is
-    /// the only way in. The list is baked into an image anybody holding the
-    /// medium can read, which is why only public halves belong in it.
+    /// Public SSH keys embedded in the installer medium. Empty disables installer SSH;
+    /// private keys must never be embedded.
     #[serde(default)]
     pub authorized_keys: Vec<String>,
 }
@@ -546,13 +482,13 @@ struct Raw {
 struct SchemaProbe {
     #[serde(default)]
     schema: Option<u32>,
-    // --- lane 5B ---
+
     /// The one table that was really in the lab's inventory. It is probed
     /// for by name because `deny_unknown_fields` would only say "unknown
     /// field", and this one has an answer: the provider moved.
     #[serde(default)]
     opennebula: Option<toml::Value>,
-    // --- end lane 5B ---
+
 }
 
 // ---------------------------------------------------------------------------
@@ -605,10 +541,8 @@ pub struct Settings {
     pub boot: BootMode,
     pub rollout: EffectiveRollout,
     pub checks: EffectiveChecks,
-    /// The binary caches this host may fetch from, accumulated in precedence
-    /// order like `profiles`: a list of substituters is the order nix tries
-    /// them in, and a group that adds a regional mirror is adding one rather
-    /// than replacing what the fleet already had.
+    /// Target caches accumulated and deduplicated in precedence order, preserving fetch
+    /// preference.
     pub substituters: Vec<String>,
 }
 
@@ -756,20 +690,8 @@ impl Inventory {
             self.effective(id)?;
         }
 
-        // --- lane 5C ---
-        // One cloud per fleet, which is the one cross-host rule `nix eval`
-        // enforces and this parser did not (L2 finding N11): two `[[host]]`
-        // entries with the cloud role in two different raft groups made
-        // `validate` say `ok` and `nix eval` say no. A syntax check that
-        // passes a file the evaluation refuses is a check somebody stops
-        // reading.
-        //
-        // The comparison is the same one nix/lib/inventory.nix makes: the
-        // raft group of each cloud host, where a host's raft group is the
-        // FIRST group it is in whose kind is `raft` (a host in two rafts is
-        // refused there on its own). `null` — a cloud in no raft group at
-        // all — counts as a value, because two clouds outside any group are
-        // still two clouds.
+        // Cloud-role hosts must resolve to the same first raft group, or all have no raft
+        // group. Nix performs additional group validation.
         let mut clouds: BTreeSet<Option<&String>> = BTreeSet::new();
         for host in self.hosts.values() {
             if !host.roles.iter().any(|r| r == "cloud") {
@@ -793,7 +715,6 @@ impl Inventory {
                 named.join(", ")
             );
         }
-        // --- end lane 5C ---
 
         for (id, service) in &self.services {
             if let Some(host) = &service.host
@@ -1026,13 +947,8 @@ fn push_new(into: &mut Vec<String>, more: &[String]) {
     }
 }
 
-/// Defaults < group < host, for one key of one host.
-///
-/// The host is asked FIRST and, when it answers, the groups are not consulted
-/// at all. That is deliberate: two groups disagreeing is only a problem when
-/// their disagreement is what decides the value, and a host that states the
-/// key has settled it for itself. An unresolved disagreement always blocks —
-/// see [`one_of`].
+/// Resolve one scalar: explicit host value, otherwise one agreed group value, otherwise the
+/// default. A host override resolves group disagreement.
 fn settle<T: PartialEq + std::fmt::Debug>(
     host_id: &str,
     key: &str,
@@ -1047,12 +963,8 @@ fn settle<T: PartialEq + std::fmt::Debug>(
     Ok(one_of(host_id, key, groups, get)?.or(from_defaults))
 }
 
-/// One value from the host's groups, or a sentence naming both groups.
-///
-/// Groups are of equal rank by design — a host is in a raft group and in a
-/// hardware class, and neither is above the other — so two of them setting
-/// the same key to different values has no answer. Picking one would mean the
-/// file's line order decides what a fleet does.
+/// Return the agreed value from equal-rank groups; reject conflicting values with both group
+/// names.
 fn one_of<T: PartialEq + std::fmt::Debug>(
     host_id: &str,
     key: &str,
@@ -1079,7 +991,7 @@ fn one_of<T: PartialEq + std::fmt::Debug>(
 fn check_schema(text: &str, origin: &str) -> Result<()> {
     let probe: SchemaProbe =
         toml::from_str(text).map_err(|e| anyhow::anyhow!("{origin} is not valid toml: {e}"))?;
-    // --- lane 5B ---
+
     if probe.opennebula.is_some() {
         bail!(
             "{origin} has an `[opennebula]` table. It is not part of a schema {SCHEMA} \
@@ -1090,7 +1002,7 @@ fn check_schema(text: &str, origin: &str) -> Result<()> {
              this inventory says about such a host is `deployment = \"context\"`."
         );
     }
-    // --- end lane 5B ---
+
     match probe.schema {
         Some(SCHEMA) => Ok(()),
         Some(1) | None => bail!(
@@ -1127,10 +1039,8 @@ fn check_install(host_id: &str, install: &Install, origin: &str) -> Result<()> {
             if install.layout.is_empty() {
                 bail!("{origin}: host {host_id} has an install table with no layout.");
             }
-            // Public halves only. The list is baked into an installer image
-            // that anybody holding the medium can read, so a private key
-            // that landed here by a slip of the hand would be a private key
-            // on a USB stick in a server room.
+            // Reject private material and require an SSH public-key prefix before embedding
+            // authorized keys.
             for key in &install.authorized_keys {
                 if key.contains("PRIVATE KEY") {
                     bail!(
@@ -1207,10 +1117,8 @@ fn check_dns_name(what: &str, value: &str, origin: &str) -> Result<()> {
     Ok(())
 }
 
-/// An id is not a host name: it may carry underscores and capitals, because
-/// it is never put into DNS or into a certificate. It still may not be empty
-/// or contain whitespace, a slash or a quote — a plan refers to it in a
-/// command line and in a file name.
+/// IDs are ASCII alphanumeric, hyphen or underscore, up to 63 bytes, starting alphanumeric.
+/// They need not be DNS labels.
 fn check_identifier(what: &str, value: &str, origin: &str) -> Result<()> {
     let ok = !value.is_empty()
         && value.len() <= 63
@@ -1240,8 +1148,6 @@ mod tests {
     fn parse(text: &str) -> Result<Inventory> {
         Inventory::parse(text, "fleet.toml")
     }
-
-    // --- lane 5C ---
 
     #[test]
     fn two_clouds_are_refused_by_the_parser_and_not_only_by_nix() {
@@ -1305,10 +1211,7 @@ roles = ["agent"]"#,
 
     #[test]
     fn a_host_that_brings_its_own_loader_has_a_word_for_it() {
-        // L2 finding N4: `packages.managed-disk-image` makes a legacy-MBR
-        // grub guest, the inventory knew `uefi` and `direct` and nothing
-        // else, and calling such a host `uefi` made `apply` ask the helper
-        // for a boot fallback it has not got.
+        // A managed disk image uses GRUB and must not request a UEFI boot fallback.
         assert_eq!(BootMode::parse("grub").unwrap(), BootMode::Grub);
         assert_eq!(BootMode::Grub.as_str(), "grub");
 
@@ -1337,8 +1240,6 @@ roles = ["agent"]"#,
         assert!(err.contains("that value is `grub`"), "{err}");
         assert!(err.contains("no boot fallback"), "{err}");
     }
-
-    // --- end lane 5C ---
 
     #[test]
     fn a_network_belongs_to_the_host_unless_the_plan_says_static() {
@@ -1391,7 +1292,6 @@ roles = ["agent"]"#,
         assert!(gpu.deviations.settings.contains_key("agent"));
     }
 
-    // --- lane 4C ---
     #[test]
     fn substituters_accumulate_the_way_profiles_do() {
         // Nothing said anywhere is a fleet that is only ever pushed to.
@@ -1436,7 +1336,6 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
             vec!["http://build/cache"]
         );
     }
-    // --- end lane 4C ---
 
     #[test]
     fn precedence_runs_defaults_then_group_then_host() {
@@ -1571,7 +1470,6 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
         assert!(err.contains("nonsense"), "{err}");
     }
 
-    // --- lane 5B ---
     /// The table that was really there gets a sentence rather than "unknown
     /// field", because there is something to say about it: the provider it
     /// named lives somewhere else now.
@@ -1583,7 +1481,6 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
         assert!(err.contains("meisterstack-lab"), "{err}");
         assert!(err.contains("deployment = \"context\""), "{err}");
     }
-    // --- end lane 5B ---
 
     #[test]
     fn a_group_that_is_not_declared_is_refused() {
@@ -1616,7 +1513,7 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
     }
 
     // ---------------------------------------------------------------
-    // How a machine is booted (M3A position 1)
+    // Boot-mode validation
     // ---------------------------------------------------------------
 
     #[test]

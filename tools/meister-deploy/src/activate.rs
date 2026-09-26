@@ -2,53 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What runs ON the target, and why it has to be a program of its own.
+//! Target-side system activation, rollback, host locks, garbage collection and key rotation.
 //!
-//! `meister-activate` is the second binary of this crate (D5). It knows no
-//! network, no manifest and no fleet: it moves the system profile of the
-//! machine it is on, and it writes down what it did before it does it. The
-//! whole rollback story of M2 stands on that record, because the operator's
-//! journal can only say what happened up to the line it managed to write —
-//! and the interesting failures are the ones where the machine goes away in
-//! the middle of the sentence. The target can answer the rest, and this is
-//! the program that answers.
+//! Activation records the previous system and arms a transient rollback timer before
+//! changing the profile. `switch` activates immediately; `boot` uses systemd-boot
+//! one-shot entries and requires a later reboot. Confirmation and rollback persist
+//! intent before changing the machine. Timers do not survive reboot.
 //!
-//! Three properties are the reason this is not a shell script that `ssh`
-//! pipes in:
-//!
-//! * **The record is written first, durably.** `txn/<id>.json` lands with a
-//!   temporary plus rename plus fsync BEFORE the profile moves, so a machine
-//!   that dies during `switch-to-configuration` still has a record that says
-//!   which generation it came from. A resume asks for that record
-//!   ([`crate::receipt::next_step`]) and never repeats an activation blind.
-//! * **The way back is armed before the way forward.** The revert timer is a
-//!   transient systemd unit, and it is created BEFORE `nix-env --set`. That
-//!   is a deliberate departure from the order the lane brief wrote down (it
-//!   says "afterwards"): `switch-to-configuration switch` restarts sshd, so
-//!   the connection this program runs over can die in the middle of it — and
-//!   a revert timer that is armed after the switch is a revert timer that a
-//!   cut connection means the machine never gets. V16 ("SSH cut during the
-//!   activation, and the target takes itself back") is only true this way
-//!   round. The cost is that a failure between arming and switching has to
-//!   disarm it again, which [`Helper::activate`] does.
-//! * **A decision is written before it is carried out.** Astra finding F07,
-//!   2026-09-23: `confirm` writes `confirming` and `revert` writes
-//!   `reverting` BEFORE the step that cannot be undone — the stop of the
-//!   revert timer in the one case, the move of the profile in the other. A
-//!   process that dies in that window used to leave a record saying
-//!   `pending` beside a machine that had already been decided about, and a
-//!   record that says less than what happened is the one thing a resume
-//!   cannot recover from. The cost is one more fsynced write per decision.
-//! * **Nothing decides by itself what is open.** A record is retired by the
-//!   run that owns it (`txn retire`), not by reaching a state. So a run that
-//!   was interrupted leaves its record behind, which is exactly what makes
-//!   the next plan refuse to start over ([`crate::plan`] blocks on any open
-//!   transaction) and a resume able to find out what happened.
-//!
-//! Everything goes through [`Runner`], [`Files`] and [`Clock`], on the
-//! target as much as on the workstation: the command lines are then
-//! readable in a unit test, which is the only place the ones that reboot a
-//! machine can be read at all.
+//! Runner, Files and Clock provide command, filesystem and time effects for tests.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -64,11 +25,7 @@ use crate::observation::{BootedKernel, Lock, Txn, TxnState};
 use crate::observe::{ACTIVATE_STATUS_SCHEMA, ActivateStatus};
 use crate::run::{Cmd, Effect, Expect, Runner};
 
-/// The transaction record's own schema. Read by this program and by nobody
-/// else — the fleet sees it through `status --json`
-/// ([`crate::observe::ActivateStatus`]) — but versioned all the same,
-/// because it is a file that has to be readable by the NEXT version of this
-/// program after a reboot.
+/// Schema for the target-side transaction record; fleet observations use a separate view.
 pub const TXN_SCHEMA: &str = "meister-deploy/activate-txn/1";
 
 /// The profile every NixOS system boots from.
@@ -78,65 +35,37 @@ pub const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 pub const CURRENT_SYSTEM: &str = "/run/current-system";
 pub const BOOTED_SYSTEM: &str = "/run/booted-system";
 
-/// How long the small local commands may take. A `systemctl is-active` that
-/// takes a minute is a machine in trouble, and hanging here would hang the
-/// rollout that is waiting for the answer.
+/// Deadline for short local commands.
 const QUICK: Duration = Duration::from_secs(30);
 
-/// How long `switch-to-configuration` may take. It stops and starts every
-/// unit of the system; on a host with guests on it that is not quick, and a
-/// deadline that cut it off half way would be worse than waiting.
+/// Deadline for profile changes and `switch-to-configuration`.
 const SWITCH: Duration = Duration::from_secs(900);
 
 /// How long the garbage collector may take. It walks the whole store.
 const COLLECT: Duration = Duration::from_secs(3600);
 
-/// How long the deadline waits for an activation that holds the decision
-/// lock (Astra finding MD02, 2026-09-25): the longest the forward path can
-/// take — `nix-env --set` and the switcher at [`SWITCH`] each, and in boot
-/// mode two `bootctl` at [`QUICK`] — and then some. A holder that is still
-/// there after that is a holder something else has to look at.
+/// Maximum wait for a busy transaction when the rollback timer fires.
+/// Allows two switch deadlines plus four short commands.
 const DEADLINE_PATIENCE: Duration = Duration::from_secs(2 * 900 + 4 * 30);
 
 /// How often the waiting deadline asks again.
 const DEADLINE_POLL: Duration = Duration::from_secs(2);
 
-/// Where a managed host keeps its key material (`meisterstack.pki.dir` of
-/// `nix/managed.nix`). The directory is created by that profile's tmpfiles
-/// rules before anything runs; this is the default so that an operator at a
-/// console types no path.
+/// Default `meisterstack.pki.dir` on managed hosts.
 pub const DEFAULT_PKI_DIR: &str = "/var/lib/meisterstack/pki";
 
-/// Who reads a key on a managed host.
-///
-/// The service user, and therefore the OWNER — `meister:meister 0600` and
-/// not `root:meister 0640`, because every key loader in this project
-/// refuses a mode with group bits in it (M0 probe S11, Gate M0 "D1
-/// changed"). Root reads it anyway.
+/// Owner of generated private keys. Keys are created mode 0600, then assigned to this user.
 pub const KEY_OWNER: &str = "meister";
 
-/// What a transient unit gets to find its programs in when nobody says
-/// otherwise.
-///
-/// `systemd-run` gives a transient service systemd's own default PATH —
-/// `/usr/bin:/bin` — and on a NixOS host there is no `nix-env` in either
-/// (measured: the first run of the VM test reverted nothing and said
-/// "nix-env could not be started"). This is the directory every program of
-/// a NixOS system is in, and it follows the system profile, so after a
-/// revert it is the OLD system's `nix-env` — which is the right one to be
-/// holding at that point.
+/// Fallback PATH for transient rollback units. NixOS commands live in the system profile;
+/// the helper binary can supply a different PATH.
 pub const SYSTEM_PATH: &str = "/run/current-system/sw/bin";
 
-/// Which way an activation goes, and therefore which way it comes back.
-///
-/// Not [`crate::plan::RollbackMode`], which has a third value: `none` is a
-/// statement about a step that changes nothing, and "activate in mode none"
-/// is not a thing this program can be asked to do.
+/// Activation mode, also used when restoring the previous system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// The running system changes now, and `switch-to-configuration switch`
-    /// takes it back when nobody confirms.
+    /// Activate immediately; rollback uses `switch-to-configuration switch`.
     Switch,
     /// The running system is left alone and the next boot is the new one.
     /// The way back is the boot entry, which is why it needs systemd-boot.
@@ -182,25 +111,16 @@ impl std::fmt::Display for Mode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SystemPoint {
-    /// The store path of the system. Null only on a machine whose profile
-    /// could not be read, and then an activation is refused rather than
-    /// recorded with a hole in it.
+    /// Resolved system path. Activation refuses a previous system it cannot resolve.
     pub toplevel: Option<String>,
     pub generation: Option<u64>,
 }
 
-// --- lane 5C ---
-/// Why a record that was still open was put aside anyway.
-///
-/// Only an `inconsistent` record can get one of these, and only because a
-/// person typed a sentence. It travels INTO the archive rather than beside
-/// it: an archive that does not say why it exists is a file somebody finds
-/// in a year and cannot read.
+/// Audit record for explicitly retiring an inconsistent transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForcedRetirement {
-    /// What the operator typed. A whole sentence, because it is the only
-    /// account of a decision nothing else records.
+    /// Operator reason retained in the forced-retirement audit record.
     pub reason: String,
     /// The run that asked, where there was one.
     pub run_id: Option<String>,
@@ -208,7 +128,7 @@ pub struct ForcedRetirement {
     /// The state the record was in when it was put aside.
     pub was: TxnState,
 }
-// --- end lane 5C ---
+
 
 /// One transaction, on disk, on the target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -223,9 +143,7 @@ pub struct TxnRecord {
     pub desired: String,
     pub mode: Mode,
     pub started_at: DateTime<Utc>,
-    /// When the revert timer fires. Null when there is none — a
-    /// `--confirm-within 0` activation, which is the one an operator drives
-    /// by hand.
+    /// Rollback deadline; absent when `confirm_within` is zero.
     pub deadline: Option<DateTime<Utc>>,
     pub state: TxnState,
     /// Why it is in that state, for the two states that have a reason:
@@ -234,15 +152,10 @@ pub struct TxnRecord {
     /// When the state last moved. The record is the evidence, and evidence
     /// without a time on it is half of one.
     pub changed_at: DateTime<Utc>,
-    // --- lane 5C ---
-    /// Set only by `txn retire --force`, and only on a record the machine
-    /// could no longer say anything coherent about. Absent everywhere
-    /// else, which is why it is skipped rather than written as null: a
-    /// record this program wrote before this field existed has to keep
-    /// reading back.
+    /// Present only after forced retirement; omitted for compatibility with older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_by_force: Option<ForcedRetirement>,
-    // --- end lane 5C ---
+
 }
 
 impl TxnRecord {
@@ -257,15 +170,7 @@ impl TxnRecord {
         crate::manifest::parse_checked(text, origin, TXN_SCHEMA)
     }
 
-    /// Whether this transaction is still in flight: something was done and
-    /// nobody has said how it ended.
-    ///
-    /// Astra finding F07, 2026-09-23: a decision that began and did not
-    /// finish is the most open a transaction can be. `confirming` and
-    /// `reverting` are therefore counted here, which is what makes them
-    /// block the next plan, keep the record out of `txn retire` and show up
-    /// in `status --json` — a decision nobody can see is the thing this
-    /// state exists to stop.
+    /// States requiring recovery or a decision before another activation may begin.
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
@@ -277,7 +182,7 @@ impl TxnRecord {
         )
     }
 
-    /// The state in the spelling a sentence and a table use.
+    /// Serialized transaction-state name.
     pub fn state_word(&self) -> &'static str {
         self.state.as_str_lower()
     }
@@ -294,11 +199,7 @@ impl TxnRecord {
     }
 }
 
-/// A transaction id has to be a file name and nothing more.
-///
-/// `--txn ../../../etc/shadow` would otherwise be a path this program
-/// writes to as root. The allowed set is what a uuid, a run id and a
-/// hand-typed name need and no more.
+/// Restrict transaction IDs to filename-safe ASCII and a bounded length.
 fn check_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 128
@@ -315,7 +216,7 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-// --- Astra finding F07, 2026-09-23 -----------------------------------------
+
 
 /// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
 /// <time>`. `None` for anything this program did not write.
@@ -325,10 +226,7 @@ fn deciding_pid(held: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Whether that process is on this machine. The same question, and the same
-/// answer, as the operator's lock asks of its own holder: signal 0 is what
-/// `kill` answers without doing anything, and `EPERM` means it exists and
-/// belongs to somebody else, which is still "it exists".
+/// Check local process existence with signal 0; EPERM also means the process exists.
 fn is_running(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -342,14 +240,8 @@ fn is_running(pid: u32) -> bool {
     )
 }
 
-/// The refusal `deciding` gives when a process that is running holds the
-/// transaction: a confirm and a revert at once leave the machine on one
-/// system and the record saying the other.
-///
-/// A type and not a sentence, because one caller reads it differently from
-/// the rest: the deadline (Astra finding MD02, 2026-09-25) waits for the
-/// holder to finish rather than giving up, since the holder it finds is the
-/// activation whose deadline it is.
+/// A live process holds this transaction’s decision lock.
+/// The timer retries this typed error; operator requests fail immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeingDecided {
     pub id: String,
@@ -371,30 +263,18 @@ impl std::fmt::Display for BeingDecided {
 
 impl std::error::Error for BeingDecided {}
 
-/// Who asked for a revert.
-///
-/// Astra finding F07, 2026-09-23: the three differ in exactly one thing —
-/// what a record that says `confirming` means to them. Everything else a
-/// revert does is the same work for all three, so this is a word about the
-/// CALLER and not a mode of the operation.
+/// Caller policy for reverting a transaction in `confirming` state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevertAsker {
-    /// An operator at a console, `apply` taking a host back after a failed
-    /// check, or this program putting back an activation of its own that
-    /// did not finish. A confirmation in flight stops it, because the
-    /// machine is then carrying a decision somebody else began.
+    /// Ordinary rollback; refuses an unfinished confirmation.
     Operator,
-    /// The transient revert timer, firing because nobody spoke. A
-    /// confirmation in flight means somebody DID speak, and the deadline
-    /// then has nothing to say: the unit leaves the machine alone.
+    /// Deadline rollback; leaves an unfinished confirmation unchanged.
     Deadline,
-    /// An operator who has read the record and says this machine goes back
-    /// anyway (`revert --force --because "<why>"`). The only way out of a
-    /// `confirming` record that no confirmation will ever finish.
+    /// Explicit override of an unfinished confirmation; requires a reason.
     Force,
 }
 
-// --- end Astra finding F07 -------------------------------------------------
+
 
 /// The state of the machine, and the tools to change it.
 pub struct Helper<'a> {
@@ -407,18 +287,11 @@ pub struct Helper<'a> {
     /// The system profile. An argument so that a test can move one that is
     /// not this machine's.
     pub profile: PathBuf,
-    /// This program, as the revert timer will have to name it. Its own path
-    /// rather than `/run/current-system/sw/bin/meister-activate`: the timer
-    /// has to survive an activation that changes what that name points at,
-    /// and a store path is pinned by the generation that holds it.
+    /// Executable used by the rollback timer. A store path remains stable across activation.
     pub own_exe: PathBuf,
-    /// The `PATH` the revert timer's unit runs with. A value rather than a
-    /// read of this process's environment, so that a test can pin it and so
-    /// that this module reads no environment of its own.
+    /// PATH passed to the rollback timer; injected rather than read from the environment.
     pub timer_path: String,
-    /// Where this host's key material lives (`meisterstack.pki.dir`). An
-    /// argument for the same reason the profile is one: a test moves a
-    /// directory that is not this machine's.
+    /// Directory containing this host’s private keys and certificates.
     pub pki_dir: PathBuf,
 }
 
@@ -471,10 +344,7 @@ impl<'a> Helper<'a> {
         self.txn_dir().join(format!("{id}.json"))
     }
 
-    /// Where a retired record goes. Not `<id>.json`, because the read-only
-    /// probe of a host globs exactly that name to find what is open
-    /// ([`crate::observe::ProbeSpec::script`]) — an archive that answered
-    /// that glob would block every plan after a successful run.
+    /// Archive suffix excluded from the probe’s `*.json` transaction scan.
     pub fn txn_archive(&self, id: &str) -> PathBuf {
         self.txn_dir().join(format!("{id}.json.done"))
     }
@@ -491,22 +361,13 @@ impl<'a> Helper<'a> {
     // status
     // -----------------------------------------------------------------
 
-    /// What this machine is, in the contract lane 2A's probe merges.
-    ///
-    /// Every field is what could be read and null where it could not: a
-    /// helper that guessed a system path would be a helper that made a
-    /// rollout act on a guess.
+    /// Report readable host facts; unavailable values remain null.
     pub fn status(&self) -> Result<ActivateStatus> {
         Ok(ActivateStatus {
             schema: ACTIVATE_STATUS_SCHEMA.to_string(),
             current_system: self.resolve(Path::new(CURRENT_SYSTEM)),
             booted_system: self.resolve(Path::new(BOOTED_SYSTEM)),
-            // The system profile IS the next boot: `switch-to-configuration
-            // boot` installs the entry for the generation the profile points
-            // at, and a `--mode boot` activation sets the one-shot entry to
-            // that same generation. What happens the boot AFTER an
-            // unconfirmed one is the previous generation, and that is the
-            // transaction's business rather than this field's.
+            // The profile names the intended next system, not the fallback boot default.
             next_boot_system: self.resolve(&self.profile),
             generation: self.generation(),
             kernel_running: self.kernel_running(),
@@ -516,13 +377,8 @@ impl<'a> Helper<'a> {
         })
     }
 
-    /// Follow a chain of symbolic links to the thing at the end of it.
-    ///
-    /// `/run/current-system` is one link to a store path; the system profile
-    /// is a link to `system-42-link`, which is a link to a store path. Both
-    /// have to come out as the store path a release names. `None` for
-    /// anything that cannot be read, which on a host that has never been
-    /// deployed to is the normal answer.
+    /// Resolve up to eight symlink hops, including relative generation links.
+    /// Return None when the initial path cannot be read or the hop limit is reached.
     fn resolve(&self, path: &Path) -> Option<String> {
         let mut at = path.to_path_buf();
         let mut followed = 0;
@@ -538,12 +394,7 @@ impl<'a> Helper<'a> {
                 }
                 // A store path is a directory, which is where the chain ends.
                 Ok(_) => return Some(at.display().to_string()),
-                // A link that points at something that is not there: what the
-                // link SAYS is still the answer — a system whose closure has
-                // been collected is a fact worth reporting, and whether the
-                // path is valid is `stage`'s question, asked with the tool
-                // that can answer it. Only a path that was not even a link is
-                // nothing.
+                // Report a dangling link’s target; `stage` separately checks store validity.
                 Err(_) if followed > 0 => return Some(at.display().to_string()),
                 Err(_) => return None,
             }
@@ -570,18 +421,10 @@ impl<'a> Helper<'a> {
             .filter(|s| !s.is_empty())
     }
 
-    /// The three fields a release promises about a boot, read off the
-    /// generation that actually booted.
-    ///
-    /// All three or none: the planner compares them as a triple, and a
-    /// half-read triple would compare unequal and cost a reboot nobody
-    /// needed. `kernel-params` is hashed rather than carried, because the
-    /// command line can hold a token and a digest cannot.
+    /// Read the booted generation’s kernel, initrd and parameter digest as one tuple.
+    /// Return None if any field is unavailable; hash parameters to avoid exposing tokens.
     fn kernel_booted(&self) -> Option<BootedKernel> {
-        // Through the store path rather than through `/run/booted-system/…`:
-        // the three files are IN the generation, and naming them there is
-        // what makes the answer a fact about a generation rather than about
-        // a symlink that a later activation moves.
+        // Resolve the generation first so all three reads use the same store path.
         let booted = PathBuf::from(self.resolve(Path::new(BOOTED_SYSTEM))?);
         let kernel = self.resolve(&booted.join("kernel"))?;
         let initrd = self.resolve(&booted.join("initrd"))?;
@@ -597,13 +440,8 @@ impl<'a> Helper<'a> {
     // the transaction records
     // -----------------------------------------------------------------
 
-    /// Every record in the transaction directory, newest name last.
-    ///
-    /// A file that does not parse is not dropped: it becomes a record in
-    /// state `inconsistent`, because a half-written transaction record is
-    /// the single most important thing a resume can find — it means a
-    /// machine died while writing one, and guessing past it is how the wrong
-    /// generation gets confirmed.
+    /// Read system transaction JSON files. Malformed JSON becomes `inconsistent`;
+    /// files that cannot be read are currently skipped.
     pub fn records(&self) -> Result<Vec<TxnRecord>> {
         let mut out = Vec::new();
         for path in self.files.list_dir(&self.txn_dir())? {
@@ -613,16 +451,11 @@ impl<'a> Helper<'a> {
             let Some(id) = name.strip_suffix(".json") else {
                 continue;
             };
-            // --- lane 5A ---
-            // A key rotation lives in the same directory and is not a
-            // system transaction. Reading one here would turn it into an
-            // `inconsistent` record — and an inconsistent record blocks
-            // every plan for that host, for ever. `keys status` is what
-            // reads these.
+            // Key rotation records have their own schema and reader.
             if id.starts_with("keys-") {
                 continue;
             }
-            // --- end lane 5A ---
+
             let text = match self.files.read_to_string(&path) {
                 Ok(text) => text,
                 Err(_) => continue,
@@ -676,11 +509,7 @@ impl<'a> Helper<'a> {
         TxnRecord::from_json(&text, &path.display().to_string())
     }
 
-    /// Write a record so that it is on the disk when this returns.
-    ///
-    /// 0600 and root-owned by the directory it is in: the record says which
-    /// generation a machine will roll back to, and a file anybody could edit
-    /// would be a file anybody could use to choose that generation.
+    /// Atomically persist a mode-0600 record before dependent host changes.
     fn write_record(&self, record: &TxnRecord) -> Result<()> {
         self.files.create_dir_all(&self.txn_dir())?;
         self.files
@@ -691,25 +520,8 @@ impl<'a> Helper<'a> {
     // stage
     // -----------------------------------------------------------------
 
-    /// Is this system here, whole, and is it a system?
-    ///
-    /// `nix-store --check-validity` rather than the `nix path-info` the lane
-    /// brief names: it needs no experimental feature — a host whose
-    /// `nix-command` is off would refuse the `path-info` form for a reason
-    /// that has nothing to do with the question — and it is the question in
-    /// the store's own words.
-    ///
-    /// It answers for the closure and not only for the top of it, and that
-    /// is a property of the store rather than a flag on the command: nix
-    /// keeps referential integrity, so a path is registered as valid only
-    /// once everything it references is. (The first draft of this asked for
-    /// `--recursive`, which `nix-store` does not have; the VM test said so.)
-    /// What it does NOT do is re-hash the bytes: that was the `nix copy`'s
-    /// job, with `require-sigs = true` behind it (M0 probe S12), and doing
-    /// it again here would be the same check with the weaker tool.
-    ///
-    /// Writes nothing, and that is the point of the verb: a staged host is a
-    /// host whose running system has not been touched.
+    /// Check store registration and the NixOS switcher without activating the system.
+    /// `nix-store --check-validity` does not rehash closure contents or verify signatures.
     pub fn stage(&self, toplevel: &str) -> Result<()> {
         let cmd = Cmd::new(Effect::Read, "nix-store", SWITCH)
             .arg("--check-validity")
@@ -734,25 +546,10 @@ impl<'a> Helper<'a> {
     // activate
     // -----------------------------------------------------------------
 
-    /// Move this machine to a new system, having first written down where it
-    /// was and armed the way back.
-    ///
-    /// The order is the guarantee, and it is this:
-    ///
-    /// 1. refuse if somebody else holds the host or a transaction is open;
-    /// 2. read where the machine is now — the way back is a fact about this
-    ///    machine and not something the caller may assert;
-    /// 3. write the record, `fsync`ed;
-    /// 4. arm the revert timer (see the module documentation for why here
-    ///    and not at the end);
-    /// 5. move the profile and run `switch-to-configuration`;
-    /// 6. in boot mode, point the one-shot entry at the new generation and
-    ///    leave the DEFAULT on the old one — which is what makes an
-    ///    unconfirmed boot a boot that happens once.
-    ///
-    /// Anything that fails from step 5 on disarms the timer and marks the
-    /// record `reverted` with the reason, because a machine that was not
-    /// moved must not be left with a timer that will move it back.
+    /// Record the previous system and arm rollback before moving the profile.
+    /// The transaction’s decision lock covers the forward path. Failed or overdue
+    /// activation attempts rollback; failed rollback leaves an inconsistent record.
+    /// Boot mode retains the previous default and selects the new generation once.
     #[allow(clippy::too_many_arguments)]
     pub fn activate(
         &self,
@@ -786,9 +583,7 @@ impl<'a> Helper<'a> {
                 self.profile.display()
             );
         }
-        // Boot mode is only a mode where there is a boot menu to put an
-        // entry in. Refused BEFORE anything is written, because the whole
-        // point of the mode is the way back (D5's documented limit).
+        // Boot fallback requires systemd-boot and a known previous generation.
         if mode == Mode::Boot {
             self.require_systemd_boot()?;
             if previous.generation.is_none() {
@@ -817,29 +612,15 @@ impl<'a> Helper<'a> {
             changed_at: now,
             retired_by_force: None,
         };
-        // Astra finding MD02, 2026-09-25: from the record to the end of the
-        // forward path this process holds the transaction's decision lock,
-        // the one `confirm` and `revert` take. Without it the deadline could
-        // fire in the middle of a long switch — a switch may take up to
-        // `SWITCH`, a confirmation is expected within
-        // `plan::CONFIRM_WITHIN_SWITCH_SECS`, and the second is the shorter
-        // — take the profile back, write `reverted`, and watch the forward
-        // path, which never looked at the record again, run the new
-        // generation's switcher on top of that. The timer that finds this
-        // lock waits for it (`revert`), and the forward path itself decides
-        // what a deadline that passed meanwhile means: it takes the machine
-        // back before it returns, so that nothing is left on a system
-        // nobody could have confirmed in time.
+        // Hold the decision lock through activation so the timer cannot revert mid-switch.
+        // If activation outlasts its deadline, this process performs the rollback.
         self.deciding(id, "activate", || {
             self.write_record(&record)?;
 
             if deadline.is_some()
                 && let Err(e) = self.arm_timer(id, confirm_within)
             {
-                // Nothing has been touched, so the transaction is closed
-                // rather than left pending for a timer that does not exist.
-                // `reverted` is the state for "the machine is on
-                // `previous`", and never having left it is a case of that.
+                // No profile change occurred; close the record because no timer was armed.
                 record.state = TxnState::Reverted;
                 record.changed_at = self.clock.now();
                 record.reason = Some(format!("{e:#}"));
@@ -857,10 +638,7 @@ impl<'a> Helper<'a> {
                     let Some(passed) = deadline.filter(|d| self.clock.now() >= *d) else {
                         return Ok(record);
                     };
-                    // The switch outlasted the window in which anybody
-                    // could have confirmed it. The timer may be waiting
-                    // outside this lock or may have given up; either way
-                    // the answer is the one it would give, given here.
+                    // The switch exceeded its confirmation window; roll back while holding the lock.
                     let because = format!(
                         "the activation itself took until {} and the deadline for confirming \
                          it was {}: nobody could have confirmed it in time",
@@ -883,14 +661,8 @@ impl<'a> Helper<'a> {
                     }
                 }
                 Err(e) => {
-                    // The machine may be half way: the profile can have
-                    // moved and the switch failed after it. So it is put
-                    // BACK here rather than left to a timer that may not
-                    // have been armed — and if that fails too, the record
-                    // says `inconsistent`, which is what makes a resume
-                    // stop and ask for a person
-                    // ([`crate::receipt::next_step`]). `revert_held` and not
-                    // `revert`: this process holds the decision already.
+                    // A failed switch may have moved the profile. Restore it under the same lock;
+                    // failed recovery leaves an inconsistent record for operator review.
                     let because = format!("the activation itself failed: {e:#}");
                     match self.revert_held(id, Some(&because), RevertAsker::Operator) {
                         Ok(_) => Err(e.context(format!("{id} was taken back to {previous_name}"))),
@@ -936,12 +708,8 @@ impl<'a> Helper<'a> {
             let previous = record.previous.generation.ok_or_else(|| {
                 anyhow::anyhow!("this transaction records no previous generation.")
             })?;
-            // The default goes BACK to the old generation and the new one is
-            // tried once. `switch-to-configuration boot` has just written
-            // loader.conf with the new generation as the default, and leaving
-            // it there would mean an unconfirmed boot loop into a system
-            // nobody could reach. The EFI variable wins over loader.conf,
-            // which is what makes this one command enough.
+            // Override the new loader default with the previous generation, then select
+            // the new entry for one boot only.
             self.runner.run(
                 &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
                     .arg("set-default")
@@ -956,7 +724,7 @@ impl<'a> Helper<'a> {
         Ok(())
     }
 
-    /// systemd-boot, or a sentence that says what a grub host can have.
+    /// Require systemd-boot for boot-mode activation.
     fn require_systemd_boot(&self) -> Result<()> {
         let cmd = Cmd::new(Effect::Read, "bootctl", QUICK)
             .arg("is-installed")
@@ -978,23 +746,13 @@ impl<'a> Helper<'a> {
         );
     }
 
-    /// The transient unit that reverts this transaction when nobody speaks.
-    ///
-    /// `systemd-run --on-active` and not a timer file: a unit file would be
-    /// part of some generation, and this has to belong to neither the old nor
-    /// the new one — that is precisely why it survives
-    /// `switch-to-configuration`, which stops and starts the units the two
-    /// generations declare and knows nothing about this one.
-    ///
-    /// It does not survive a reboot, and that is the documented limit of the
-    /// switch mode's safety net: in boot mode the net is the boot entry.
+    /// Arm a transient rollback timer independent of declared generation units.
+    /// It survives activation, but not reboot; boot mode also configures a fallback entry.
     fn arm_timer(&self, id: &str, seconds: u64) -> Result<()> {
         let cmd = Cmd::new(Effect::TargetWrite, "systemd-run", QUICK)
             .arg(format!("--on-active={seconds}"))
             .arg(format!("--unit={}", timer_unit(id)))
-            // So that the transient unit disappears once it has run: a
-            // failed unit that stays loaded is a unit the next activation of
-            // the same id cannot create.
+            // Unload completed units so the transaction ID can be reused.
             .arg("--collect")
             .arg(format!(
                 "--description=meister-deploy reverts the transaction {id} unless it is \
@@ -1011,11 +769,7 @@ impl<'a> Helper<'a> {
             .arg(self.deploy_dir.display().to_string())
             .arg("--profile")
             .arg(self.profile.display().to_string())
-            // Astra finding F07, 2026-09-23: this revert is the DEADLINE,
-            // and the deadline is the one caller that reads a `confirming`
-            // record as "somebody spoke after all". An operator's revert
-            // carries no such word and is stopped by that record instead
-            // ([`RevertAsker`]).
+            // Timer rollback leaves a persisted `confirming` decision unchanged.
             .arg("--by-timer")
             .arg("--because")
             .arg("nobody confirmed this activation before its deadline");
@@ -1028,12 +782,8 @@ impl<'a> Helper<'a> {
         Ok(())
     }
 
-    /// Stop the timer, and be sure it is stopped.
-    ///
-    /// Two commands, because `systemctl stop` of a unit that is already gone
-    /// exits non-zero and that is not a failure — while a timer that is
-    /// still armed after a confirm IS one, and would revert a machine
-    /// somebody has just accepted.
+    /// Stop the timer and reject a subsequent active/activating state.
+    /// A missing timer is acceptable.
     fn stop_timer(&self, id: &str) -> Result<()> {
         let unit = timer_unit(id);
         let stop = Cmd::new(Effect::TargetWrite, "systemctl", QUICK)
@@ -1061,37 +811,15 @@ impl<'a> Helper<'a> {
     // confirm and revert
     // -----------------------------------------------------------------
 
-    /// Hold one transaction for the length of one decision.
-    ///
-    /// Astra finding F07, 2026-09-23: `confirm` and `revert` were both a
-    /// read, a look at the state, work on the machine and a write, with
-    /// nothing between them. The two arrive from different directions —
-    /// an operator (or `apply`) over ssh, and the transient revert timer on
-    /// the host itself — and they meet exactly at the deadline, which is
-    /// the moment this whole mechanism exists for. Interleaved, both read
-    /// `pending`, the revert puts the old system back and the confirm then
-    /// writes `confirmed`: the machine runs one system and its record says
-    /// the other, which is the one thing no resume can recover from.
-    ///
-    /// `O_EXCL` on a file beside the record, for the same reason the host
-    /// lock uses it and in the same directory — `records()` reads only
-    /// `<id>.json`, so this name is invisible to every reader. A holder
-    /// whose process is gone is not a holder: a machine that lost power
-    /// while deciding must not be a machine whose timer can never fire
-    /// again.
+    /// Serialize decisions for one transaction with an exclusive-create lock file.
+    /// A dead local holder can be reclaimed; malformed lock contents require review.
     fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let path = self.txn_dir().join(format!("{id}.deciding"));
         self.files.create_dir_all(&self.txn_dir())?;
         let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
         self.hold_decision(id, &path, &mine)?;
         let out = f();
-        // Given back whatever happened: a decision that failed is a
-        // decision somebody has to be able to make again.
-        //
-        // Astra finding MD03, 2026-09-25: given back only while it is still
-        // this process's. The name alone is not ownership — a holder whose
-        // process died is succeeded by the next decider (`hold_decision`),
-        // and a remove by name here would have removed THAT one's lock.
+        // Release only a lock whose contents still match this process’s claim.
         match self.files.read_if_present(&path) {
             Ok(Some(held)) if held == mine => {
                 if let Err(e) = self.files.remove_file(&path) {
@@ -1109,27 +837,11 @@ impl<'a> Helper<'a> {
         out
     }
 
-    /// Take `<id>.deciding` for this process, or say who has it.
-    ///
-    /// Astra finding MD03, 2026-09-25. Two things were wrong with the take:
-    /// a record nobody could read was treated as nobody's, and a stale one
-    /// was succeeded by a remove and a create — three steps two deciders
-    /// could both take, the loser's remove taking away the winner's fresh
-    /// lock. Now an unreadable record is a refusal (a file in this place
-    /// that this program did not write is the operator's to look at), and
-    /// the succession is a rename, which exactly one of two deciders can
-    /// succeed at; what was carried away is read once more, because between
-    /// the read and the rename the dead holder may have been succeeded by a
-    /// live one, and that one goes back with `create_new`, which cannot
-    /// overwrite.
-    ///
-    /// No exception for this process's own pid: nothing here decides one
-    /// transaction inside another, so a holder that is running is a holder
-    /// whatever its number is.
+    /// Acquire `<id>.deciding`; reclaim a dead holder by renaming its record.
+    /// Recheck the claimed record and restore a live holder without overwriting a new lock.
+    /// A live PID, including this process’s PID, prevents acquisition.
     fn hold_decision(&self, id: &str, path: &Path, mine: &str) -> Result<()> {
-        // A few tries, not a loop: a name that vanishes between the failed
-        // create and the read is a holder that finished, and the create is
-        // simply asked again. A name that keeps changing hands is reported.
+        // Retry boundedly if the holder disappears between create and read.
         for _ in 0..4 {
             let Err(e) = self.files.create_new(path, mine.as_bytes(), 0o600) else {
                 return Ok(());
@@ -1154,14 +866,11 @@ impl<'a> Helper<'a> {
                     held.trim()
                 ),
             }
-            // A holder whose process is gone is not a holder: a machine
-            // that lost power while deciding must not be a machine whose
-            // timer can never fire again. The succession is the rename.
+            // Claim the stale record before attempting a fresh exclusive create.
             let claim =
                 path.with_file_name(format!("{id}.deciding.taken-by-{}", std::process::id()));
             if self.files.rename(path, &claim).is_err() {
-                // Somebody else carried it away first; from the top, where
-                // that somebody's fresh lock is found with a running pid.
+                // Retry from the start if another contender reclaimed the stale record.
                 continue;
             }
             let carried = self.files.read_to_string(&claim).unwrap_or_default();
@@ -1213,12 +922,7 @@ impl<'a> Helper<'a> {
                  is not confirmed afterwards; plan again.",
                 record.reason.as_deref().unwrap_or("no reason recorded")
             ),
-            // Astra finding F07, 2026-09-23: a revert that wrote its intent
-            // and did not finish may have moved the profile back already,
-            // and no reader of this record can tell how far it got. A
-            // confirmation on top of it would be this program asserting the
-            // new system on a machine that may be running the old one —
-            // exactly the lie the two in-flight states exist to prevent.
+            // An interrupted rollback may already have moved the profile; finish it before confirming.
             TxnState::Reverting => bail!(
                 "a revert of {id} began at {} and did not finish, so this record cannot say \
                  which system this machine is on and nothing here will confirm one. Finish \
@@ -1230,22 +934,10 @@ impl<'a> Helper<'a> {
                 "the record of {id} does not say a coherent thing, so there is nothing here \
                  to confirm. Read it with `meister-activate txn show --txn {id}`."
             ),
-            // `confirming` is a confirmation this program began and did not
-            // finish, and finishing it is the whole of what this verb does.
-            // It needs no separate repair path: the work below is the same
-            // work, and all of it may be done twice — `stop_timer` tolerates
-            // a unit that is already gone, `bootctl set-default` names the
-            // generation that is already the default, and the record is
-            // written whole.
+            // Retrying an unfinished confirmation repeats the same timer and boot-menu operations.
             TxnState::Staged | TxnState::Pending | TxnState::Confirming => {}
         }
-        // Astra finding F07, 2026-09-23: the intent is on the disk BEFORE
-        // the timer is stopped. A process that died between the stop and
-        // the `confirmed` below used to leave a record saying `pending`
-        // beside a revert timer that no longer existed: the host ran the new
-        // system with no way back, and nothing on it said that a decision
-        // had been in flight. `confirming` is that sentence, it is fsynced,
-        // and it is what `confirm` and a resume come back to.
+        // Persist confirmation intent before stopping the timer so a crash remains recoverable.
         if record.state != TxnState::Confirming {
             record.state = TxnState::Confirming;
             record.changed_at = self.clock.now();
@@ -1255,10 +947,7 @@ impl<'a> Helper<'a> {
             self.stop_timer(id)?;
         }
         if record.mode == Mode::Boot {
-            // The one-shot has been consumed by the boot that got us here;
-            // what is left is the default, which still points at the old
-            // generation. Making the new one the default is the whole
-            // content of "confirmed" in boot mode.
+            // After the intended boot, make the selected profile generation the default.
             let generation = self.generation().ok_or_else(|| {
                 anyhow::anyhow!(
                     "the system profile does not name a generation, so the boot entry to \
@@ -1278,19 +967,10 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// Take it back. Called by an operator, by `apply` when a check fails,
-    /// and by the timer when nobody says anything at all.
-    ///
-    /// Who asks decides one thing and only one: what a record that says
-    /// `confirming` means ([`RevertAsker`]).
+    /// Restore the previous system; caller policy governs unfinished confirmations.
     pub fn revert(&self, id: &str, because: Option<&str>, asked: RevertAsker) -> Result<TxnRecord> {
         check_id(id)?;
-        // Astra finding MD02, 2026-09-25: the deadline waits for a decision
-        // that is being made. The holder it finds is the activation whose
-        // deadline it is (or a confirm, which then decides), and a one-shot
-        // timer that fails on "busy" is a deadline that never fires — the
-        // machine would stay on a system nobody confirmed. An operator and
-        // `apply` are refused at once, as before: they can ask again.
+        // A one-shot deadline waits for an active decision; ordinary callers may retry later.
         let started = self.clock.now();
         loop {
             match self.deciding(id, "revert", || self.revert_held(id, because, asked)) {
@@ -1332,20 +1012,9 @@ impl<'a> Helper<'a> {
             // Idempotent on purpose: the timer and an operator can both
             // arrive here, and the second one must not fail a rollout.
             TxnState::Reverted => return Ok(record),
-            // Astra finding F07, 2026-09-23: a confirmation was in flight.
-            // The record was written before the timer was told to stop, so
-            // whoever wrote it had decided to keep this system — and the
-            // three callers of a revert read that differently.
+            // The durable confirmation intent distinguishes an interrupted decision from silence.
             TxnState::Confirming => match asked {
-                // The deadline says "nobody spoke". Somebody did, and the
-                // record is the evidence, so this unit takes nothing back
-                // and changes nothing: not the profile, not the boot menu,
-                // not the record. The decision is finished by `confirm`,
-                // which a resume calls and an operator can call by hand —
-                // and until then the record is open, so no plan starts over
-                // on top of it. Ok rather than an error, because a
-                // transient unit that fails is noise about a machine that
-                // is doing exactly the right thing.
+                // Confirmation was requested; leave recovery to a repeated confirm or explicit force.
                 RevertAsker::Deadline => return Ok(record),
                 RevertAsker::Operator => bail!(
                     "a confirmation of {id} was in flight since {} and this revert did \
@@ -1358,16 +1027,11 @@ impl<'a> Helper<'a> {
                 ),
                 RevertAsker::Force => {}
             },
-            // `reverting` is a way back that began and did not finish, and
-            // the way back is the one thing in this program that may simply
-            // be done again: the same profile, the same switch, the same
-            // boot entries.
+            // Retry interrupted rollback with the same profile and switcher.
             TxnState::Staged | TxnState::Pending | TxnState::Reverting | TxnState::Inconsistent => {
             }
         }
-        // Astra finding F07, 2026-09-23: a force overrules a decision
-        // somebody else began, and the record is the only account of that
-        // there will ever be — the same rule `txn retire --force` follows.
+        // Forced reversal must retain the operator’s reason.
         if asked == RevertAsker::Force && because.map(str::trim).unwrap_or_default().is_empty() {
             bail!(
                 "`revert --force` needs `--because <sentence>`: it takes a machine back over \
@@ -1382,14 +1046,7 @@ impl<'a> Helper<'a> {
             )
         })?;
 
-        // Astra finding F07, 2026-09-23: the intent first, and before the
-        // timer as much as before the profile. A revert that died after
-        // `nix-env --set` used to leave a record saying `pending` on a
-        // machine that was already back on its previous system — and the
-        // next `confirm` would have written `confirmed` over it, which is
-        // the record claiming the one system while the machine runs the
-        // other. The reason goes down with it: a record of a decision
-        // nobody finished is worth much less without the why.
+        // Persist rollback intent and reason before changing the timer or profile.
         if record.state != TxnState::Reverting {
             record.state = TxnState::Reverting;
             record.changed_at = self.clock.now();
@@ -1413,9 +1070,7 @@ impl<'a> Helper<'a> {
                 .arg(record.mode.switch_argument()),
         )?;
         if record.mode == Mode::Boot {
-            // Clear the one-shot — the machine has not rebooted yet, so the
-            // entry that was to be tried once must not be tried at all — and
-            // put the default back where it was.
+            // Clear any unconsumed one-shot entry and restore the previous default.
             self.runner.run(
                 &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
                     .arg("set-oneshot")
@@ -1437,42 +1092,14 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// The run that owns a record says it is done with it.
-    ///
-    /// This is what makes "an open transaction" mean "a run that was
-    /// interrupted" rather than "a host that has ever been deployed to". The
-    /// archive lands before the record goes, so a crash in between leaves
-    /// both — and both-present is read as still open, which is the
-    /// conservative half of the two.
+    /// Archive a finished transaction before removing its live record.
+    /// An interrupted archive leaves the live file available to readers.
     pub fn retire(&self, id: &str, run_id: Option<&str>) -> Result<TxnRecord> {
         self.retire_inner(id, run_id, None)
     }
 
-    // --- lane 5C ---
-    /// Put an `inconsistent` record aside because a person says so.
-    ///
-    /// There was no way back out of `inconsistent` (L2 finding N13). The
-    /// record refuses to retire, because a record is the only thing that
-    /// says a machine may still have to go back; `apply --resume` refuses
-    /// too, because the run it was continuing is not the plan in front of
-    /// the operator any more. What the lab did was move the file by hand
-    /// into /root — a defensible decision, and no way for a tool to leave
-    /// it.
-    ///
-    /// Three things make this narrow rather than a `--force` that means
-    /// "stop complaining":
-    ///
-    /// * Only `inconsistent`. A `staged` or `pending` record says exactly
-    ///   what the machine may still do, and taking it away is taking away
-    ///   the rollback. Those two are still refused, by name.
-    /// * A reason, as a sentence, and the command refuses an empty one.
-    /// * The archive says it was forced, who asked, when, and out of which
-    ///   state ([`ForcedRetirement`]). The file is the record of the
-    ///   decision.
-    ///
-    /// The machine itself is not touched: no profile is moved, no unit is
-    /// started. What this does is stop a dead record from blocking the
-    /// next plan.
+    /// Archive an inconsistent transaction with an explicit reason and audit fields.
+    /// Other open states remain protected. This changes records only, not the host system.
     pub fn retire_forced(&self, id: &str, run_id: Option<&str>, reason: &str) -> Result<TxnRecord> {
         self.retire_inner(id, run_id, Some(reason))
     }
@@ -1485,14 +1112,7 @@ impl<'a> Helper<'a> {
     ) -> Result<TxnRecord> {
         let mut record = match self.record(id) {
             Ok(record) => record,
-            // Astra finding F06, 2026-09-23: a retire that has already
-            // happened is the outcome this asks for. A resume now repeats
-            // the `unlock` step of a host whose run stopped after the
-            // confirm, and that step retires a record the interrupted run
-            // may already have archived — which used to fail the whole
-            // resume with "there is no transaction on this host". The
-            // archive is the proof that it happened, and it is handed back
-            // unchanged.
+            // An existing archive makes repeated retirement idempotent.
             Err(e) => {
                 let archive = self.txn_archive(id);
                 if !self.files.exists(&archive) {
@@ -1553,7 +1173,7 @@ impl<'a> Helper<'a> {
                 ),
             }
         }
-        // --- end lane 5C ---
+
         self.files
             .write_atomic(&self.txn_archive(id), &record.to_json()?, 0o600)?;
         self.files.remove_file(&self.txn_path(id))?;
@@ -1564,11 +1184,7 @@ impl<'a> Helper<'a> {
     // the lock
     // -----------------------------------------------------------------
 
-    /// Who holds this host, or nobody.
-    ///
-    /// A file at the lock path that this program did not write is `None`
-    /// here and is never overwritten: it might be somebody's lock in a
-    /// spelling this version does not know.
+    /// Read the host lock; malformed JSON currently returns None without removing the file.
     pub fn read_lock(&self) -> Result<Option<Lock>> {
         let path = self.lock_path();
         if !self.files.exists(&path) {
@@ -1578,14 +1194,7 @@ impl<'a> Helper<'a> {
         Ok(serde_json::from_str::<Lock>(&text).ok())
     }
 
-    /// Take the host, or say who has it.
-    ///
-    /// `O_EXCL` on `lock/owner.json` and not `mkdir lock/`, which is what
-    /// the lane brief says: the directory is created by the tmpfiles rules of
-    /// nix/managed.nix before anything runs, so a `mkdir` of it could never
-    /// be the thing two runs race for. An exclusive create of the file
-    /// inside it is that thing, and it is the same file the read-only probe
-    /// already reads.
+    /// Acquire `lock/owner.json` using exclusive create. The containing directory may preexist.
     pub fn lock_acquire(&self, run_id: &str, operator: &str, pid: u32) -> Result<Lock> {
         let record = Lock {
             run_id: run_id.to_string(),
@@ -1599,21 +1208,8 @@ impl<'a> Helper<'a> {
         match self.files.create_new(&self.lock_path(), &bytes, 0o600) {
             Ok(()) => Ok(record),
             Err(e) => match self.read_lock()? {
-                // The same run asking twice is asking whether it may act,
-                // and the answer is yes.
-                //
-                // Astra finding F04, 2026-09-23: the run id alone was the
-                // whole question, so two operator processes carrying one run
-                // both got a yes here. This host cannot judge a pid — the
-                // number in the record is a process on a WORKSTATION and
-                // `kill(0)` here would ask about a stranger — so what it can
-                // ask is who is carrying the run, and it does. The other
-                // half of the door is `state::acquire_lock`, which refuses a
-                // second live process of one run on the workstation itself;
-                // the two together are what makes one run one writer. A pid
-                // that differs and an operator that does not is a resume
-                // after a kill, and that is the flow this shortcut exists
-                // for.
+                // The same run and operator may resume with a new workstation PID.
+                // Workstation locking supplies process exclusion; the target cannot validate that PID.
                 Some(held) if held.run_id == run_id && held.operator == operator => Ok(held),
                 Some(held) if held.run_id == run_id => bail!(
                     "this host is held by the run {} as it is carried by {}, and this is {}. \
@@ -1662,16 +1258,8 @@ impl<'a> Helper<'a> {
         }
     }
 
-    /// Take a named run's lock, deliberately. The id has to match what is
-    /// there, so that a takeover cannot take over a run that started while
-    /// somebody was reading the refusal.
-    ///
-    /// Astra finding F04, 2026-09-23: read, remove, create is three steps,
-    /// and two takeovers that both read the old owner went through all
-    /// three — the loser's `remove_file` taking away the winner's fresh
-    /// lock. The claim is a rename to a name of the taker's own, exactly as
-    /// in `state::take_over_lock`: a rename of a file that is gone fails, so
-    /// of two takers exactly one carries the record away.
+    /// Claim the named run’s lock by rename, then acquire a fresh lock.
+    /// Restore a mismatched claim with exclusive create to avoid overwriting another holder.
     pub fn lock_take_over(
         &self,
         of_run: &str,
@@ -1683,26 +1271,13 @@ impl<'a> Helper<'a> {
         if !self.files.exists(&path) {
             return self.lock_acquire(run_id, operator, pid);
         }
-        // --- lane 5C ---
-        // The taking run already has it, so there is nothing to take and the
-        // answer is yes — the same answer `lock_acquire` gives a run that
-        // asks twice. Asked BEFORE the claim below, because a run that
-        // already holds the host must not carry its own lock away.
-        //
-        // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>` on
-        // a host the abandoned run had never locked. The fleet anchor (D6)
-        // reaches every control-plane host FIRST, finds no lock, and the
-        // takeover falls through to an acquire — so by the time the plan's
-        // own `lock` step runs on that same host, it is held by the NEW run,
-        // and the helper answered "this host is held by the run <new>, not
-        // by <old>. Nothing was taken over." The run took over from itself
-        // and the rollout stopped.
+        // A takeover may reach the same host through the fleet anchor and its own plan step.
         if let Some(held) = self.read_lock()?
             && held.run_id == run_id
         {
             return Ok(held);
         }
-        // --- end lane 5C ---
+
         let claim = path.with_file_name(format!("owner.taken-by-{run_id}.json"));
         self.files.rename(&path, &claim).with_context(|| {
             format!(
@@ -1717,9 +1292,7 @@ impl<'a> Helper<'a> {
                 self.files.remove_file(&claim)?;
                 self.lock_acquire(run_id, operator, pid)
             }
-            // Not the run that was named, so it goes back exactly as it was.
-            // `create_new` and not `write_atomic`: it refuses to overwrite,
-            // so a lock somebody took in this window is not lost either.
+            // Restore a mismatched claim without replacing a lock acquired in the meantime.
             other => {
                 let restored = self.files.create_new(&path, &bytes, 0o600);
                 let whose = match &other {
@@ -1743,7 +1316,7 @@ impl<'a> Helper<'a> {
         }
     }
 
-    /// Refuse to touch a host somebody else holds.
+    /// Reject host operations owned by a different run.
     fn refuse_if_held(&self, run_id: Option<&str>) -> Result<()> {
         match self.read_lock()? {
             None => Ok(()),
@@ -1763,19 +1336,9 @@ impl<'a> Helper<'a> {
     // gc
     // -----------------------------------------------------------------
 
-    /// Keep the running system, the booted one, and the newest N besides
-    /// them; collect what nothing points at any more.
-    ///
-    /// Refuses while a transaction is open, and that is the whole safety of
-    /// the verb: the generation an unconfirmed activation would roll back to
-    /// is a generation that must not be collected, and no amount of
-    /// arithmetic here is worth more than asking the operator to finish what
-    /// they started.
-    ///
-    /// `nix-collect-garbage` without `-d`: deleting old generations of EVERY
-    /// profile on the machine — including a user's — is not this program's
-    /// business, and the generations it is about have just been named
-    /// explicitly.
+    /// Keep the profile generation, a matching booted generation and the newest N others.
+    /// Refuse while a readable transaction is open, then delete selected generations and
+    /// run garbage collection without `-d`, preserving other profiles’ generations.
     pub fn gc(&self, keep: usize) -> Result<GcOutcome> {
         if let Some(open) = self.records()?.iter().find(|r| r.is_open()) {
             bail!(
@@ -1796,9 +1359,7 @@ impl<'a> Helper<'a> {
         let mut keep_set: Vec<u64> = Vec::new();
         keep_set.extend(current);
         keep_set.extend(booted_generation);
-        // The newest N below the current one, so that "keep 3" is three
-        // generations somebody can go back to and not three including the
-        // one that is running.
+        // Retain N additional generations, excluding the profile and booted generations.
         let mut older: Vec<u64> = generations
             .iter()
             .map(|g| g.number)
@@ -1874,38 +1435,15 @@ impl<'a> Helper<'a> {
         Ok(parse_generations(&out.stdout))
     }
 
-    // -----------------------------------------------------------------
-    // keygen (lane 3B)
-    // -----------------------------------------------------------------
+    // Key generation.
 
-    /// Make this host's own key, and hand out a request over it.
-    ///
-    /// **The private half is made here and stays here.** That is the whole
-    /// of D10 and the reason this is a command of the TARGET's helper
-    /// rather than a verb of the workstation: a workstation that generated
-    /// node keys would be a workstation holding every identity of the
-    /// fleet, and its backup would be the fleet.
-    ///
-    /// Idempotent on purpose. A rollout can be interrupted between the
-    /// `ssh` that started this and the answer coming back, and the operator
-    /// will run it again. Without `--replace` an existing key is LEFT
-    /// ALONE and only a new request is made over it — because a second key
-    /// would be a second identity, and the certificate that was issued over
-    /// the first one would then be a certificate for a key nobody has.
-    ///
-    /// `--replace` is what a rotation is made of (M5A) and what a
-    /// reinstalled host needs; it is a flag rather than the default for the
-    /// same reason.
+    /// Generate a host-local private key and return its CSR and public-key digest.
+    /// Reuse an existing key unless replacement is explicit, so retries preserve identity.
     pub fn keygen(&self, subject: &str, kind: KeyKind, replace: bool) -> Result<KeygenOutcome> {
         self.keygen_into(subject, kind, replace, None)
     }
 
-    /// The same, beside the key that is in use rather than over it.
-    ///
-    /// `suffix = Some("next")` writes `<kind>.key.next`, which is how a
-    /// rotation begins (lane 5A): the new key lives next to the old one
-    /// until somebody has a certificate for it, and nothing that is running
-    /// notices it is there.
+    /// Generate or reuse a suffixed key, such as `.key.next`, beside the active key.
     pub fn keygen_into(
         &self,
         subject: &str,
@@ -1931,21 +1469,12 @@ impl<'a> Helper<'a> {
         } else {
             let made = pki::generate_key_and_csr(subject)
                 .map_err(|e| anyhow::anyhow!("making a key pair for {subject}: {e}"))?;
-            // 0600 from the start, never chmod'ed onto an existing file:
-            // `Files::write_atomic` opens the temporary with the mode and
-            // renames it into place, so there is no moment in which this
-            // file is readable by anybody but its owner. That is exactly
-            // what `pki::pem::write_secret` does, and it goes through this
-            // crate's file door instead so that `--dry-run` refuses it and
-            // a unit test can watch it (tests/no_direct_effects.rs).
+            // Create the key atomically with mode 0600; Files enforces dry-run policy.
             self.files
                 .create_dir_all(path.parent().unwrap_or_else(|| Path::new(DEFAULT_PKI_DIR)))?;
             self.files
                 .write_atomic(&path, made.key_pem.as_bytes(), 0o600)?;
-            // And the owner is the user that reads it. Root wrote it, so
-            // the file was never readable by anybody else in between.
-            // `chown` through the runner because there is no door for it —
-            // a file's owner is not something `Files` knows about.
+            // Assign the root-created key to its reader through the command runner.
             self.runner.run(
                 &Cmd::new(Effect::Key, "chown", QUICK)
                     .arg(format!("{KEY_OWNER}:{KEY_OWNER}"))
@@ -1954,9 +1483,7 @@ impl<'a> Helper<'a> {
             (made.key_pem, true)
         };
 
-        // The request is made over the key either way: a fresh key and an
-        // existing one are asked the same question, which is what makes a
-        // second run of this command an answer rather than a change.
+        // Generate the CSR from either the reused or newly created key.
         let csr_pem = pki::csr_for_key(&key_pem, subject)
             .map_err(|e| anyhow::anyhow!("making a certificate request for {subject}: {e}"))?;
         let public_key_sha256 = pki::public_key_sha256(&key_pem)
@@ -1976,7 +1503,7 @@ impl<'a> Helper<'a> {
         self.pki_dir.join(format!("{}.key", kind.as_str()))
     }
 
-    // --- lane 5A: a key beside the one in use ---------------------------
+
 
     /// `<pki.dir>/<kind>.key`, `.key.next` or `.key.prev`.
     pub fn key_path_with(&self, kind: KeyKind, suffix: Option<&str>) -> PathBuf {
@@ -1998,27 +1525,9 @@ impl<'a> Helper<'a> {
         self.txn_dir().join(format!("keys-{}.json", kind.as_str()))
     }
 
-    /// Where a rotation of this key has got to.
-    ///
-    /// The FILES are the truth and the record is the story. A machine that
-    /// lost power between the rename and the record would otherwise be a
-    /// machine whose record says one thing and whose disk says another, and
-    /// the resume would believe the record — so the state is derived from
-    /// what is on the disk, and the record is what says whose rotation it
-    /// was and why it ended. The two states the files cannot show
-    /// (`confirmed`, `reverted`) are the record's alone.
-    ///
-    /// Astra finding F08, 2026-09-23: the switch is FOUR renames, and this
-    /// read the presence of any `.prev` as "switched" — so all three of the
-    /// half-switched shapes a crash leaves behind were read as the finished
-    /// one. The resume then skipped to `verify`, the verify found the wrong
-    /// certificate (or none), and `keys revert` refused because it needs
-    /// BOTH `.prev` files: the host was left without an active certificate
-    /// and in `recovery-required`, with no way for this tool to finish what
-    /// it started. So the four files are read as four, and only the one
-    /// tuple that is a finished switch is `switched`. Every other shape with
-    /// a `.prev` in it is `inconsistent`, which sends the resume to a person
-    /// instead of to a verify it cannot undo.
+    /// Infer rotation progress from `.next` and `.prev` files. Completed/reverted records
+    /// resolve the state only when no temporary pairs remain. Partial file layouts become
+    /// inconsistent; the four switch renames are not an atomic pair replacement.
     pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
         let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
         let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
@@ -2069,10 +1578,7 @@ impl<'a> Helper<'a> {
                 )),
             ),
             (false, false, false, false) => (finished.unwrap_or(KeysState::None), None),
-            // A switch that stopped between two of its renames. Which files
-            // are there says where it stopped, and that is what a person
-            // needs; this tool will not finish a switch it can only see half
-            // of, and it will not call one done either.
+            // Other layouts containing `.prev` indicate an interrupted switch requiring inspection.
             _ => (
                 KeysState::Inconsistent,
                 Some(format!(
@@ -2113,14 +1619,9 @@ impl<'a> Helper<'a> {
             .write_atomic(&self.keys_record_path(kind), &record.to_json()?, 0o600)
     }
 
-    /// Put the prepared pair in and the one in use aside, in one move.
-    ///
-    /// Four renames and an order that matters: the CERTIFICATE goes last on
-    /// the way in, because a process that reads the pair between the two
-    /// renames must never find a new key under an old certificate. The
-    /// loaders of this stack read both files at once and refuse a pair that
-    /// does not belong together, so the window is a refusal rather than a
-    /// wrong identity — but it is still the shorter window that is wanted.
+    /// Replace a prepared key/certificate pair through four ordered renames.
+    /// Move the old certificate and key aside, then install the new key and certificate.
+    /// Readers may observe a missing or mismatched pair between renames.
     pub fn keys_switch(&self, kind: KeyKind, run_id: Option<&str>) -> Result<KeysRecord> {
         let key_next = self.key_path_with(kind, Some("next"));
         let crt_next = self.cert_path_with(kind, Some("next"));
@@ -2140,9 +1641,7 @@ impl<'a> Helper<'a> {
         let crt_prev = self.cert_path_with(kind, Some("prev"));
         let previous = self.digest_of(&crt);
 
-        // What is in use goes aside first: a pair that is half replaced is
-        // worse than one that is briefly absent, and absent is what a
-        // restart of the unit would survive.
+        // Move the old certificate aside before replacing its key.
         if self.files.exists(&crt) {
             self.files.rename(&crt, &crt_prev)?;
         }
@@ -2170,12 +1669,7 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// Put the pair that was in use back, and drop the one that failed.
-    ///
-    /// The failed pair is not kept: its certificate is in the operator's
-    /// repository (that is where it was issued), and its private half is a
-    /// key that never served a connection. What IS kept is the record,
-    /// which says that a rotation was taken back and why.
+    /// Restore the `.prev` pair and discard the current pair; retain the rollback reason.
     pub fn keys_revert(&self, kind: KeyKind, because: Option<&str>) -> Result<KeysRecord> {
         let key_prev = self.key_path_with(kind, Some("prev"));
         let crt_prev = self.cert_path_with(kind, Some("prev"));
@@ -2235,30 +1729,21 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// `sha256:<hex>` of a file, or `None` when it is not there.
-    ///
-    /// The same shape the read-only probe reports for a public file, so
-    /// that a record and a snapshot say the same thing about one
-    /// certificate.
+    /// Return the certificate/file digest in probe format, or None if reading fails.
     fn digest_of(&self, path: &Path) -> Option<String> {
         self.files
             .read(path)
             .ok()
             .map(|bytes| format!("sha256:{}", crate::ids::sha256_hex(&bytes)))
     }
-    // --- end lane 5A ----------------------------------------------------
+
 }
 
-// --- lane 5A: the key transaction ------------------------------------------
+
 
 pub const KEYS_SCHEMA: &str = "meister-deploy/activate-keys/1";
 
-/// Where a rotation of one key has got to.
-///
-/// Five states and a sixth for "this does not add up", which is the same
-/// shape [`TxnState`] has and for the same reason: a resume decides what to
-/// do next from this word, and a word that could mean two things is a word
-/// that decides wrongly once.
+/// Observed progress of one key rotation, including inconsistent file layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum KeysState {
@@ -2299,13 +1784,7 @@ impl std::fmt::Display for KeysState {
     }
 }
 
-/// One key rotation, on disk, on the target.
-///
-/// Beside the system transactions and NOT among them: `records()` skips
-/// `keys-*.json` on purpose, because an open key rotation is not a reason to
-/// refuse to roll a system forward — and a file in `txn/` that the system's
-/// own parser cannot read would otherwise make every plan see an
-/// `inconsistent` transaction and block the host.
+/// Target-side key rotation record. System transaction enumeration skips `keys-*.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeysRecord {
@@ -2317,9 +1796,7 @@ pub struct KeysRecord {
     pub run_id: Option<String>,
     /// `sha256:<hex>` of the certificate that was in use before the switch.
     pub previous_sha256: Option<String>,
-    /// And of the one that is in use now. The same shape the read-only probe
-    /// reports for a public file, so a record and a snapshot say the same
-    /// thing about one certificate.
+    /// Digest of the current certificate in the read-only probe’s format.
     pub sha256: Option<String>,
     pub started_at: DateTime<Utc>,
     pub changed_at: DateTime<Utc>,
@@ -2365,23 +1842,16 @@ pub struct KeysView {
     pub key_next: bool,
     /// `<kind>.crt.next` is there.
     pub crt_next: bool,
-    /// A `.prev` pair is there: the switch happened and nobody has removed
-    /// what it replaced.
+    /// Previous key/certificate pair retained after a switch.
     pub prev: bool,
     /// What makes this inconsistent, when it is.
     pub reason: Option<String>,
     pub record: Option<KeysRecord>,
 }
 
-// --- end lane 5A -----------------------------------------------------------
 
-/// Which of the two keys a managed host holds.
-///
-/// Two and not one, because they answer different questions: `identity.key`
-/// is what this machine DIALS with (`CN=system:…`), `serving.key` is what a
-/// client checks this ADDRESS against (`CN=<host name>`, with SANs). The
-/// file names are the ones `nix/agent.nix` and `nix/controllers.nix` put
-/// into every rendered configuration.
+
+/// Host key purpose: identity for outbound authentication, serving for TLS endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
     Identity,
@@ -2415,11 +1885,7 @@ impl std::fmt::Display for KeyKind {
     }
 }
 
-/// What `keygen` answers with.
-///
-/// There is no field for the key and there must not be: this object is
-/// printed as json on stdout, travels back over ssh and is read by a
-/// workstation that writes parts of it into a repository somebody commits.
+/// Public key-generation result. Private key material must never enter this serialized reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeygenOutcome {
@@ -2449,10 +1915,7 @@ pub struct GcOutcome {
     pub archives_removed: usize,
 }
 
-/// `  42   2026-09-20 11:02:33   (current)` -> 42, current.
-///
-/// The number is the first field of every line `nix-env
-/// --list-generations` prints, and `(current)` marks one of them.
+/// Parse generation numbers from the first field and `(current)` from the listing.
 pub fn parse_generations(text: &str) -> Vec<Generation> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -2479,12 +1942,7 @@ fn generation_of(link: &Path) -> Option<u64> {
     number.parse().ok()
 }
 
-/// The systemd-boot entry NixOS writes for a generation.
-///
-/// The name is NixOS's own (`nixos-generation-<n>.conf`, from the
-/// systemd-boot builder). A specialisation adds a suffix, and a host that
-/// uses one has no boot fallback here — which is the same class of limit as
-/// grub and is documented with it.
+/// Standard NixOS systemd-boot entry name; specialisation-specific entries are unsupported.
 fn entry_of(generation: u64) -> String {
     format!("nixos-generation-{generation}.conf")
 }
@@ -2495,16 +1953,12 @@ pub fn timer_unit(id: &str) -> String {
 }
 
 impl TxnState {
-    /// The state in the spelling a sentence uses. On the observation type
-    /// rather than beside it, because there is one spelling of these seven
-    /// words and the json is the other half of it.
+    /// Stable lowercase transaction-state spelling shared by status and diagnostics.
     pub(crate) fn as_str_lower(self) -> &'static str {
         match self {
             TxnState::Staged => "staged",
             TxnState::Pending => "pending",
-            // Astra finding F07, 2026-09-23: the two in-flight words. The
-            // json spelling is the same one, so a sentence at a console and
-            // `status --json` say the same thing about the same record.
+            // Persisted in-flight states distinguish interrupted decisions from pending activation.
             TxnState::Confirming => "confirming",
             TxnState::Reverting => "reverting",
             TxnState::Confirmed => "confirmed",
@@ -2569,13 +2023,8 @@ mod tests {
         Helper::new(runner, files, clock, "/var/lib/meisterstack/deploy", "/exe")
     }
 
-    /// A runner that moves the profile link the way `nix-env --set` does.
-    ///
-    /// The boot mode names TWO generations — the one to fall back to and the
-    /// one to try once — and the second of them only exists after the
-    /// profile has moved. A fake filesystem that cannot change during the
-    /// call could not tell the two numbers apart, and a test in which they
-    /// are the same number would prove nothing about the thing that matters.
+    /// Fake runner that moves the profile link after `nix-env --set`, exposing the new
+    /// generation number to boot-menu operations.
     struct Moving<'a> {
         inner: StrictFake,
         files: &'a MemFiles,
@@ -2643,9 +2092,7 @@ mod tests {
 
     #[test]
     fn a_half_read_boot_triple_is_no_triple() {
-        // The kernel link is there and the params file is not: the planner
-        // compares three fields, and two of them plus a guess would cost a
-        // reboot nobody needed.
+        // A missing parameter file invalidates the entire boot tuple.
         let files = MemFiles::new()
             .given_symlink("/run/booted-system", PREV)
             .given_symlink(format!("{PREV}/kernel"), "/nix/store/kkkk-linux/bzImage")
@@ -2795,9 +2242,7 @@ mod tests {
                 Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), none()),
                 Output::failing(1, "the activation script failed"),
             )
-            // The way back: the timer goes, the profile goes back, and the
-            // OLD system's own switcher runs. The profile may have moved
-            // already, so this is not optional politeness.
+            // Restore both the profile and old system after a failed switch.
             .expect(
                 Matcher::exact("systemctl", ["stop", "meister-revert-r2.timer"]),
                 Output::stdout(""),
@@ -2994,12 +2439,7 @@ mod tests {
         helper.write_record(&pending("c2", Mode::Switch)).unwrap();
         let err = helper.confirm("c2").unwrap_err().to_string();
         assert!(err.contains("still active"), "{err}");
-        // Astra finding F07, 2026-09-23: the machine is untouched — nothing
-        // ran but the two systemctl words, which `verify` below is the
-        // proof of — and the record says a confirmation was in flight,
-        // because it was. It is NOT put back to `pending`: that would be
-        // this program forgetting a decision it had already made durable,
-        // which is the whole of what this state is for.
+        // Confirmation intent remains durable even if stopping the timer fails.
         assert_eq!(helper.record("c2").unwrap().state, TxnState::Confirming);
         runner.verify().unwrap();
     }
@@ -3039,7 +2479,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // Astra finding F07, 2026-09-23.
+
     #[test]
     fn a_confirm_and_a_timer_revert_do_not_both_win() {
         let files = host();
@@ -3047,9 +2487,7 @@ mod tests {
         let clock = clock();
         let helper = helper(&runner, &files, &clock);
         helper.write_record(&pending("d1", Mode::Switch)).unwrap();
-        // The timer is inside its decision: it has read the record and is
-        // on its way to `nix-env --set`. This process is what holds it, so
-        // the holder is demonstrably alive.
+        // Simulate a live timer process holding the decision lock before profile rollback.
         let held = helper.txn_dir().join("d1.deciding");
         files
             .write_atomic(
@@ -3071,12 +2509,10 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // Astra finding F07, 2026-09-23.
+
     #[test]
     fn a_decision_whose_process_is_gone_does_not_block_the_next_one() {
-        // The other half of the door. A machine that lost power while
-        // deciding must not be a machine whose timer can never fire again,
-        // so a holder that is not a process is not a holder.
+        // A dead lock holder must not block recovery.
         let files = host();
         let runner = StrictFake::new()
             .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
@@ -3108,7 +2544,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // --- Astra finding F07, 2026-09-23: the decision that did not finish ---
+
 
     /// A record in the state a crash between the two steps leaves behind.
     fn confirming(id: &str) -> TxnRecord {
@@ -3119,11 +2555,7 @@ mod tests {
 
     #[test]
     fn a_crash_between_the_timer_stop_and_the_record_leaves_confirming() {
-        // The window: `confirm` wrote its intent, the timer was stopped,
-        // and the process died before `confirmed` reached the disk. What
-        // the machine is left holding is this record and no timer — which
-        // used to read `pending`, a sentence that says the host is waiting
-        // for a word it has in fact already been given.
+        // Simulate a crash after stopping the timer but before writing `confirmed`.
         let files = host();
         let runner = StrictFake::new()
             // What `status` reads on its way past, before anything here
@@ -3131,11 +2563,7 @@ mod tests {
             .expect(Matcher::exact("uname", ["-r"]), Output::stdout("6.12.41\n"))
             .expect(
                 Matcher::exact("systemctl", ["stop", "meister-revert-f1.timer"]),
-                // What systemd answers for a unit that is not there any
-                // more. `stop_timer` reads the ANSWER of `is-active`, not
-                // this exit code, and that is what makes finishing a
-                // confirmation whose timer is already gone the same work as
-                // finishing one whose timer is not.
+                // A missing timer is accepted when resuming confirmation.
                 Output::failing(5, "Failed to stop meister-revert-f1.timer: not loaded."),
             )
             .expect(
@@ -3146,9 +2574,7 @@ mod tests {
         let helper = helper(&runner, &files, &clock);
         helper.write_record(&confirming("f1")).unwrap();
 
-        // Before anything repairs it, the host SAYS so: the record is open,
-        // so no plan starts over on top of it, and `status --json` carries
-        // the word.
+        // The unfinished decision remains visible as an open transaction.
         let status = helper.status().unwrap();
         assert_eq!(status.open_txns.len(), 1, "{status:?}");
         assert_eq!(status.open_txns[0].state, TxnState::Confirming);
@@ -3165,10 +2591,7 @@ mod tests {
 
     #[test]
     fn a_confirmation_in_flight_is_finished_not_reverted() {
-        // The timer fires into the window: the record says a confirmation
-        // began, the deadline says nobody spoke. Somebody did, so the unit
-        // takes nothing back — and the StrictFake with no expectation in it
-        // is the proof that not one command ran.
+        // A timer encountering confirmation intent must leave the system unchanged.
         let files = host();
         let timer = StrictFake::new();
         let clock = clock();
@@ -3206,9 +2629,7 @@ mod tests {
 
     #[test]
     fn a_second_confirm_completes_a_confirming_record() {
-        // The timer is still armed — the first confirm died BEFORE it got
-        // to stop it — so this one stops it and finishes, which is the
-        // ordinary path and not a repair.
+        // Resume a confirmation interrupted before stopping its timer.
         let files = host();
         let runner = StrictFake::new()
             .expect(
@@ -3264,7 +2685,7 @@ mod tests {
         }
         quiet.verify().unwrap();
 
-        // And with the sentence, the machine goes back.
+        // An explicit reason permits the forced rollback.
         let runner = StrictFake::new()
             .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
             .expect(
@@ -3296,11 +2717,7 @@ mod tests {
 
     #[test]
     fn a_crash_in_the_middle_of_a_revert_leaves_reverting() {
-        // The other half of the same window: the intent is on the disk
-        // before `nix-env --set`, so a revert that dies at the profile
-        // leaves a record that says a way back began — and not `pending`,
-        // which the next confirm would have turned into `confirmed` on a
-        // machine that is already somewhere else.
+        // A failed profile rollback leaves durable intent and blocks confirmation.
         let files = host();
         let runner = StrictFake::new()
             .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
@@ -3335,7 +2752,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // --- end Astra finding F07 --------------------------------------------
+
 
     #[test]
     fn a_second_revert_is_the_same_answer_and_runs_nothing() {
@@ -3526,13 +2943,11 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // --- lane 5C ---
+
 
     #[test]
     fn an_inconsistent_record_can_be_put_aside_by_a_person_with_a_sentence() {
-        // L2 finding N13. `inconsistent` had no way out: retire refused,
-        // `apply --resume` refused (another plan had been built since), and
-        // what the lab did was move the file into /root by hand.
+        // An inconsistent record requires explicit, audited retirement.
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
@@ -3550,7 +2965,7 @@ mod tests {
             .to_string();
         assert!(err.contains("--force --reason"), "{err}");
 
-        // And an empty sentence is not one.
+        // Reject an empty reason.
         let err = helper
             .retire_forced("stuck", Some("run-1"), "   ")
             .unwrap_err()
@@ -3578,8 +2993,7 @@ mod tests {
 
     #[test]
     fn force_does_not_take_away_a_record_that_still_says_what_may_happen() {
-        // The narrow half: `staged` and `pending` are the two states in
-        // which the record IS the rollback, and no sentence buys them.
+        // Forced retirement cannot discard staged or pending rollback state.
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
@@ -3600,10 +3014,7 @@ mod tests {
 
     #[test]
     fn a_record_written_before_this_field_existed_still_reads_back() {
-        // `retired_by_force` is skipped when it is absent, so a record on
-        // a machine that was deployed to last week parses unchanged — and
-        // `deny_unknown_fields` means the other direction is a sentence
-        // rather than a silent drop.
+        // Old records omit this optional field; serialization preserves that omission.
         let record = TxnRecord::from_json(
             &serde_json::json!({
                 "schema": TXN_SCHEMA,
@@ -3628,7 +3039,7 @@ mod tests {
         assert!(!text.contains("retired_by_force"), "{text}");
     }
 
-    // --- end lane 5C ---
+
 
     #[test]
     fn a_transaction_id_is_a_file_name_and_nothing_more() {
@@ -3678,9 +3089,7 @@ mod tests {
 
     #[test]
     fn the_lock_record_is_exactly_what_the_read_only_probe_parses() {
-        // `observation::Lock` denies unknown fields, and the probe reads
-        // owner.json straight into it: a fifth key here would make every
-        // observation of a locked host blind to the lock.
+        // The probe reads owner.json directly into the strict observation Lock schema.
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
@@ -3712,7 +3121,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // Astra finding F04, 2026-09-23.
+
     #[test]
     fn two_operators_carrying_one_run_do_not_both_hold_the_host() {
         let files = host();
@@ -3720,16 +3129,12 @@ mod tests {
         let clock = clock();
         let helper = helper(&runner, &files, &clock);
         let first = helper.lock_acquire("run-a", "silas@manacor", 42).unwrap();
-        // The same run from the same workstation is a resume after a kill,
-        // whatever the pid says: the process is gone and the lock it left is
-        // the lock of this run.
+        // A resumed run may carry a new PID on the same workstation.
         assert_eq!(
             helper.lock_acquire("run-a", "silas@manacor", 99).unwrap(),
             first
         );
-        // The same run from somewhere else is a second writer, and this host
-        // cannot ask a workstation whether a pid is still there — so it asks
-        // the only question it can answer.
+        // A different operator carrying the same run ID is refused.
         let err = helper
             .lock_acquire("run-a", "leandro@calvia", 7)
             .unwrap_err()
@@ -3740,7 +3145,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // Astra finding F04, 2026-09-23.
+
     #[test]
     fn two_takeovers_of_one_run_leave_exactly_one_holder_of_the_host() {
         let files = host();
@@ -3752,9 +3157,7 @@ mod tests {
             .lock_take_over("run-a", "run-b", "silas@manacor", 2)
             .unwrap();
         assert_eq!(winner.run_id, "run-b");
-        // The second takeover read run-a before any of that. It used to
-        // remove run-b's fresh lock and take the host as well; now it
-        // carries that lock away, sees it is not run-a, and puts it back.
+        // A second takeover must restore the first takeover’s fresh lock.
         let err = helper
             .lock_take_over("run-a", "run-c", "silas@manacor", 3)
             .unwrap_err()
@@ -3773,16 +3176,11 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // --- lane 5C ---
+
 
     #[test]
     fn a_takeover_of_a_host_the_taking_run_already_holds_is_the_answer_yes() {
-        // L2 finding N8. A takeover reaches a host twice: the fleet anchor
-        // takes every control-plane host before the walk, and the plan's
-        // own `lock` step takes the host again. When the abandoned run
-        // never held this host, the first call finds nothing and acquires,
-        // and the second one used to answer "this host is held by the run
-        // run-b, not by run-a" — the run refused to take over from itself.
+        // The fleet anchor and host lock step may attempt the same takeover twice.
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
@@ -3805,7 +3203,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    // --- end lane 5C ---
+
 
     #[test]
     fn gc_keeps_the_current_the_booted_and_n_others() {
@@ -3902,7 +3300,7 @@ mod tests {
         let record = pending("rt", Mode::Boot);
         let text = String::from_utf8(record.to_json().unwrap()).unwrap();
         assert_eq!(TxnRecord::from_json(&text, "a test").unwrap(), record);
-        // And a record of another schema is a sentence, not a guess.
+        // Reject records with an unsupported schema.
         let wrong = text.replace(TXN_SCHEMA, "meister-deploy/activate-txn/2");
         let err = TxnRecord::from_json(&wrong, "a test")
             .unwrap_err()
@@ -3910,7 +3308,7 @@ mod tests {
         assert!(err.contains("activate-txn/2"), "{err}");
     }
 
-    // --- lane 3B: keygen ---------------------------------------------
+
 
     const PKI: &str = "/var/lib/meisterstack/pki";
 
@@ -3984,9 +3382,7 @@ mod tests {
         );
     }
 
-    /// An interrupted rollout runs this again. A second key would be a
-    /// second identity, and the certificate issued over the first would be
-    /// a certificate for a key nobody has.
+    /// Retries preserve the key to which an already issued certificate is bound.
     #[test]
     fn a_second_run_keeps_the_key_and_makes_another_request() {
         let first_runner =
@@ -4116,7 +3512,7 @@ mod tests {
         }
     }
 
-    // --- lane 5A: rotating a key in phases -----------------------------
+
 
     /// A prepared key lies BESIDE the one in use, and nothing that is
     /// running notices it is there.
@@ -4155,9 +3551,7 @@ mod tests {
         );
     }
 
-    /// Asking twice prepares one key: a second one would be a second
-    /// identity, and the certificate issued over the first would be a
-    /// certificate for a key nobody has.
+    /// Repeated preparation reuses the key bound to the pending certificate.
     #[test]
     fn preparing_twice_prepares_one_key() {
         let first = StrictFake::new().expect(
@@ -4244,18 +3638,11 @@ mod tests {
         assert!(view.reason.unwrap().contains("without the key"));
     }
 
-    // Astra finding F08, 2026-09-23.
+
     #[test]
     fn keys_status_names_every_half_switch() {
-        // `keys_switch` is four renames in this order: the certificate in
-        // use goes aside, then the key in use, then the prepared key comes
-        // in, then the prepared certificate. A machine that stops between
-        // any two of them leaves one of the first three shapes below. All
-        // three used to read as `switched`, because any `.prev` was the
-        // whole question — so the resume skipped to `verify`, the verify
-        // found no certificate, and `keys revert` refused because it needs
-        // BOTH `.prev` files. The host was left with no active certificate
-        // and no way forward.
+        // Check each partial layout between the four switch renames: old certificate aside,
+        // old key aside, then new key installed. None is a completed switch.
         let runner = StrictFake::new();
         let clock = clock();
         let key = format!("{PKI}/identity.key");
@@ -4449,7 +3836,7 @@ mod tests {
                 .state,
             KeysState::Confirmed
         );
-        // Twice is a sentence, not a second removal.
+        // Repeated removal is rejected.
         assert!(
             helper(&runner, &files, &clock)
                 .keys_remove(KeyKind::Identity)
@@ -4493,7 +3880,7 @@ mod tests {
         );
     }
 
-    // --- Astra finding MD03, 2026-09-25 ---------------------------------
+
 
     fn deciding_path(helper: &Helper<'_>) -> PathBuf {
         helper.txn_dir().join("run-1.deciding")
@@ -4582,8 +3969,7 @@ mod tests {
         let clock = clock();
         let helper = helper(&runner, &files, &clock);
         let path = deciding_path(&helper);
-        // While this process decides, somebody who took it for dead
-        // succeeds it. The record is theirs then, and stays.
+        // Dropping an old guard must preserve its successor's lock record.
         helper
             .deciding("run-1", "confirm", || {
                 files
@@ -4598,7 +3984,7 @@ mod tests {
         );
     }
 
-    // --- Astra finding MD02, 2026-09-25 ---------------------------------
+
 
     /// A runner under which one command takes a while.
     struct Slow<'a> {
@@ -4720,9 +4106,7 @@ mod tests {
             .activate("run-1", TOP, Mode::Switch, 300, Some("run-1"))
             .unwrap();
         runner.verify().unwrap();
-        // The lock was taken before the record was written and given back
-        // after the switch: in the trail of writes, `run-1.deciding` comes
-        // first and its removal last.
+        // Check that lock creation precedes the record and removal follows it.
         let attempts = files.attempts();
         let taken = attempts
             .iter()

@@ -2,20 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `keys import` against a CA that really exists.
+//! Import CLI checks using a temporary CA and real OpenSSL.
 //!
-//! The other CLI tests put shims on `PATH` so that what they measure is
-//! this tool's own argv. This one does the opposite: it makes a throwaway
-//! CA with `tools/meister-ca`, with real openssl, under the fixed file
-//! names a lab that predates this tool has — `system-node-<id>.crt`,
-//! `system-cluster-<group>.crt` — and then imports them. What it proves is
-//! the one thing a shim cannot: that the subject this fleet would issue and
-//! the subject an existing certificate carries are the same string, so a
-//! migration does not end in a host presenting a name nobody expects.
-//!
-//! The CA is made in a temporary directory and thrown away with it. The
-//! lab's own PKI is never read: `/mnt/vmstore/MeisterStack/labpki` is not
-//! touched here or anywhere in this crate.
+//! Fixtures cover node and cluster subject mapping and public-file placement.
+//! The source CA also retains the issued certificates, so these tests do not
+//! exercise indexing a previously unknown external certificate.
 
 mod support;
 
@@ -59,11 +50,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    /// A CA, two identities, and the folder somebody would hand over.
-    ///
-    /// `--node n1` and `--cluster-identity <group>` are the two shapes that
-    /// matter: one names a host and one names a GROUP of hosts, and the
-    /// second is the one a file name cannot tell you the host of.
+    /// Temporary CA, node/cluster identities and a separate handover directory.
     fn new() -> Option<Scratch> {
         if Command::new("openssl").arg("version").output().is_err() {
             eprintln!("skipped: no openssl on this machine");

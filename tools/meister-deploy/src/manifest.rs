@@ -2,31 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The first two of the four contracts: what Nix says, and what `resolve`
-//! made of it.
+//! JSON contracts for Nix evaluation and resolved fleets. Resolution joins inventory and
+//! evaluated hosts, checks references, and assigns a content ID; Nix derives deployment
+//! settings.
 //!
-//! [`NixManifest`] is the `meisterDeployment` attribute of an operator's
-//! flake — the whole of what Nix derived from `fleet.toml`, evaluated once and
-//! handed over as JSON. [`ResolvedFleet`] is that, plus who asked and from
-//! which tree, with an id over its content. Nothing between the two derives a
-//! deployment value: `resolve` joins, checks and names, and that is all it is
-//! allowed to do, because Nix is the single derivation (D2) and a second one
-//! in Rust would be a second answer to keep in step.
-//!
-//! **This module is the contract for lane 1B.** Two rules make it one rather
-//! than a suggestion:
-//!
-//! * Every field is required. The ones that may have no value are `null`,
-//!   not absent — a missing key is a field somebody forgot, and the two
-//!   cases have to be told apart.
-//! * Every struct is `deny_unknown_fields`. A key Nix emits and Rust does
-//!   not know is an error here, not a value quietly dropped on the way to a
-//!   receipt.
-//!
-//! Numbers are integers. Sizes are bytes (`size_bytes`), not gigabytes, even
-//! where the inventory is written in gigabytes: the conversion belongs to the
-//! one derivation. File modes are strings (`"0600"`), because `0600` in JSON
-//! is the number six hundred.
+//! Schema identifiers are checked before decoding. Contract structs reject unknown fields;
+//! non-optional fields are required unless defaulted. Option fields accept both null and
+//! omission. Sizes are integer bytes; file modes are strings such as "0600".
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -204,20 +186,13 @@ pub struct Install {
     /// Paths a reinstall keeps. Checked against `persistence` before an
     /// install is planned.
     pub preserve: Vec<String>,
-    /// PUBLIC ssh keys that may reach the installer MEDIUM, and the thing
-    /// that decides whether that medium has an sshd at all. Empty is the
-    /// default and means the console is the only way in — which is the right
-    /// answer for an image somebody carries to a machine by hand.
+    /// Public SSH keys authorized on the installer medium. Empty disables installer SSH
+    /// access; use the console.
     pub authorized_keys: Vec<String>,
 }
 
-/// How a host gets its kernel: the contract's copy of
-/// [`crate::inventory::BootMode`].
-///
-/// Two types for one word, like [`RebootPolicy`] beside it, and for the same
-/// reason: this one is part of a JSON contract that other programs read
-/// (`deny_unknown_fields`, a JSON Schema, a stable spelling), and the other
-/// is how a TOML file somebody edits is parsed. Nix writes this one.
+/// JSON contract boot mode, separate from the inventory parser type so its serialized
+/// spelling and schema remain explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BootMode {
@@ -228,13 +203,11 @@ pub enum BootMode {
     /// inside, no boot menu, and the next boot is the provider's fact and
     /// not the guest's.
     Direct,
-    // --- lane 5C ---
-    /// The machine boots itself out of a loader this flake did not
-    /// install: grub on an MBR disk. The switch rollback works; there is
-    /// no boot rollback, because `bootctl set-oneshot` is what one is made
-    /// of. Every VM built from `packages.managed-disk-image` is this.
+
+    /// An existing GRUB loader boots the host. Activation can roll back by switching;
+    /// automated boot fallback is unavailable.
     Grub,
-    // --- end lane 5C ---
+
 }
 
 impl BootMode {
@@ -298,18 +271,8 @@ pub struct SecretSource {
     pub reference: String,
 }
 
-/// How key material gets to the place a unit reads it.
-///
-/// One way, and one way only: a file, owned by the service user, mode
-/// `0600`, under the fleet's `pki.dir`. There WAS a second way — systemd's
-/// `LoadCredential` — and it was measured in a VM in M0 (probe S11) and
-/// dropped: systemd puts a credential in `/run/credentials/<unit>/` as
-/// `root:root 0440`, and every loader in this codebase refuses a key whose
-/// group can read it (`pki/pem.rs`, `proto/lib.rs`, `cli/config.rs`). The
-/// options were to loosen the loaders or to stop using credentials for
-/// keys. Loosening a refusal that exists to keep a private key private is
-/// not a trade this fleet makes, so the enum has one variant and the
-/// contract has one answer.
+/// Deliver key material through ordinary files with declared ownership and mode. Private-key
+/// loaders reject group-readable modes, including systemd LoadCredential defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Delivery {
@@ -365,15 +328,8 @@ pub struct Boot {
     pub kernel_version: String,
     /// Who decides which of the three above this machine actually starts.
     pub mode: BootMode,
-    /// For a `direct` host: the whole command line its provider is handed,
-    /// `<kernel params> init=<toplevel>/init`. Null for a `uefi` host, which
-    /// reads its own boot menu and has nobody outside it to hand anything
-    /// to.
-    ///
-    /// The `init=` is why this is not the same as the kernel params: a NixOS
-    /// system is started by `<toplevel>/init`, and a guest whose loader does
-    /// not say which toplevel would boot a new kernel into whatever userland
-    /// the initrd finds.
+    /// Provider-loaded command line for direct boot, including `init=<toplevel>/init` to
+    /// select userland. Null for hosts using their own loader.
     pub cmdline: Option<String>,
 }
 
@@ -513,14 +469,8 @@ pub struct InventoryHost {
     pub hardware: Hardware,
     /// Null for a host that is never installed by this tool.
     pub install: Option<Install>,
-    /// The binary caches this host is configured to FETCH from
-    /// (`meisterstack.managed.substituters`), in the order nix tries them.
-    ///
-    /// Here because a stage has to know it: `nix copy --to ssh-ng://` can
-    /// let the far store pull what it can reach itself, and whether that is
-    /// worth asking for is a fact about the target's configuration. Empty is
-    /// a host that fetches from nowhere and is only ever pushed to, which is
-    /// the smaller attack surface and the default.
+    /// Binary caches configured on the target, in fetch order. Stage can allow the remote
+    /// store to substitute available paths. Empty means push-only staging.
     pub substituters: Vec<String>,
 }
 
@@ -533,12 +483,8 @@ pub struct NixHost {
     /// `{"agent_toml_out": "/nix/store/…-agent.toml"}`: the rendered
     /// configuration files, by role.
     pub config_artifacts: BTreeMap<String, String>,
-    /// Every systemd unit this host's system generation carries, by name.
-    ///
-    /// Names and not units: what a plan does with them is tell this stack's
-    /// units from the operator's own. A unit nobody here declared is a unit
-    /// whose disruption this tool cannot predict, which is what an
-    /// `unknowns[]` entry says out loud instead of guessing.
+    /// Names of units in the evaluated generation. The planner compares names to detect
+    /// additions; it cannot detect changed contents from this list.
     pub units: Vec<String>,
     pub secret_refs: Vec<SecretRef>,
     pub persistence: Vec<Persistence>,
@@ -599,10 +545,8 @@ pub struct SecretScan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DevMode {
-    /// sha256 over the snapshot of every tracked and untracked file, path
-    /// and content. This is what makes a dirty tree nameable: git would name
-    /// only what is committed, and Nix would ignore the untracked files in
-    /// silence.
+    /// Digest of the tracked and non-ignored untracked source snapshot, including file paths
+    /// and contents.
     pub content_hash: String,
     pub untracked_files: Vec<String>,
     pub secret_scan: SecretScan,
@@ -624,25 +568,16 @@ pub struct Source {
     pub git_rev: Option<String>,
     pub tree_hash: Option<String>,
     pub dirty: bool,
-    /// `git:<rev>:<tree_hash>` for a clean tree, `dev:<content hash>` for a
-    /// snapshot. One string, two namespaces, never confusable — a `dev:`
-    /// fingerprint in a receipt is a receipt for something nobody can check
-    /// out again, and it has to be obvious.
+    /// Source identity: `git:<rev>:<tree_hash>` for a clean checkout or `dev:<content hash>`
+    /// for a materialized development snapshot.
     pub fingerprint: String,
     /// Null unless `--dev` was used.
     pub dev_mode: Option<DevMode>,
     pub flake_lock: BTreeMap<String, FlakeInput>,
     pub inventory_path: String,
     pub inventory_sha256: String,
-    /// Null when this tool evaluated the flake itself, which is the normal
-    /// case. Set when the evaluation was handed over (`resolve --from`).
-    ///
-    /// The distinction is worth a field rather than a note, because it is
-    /// the one thing a reader of a manifest cannot work out afterwards: the
-    /// SOURCE below is this repository either way — read with git, here —
-    /// but whether the systems named in the manifest are what that tree
-    /// evaluates to was checked by somebody else. The digest is of the file
-    /// that was handed over, so the claim is at least nameable.
+    /// Set for `resolve --from`: records the supplied evaluation file and its digest. Its
+    /// consistency with the captured source tree was not established by this tool.
     pub provided_evaluation: Option<ProvidedEvaluation>,
 }
 
@@ -703,12 +638,8 @@ pub struct ResolvedFleet {
     pub hosts: BTreeMap<String, ResolvedHost>,
     pub services: BTreeMap<String, Service>,
     pub packages: Packages,
-    /// Whether this describes only part of the fleet — `resolve --hosts a,b`.
-    ///
-    /// A partial manifest LOOKS complete: it has an inventory, groups and
-    /// packages, and a plan built over it would quietly cover two hosts of
-    /// seventy. So it says so, and M2's `plan` refuses a fleet-wide plan over
-    /// one and requires its selection to be a subset of `evaluated_hosts`.
+    /// True when resolution used an explicit host subset. The evaluated host list defines the
+    /// available scope; planning records this limitation in unknowns.
     pub partial: bool,
     /// The hosts this manifest was resolved for — the keys of `hosts`, stated
     /// where a reader will look for them.
@@ -740,15 +671,9 @@ impl ResolvedFleet {
 // resolve
 // ---------------------------------------------------------------------------
 
-/// Join what Nix said with who asked, check that it hangs together, and name
-/// it. Pure: no clock, no file, no command — `now` and `source` are handed
-/// in, which is what makes "the same tree resolves to the same id" a test
-/// rather than a hope.
-///
-/// `selection` is what `--hosts` asked for, or `None` for the whole fleet.
-/// It is checked rather than trusted: the restriction happens in Nix, and if
-/// the evaluated set and the asked-for set ever drift apart, a partial
-/// manifest would be silently wrong about which hosts it covers.
+/// Join Nix inventory and evaluation, validate references and selected host coverage, and
+/// compute the manifest ID. Pure: source, tool, selection, and time are supplied by the
+/// caller.
 pub fn resolve(
     nix: NixManifest,
     source: Source,
@@ -878,20 +803,8 @@ pub fn resolve(
             );
         }
     }
-    // --- lane 4C: B2 -------------------------------------------------
-    //
-    // A manifest with no host in it is not a small manifest, it is a
-    // manifest about nothing: every verb after this one would work and do
-    // nothing — `build` would build the packages, `plan` would produce a
-    // plan with no actions, `apply` would report success — and the operator
-    // would be looking at a green run over an empty fleet.
-    //
-    // nix/lib/inventory.nix already refuses a file with no `[[host]]` at
-    // all, so the only way to get here is a fleet whose hosts are all
-    // `deployment = "context"`: those have no closure, no toplevel and no
-    // `build`, and the pre-v1 push serves them until L3. Found in lane L1,
-    // where a lab inventory of twelve context VMs resolved to a silent
-    // manifest of zero hosts (finding B2).
+    // Reject an empty evaluated fleet; context-only inventories provide no NixOS systems to
+    // deploy.
     if hosts.is_empty() {
         bail!(
             "the fleet {:?} has no host this flake builds a system for, so there is nothing \
@@ -902,7 +815,7 @@ pub fn resolve(
             inventory.fleet.name
         );
     }
-    // --- end lane 4C ---------------------------------------------------
+
     let evaluated_hosts: Vec<String> = hosts.keys().cloned().collect();
 
     let mut resolved = ResolvedFleet {
@@ -957,10 +870,8 @@ impl Contract {
     }
 }
 
-/// Read a contract object and say which one it was. This is the hook lane 1B
-/// hangs its `manifest-json` check on: `nix eval --json …#meisterDeployment`
-/// piped into `meister-deploy validate --manifest -` fails the flake check
-/// when the derivation and these types have drifted apart.
+/// Parse either manifest contract. Resolved fleets additionally require a matching content
+/// ID.
 pub fn parse_contract(text: &str, origin: &str) -> Result<Contract> {
     let schema = schema_of(text, origin)?;
     match schema.as_str() {
@@ -1013,11 +924,8 @@ fn schema_of(text: &str, origin: &str) -> Result<String> {
     }
 }
 
-/// Check the `schema` field, then parse the whole thing — the way every
-/// contract file in this tool is read. Public because the contracts that
-/// come after these two ([`crate::release`], [`crate::plan`],
-/// [`crate::receipt`]) are read exactly the same way, and a second copy of
-/// "which sentence for which kind of malformed file" would drift.
+/// Validate the schema identifier, then decode with origin and location diagnostics. Other
+/// contract modules share this parser.
 pub fn parse_checked<T: serde::de::DeserializeOwned>(
     text: &str,
     origin: &str,
@@ -1163,7 +1071,6 @@ mod tests {
         );
     }
 
-    // --- lane 4C: B2 -------------------------------------------------
     #[test]
     fn a_fleet_of_context_hosts_only_is_a_sentence_and_not_an_empty_manifest() {
         let mut manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
@@ -1188,7 +1095,6 @@ mod tests {
         assert!(err.contains("context"), "{err}");
         assert!(err.contains("legacy/push.sh"), "it says the way: {err}");
     }
-    // --- end lane 4C ---------------------------------------------------
 
     #[test]
     fn a_changed_unit_list_is_a_different_manifest_id() {
@@ -1564,10 +1470,8 @@ mod tests {
 
     #[test]
     fn a_key_handed_over_by_systemd_is_not_a_delivery_this_tool_speaks() {
-        // M0's probe S11 measured what `LoadCredential` produces and the
-        // loaders refuse it. A manifest that asks for it is a manifest from
-        // before that decision, and it gets a sentence rather than a key
-        // nobody can read.
+        // LoadCredential is unsupported because its default group-readable modes are rejected
+        // by private-key loaders.
         let text = fixture().replace(
             "\"delivery\": \"file\"",
             "\"delivery\": \"systemd-credential\"",

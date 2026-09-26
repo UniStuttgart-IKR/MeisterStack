@@ -2,19 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What `meister-deploy plan` does to the machine it runs on — measured.
-//!
-//! The same instrument as `cli_effects.rs`: `PATH` holds four shims called
-//! `nix`, `ssh`, `git` and `rsync`, each of which records its argv and exits
-//! 97, and the working and output directories are compared byte for byte
-//! before and after. The planner is supposed to be pure, so the interesting
-//! assertions here are all negative: no program was started, no file
-//! appeared, and the two refusals the contract names came out as sentences
-//! with the right exit code.
-//!
-//! The release and the snapshot this test plans from are built here through
-//! the public API rather than checked in, so a change to a contract breaks
-//! this at the contract and not at a stale fixture.
+//! CLI planning tests with temporary directories and five PATH shims: nix, ssh, git, rsync,
+//! and ssh-keygen. Shims log calls and fail. Releases and observations use the public
+//! contract builders; filesystem snapshots detect unintended writes.
 
 mod support;
 
@@ -47,10 +37,8 @@ impl Sandbox {
         let log = shims.path().join("calls.log");
         for name in SHIMS {
             let path = shims.path().join(name);
-            // The whole line in ONE append: several hosts are asked at
-            // once, and three writes per call would interleave into
-            // nonsense exactly when the parallelism is what is being
-            // tested.
+            // Append each call as one line so concurrent shim executions do not interleave
+            // argument records.
             std::fs::write(
                 &path,
                 format!(
@@ -239,11 +227,8 @@ fn offline_and_out_together_is_a_refusal_with_a_sentence() {
 
 #[test]
 fn without_a_snapshot_it_asks_the_hosts_and_nobody_who_is_not_enrolled() {
-    // The snapshot used to arrive with lane 2A; it is here now. What this
-    // pins is the ORDER: the fleet's own `known_hosts` is consulted first,
-    // and a host with no key in it is never connected to. The shims answer
-    // 97 to everything, so every lookup fails, so no `ssh` may appear in
-    // the log at all.
+    // Failed host-key lookup must stop before SSH. All shims exit 97, so only ssh-keygen
+    // calls should appear.
     let sandbox = Sandbox::new();
     let before = snapshot_of(sandbox.cwd.path());
     let out = sandbox.run(&[
@@ -369,11 +354,8 @@ fn a_blocked_plan_is_exit_two_and_still_a_plan() {
 #[test]
 fn a_plan_kind_that_does_not_exist_yet_says_which_milestone_it_arrives_in() {
     let sandbox = Sandbox::new();
-    // `install` is no longer one of these: lane 3A built it, and
-    // tests/cli_install.rs is where it is argued about. Nor is
-    // `keys-revoke`, which lane 5A built — `keys revoke` makes one after it
-    // has written the list, and this door is for the other order. Nor is
-    // `retire`, which lane 5B built and which works the same way round.
+    // Only unsupported plan kinds belong here; installation, revocation, and retirement have
+    // their own tests.
     for (kind, needle) in [
         ("keys-rotate", "made by `keys rotate`"),
         ("nonsense", "is not a plan kind"),
@@ -416,16 +398,8 @@ fn an_unknown_selector_lists_what_exists_and_writes_nothing() {
 
 #[test]
 fn a_missing_cli_reference_is_a_note_and_the_plan_says_which_steps_it_blocks() {
-    // D7: no `[operator] cli_config` anywhere, because the inventory that
-    // would carry it is not there — the ordinary case for a plan made away
-    // from the operator's repository.
-    //
-    // The path is named EXPLICITLY, inside this sandbox. Until lane 3B it
-    // was the one the fixture's `source.repo_path` points at, and that is a
-    // real directory on the machine this was written on: the day
-    // `~/git/meisterstack-lab` came into existence (lane L1), this test
-    // read a real fleet.toml and failed. A test about a missing file has to
-    // own the file it misses.
+    // Use an explicitly missing inventory inside the sandbox so the test cannot read a real
+    // repository through the fixture's source path.
     let sandbox = Sandbox::new();
     let absent = sandbox.cwd.path().join("no-such-inventory.toml");
     assert!(!absent.exists());

@@ -2,29 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! There is one way this tool connects to a host, and this test is what
-//! keeps it one.
-//!
-//! `transport.rs` can be reviewed once; a second call site that builds its
-//! own ssh options cannot be reviewed at all, because nobody will look for
-//! it. The pre-v1 tool had three ways — `accept-new`, `no` plus
-//! `UserKnownHostsFile=/dev/null`, and `nixos-rebuild` with no options —
-//! and the one that changed machines was the one with no options. So the
-//! source is read: the three spellings that turn host key verification off
-//! do not appear anywhere, and the one that turns it on appears in exactly
-//! one file. There is no exempt directory any more — `legacy/` was the last
-//! one and M5B removed it.
-//!
-//! A source-reading test is blunt. It is chosen for the same reason
-//! `no_direct_effects.rs` is: the alternative is a promise in a comment.
+//! Source-string checks for disabled host-key verification and duplicate strict
+//! option construction. These cover known spellings, not arbitrary equivalent code.
 
 use std::path::{Path, PathBuf};
 
-/// Nothing is exempt. The pre-v1 wing was, and it is gone (M5B).
+/// Source directories covered by the spelling check.
 const EXEMPT: &[&str] = &[];
 
-/// What must not be in new code, and why each one is a refusal rather than a
-/// preference.
+/// Forbidden SSH trust-option spellings.
 const FORBIDDEN: &[(&str, &str)] = &[
     (
         "StrictHostKeyChecking=accept-new",
@@ -62,12 +48,7 @@ fn nothing_outside_the_old_wing_turns_host_key_checking_off() {
         checked += 1;
         let text = std::fs::read_to_string(&file).expect("the file we just walked to");
         for (line_no, line) in text.lines().enumerate() {
-            // A comment is not a call site. `transport.rs` explains what the
-            // pre-v1 tool did and why it does not do it, and a rule that
-            // forbade naming the thing would only make the explanation
-            // disappear. A line of CODE that mentions one is still caught:
-            // only a line that begins as a comment is skipped, so
-            // `.arg("StrictHostKeyChecking=no") // why` is not.
+            // Skip standalone comments; forbidden text on code lines still counts.
             if line.trim_start().starts_with("//") {
                 continue;
             }

@@ -2,28 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The one door to the outside, and the door knows what it lets through.
+//! Subprocess execution with effect admission, deadlines and cancellation.
 //!
-//! Everything this tool does to a machine it does by running a program that
-//! was already the right answer: `nix` builds, `ssh` carries, `git` reads the
-//! operator's repository, `tools/meister-ca` signs. None of that is
-//! reimplemented here — no ssh library, no nix evaluator — because the shell
-//! tools are what an operator can run by hand when this binary is not what
-//! they want, and because a deployment tool that reimplements ssh is a
-//! deployment tool with its own bugs in somebody's authentication.
-//!
-//! What is new against the pre-v1 door is that every [`Cmd`] carries its
-//! [`Effect`] class, and [`Policy`] decides BEFORE the spawn whether a command
-//! of that class may run at all. `--dry-run` and `--offline` are therefore
-//! properties of this module rather than promises made at each call site, and
-//! a forbidden command is an error with a sentence — never a fabricated
-//! `status: 0`, which is what the old runner returned and what made a dry run
-//! able to report a success nobody had.
-//!
-//! The second new thing is that a command cannot be built without a deadline.
-//! `ssh` to a box that is rebooting, `nix build` against a substituter that
-//! accepted the connection and then stopped talking: both hang forever, and a
-//! rollout that hangs holds a lock on a fleet.
+//! Every command declares an effect class; real and fake runners enforce the
+//! same policy before execution. Commands retain argv boundaries, support
+//! explicit redaction and terminate their process group on timeout or cancellation.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -37,15 +20,8 @@ use anyhow::{Context, Result, bail};
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, killpg, sigaction};
 use nix::unistd::Pid;
 
-/// What a command does to the world. The class is the whole point: it is what
-/// `--dry-run` and `--offline` are decided on, and it is what a journal entry
-/// and an approval class are derived from later.
-///
-/// The order is from harmless to irreversible, and nothing is allowed to be
-/// cheaper than it is: `nix eval` is [`Effect::NixEval`] and not
-/// [`Effect::Read`] even though it only reads the operator's repository,
-/// because it needs a Nix on the machine and an evaluation that can take
-/// minutes — an `--offline` run has to say so rather than fail obscurely.
+/// Command effect class used for policy admission. Nix evaluation has its own
+/// class even when its expression only reads local files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Effect {
     /// Touches nothing outside this process and no network: `git --version`,
@@ -95,9 +71,8 @@ pub enum Expect {
     ExitZero,
     /// Every exit code is an answer; the caller reads `status`.
     AnyExit,
-    /// These codes are answers, everything else is an error. `ssh` uses 255
-    /// for its own failures and passes the remote code through otherwise, so
-    /// "the remote said 1" and "ssh could not connect" are distinguishable.
+    /// Accept these exit codes. SSH transport failures (255) remain distinguishable
+    /// from expected remote statuses.
     Codes(Vec<i32>),
 }
 
@@ -111,19 +86,12 @@ impl Expect {
     }
 }
 
-/// A command line, kept as a program and its arguments rather than as a
-/// string: a certificate path with a space in it is an argument, not two.
-///
-/// There is deliberately no constructor without a `deadline` and without an
-/// [`Effect`]: both are decisions, and a default would make them somebody's
-/// oversight instead.
+/// Program and argv with mandatory effect classification and deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
-    /// Where it runs. `None` means the process's own directory — which for
-    /// anything reading an operator repository is the wrong answer, so the
-    /// repository-reading callers all set it.
+    /// Working directory; repository-reading callers set it explicitly.
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// Start from an empty environment instead of inheriting this process's.
@@ -132,10 +100,7 @@ pub struct Cmd {
     /// How long it may take before it is killed. Not optional.
     pub deadline: Duration,
     pub expect: Expect,
-    /// Substrings that appear as `***` wherever this command is printed — in
-    /// a log line, in an error, in a journal entry. A token handed to a
-    /// provider, a one-time password: the value has to travel in the argv,
-    /// and it must not travel into a report somebody attaches to a ticket.
+    /// Exact substrings replaced with `***` in formatted commands and error output.
     pub redact: Vec<String>,
     pub effect: Effect,
 }
@@ -195,20 +160,17 @@ impl Cmd {
         self
     }
 
-    /// Hide this exact substring wherever the command is printed.
+    /// Redact this exact nonempty substring.
     pub fn redact(mut self, secret: impl Into<String>) -> Cmd {
         let secret = secret.into();
-        // An empty needle would match everywhere and hide nothing, and a
-        // caller that passes one means "there is no secret here".
+        // An empty value does not identify a secret.
         if !secret.is_empty() {
             self.redact.push(secret);
         }
         self
     }
 
-    /// The command as a human would type it, with every redacted value gone.
-    /// Quoted only where it has to be, so that a line printed here can be
-    /// pasted into a shell — which is the whole point of printing it.
+    /// Render a redacted, shell-quoted command line.
     pub fn line(&self) -> String {
         let mut out = shell_quote(&self.redacted(&self.program));
         for a in &self.args {
@@ -218,8 +180,7 @@ impl Cmd {
         out
     }
 
-    /// The same, with the directory and the environment it runs in — for the
-    /// journal, where "which command" alone is not enough to repeat a run.
+    /// Include working directory and environment assignments in the description.
     pub fn described(&self) -> String {
         let mut out = String::new();
         if let Some(dir) = &self.cwd {
@@ -232,9 +193,7 @@ impl Cmd {
         out
     }
 
-    /// Apply the redaction list to any text that came from or names this
-    /// command — its own argv, but also the stderr it produced, which happily
-    /// echoes back the argument it did not like.
+    /// Apply exact-substring redaction to command text or captured diagnostics.
     pub fn redacted(&self, text: &str) -> String {
         let mut out = text.to_string();
         for secret in &self.redact {
@@ -244,16 +203,9 @@ impl Cmd {
     }
 }
 
-/// Quote an argument so that the printed line can be pasted into a shell.
-///
-/// An allowlist rather than a list of dangerous characters: a glob, a brace, a
-/// backtick or a newline in a path all change what a pasted line means, and a
-/// denylist is a list somebody forgets to extend.
-///
-/// Public because one string this tool produces is not printed but EXECUTED
-/// by something else: `NIX_SSHOPTS` is handed to nix, which splits it. See
-/// [`crate::transport::Ssh::nix_sshopts`], which uses the same predicate to
-/// decide when a path cannot be passed that way at all.
+/// Quote a POSIX shell argument using an allowlist for unquoted words.
+/// [`crate::transport::Ssh::nix_sshopts`] uses the same predicate to reject
+/// arguments that Nix cannot represent in its whitespace-split SSH options.
 pub fn shell_quote(a: &str) -> String {
     if is_bare(a) {
         a.to_string()
@@ -262,8 +214,7 @@ pub fn shell_quote(a: &str) -> String {
     }
 }
 
-/// Whether a string is a word every shell — and nix's own tokenizer — reads
-/// back as exactly one argument, without quotes around it.
+/// Whether an argument needs no quoting for the shell or Nix SSH options.
 pub fn is_bare(a: &str) -> bool {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     !a.is_empty() && a.chars().all(safe)
@@ -304,9 +255,7 @@ impl Output {
     }
 }
 
-/// What this run is allowed to do. Checked before the spawn, by every
-/// [`Runner`], including the one the tests use — so a test can pin that
-/// `--offline` refuses rather than pin that a caller remembered to ask.
+/// Effect admission policy enforced before execution by both runners.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Policy {
     /// Say what would happen, and read whatever is needed to say it.
@@ -334,9 +283,7 @@ impl Policy {
         }
     }
 
-    /// Whether a command of this class may run. `--offline` is the stricter
-    /// of the two, so when both are set both sentences would be true and the
-    /// offline one is the one printed.
+    /// Check offline restrictions first, then dry-run restrictions.
     pub fn admits(&self, effect: Effect) -> Result<()> {
         if self.offline && effect != Effect::Offline {
             bail!("it is a {effect} command and --offline permits only offline ones");
@@ -350,8 +297,7 @@ impl Policy {
         Ok(())
     }
 
-    /// One sentence, not a context chain: a refusal is printed with
-    /// `{e}` as often as with `{e:#}`, and the reason has to survive both.
+    /// Keep refusal context in the outer error for both display formats.
     fn gate(&self, cmd: &Cmd) -> Result<()> {
         match self.admits(cmd.effect) {
             Ok(()) => Ok(()),
@@ -360,14 +306,8 @@ impl Policy {
     }
 }
 
-/// A token that ends the command that is running right now.
-///
-/// The child runs in its own process group so that a `nix build` cannot be
-/// half-killed by a Ctrl-C the shell delivered to it and not to us; the price
-/// is that Ctrl-C no longer reaches the child at all, which is why this
-/// exists. [`Cancel::on_sigint`] catches the signal here and kills the group
-/// deliberately — one place that decides, rather than the terminal's idea of
-/// a foreground process group.
+/// Cancellation token for commands running in separate process groups.
+/// [`Cancel::on_sigint`] records Ctrl-C so the runner can terminate the group.
 #[derive(Debug, Clone, Default)]
 pub struct Cancel(Arc<AtomicBool>);
 
@@ -393,19 +333,8 @@ impl Cancel {
         self.0.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst)
     }
 
-    /// Work on, even when the connection that started this went away.
-    ///
-    /// For the target-side helper: it is started over ssh, and the very
-    /// thing it does — `switch-to-configuration` — restarts sshd and the
-    /// network under its own connection. A `SIGHUP` at that moment would
-    /// kill it between moving the profile and arming the way back, which is
-    /// the one place this program must not be interrupted. Measured in
-    /// nix/tests/update.nix: the switch finished and the operator's ssh
-    /// came back 255 with nothing to say.
-    ///
-    /// Only the helper calls this. `meister-deploy` on a workstation has a
-    /// terminal, and a program that ignores its hangup there would be a
-    /// program somebody cannot close a laptop on.
+    /// Ignore SIGHUP in the target helper so activation can survive an SSH disconnect.
+    /// Workstation commands retain normal hangup behavior.
     pub fn ignore_sighup() -> Result<()> {
         let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
         // SAFETY: SIG_IGN installs no handler; there is no code to be
@@ -414,10 +343,7 @@ impl Cancel {
         Ok(())
     }
 
-    /// Install the SIGINT handler once, for the whole process. Called from
-    /// `main`, never from a library path: a library that installs signal
-    /// handlers behind its caller's back is a library that breaks the next
-    /// program to link it.
+    /// Install the process-wide SIGINT handler once, from the binary entry point.
     pub fn on_sigint() -> Result<()> {
         if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -436,38 +362,22 @@ impl Cancel {
 }
 
 pub trait Runner {
-    /// Run it, or say why it was not run. An exit code the command's
-    /// [`Expect`] does not accept is an error here — the decision belongs to
-    /// the command, not to every call site.
+    /// Run a command and validate its exit status against [`Expect`].
     fn run(&self, cmd: &Cmd) -> Result<Output>;
 
-    /// What this runner refuses. Callers read it to skip a phase entirely
-    /// rather than to walk into a refusal.
+    /// Admission policy, available to callers that skip unsupported phases.
     fn policy(&self) -> Policy;
 }
 
-/// The real one: spawns, waits with a deadline, and kills the process GROUP
-/// when the deadline passes or the operator interrupts.
+/// Subprocess runner with deadlines and process-group cancellation.
 pub struct Real {
     pub policy: Policy,
-    /// Print every command to stderr before running it. stdout belongs to the
-    /// answer — `--json` has to stay machine-readable — so diagnostics never
-    /// go there.
+    /// Print command diagnostics to stderr, preserving stdout for results.
     pub verbose: bool,
     pub cancel: Cancel,
-    // --- lane 4B ---
-    /// Whether the operator's interrupt reaches the commands this runner
-    /// spawns.
-    ///
-    /// True for everything, with exactly one exception: the work that has to
-    /// happen BECAUSE the operator interrupted. `verify` takes its guests
-    /// back when it is stopped, and a runner that honoured the same Ctrl-C
-    /// would kill the `vm rm` it had just started — measured on manacor, the
-    /// first interrupted run left two guests standing, because the delete
-    /// and the listing after it were in the process group the interrupt had
-    /// killed. The deadline still applies, so this cannot hang.
+    /// Whether SIGINT cancels spawned commands. Cleanup runners disable cancellation
+    /// so an interrupted operation can remove its temporary resources; deadlines remain.
     pub stoppable: bool,
-    // --- end lane 4B ---
 }
 
 impl Real {
@@ -485,24 +395,18 @@ impl Real {
         self
     }
 
-    // --- lane 4B ---
     /// A runner whose commands the operator's interrupt does not reach. See
     /// [`Real::stoppable`]; nothing but a cleanup may use it.
     pub fn unstoppable(mut self) -> Real {
         self.stoppable = false;
         self
     }
-    // --- end lane 4B ---
 }
 
-/// How often the wait loop looks at the child. Small enough that a 200 ms
-/// deadline is honoured to within a rounding error, large enough that a
-/// ten-minute `nix build` is not a spin loop.
+/// Poll child completion and cancellation every five milliseconds.
 const POLL: Duration = Duration::from_millis(5);
 
-/// How long a killed process group gets between SIGTERM and SIGKILL. `nix`
-/// removes its temporary roots on SIGTERM and `ssh` closes its channel, and
-/// both are worth waiting for; neither takes two seconds.
+/// Allow two seconds for graceful process-group termination.
 const GRACE: Duration = Duration::from_secs(2);
 
 impl Runner for Real {
@@ -531,9 +435,7 @@ impl Runner for Real {
         if let Some(dir) = &cmd.cwd {
             builder.current_dir(dir);
         }
-        // Its own process group, so that the deadline can take the whole tree
-        // with it: `ssh host 'nix build'` and `sh -c '... &'` both leave
-        // children that outlive the process we spawned.
+        // Isolate the process group so timeout cleanup reaches descendant processes.
         {
             use std::os::unix::process::CommandExt;
             builder.process_group(0);
@@ -542,9 +444,7 @@ impl Runner for Real {
         let mut child = builder.spawn().with_context(|| missing(&cmd.program))?;
         let pgid = Pid::from_raw(child.id() as i32);
 
-        // Three pipes, three threads. A child that writes more than a pipe
-        // buffer to stderr while we wait on stdout deadlocks, and `nix build`
-        // writes a great deal to stderr.
+        // Read both outputs and write stdin concurrently to avoid pipe deadlocks.
         let stdin_thread = cmd.stdin.clone().map(|bytes| {
             let mut pipe = child.stdin.take().expect("stdin was piped");
             std::thread::spawn(move || {
@@ -592,17 +492,8 @@ impl Runner for Real {
             std::thread::sleep(POLL);
         };
 
-        // The child is gone. Anything still in its process group is something
-        // it left behind — and that something inherited the write end of our
-        // stdout and stderr pipes, so `read_to_end` below would wait for IT
-        // rather than for the command. `sh -c 'sleep 1000 & echo hi'` exits
-        // immediately and would hang this call for a quarter of an hour: the
-        // deadline would be a promise about the child alone, which is not what
-        // the caller asked for. So the group is swept BEFORE the readers are
-        // joined, and the joins are bounded by that rather than by patience.
-        //
-        // It is also the right thing on its own terms: this tool does not
-        // leave background processes on an operator's machine.
+        // Terminate remaining group members before joining pipe readers: background
+        // children may retain stdout/stderr after the direct child exits.
         sweep(pgid);
 
         if let Some(t) = stdin_thread {
@@ -628,8 +519,7 @@ impl Runner for Real {
         }
 
         let out = Output {
-            // A process killed by a signal has no exit code; -1 is not a code
-            // any program returns, and the sentence below says which signal.
+            // Signal termination has no exit code; use -1 and retain the signal diagnostic.
             status: status.code().unwrap_or(-1),
             stdout,
             stderr,
@@ -642,12 +532,8 @@ impl Runner for Real {
     }
 }
 
-/// Take whatever is left of a process group: SIGTERM, up to [`GRACE`] to go,
-/// then SIGKILL.
-///
-/// Called once the child has been reaped, so an empty group is the normal
-/// case and both signals are then a no-op — `killpg` answers `ESRCH`, which
-/// is the answer "nobody was left" and not an error worth a sentence.
+/// After reaping the child, terminate remaining group members with SIGTERM,
+/// then SIGKILL after [`GRACE`]. An absent group needs no cleanup.
 fn sweep(pgid: Pid) {
     let _ = killpg(pgid, Signal::SIGTERM);
     let since = Instant::now();
@@ -663,9 +549,7 @@ fn group_is_alive(pgid: Pid) -> bool {
     killpg(pgid, None).is_ok()
 }
 
-/// Check the exit code against what the command expects, and turn a refusal
-/// into a sentence that carries the command and what it said. Shared, so that
-/// [`StrictFake`] refuses exactly what [`Real`] refuses.
+/// Apply the same exit-status contract to real and fake results.
 fn finish(cmd: &Cmd, out: Output) -> Result<Output> {
     if cmd.expect.accepts(out.status) {
         return Ok(out);
@@ -683,12 +567,7 @@ fn finish(cmd: &Cmd, out: Output) -> Result<Output> {
     );
 }
 
-/// The last few lines of what a tool said. `nix` can produce a screen of
-/// progress before the one line that matters, and the one line that matters
-/// is at the end.
-///
-/// Public because a failed check records what the thing it ran said, and it
-/// records it the same way an error does.
+/// Last five output lines, shared by command errors and check reports.
 pub fn last_lines(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
@@ -760,22 +639,9 @@ impl Matcher {
     }
 }
 
-/// The runner the tests use, and the only one they may use.
-///
-/// It answers a fixed sequence of expected commands and nothing else. An
-/// unexpected command is an error AND is remembered; an expectation nobody
-/// used is an error from [`StrictFake::verify`] and a panic from `Drop`. The
-/// pre-v1 fake did neither — it answered anything with a default success and
-/// forgot what it was asked — which is how a test could pass while the code
-/// under it ran a command the test had never thought about.
-///
-/// Its state is behind a `Mutex` rather than a `RefCell` so that it is
-/// `Sync`, like [`Real`]: code that asks several hosts at once takes a
-/// `&(dyn Runner + Sync)`, and a fake that could not stand in for the real
-/// runner there would mean that path is only ever exercised for real. The
-/// expectations stay a strict SEQUENCE — a test that lets two threads
-/// through this at once is a test whose command order is a race, and it
-/// will say so by failing.
+/// Strict, ordered subprocess fake. Unexpected and unused commands fail verification;
+/// `Drop` checks expectations unless the caller already verified or is panicking.
+/// Mutexes provide `Sync`, but concurrent callers must still obey the expected order.
 pub struct StrictFake {
     policy: Policy,
     expects: Mutex<VecDeque<(Matcher, Output)>>,
@@ -784,9 +650,7 @@ pub struct StrictFake {
     checked: AtomicBool,
 }
 
-/// One lock, one sentence: a poisoned mutex here means a test panicked
-/// while holding it, and the panic that poisoned it is the failure worth
-/// reading.
+/// A poisoned fake-runner mutex indicates a test panic.
 fn held<T>(guard: std::sync::LockResult<T>) -> T {
     guard.expect("a StrictFake is only locked in its own methods")
 }
@@ -825,9 +689,7 @@ impl StrictFake {
         held(self.calls.lock()).clone()
     }
 
-    /// Every expectation was used and no unexpected command arrived. A test
-    /// that calls this takes responsibility for the answer; a test that does
-    /// not gets the same verdict from `Drop`, as a panic.
+    /// Check all expectations; calling this suppresses the equivalent Drop check.
     pub fn verify(&self) -> Result<()> {
         self.checked.store(true, Ordering::SeqCst);
         let unused = held(self.expects.lock());
@@ -863,9 +725,7 @@ impl StrictFake {
 
 impl Drop for StrictFake {
     fn drop(&mut self) {
-        // A test that already failed gets one message, not two: panicking
-        // inside a panic aborts the process and takes the real failure's
-        // output with it.
+        // Avoid a second panic during unwinding.
         if self.checked.load(Ordering::SeqCst) || std::thread::panicking() {
             return;
         }
@@ -960,9 +820,7 @@ mod tests {
 
     #[test]
     fn the_whole_process_group_dies_not_only_the_child() {
-        // sh backgrounds the first sleep and waits on the second. Without a
-        // process group the background one would survive the kill, reparent
-        // to init and hold the deadline's promise open for two more days.
+        // A background child must be killed with its process group.
         let cmd = sh("sleep 987655 & sleep 987655", Duration::from_millis(200));
         let err = Real::new(Policy::real()).run(&cmd).unwrap_err().to_string();
         assert!(err.contains("process group was killed"), "{err}");
@@ -972,9 +830,7 @@ mod tests {
 
     #[test]
     fn a_grandchild_holding_the_pipe_does_not_outlast_the_command() {
-        // sh backgrounds the sleep and exits at once. The sleep inherits the
-        // stdout pipe, so joining the reader without sweeping the group would
-        // wait for the sleep — eleven days, with a five-second deadline set.
+        // A background child retaining stdout must not keep the reader blocked.
         let cmd = sh("sleep 987657 & echo hi", Duration::from_secs(5));
         let began = Instant::now();
         let out = Real::new(Policy::real()).run(&cmd).unwrap();
@@ -989,13 +845,8 @@ mod tests {
         assert!(!pgrep("987657"), "the background sleep was left running");
     }
 
-    /// Is any process still RUNNING with this in its command line?
-    ///
-    /// A zombie does not count. Once a killed background process's parent is
-    /// gone, the entry stays in the process table until init gets round to
-    /// reaping it, and on a busy machine that is long enough to make this
-    /// test fail for something that is not true: a zombie holds no file
-    /// descriptor, so it is not what these tests are about.
+    /// Check for running processes matching the marker. Zombies hold no pipe
+    /// descriptors and do not count as surviving children.
     fn pgrep(needle: &str) -> bool {
         let out = Command::new("pgrep")
             .arg("-f")
@@ -1013,9 +864,7 @@ mod tests {
 
     fn is_zombie(pid: i32) -> bool {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            // "<pid> (comm) <state> …", and `comm` may itself contain spaces
-            // and parentheses — so the state is the first character after the
-            // LAST closing parenthesis.
+            // The process name may contain parentheses; state follows the final closing one.
             Ok(text) => {
                 text.rfind(')')
                     .and_then(|i| text[i + 1..].trim_start().chars().next())

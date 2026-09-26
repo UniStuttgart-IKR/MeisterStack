@@ -2,17 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What `meister-deploy install` does to the machine it runs on — measured.
-//!
-//! The verb that prepares a first installation: it builds a medium, writes
-//! down what that medium is, and prints the sheet somebody carries to the
-//! machine. It destroys nothing, and every test in here is about the
-//! refusals in front of that — a plan of the wrong kind, a plan for another
-//! release, a host the plan does not cover, a blocked host, and the missing
-//! approval.
-//!
-//! `PATH` holds a `nix` that records its argv and exits 97, so "nothing was
-//! built" is a log file somebody read.
+//! CLI tests for preparing installation media.
+//! Check plan kind, release/host binding, blocked verdicts and approval.
+//! A logging Nix shim prevents real builds; target formatting belongs to meister-install.
 
 mod support;
 
@@ -52,8 +44,7 @@ impl Sandbox {
 
         let cwd = tempfile::tempdir().unwrap();
         let release = release_of(enrolled());
-        // Nobody answered: a rack of machines that have never been
-        // installed, which is what an install plan is made from.
+        // Unreachable observations represent hosts awaiting first installation.
         let mut observation = observed(&release, at("2026-09-21T11:59:00Z"));
         for host in observation.hosts.values_mut() {
             host.reachable = false;
@@ -74,7 +65,7 @@ impl Sandbox {
         std::fs::write(cwd.path().join("release.json"), release.to_json().unwrap()).unwrap();
         std::fs::write(cwd.path().join("install.json"), the_plan.to_json().unwrap()).unwrap();
 
-        // …and an upgrade plan of the same release, for the refusal.
+        // Build an upgrade plan to test the wrong-kind refusal.
         let running = observed(&release, at("2026-09-21T11:59:00Z"));
         let upgrade = plan::plan(
             &release,
@@ -137,9 +128,7 @@ impl Sandbox {
     }
 }
 
-/// The fixture with every host enrolled: `support::onebox` leaves `n2`
-/// without a host key on purpose, and a plan about a host nothing can
-/// connect to is a plan about enrolment rather than about installing.
+/// Enroll every fixture host so these tests isolate installation behavior from enrollment checks.
 fn enrolled() -> meister_deploy::manifest::ResolvedFleet {
     let mut fleet = onebox();
     for (id, host) in fleet.hosts.iter_mut() {
@@ -281,9 +270,7 @@ fn a_host_the_plan_does_not_cover_is_a_sentence() {
 
 #[test]
 fn a_blocked_installation_is_exit_two_and_no_medium() {
-    // The same fleet, planned while every host answers: an install over a
-    // running machine is blocked, and a verb that built a medium anyway
-    // would be a verb that handed somebody a disk formatter.
+    // A reachable installed host must block first-install media preparation.
     let sandbox = Sandbox::new();
     let release = release_of(enrolled());
     let running = observed(&release, at("2026-09-21T11:59:00Z"));

@@ -2,14 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a verification does, measured with a strict fake and a fake clock.
-//!
-//! Two of these tests are about an ORDER rather than a result — the ledger
-//! is written before the create, and the cleanup happens whatever else did —
-//! so the runner here is a small one of its own that photographs the ledger
-//! file at the moment each command goes out. Everything else uses the crate's
-//! own [`StrictFake`], which refuses a command nobody expected and fails on
-//! an expectation nobody used.
+//! Verification tests with strict command expectations and a fake clock.
+//! A ledger-observing runner checks persistence at the instant commands execute.
 
 use std::cell::RefCell;
 
@@ -32,10 +26,7 @@ fn guest(n: usize) -> String {
     format!("{}-{n}", tag())
 }
 
-/// A release that carries the guest this suite boots. The fixture's own
-/// `release_of` binds no packages, so this adds the one the suite reads and
-/// renames the release, because a release whose content changed and whose id
-/// did not is one `validate` refuses.
+/// Add guest-tiny artifacts to the fixture release and recompute its content-derived ID.
 fn release_with_guest() -> ReleaseManifest {
     let mut release = release_of(onebox_enrolled());
     release.packages.insert(
@@ -151,12 +142,7 @@ fn ledger_path() -> PathBuf {
     state().run_dir(RUN).join("ledger.json")
 }
 
-/// A runner that photographs the ledger file every time a command goes out.
-///
-/// The order "ledger first, then create" cannot be shown by comparing two
-/// logs — they are two lists with no common clock — so this takes the one
-/// measurement that decides it: what was on the disk at the moment the
-/// create was spawned.
+/// Snapshot the ledger when each command runs to verify create/persistence ordering.
 struct Watching<'a> {
     inner: &'a StrictFake,
     files: &'a MemFiles,
@@ -248,8 +234,7 @@ fn one_guest_alone_first_and_then_the_budget() {
 
     let mut fake = StrictFake::new();
     fake = a_good_guest(fake, &guest(1), "n1");
-    // The batch: both created, then both read, then both deleted — which is
-    // what "two alive at once" means.
+    // Create both guests before checking and deleting either.
     fake = fake
         .expect(
             Matcher::prefix("meister", cli_args(&["vm", "create", &guest(2), "-f"])),
@@ -403,9 +388,7 @@ fn keep_leaves_the_guests_and_says_which() {
     let mut options = options(Suite::VmLifecycle);
     options.keep = true;
 
-    // Two guests that work, and nothing that removes them: `--keep` is for
-    // somebody who wants to look at one, so no `vm rm` and no `vm ls` may
-    // appear — a StrictFake turns an attempt into a failure.
+    // Keep mode must issue neither removal nor absence checks.
     let mut fake = StrictFake::new();
     for n in [1, 2] {
         fake = fake
@@ -469,8 +452,7 @@ fn the_cleanup_will_not_delete_a_name_it_cannot_prove_it_made() {
     let world = world();
     let files = MemFiles::new();
     let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
-    // Nothing is expected of the runner at all: a foreign name must not
-    // reach a `vm rm`, and a StrictFake turns an attempt into a failure.
+    // Foreign names must never reach the command runner.
     let fake = StrictFake::new();
     let mut verifier = Verifier::new(
         &fake,
@@ -578,8 +560,7 @@ fn a_deadline_that_passes_stops_the_run_and_still_takes_the_guests_back() {
     assert!(stopped.reason.contains("budget"), "{}", stopped.reason);
 }
 
-/// A runner that pulls the interrupt out from under the run, after the
-/// command whose line contains this needle.
+/// Set the interruption token after a command matching the configured substring.
 struct Interrupting<'a> {
     inner: &'a StrictFake,
     cancel: Cancel,
@@ -611,8 +592,7 @@ fn an_interrupted_run_deletes_what_it_made_and_is_aborted() {
     rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
     rm.push(name.clone());
 
-    // The guest exists — the create returned — and the interrupt arrives
-    // with that answer. Everything after it is the way back.
+    // Interrupt after the successful create response, leaving cleanup responsible for the guest.
     let fake = StrictFake::new()
         .expect(
             Matcher::prefix("meister", cli_args(&["vm", "create", &name, "-f"])),
@@ -878,8 +858,7 @@ fn a_gpu_host_that_declares_everything_and_measures_nothing_fails_rather_than_sk
     fleet.manifest_id = content_id(IdKind::Manifest, &fleet).expect("a manifest hashes");
     let mut release = release_with_guest();
     release.resolved_fleet = fleet;
-    // The snapshot has kvm and NOT vfio: the fixture's `observed` copies the
-    // declared capabilities, so this takes it back out to make the point.
+    // Remove VFIO from the fixture observation while retaining declared GPU hardware.
     let mut observation = observed(&release, at("2026-09-22T19:00:00Z"));
     observation
         .hosts
@@ -953,8 +932,7 @@ fn an_rdma_peer_is_a_declared_one_and_never_an_assumed_one() {
             gateway: None,
         });
     }
-    // `box` declares an rdma nic on a DIFFERENT storage network, so it is
-    // nobody's peer here.
+    // Box has a different storage-address prefix and therefore no default peer.
     {
         let host = fleet.hosts.get_mut("box").expect("the fixture has it");
         host.hardware.nics.push(crate::manifest::Nic {
@@ -1099,8 +1077,7 @@ fn without_the_operator_cli_reference_nothing_is_created() {
     assert_eq!(stopped.status, Status::Unknown);
     assert!(stopped.reason.contains("cli_config"), "{}", stopped.reason);
     assert_eq!(run.outcome, Outcome::Aborted);
-    // The ledger is the whole point of the order: the guest was written
-    // down, nothing was created, and the cleanup says it could not even ask.
+    // Create intent persists even when commands cannot run; cleanup reports the unresolved resource.
     assert_eq!(run.ledger.resources.len(), 1);
     assert_eq!(run.ledger.resources[0].state, ResourceState::Lost);
     let cleanup = run
@@ -1136,8 +1113,7 @@ fn the_guest_spec_is_the_one_the_package_builds() {
             .contains("console=ttyS0")
     );
     assert!(value.get("nics").is_none(), "a lifecycle guest has no nic");
-    // The two the cluster tier refused when this was first run for real:
-    // `desired` is controller-owned, and a vm needs a boot disk.
+    // The control plane owns `desired` and requires a boot disk.
     assert!(
         value.get("desired").is_none(),
         "spec.vm.desired is controller-owned (422 from the cluster tier)"
@@ -1158,10 +1134,7 @@ fn the_guest_spec_is_the_one_the_package_builds() {
     assert_eq!(value["devices"][0]["params"]["pci_address"], "0000:41:00.0");
 }
 
-// Astra finding MD08, 2026-09-25: a refused delete and a listing that exits
-// 0 with nothing on stdout. That used to be a `deleted` resource — the
-// empty answer counted as "not listed" — and a guest left on the node with a
-// green line in the ledger.
+// An empty successful listing cannot prove a failed delete removed the guest.
 #[test]
 fn a_listing_that_says_nothing_leaves_a_refused_delete_lost_not_deleted() {
     let world = world();
@@ -1192,8 +1165,7 @@ fn a_listing_that_says_nothing_leaves_a_refused_delete_lost_not_deleted() {
             Matcher::exact("meister", rm),
             Output::failing(1, "the node refused: still terminating"),
         )
-        // Exit 0 and not a byte: the one listing, because an answer nobody
-        // can read ends the wait rather than being asked again.
+        // Stop verification on unreadable listing output.
         .expect(
             Matcher::exact("meister", cli_args(&["vm", "ls"])),
             Output::stdout(""),
@@ -1235,23 +1207,19 @@ fn a_listing_that_says_nothing_leaves_a_refused_delete_lost_not_deleted() {
     assert_ne!(run.outcome, Outcome::Success);
 }
 
-// Astra finding MD08, 2026-09-25: an answer nobody can read is not an
-// answer in EITHER direction. This test used to require an empty stdout to
-// be read as "gone".
+// Unsupported listings must not establish either presence or absence.
 #[test]
 fn an_answer_that_cannot_be_read_is_never_read_as_gone() {
     assert!(lists_name(r#"{"items":[{"metadata":{"name":"a"}}]}"#, "a").unwrap());
     assert!(!lists_name(r#"{"items":[]}"#, "a").unwrap());
-    // Not json, and not empty: something answered and nobody understood it.
+    // Nonempty invalid JSON remains an error.
     let err = lists_name("Error: the cluster is not reachable", "a").unwrap_err();
     assert!(err.to_string().contains("not json"), "{err}");
-    // Nothing at all: a process that printed nothing has said nothing, and
-    // in particular it has not said that `a` is gone.
+    // Empty stdout does not prove deletion.
     let err = lists_name("", "a").unwrap_err();
     assert!(err.to_string().contains("nothing at all"), "{err}");
     assert!(lists_name("  \n\t \n", "a").is_err());
-    // A document without `items` is one this tool does not know, and
-    // guessing "gone" from it is how a leak becomes a green line.
+    // Missing `items` is an unsupported listing shape.
     let err = lists_name(r#"{"kind":"Status","code":500}"#, "a").unwrap_err();
     assert!(err.to_string().contains("no `items`"), "{err}");
 }
@@ -1288,8 +1256,7 @@ fn the_placement_is_read_back_out_of_the_object() {
 // the gpu suite: pinned, not run
 // ---------------------------------------------------------------------------
 
-/// The fleet with n1 turned into a passthrough host: one device declared,
-/// the capability declared, and the snapshot measuring it.
+/// Declare one VFIO GPU on n1 and observe the corresponding capability.
 fn gpu_world(pci: &str) -> (ReleaseManifest, Observations) {
     let mut fleet = onebox_enrolled();
     {
@@ -1341,8 +1308,7 @@ fn the_gpu_suite_hands_the_device_out_and_back_five_times_and_pins_every_line() 
                 listing(&[]),
             );
     }
-    // The refusal: a PCI address in a domain nothing uses has to be turned
-    // down, and the refusal is the pass.
+    // The fake rejects the invalid PCI request.
     fake = fake.expect(
         Matcher::prefix(
             "meister",
@@ -1393,8 +1359,7 @@ fn the_gpu_suite_hands_the_device_out_and_back_five_times_and_pins_every_line() 
     assert_eq!(refusal[0].status, Status::Pass);
     assert!(refusal[0].observed.contains("refused"), "{:?}", refusal[0]);
 
-    // The computation half, and the sentence that says what would have to
-    // exist for it to be run.
+    // Computation remains unavailable with the current guest image.
     let compute = by_id("gpu.compute");
     assert_eq!(compute.len(), 1);
     assert_eq!(compute[0].status, Status::NotApplicable);
@@ -1404,9 +1369,7 @@ fn the_gpu_suite_hands_the_device_out_and_back_five_times_and_pins_every_line() 
         compute[0].reason
     );
 
-    // `gpu.in-guest` is `unknown` and the inventory makes this suite a
-    // required one for n1, so the run is blocked — a suite that could not
-    // look inside the guest has not shown a passthrough.
+    // Required in-guest visibility remains unknown, so acceptance is blocked.
     assert!(!crate::checks::acceptance(&run.checks).is_accepted());
     assert!(
         run.ledger
@@ -1500,9 +1463,7 @@ fn a_backend_that_takes_a_device_it_does_not_have_is_a_failure_and_the_guest_is_
 // the rdma suite: pinned, not run
 // ---------------------------------------------------------------------------
 
-/// The fixture fleet with a fabric: n1 and n2 on one storage network, `box`
-/// on another one of its own, so that a peer is a declared peer and never a
-/// nearby one.
+/// RDMA fixture with n1 and n2 sharing a textual storage prefix and box on another.
 fn fabric_world() -> (ReleaseManifest, Observations) {
     let mut fleet = onebox_enrolled();
     for (id, last, net) in [("n1", 11u8, 200u8), ("n2", 12, 200), ("box", 10, 201)] {
@@ -1604,7 +1565,7 @@ fn the_rdma_suite_runs_a_server_then_a_client_and_every_line_is_pinned() {
                     _ => include_str!("../../tests/fixtures/rdma/ib_write_bw.txt"),
                 }),
             )
-            // Then the server goes, whatever the client did.
+            // Stop the server after the client command.
             .expect(
                 Matcher::exact("ssh", ssh_argv(&ssh, &release, "n1", &["sh", "-c", &stop])),
                 Output::stdout(""),
@@ -1661,8 +1622,7 @@ fn the_rdma_suite_runs_a_server_then_a_client_and_every_line_is_pinned() {
         );
     }
     assert_eq!(run.outcome, Outcome::Success);
-    // Nothing was created, so nothing is in the ledger: this suite measures
-    // and makes nothing.
+    // RDMA servers are not represented in the VM ownership ledger.
     assert!(
         run.ledger.resources.is_empty(),
         "{:?}",
@@ -1758,8 +1718,7 @@ fn a_pair_somebody_named_by_hand_has_to_be_one_the_inventory_declares() {
     let hosts = vec!["n1".to_string(), "n2".to_string()];
     let fake = StrictFake::new();
     let mut options = options(Suite::Rdma);
-    // `cloud-a` is not in this fixture at all; `n1:ghost` is a host nobody
-    // has.
+    // Reject pairs containing unknown hosts.
     options.pairs = vec![("n1".to_string(), "ghost".to_string())];
 
     let mut verifier = Verifier::new(
@@ -1802,8 +1761,7 @@ fn what_the_three_tools_say_is_read_off_the_row_and_not_guessed() {
     assert_eq!(bandwidth.peak, 5947.72);
     assert_eq!(bandwidth.average, 5946.88);
 
-    // A latency row read as a bandwidth would give a plausible number out of
-    // the wrong column, so the column count decides and the answer is None.
+    // Reject a nine-column latency row when parsing bandwidth.
     assert_eq!(
         bandwidth_of(include_str!("../../tests/fixtures/rdma/ib_send_lat.txt")),
         None
@@ -1815,12 +1773,7 @@ fn what_the_three_tools_say_is_read_off_the_row_and_not_guessed() {
 
 #[test]
 fn a_console_record_that_stops_mid_line_is_unknown_and_not_a_failure() {
-    // The one this is for, measured on manacor: the node's serial recorder
-    // attaches on a reconcile pass, and by then cloud-hypervisor has
-    // replayed only the first 278 bytes of a boot that was over in half a
-    // second. The record ends in the middle of "[Firmware Bug]: TSC doesn't
-    // count with P" — a guest does not write half a line, so what is
-    // missing is the recording.
+    // A recording ending mid-line remains unknown even if the VM phase is Running.
     assert_eq!(
         record_of(
             "[    0.000000] Linux version 6.12.93\n[    0.000000] [Firmware Bug]: TSC doesn't count with P"
@@ -1905,7 +1858,7 @@ fn a_guest_whose_record_is_incomplete_blocks_without_calling_the_guest_broken() 
         "{}",
         console.reason
     );
-    // Whatever the console said, the guests still went.
+    // Console failure must not prevent guest cleanup.
     assert!(
         run.ledger
             .resources

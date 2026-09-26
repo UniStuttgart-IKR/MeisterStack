@@ -2,15 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The fleets the integration tests argue about, built through the public
-//! API only — the same `NixManifest::from_json`, `resolve` and `bind` an
-//! operator's flake goes through. A fleet that would not validate is not a
-//! fleet these tests are allowed to prove anything about.
-//!
-//! The seventy-host manifest is GENERATED from the checked-in one-box
-//! fixture rather than checked in beside it: seventy hosts of JSON is
-//! something nobody reviews, and generating it from the file lane 1B has to
-//! produce keeps both honest at once.
+//! Fleet fixtures built through public manifest resolution and release binding.
+//! The 70-host fixture derives from the checked-in one-box evaluation.
 
 // Shared by two test binaries; each uses part of it.
 #![allow(dead_code)]
@@ -161,15 +154,8 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     .expect("the fixture binds")
 }
 
-// --- lane 4B: the guest a verification boots ------------------------------
 
-/// The same release with the `guest-tiny` package in it.
-///
-/// `release_of` binds no packages, and `verify --suite vm-lifecycle` reads
-/// exactly one: the kernel and the initramfs
-/// `nix/packages/guest-tiny.nix` builds. The id is recomputed, because a
-/// release whose content changed and whose id did not is one `validate`
-/// refuses.
+/// Add guest-tiny artifacts required by VM verification and recompute the release ID.
 pub fn with_guest_tiny(mut release: ReleaseManifest, store_path: &str) -> ReleaseManifest {
     release.packages.insert(
         "guest-tiny".to_string(),
@@ -184,7 +170,6 @@ pub fn with_guest_tiny(mut release: ReleaseManifest, store_path: &str) -> Releas
     release
 }
 
-// --- end lane 4B ----------------------------------------------------------
 
 /// A release in which the named hosts got a new system.
 pub fn with_new_systems(
@@ -212,11 +197,8 @@ pub fn with_new_systems(
     release_of(fleet)
 }
 
-// --- lane 3-integration: a host whose provider loads its kernel ----------
 
-/// The same fleet with one host turned into a `boot = "direct"` guest: no
-/// boot loader, a command line that names the system its kernel is to start,
-/// and therefore a bundle its provider is handed.
+/// Give one host provider-loaded boot artifacts without a bootloader.
 pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
     {
         let host = fleet
@@ -234,8 +216,7 @@ pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
     fleet
 }
 
-/// The same fleet after another evaluation, without binding it to a release:
-/// a fleet with a direct-boot host needs [`direct_release_of`] for that.
+/// Update evaluated outputs; direct-boot hosts require direct_release_of.
 pub fn with_new_toplevels(
     mut fleet: ResolvedFleet,
     hosts: &[&str],
@@ -266,9 +247,7 @@ pub fn with_new_toplevels(
     fleet
 }
 
-/// [`release_of`] for a fleet with direct-boot hosts: each of them carries
-/// the bundle its provider is handed, because `release::bind` refuses a
-/// release in which one does not.
+/// Bind a release with the required provider boot bundles.
 pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     let mut artifacts = artifacts_for(&resolved);
     for (id, host) in &resolved.hosts {
@@ -316,17 +295,14 @@ pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     .expect("the fixture binds")
 }
 
-/// Every host running exactly what this release says, with nothing in the
-/// way.
+/// Build healthy observations matching the release.
 pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observations {
     let fleet = &release.resolved_fleet;
     let mut hosts = BTreeMap::new();
     for (id, host) in &fleet.hosts {
         let artifacts = &release.artifacts[id];
         let system = artifacts.toplevel.store_path.clone();
-        // Every unit the probe of this host asks about: a fixture of a
-        // healthy host is one whose every unit was asked about and
-        // answered.
+        // Include every probed unit as active.
         let units: BTreeMap<String, String> = meister_deploy::observe::ProbeSpec::for_host(host)
             .units
             .into_iter()
@@ -377,7 +353,6 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 lock: None,
                 capabilities: host.hardware.capabilities.clone(),
                 enrolled: true,
-                // --- lane 4A: a machine that is what the fleet says ---
                 disk_free_nix_bytes: Some(40_000_000_000),
                 pci: host
                     .hardware
@@ -398,7 +373,6 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                     })
                     .collect(),
                 generation_units: host.units.clone(),
-                // --- end lane 4A ---
                 unknown_reason: None,
             },
         );
@@ -457,16 +431,9 @@ pub const CLASSES: [&str; 4] = ["compute-cpu", "compute-gpu", "compute-rdma", "c
 /// The three hosts that carry two roles at once.
 pub const MULTI_ROLE: [&str; 3] = ["cluster-1-c", "cluster-2-b", "cluster-2-c"];
 
-/// A fleet of exactly seventy hosts, as a `nix-manifest/1`:
-///
-/// * 3 cloud controllers in one raft group,
-/// * 2 cluster groups of 3, also raft — three of those six also carry the
-///   agent role, which is what makes a multi-role host a real case here,
-/// * 61 agents in four hardware classes, each reporting to one of the two
-///   cluster groups.
-///
-/// Built from the one-box fixture's own hosts, so every field is one lane 1B
-/// has to produce and the whole thing goes through the real parser.
+/// Generate 3 cloud controllers, 6 cluster controllers and 61 agents.
+/// Three cluster controllers also carry the agent role. This models placement
+/// and scheduling; it does not validate multi-role credential deployment.
 pub fn fleet70_json() -> Value {
     let template = onebox_json();
     let controller = template["inventory"]["hosts"]["box"].clone();
@@ -634,12 +601,7 @@ pub fn fleet70() -> ResolvedFleet {
     resolve_value(fleet70_json())
 }
 
-/// What one host says to the read-only probe when it runs exactly what the
-/// release names.
-///
-/// Built from the release and the probe's own [`ProbeSpec`], so it is the
-/// answer of a healthy host rather than a string somebody kept in step by
-/// hand. Shared by the integration tests that shim `ssh`.
+/// Render a healthy probe response for CLI tests using a fake SSH executable.
 pub fn probe_answer(fleet: &ResolvedFleet, release: &ReleaseManifest, id: &str) -> String {
     use meister_deploy::observe::ProbeSpec;
     let host = &fleet.hosts[id];
@@ -691,10 +653,7 @@ pub fn probe_answer(fleet: &ResolvedFleet, release: &ReleaseManifest, id: &str) 
     for cap in &host.hardware.capabilities {
         s.push_str(&format!("cap={cap}\n"));
     }
-    // --- lane 4A: the machine under the closure ---
-    // A healthy host has room, has the cards the fleet names, has the
-    // interfaces the fleet names, and runs the units of the generation the
-    // release builds — so a test about anything else finds nothing here.
+    // Provide sufficient disk space and the hardware/units declared by the release.
     s.push_str(&format!(
         "disk_free_nix={}\n",
         artifacts.toplevel.closure_size * 20
@@ -702,16 +661,13 @@ pub fn probe_answer(fleet: &ResolvedFleet, release: &ReleaseManifest, id: &str) 
     for gpu in &host.hardware.gpus {
         s.push_str(&format!("pci={}\t10de:2684\n", gpu.pci));
     }
-    // One device that is nobody's business, so that the list is never empty
-    // on a host without a declared card: an empty list means "nobody could
-    // ask" and would block a host that is perfectly fine.
+    // Include an unrelated device so an empty inventory cannot mean probe failure.
     s.push_str("pci=0000:00:01.0\t8086:1237\n");
     for nic in &host.hardware.nics {
         s.push_str(&format!("nic={}\t{}\n", nic.name, nic.mac));
     }
     s.push_str("nic=lo\t00:00:00:00:00:00\n");
     s.push_str(&format!("gen_units={}\n", host.units.join(" ")));
-    // --- end lane 4A ---
     if let Some(etcd) = &spec.etcd {
         let name = etcd.member_name.clone().unwrap_or_else(|| id.to_string());
         s.push_str(&format!(

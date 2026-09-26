@@ -2,42 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `build`: make exist what the manifest promised, and nothing else.
+//! Build resolved derivations without reevaluating the operator flake.
 //!
-//! **It builds the derivations of the manifest, not the flake.** `resolve`
-//! evaluated the operator's repository and wrote down the `.drv` path of
-//! every system it named. Building those paths rather than re-evaluating
-//! `<repo>#nixosConfigurations.<host>` is what makes a release a binding: a
-//! derivation path IS the evaluation, so nothing between `resolve` and
-//! `build` — a commit, a `flake update`, an edited profile, a changed
-//! `$NIX_PATH` — can move what gets built. If a derivation is gone from the
-//! store (a garbage collection between the two steps), the answer is to
-//! resolve again, and the sentence says so; it is not to evaluate something
-//! that might be different now.
-//!
-//! **Signatures are not optional.** M0's probe S12 measured it in two VMs: a
-//! host with `nix.settings.require-sigs = true` refuses an unsigned closure
-//! over `ssh-ng://`, root or not, and the only way round it would be the old
-//! `ssh://` store — which is the pre-v1 path and throws away the guarantee
-//! `require-sigs` exists for. `--no-check-sigs` is not a flag this tool has.
-//! So a build that covers a managed host and has no signing key is an error
-//! with a sentence, and every store path a release names carries at least
-//! one signature by the time the release is written. The key's PATH is
-//! redacted out of every line this tool prints; the key's NAME (the part
-//! before the colon in the key file) goes into `build_env` because a target
-//! has to be told which public key to trust.
-//!
-//! **A release is protected from the collector.** A closure that was built,
-//! signed and named in a release, and then collected before `apply` ran, is
-//! an afternoon of building for nothing. So each release gets a directory of
-//! indirect garbage-collector roots under the state directory, and `gc
-//! --keep N` is the one thing that removes them.
-//!
-//! What `build` does NOT do: evaluate anything, ask any host anything, build
-//! an image (that is `image`, M3), or decide anything about the fleet. It
-//! realises, it measures, it signs, and it hands the result to
-//! [`crate::release::bind`], which refuses it if it is not what the manifest
-//! asked for.
+//! Managed systems require a signing key. The builder checks promised outputs,
+//! optionally rebuilds for reproducibility, signs recursively, measures artifacts,
+//! optionally pushes a cache, binds the release and creates GC roots.
+//! Images are built separately from derivations already named by the release.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -58,14 +28,7 @@ use crate::release::{
 use crate::run::{Cmd, Effect, Expect, Runner};
 use crate::state::StateDir;
 
-/// How long one derivation may take.
-///
-/// Four hours, because one of these derivations is a kernel and another is a
-/// NixOS system closure of several gigabytes on a cold substituter — and
-/// because the alternative to a generous deadline is an operator who wraps
-/// this tool in `timeout` and gets a half-built store with no journal entry
-/// about it. A build that has not finished in four hours has a problem a
-/// longer wait will not solve.
+/// Four-hour deadline for the artifact build invocation or an individual rebuild.
 pub const BUILD_DEADLINE: Duration = Duration::from_secs(4 * 3600);
 
 /// Signing walks a closure and writes a signature per path. Minutes for a
@@ -88,10 +51,7 @@ pub enum DrvKind {
     Package,
     /// A check the manifest requires: it passes by building.
     Check,
-    /// The kernel, the initrd and the command line of a host that boots
-    /// `direct`, in one directory. Built here and not by `image`, because a
-    /// direct-boot host cannot be started at all without it: it is part of
-    /// the release the way a toplevel is, not an image somebody may want.
+    /// Direct-boot kernel, initrd and command-line bundle, built as part of the release.
     DirectBoot,
 }
 
@@ -112,34 +72,21 @@ pub struct BuildOptions {
     /// `--builders`, offered to nix in the order they were given.
     pub builders: Vec<String>,
     pub substituters: Vec<String>,
-    /// `--max-jobs`, as a string because nix takes `auto` as well as a
-    /// number. Passed on unread: what a sensible parallelism is on the
-    /// machine that builds is that machine's question, not this tool's.
+    /// Nix `--max-jobs` value, including `auto`; passed through unchanged.
     pub max_jobs: Option<String>,
-    /// `--option <name> <value>`, for the settings that have no flag of
-    /// their own. Sorted, so that the release records them in one order and
-    /// two runs with the same options produce the same `build_env`.
+    /// Additional Nix options in stable key order.
     pub options: BTreeMap<String, String>,
-    /// Where this release's closures are pushed once they are signed:
-    /// `file:///srv/cache`, an `s3://` bucket, an `ssh-ng://` store. A nix
-    /// store url, handed to `nix copy --to` unread — which urls nix speaks
-    /// is nix's question and not a list this tool keeps in step with it.
+    /// Optional Nix store URL receiving signed release closures via `nix copy --to`.
     pub cache: Option<String>,
-    /// Build every host's system a second time and let nix compare, so that
-    /// `reproducibility.bit_identical_verified` is a measurement rather than
-    /// a hope. Expensive by construction: it is the whole fleet, twice.
+    /// Rebuild every selected system and record Nix’s reproducibility verdict.
     pub verify_reproducible: bool,
     /// Only these hosts. A build of part of a fleet is for looking at, not
     /// for releasing — see [`Builder::realise`].
     pub hosts: Option<Vec<String>>,
 }
 
-/// The derivations a build over these hosts would realise, in the order it
-/// would realise them.
-///
-/// Pure, so that `--dry-run` prints exactly the list a real run builds and
-/// not a description of it. Hosts first (they are what a rollout is about),
-/// then the packages, then the checks.
+/// List system, direct-boot, package and build-check derivations deterministically.
+/// Used by dry-run output and the builder.
 pub fn derivations(resolved: &ResolvedFleet, hosts: &[String]) -> Vec<Derivation> {
     let mut out = Vec::new();
     for id in hosts {
@@ -182,9 +129,7 @@ pub fn derivations(resolved: &ResolvedFleet, hosts: &[String]) -> Vec<Derivation
             drv,
         });
     }
-    // A required check that IS a derivation passes by building. The other
-    // entries name readiness checks — `units`, `session`, `mounts` — which
-    // are about a running host and belong to `check`, not here.
+    // Only `.drv` checks build here; runtime checks belong to host readiness.
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for id in hosts {
         if let Some(host) = resolved.hosts.get(id) {
@@ -248,13 +193,7 @@ struct RawPathInfoV2 {
     info: BTreeMap<String, RawPathInfo>,
 }
 
-/// Read `nix path-info --json`, in either of the two shapes nix produces.
-///
-/// Version 1 is an object keyed by full store path. Version 2 (nix 2.35
-/// asks for it and will one day only produce it) wraps the same objects in
-/// `info`, keyed by base name, with the store directory beside them. Both
-/// are read, because a tool that only understood one of them would break on
-/// whichever nix the operator's workstation has.
+/// Parse path-info v1 (full-path keys) or v2 (`storeDir` plus basename-keyed `info`).
 pub fn parse_path_info(text: &str, origin: &str) -> Result<BTreeMap<String, PathInfo>> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| anyhow::anyhow!("{origin} did not answer with json: {e}."))?;
@@ -274,9 +213,7 @@ pub fn parse_path_info(text: &str, origin: &str) -> Result<BTreeMap<String, Path
 
     let mut out = BTreeMap::new();
     for (path, info) in entries {
-        // A path-info entry without a nar hash is an entry about a path that
-        // is not in the store. Guessing a hash here would put a guess in a
-        // release.
+        // A release requires a reported NAR hash for each measured path.
         let Some(nar_hash) = info.nar_hash else {
             bail!(
                 "{origin} says nothing about the contents of {path}; a release cannot name a \
@@ -297,11 +234,7 @@ pub fn parse_path_info(text: &str, origin: &str) -> Result<BTreeMap<String, Path
     Ok(out)
 }
 
-/// `nix build --no-link --print-out-paths <drv>^*`.
-///
-/// `^*` asks for every output of the derivation; `--no-link` because the
-/// links this tool wants are the release's own garbage-collector roots and
-/// not a `result` symlink in whatever directory somebody stood in.
+/// Build every derivation output without creating a working-directory result link.
 pub fn build_cmd(drv: &str, options: &BuildOptions) -> Cmd {
     let mut cmd = Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args([
         "build",
@@ -312,33 +245,15 @@ pub fn build_cmd(drv: &str, options: &BuildOptions) -> Cmd {
     cmd.arg(format!("{drv}^*"))
 }
 
-/// `nix build --no-link --json <drv1>^* <drv2>^* …`: the whole fleet, once.
-///
-/// One invocation and not one per derivation, and the reason is nix's
-/// scheduler: seventy systems handed over separately are seventy build
-/// graphs built one after the other, where one graph is seventy roots nix
-/// schedules across `--max-jobs` and `--builders` at the same time and whose
-/// shared dependencies — one kernel, one nixpkgs, one meisterstack — are
-/// realised once by construction rather than found in the store seventy
-/// times.
-///
-/// `--json` and not `--print-out-paths`, which is what the per-derivation
-/// road used: with several installables the printed paths are a LIST, and
-/// deciding which of seventy systems a path belongs to by its position in
-/// that list would be a guess. The json answer names the `drvPath` beside
-/// every output, so the mapping is nix's own statement.
+/// Build deduplicated artifact derivations together for Nix scheduling.
+/// JSON associates outputs with `drvPath`, avoiding dependence on output order.
 pub fn build_many_cmd(drvs: &[String], options: &BuildOptions) -> Cmd {
     let cmd = Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--no-link", "--json"]);
     let cmd = with_nix_options(cmd, options);
     cmd.args(drvs.iter().map(|drv| format!("{drv}^*")))
 }
 
-/// The flags this tool hands nix untouched: where it may build, what it may
-/// fetch from, how much at once, and whatever else the operator named.
-///
-/// Recorded in `build_env` as well, because a release built on a farm and a
-/// release built on a laptop are the same release and the question "where
-/// did this come from" still has an answer.
+/// Forward Nix options unchanged; the release also records them in build_env.
 fn with_nix_options(cmd: Cmd, options: &BuildOptions) -> Cmd {
     let mut cmd = cmd;
     if !options.builders.is_empty() {
@@ -371,10 +286,7 @@ pub fn parse_build_json(text: &str, origin: &str) -> Result<BTreeMap<String, Vec
         .map_err(|e| anyhow::anyhow!("{origin} did not answer with a build result: {e}."))?;
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for result in results {
-        // `outputs` is keyed by output NAME (`out`, `dev`, …) and the names
-        // are sorted here so that a derivation with two of them is refused
-        // with the same sentence twice rather than with whichever order nix
-        // happened to answer in.
+        // BTreeMap output names give multi-output refusals a stable order.
         let paths: Vec<String> = result.outputs.into_values().collect();
         out.entry(result.drv_path).or_default().extend(paths);
     }
@@ -386,9 +298,7 @@ pub fn path_info_cmd(paths: &[String]) -> Cmd {
     crate::nix::path_info_cmd(None, paths)
 }
 
-/// Whether these derivations are still in the store, as one question.
-///
-/// `AnyExit`, because "no" is the answer this is asked for.
+/// Query derivation presence in one command; a nonzero exit is inspected by the caller.
 pub fn drv_present_cmd(drvs: &[String]) -> Cmd {
     Cmd::new(Effect::Read, "nix", STORE_DEADLINE)
         .args(["path-info", "--json"])
@@ -396,11 +306,7 @@ pub fn drv_present_cmd(drvs: &[String]) -> Cmd {
         .expect(Expect::AnyExit)
 }
 
-/// `nix store sign --recursive --key-file <key> <paths…>`.
-///
-/// `--recursive`, so that every path in the closure carries a signature:
-/// `nix copy` checks each path it transfers, not only the top of the tree.
-/// The key path is redacted out of every printed form of this command.
+/// Sign closures recursively; redact the signing-key path in printed commands.
 pub fn sign_cmd(key: &std::path::Path, paths: &[String]) -> Cmd {
     let key = key.display().to_string();
     Cmd::new(Effect::Build, "nix", SIGN_DEADLINE)
@@ -410,52 +316,23 @@ pub fn sign_cmd(key: &std::path::Path, paths: &[String]) -> Cmd {
         .redact(key)
 }
 
-/// `nix build --rebuild --no-link <drv>^*`: build it AGAIN, on top of the
-/// output that is already there, and let nix compare.
-///
-/// nix does the comparison itself and refuses with "may not be
-/// deterministic: output … differs", which is a better answer than hashing
-/// two nars here would be: nix knows which output of a multi-output
-/// derivation differed and it knows what to do with a fixed-output one.
-///
-/// One derivation per call and not the whole fleet in one, which is the
-/// opposite of [`build_many_cmd`] and deliberately so: what this produces is
-/// a per-host VERDICT, and a batch that exited 1 would say "something in the
-/// fleet differed" — the one thing an operator cannot act on.
+/// Rebuild one derivation with the original options and let Nix compare outputs.
+/// Separate calls retain per-host failure attribution.
 pub fn rebuild_cmd(drv: &str, options: &BuildOptions) -> Cmd {
     let cmd =
         Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--rebuild", "--no-link"]);
-    // `--builders` and `--substituters` on purpose, `--max-jobs` and the
-    // operator's `--option`s too: the question is whether THIS build
-    // environment produces the same bytes twice, so it has to be the same
-    // build environment.
+    // Reproduce the original build environment, including builder and option overrides.
     let cmd = with_nix_options(cmd, options);
     cmd.arg(format!("{drv}^*")).expect(Expect::AnyExit)
 }
 
-/// What nix says when a rebuild came out different. Matched rather than
-/// guessed at, because every other non-zero exit is a check that could not
-/// be MADE — a builder that went away, a disk that filled — and reporting
-/// that as "not reproducible" would be this tool inventing a finding.
+/// Nix diagnostic identifying differing rebuild output; other failures abort verification.
 const NOT_DETERMINISTIC: &str = "may not be deterministic";
 
-/// How long pushing a fleet's closures into a cache may take. Seventy
-/// system closures are tens of gigabytes of nar over whatever link the cache
-/// is on.
+/// Two-hour deadline for copying signed release closures to a cache.
 pub const CACHE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 
-/// `nix copy --to <cache> <paths…>`: the closures, into the store a fleet
-/// fetches from.
-///
-/// After signing, and that is the whole order: `nix copy` carries the
-/// signatures that are in the local store when it runs, and a cache full of
-/// unsigned paths is a cache a managed host refuses to fetch from —
-/// `require-sigs = true` is as true for a substituter as for an `ssh-ng://`
-/// push (M0 probe S12).
-///
-/// No `--no-check-sigs`, no `--all`, and nothing about the target hosts:
-/// this pushes exactly the paths this release names, and what a host is
-/// allowed to fetch is decided by that host's own configuration.
+/// Copy signed release paths to the configured cache; signatures must be added first.
 pub fn cache_copy_cmd(cache: &str, paths: &[String]) -> Cmd {
     Cmd::new(Effect::Build, "nix", CACHE_DEADLINE)
         .args(["copy", "--to"])
@@ -489,19 +366,13 @@ pub struct Builder<'a> {
     pub files: &'a dyn Files,
     pub clock: &'a dyn Clock,
     pub options: BuildOptions,
-    /// Where the garbage-collector roots go. `None` leaves the closures
-    /// unprotected, which is only right for a build nobody will apply.
+    /// Optional state directory for GC roots. `None` leaves outputs without these roots.
     pub state: Option<StateDir>,
 }
 
 impl Builder<'_> {
-    /// Build everything this manifest names, and bind it into a release.
-    ///
-    /// The order matters and is the order below: check that the derivations
-    /// are still there, build them, compare every path against what the
-    /// manifest promised, sign, measure (so that the measurement includes
-    /// the signatures), bind, root. Signing before measuring is the whole
-    /// reason `signatures` in a release is worth anything.
+    /// Build artifacts, validate outputs, optionally rebuild, sign, measure and bind a release.
+    /// Create roots only after binding succeeds.
     pub fn realise(&self, resolved: ResolvedFleet) -> Result<Built> {
         let hosts = self.hosts_of(&resolved)?;
         let partial = hosts.len() != resolved.evaluated_hosts.len();
@@ -514,17 +385,7 @@ impl Builder<'_> {
 
         self.ensure_present(&drvs)?;
 
-        // The artifacts, in ONE nix invocation: every system, every bundle
-        // and every package of the fleet as one build graph.
-        //
-        // The check derivations are NOT in it, and that is the one thing
-        // this does not batch. A check is a data object — id, status,
-        // expected, observed, reason, duration — and a batch that failed
-        // would answer "nix exited 1" for all of them together. So each one
-        // is asked on its own, with `AnyExit`, and a required check that
-        // does not pass is a sentence that names it. In a real fleet these
-        // are few: `checks.required` is usually `units, session, mounts`,
-        // which are questions about a running host and belong to `check`.
+        // Batch artifacts; build checks separately to retain a verdict and evidence per check.
         let artifacts: Vec<&Derivation> =
             drvs.iter().filter(|d| d.kind != DrvKind::Check).collect();
         let outputs = self.build_artifacts(&artifacts)?;
@@ -542,10 +403,7 @@ impl Builder<'_> {
             checks.push(result);
         }
 
-        // A partial build is for looking at. It cannot be a release, because
-        // a release covers every host of its manifest — `release::bind`
-        // enforces exactly that, and a "release" over three of four hosts
-        // would let a plan quietly leave one behind.
+        // A partial build produces paths but cannot bind a release covering the full manifest.
         if partial {
             bail!(
                 "this built {} of the manifest's {} host(s), so it is not a release: a \
@@ -565,16 +423,11 @@ impl Builder<'_> {
 
         self.check_promises(&resolved, &hosts, &outputs)?;
 
-        // Was it the same build twice? Asked here, next to the build it is
-        // a claim about, and only when the operator asked for it: this
-        // builds every host's system a SECOND time.
+        // Rebuild only when explicitly requested.
         let reproducibility = self.verify_reproducible(&resolved, &hosts)?;
 
         let mut to_measure: Vec<String> = outputs.values().cloned().collect();
-        // The configuration files are in the closure of the systems that
-        // read them, so they exist once the toplevels are built; they are
-        // measured by their content rather than by a nar, because what a
-        // unit reads is the file.
+        // Hash rendered configuration bytes after system builds make those files available.
         let config_files = self.config_files(&resolved, &hosts)?;
 
         if let Some(key) = &self.options.sign_key {
@@ -586,12 +439,7 @@ impl Builder<'_> {
         let info = self.measure(&to_measure)?;
         self.require_signatures(&resolved, &hosts, &outputs, &info)?;
 
-        // Into the cache, after the signatures are on and after they have
-        // been checked: a cache is only worth having if what a host pulls
-        // out of it is what a host would have accepted over ssh. A push that
-        // fails is a build that fails — a release whose `cache_url` named a
-        // store the closures never reached would be a release that lies
-        // about where they are.
+        // Cache push failure aborts release creation rather than recording an unavailable cache.
         self.push_to_cache(&to_measure)?;
 
         let artifacts = self.host_artifacts(&resolved, &hosts, &outputs, &info, config_files)?;
@@ -602,9 +450,7 @@ impl Builder<'_> {
             resolved,
             artifacts,
             packages,
-            // Guest artifacts are what a verification suite boots. They are
-            // not part of any host's closure and no manifest field names
-            // them individually yet, so `verify` (M4B) is what fills this.
+            // No individual guest-artifact binding is supplied by this builder.
             Vec::new(),
             build_env,
             checks,
@@ -679,9 +525,7 @@ impl Builder<'_> {
         );
     }
 
-    /// A cache of unsigned closures is a cache no host of this fleet can
-    /// fetch from, and finding that out after an hour of copying is finding
-    /// it out too late.
+    /// Require a signing key before building for a configured cache.
     fn require_a_key_for_the_cache(&self) -> Result<()> {
         if self.options.cache.is_none() || self.options.sign_key.is_some() {
             return Ok(());
@@ -715,9 +559,7 @@ impl Builder<'_> {
             }
         }
         if gone.is_empty() {
-            // The batch failed and every single one is there: something
-            // else was wrong with the question, and the answer nix gave is
-            // the one worth printing.
+            // A batch failure with all individual paths present has another cause; retain its diagnostic.
             bail!(
                 "nix would not say whether the manifest's derivations are in the store: {}",
                 out.stderr.trim()
@@ -736,17 +578,8 @@ impl Builder<'_> {
         );
     }
 
-    /// Build these derivations in one nix invocation, and say which output
-    /// belongs to which of them.
-    ///
-    /// The mapping is nix's own (`drvPath` beside `outputs` in the json
-    /// answer) and not the order of the arguments: a release that named
-    /// seventy systems by the position of a line in a list would be a
-    /// release that is right until nix reorders its output.
-    ///
-    /// Two derivations of one manifest may be the same path — two hosts of a
-    /// fleet can be the same system — so the arguments are deduplicated and
-    /// the answer is read back per `what`.
+    /// Build unique derivation paths together and map each result by drvPath.
+    /// Multiple logical artifacts may share a derivation; each must have exactly one output.
     fn build_artifacts(&self, drvs: &[&Derivation]) -> Result<BTreeMap<String, String>> {
         if drvs.is_empty() {
             return Ok(BTreeMap::new());
@@ -778,9 +611,7 @@ impl Builder<'_> {
                      release that nobody can point at.",
                     drv.drv
                 ),
-                // A derivation with several outputs: the manifest names one
-                // out path per derivation, so which of them it meant is not
-                // this tool's to guess.
+                // Refuse ambiguous multi-output artifacts.
                 _ => bail!(
                     "the derivation {} for {} has {} outputs ({}), and the manifest names \
                      one. The one derivation has to expose a single output per host, \
@@ -816,9 +647,7 @@ impl Builder<'_> {
         let passed = out.ok();
         Ok(CheckResult {
             id: drv.what.clone(),
-            // A check derivation is about the fleet unless its name says a
-            // host, and `config-<host>` does. Guessing further would be
-            // guessing.
+            // Attribute suffix-matched check names to hosts; otherwise use a resource subject.
             subject: match resolved
                 .hosts
                 .keys()
@@ -850,12 +679,7 @@ impl Builder<'_> {
         })
     }
 
-    /// Every built path is the path the manifest said it would be.
-    ///
-    /// `release::bind` checks this too and is the last word. It is checked
-    /// here as well because here is where the command that produced the
-    /// path can be named, and because signing a closure that is about to be
-    /// refused is a waste of an operator's afternoon.
+    /// Reject host outputs that differ from the resolved manifest before signing.
     fn check_promises(
         &self,
         resolved: &ResolvedFleet,
@@ -933,20 +757,8 @@ impl Builder<'_> {
         Ok(info)
     }
 
-    /// Build every host's system a second time and say whether the bytes
-    /// came out the same.
-    ///
-    /// Without `--verify-reproducible` this runs nothing and answers
-    /// `bit_identical_verified: false, method: null` — which is the honest
-    /// shape of "nobody checked", and the reason the two fields are
-    /// separate from `inputs_pinned`. Pinned inputs are a reason to EXPECT
-    /// the same bytes and never evidence of them.
-    ///
-    /// A rebuild that could not be MADE — a builder that went away, a disk
-    /// that filled, a derivation nix refused for some other reason — stops
-    /// the build with what nix said. An operator who asked for a
-    /// verification and got `false` without one would have been told
-    /// something that is not true.
+    /// Optionally rebuild each system. Record differing outputs; abort on other rebuild failures.
+    /// Without the option, reproducibility remains unverified even though inputs are pinned.
     fn verify_reproducible(
         &self,
         resolved: &ResolvedFleet,
@@ -986,24 +798,13 @@ impl Builder<'_> {
         Ok(Reproducibility {
             inputs_pinned: true,
             bit_identical_verified: differences.is_empty(),
-            // Named even when the answer is `false`: what makes this field
-            // worth anything is that somebody can tell "checked and
-            // different" from "not checked".
+            // A method distinguishes checked-and-different from not checked.
             method: Some("nix build --rebuild".to_string()),
             differences,
         })
     }
 
-    /// Push the whole release into the cache the operator named.
-    ///
-    /// One `nix copy` over every path of the release, for the same reason
-    /// the build is one `nix build`: seventy closures that share a kernel,
-    /// a nixpkgs and one meisterstack are one graph to walk, and seventy
-    /// invocations would query the cache for the shared half seventy times.
-    ///
-    /// A build with no `--cache` runs no command here at all — not an empty
-    /// one, not a probe. That is what makes `cache_url: null` in a release a
-    /// statement rather than an absence.
+    /// Push all measured paths in one invocation; no configured cache means no command.
     fn push_to_cache(&self, paths: &[String]) -> Result<()> {
         let Some(cache) = &self.options.cache else {
             return Ok(());
@@ -1070,9 +871,7 @@ impl Builder<'_> {
                     installer_iso: None,
                     disk_image: None,
                     direct_boot: self.direct_boot(id, host, outputs)?,
-                    // Straight from the manifest: these three fields are
-                    // what the reboot class is decided on, and `bind`
-                    // refuses them if they differ from the evaluation.
+                    // Use resolved boot facts, which release binding checks against the manifest.
                     boot: BootArtifacts {
                         kernel_store_path: host.build.boot.kernel_out.clone(),
                         initrd_store_path: host.build.boot.initrd_out.clone(),
@@ -1085,16 +884,7 @@ impl Builder<'_> {
         Ok(out)
     }
 
-    /// The bundle of a host that boots `direct`, measured.
-    ///
-    /// The kernel and the initrd are named by the paths the MANIFEST
-    /// promised rather than by anything found in the bundle: those two are
-    /// what `bind` compares and what the planner decides a reboot class on,
-    /// and reading them back out of a directory of symlinks would be a
-    /// second source for one fact. What the bundle contributes is the
-    /// directory itself — one name a provider adapter can be handed — and
-    /// the sha256 of the two files, which is what an adapter uploads them
-    /// under.
+    /// Bind a direct-boot bundle path, manifest command line and measured kernel/initrd bytes.
     fn direct_boot(
         &self,
         id: &str,
@@ -1125,9 +915,7 @@ impl Builder<'_> {
         }))
     }
 
-    /// One file of the store, by its bytes. Read rather than asked of nix:
-    /// what a hypervisor loads is the FILE, and `nix path-info` answers
-    /// about the store object that holds it.
+    /// Hash file bytes loaded by the provider, rather than the containing store object’s NAR.
     fn file_artifact(
         &self,
         id: &str,
@@ -1172,9 +960,7 @@ impl Builder<'_> {
         Ok(out)
     }
 
-    /// Where this build happened. Recorded, and not part of the
-    /// `release_id`: the same closures built on a laptop and on a build farm
-    /// are the same release.
+    /// Record the build environment separately from content-based release identity.
     fn build_env(&self) -> Result<BuildEnv> {
         let version = self
             .runner
@@ -1202,13 +988,7 @@ impl Builder<'_> {
         })
     }
 
-    /// The NAME of a signing key, out of the key file.
-    ///
-    /// A nix signing key file is one line, `<name>:<base64 secret>`. Only
-    /// the name is read and only the name is kept: the target needs to know
-    /// which public key to trust, and nothing else about this file may
-    /// leave this function — not into a return value, not into an error
-    /// message.
+    /// Read only the signing key’s public name into the release; never return secret bytes.
     fn key_name(&self, key: &std::path::Path) -> Result<String> {
         let text = self.files.read_to_string(key)?;
         let Some((name, rest)) = text.trim().split_once(':') else {
@@ -1242,11 +1022,7 @@ impl Builder<'_> {
             roots.push(link);
         }
         for (id, artifacts) in &release.artifacts {
-            // The bundle is its own store path and is NOT in the toplevel's
-            // closure — it is a directory of symlinks into it — so a root on
-            // the system does not keep it. A provider that is handed a
-            // bundle path a collector removed between `build` and the reboot
-            // is a guest that does not come up.
+            // The bundle is a separate store object and needs its own collector root.
             if let Some(bundle) = &artifacts.direct_boot {
                 let link = dir.join(direct_boot_key(id));
                 self.runner
@@ -1259,9 +1035,7 @@ impl Builder<'_> {
             self.runner.run(&add_root_cmd(&link, &package.store_path))?;
             roots.push(link);
         }
-        // When this release was made, so that `gc --keep N` can tell the
-        // oldest roots from the newest. A release id is a content hash and
-        // says nothing about time.
+        // Date the root directory; release IDs contain no ordering information.
         self.files.write_atomic(
             &dir.join(STAMP),
             format!("{}\n", release.created_at.to_rfc3339()).as_bytes(),
@@ -1275,15 +1049,7 @@ impl Builder<'_> {
 // image
 // ---------------------------------------------------------------------------
 
-/// Which of a host's three media is wanted.
-///
-/// One verb and three kinds rather than three verbs, because what differs
-/// between them is one derivation path out of the same manifest: an
-/// installer ISO, a prebuilt disk, and the bundle a hypervisor loads. What
-/// they have in common is everything else — the release says which
-/// derivation, the build is the release's and not a fresh evaluation, and
-/// the result gets a garbage-collector root so that the file an operator is
-/// about to write to a stick is still there when they get to it.
+/// Installer ISO, disk image or direct-boot bundle built from a release’s derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
     Installer,
@@ -1314,9 +1080,7 @@ impl ImageKind {
         }
     }
 
-    /// What the FILE inside the output is called, by its extension. The
-    /// derivations of nixpkgs put their result in a directory next to a
-    /// `nix-support` folder, so "the image" is not the out path itself.
+    /// File extensions used to locate media inside a derivation output directory.
     fn extensions(self) -> &'static [&'static str] {
         match self {
             ImageKind::Installer => &["iso"],
@@ -1355,8 +1119,7 @@ pub struct ImageResult {
 
 pub const IMAGE_SCHEMA: &str = "meister-deploy/image/1";
 
-/// The derivation this release names for that host and that kind, or the
-/// sentence that says why there is none.
+/// Find the host's image derivation in the release, or return a descriptive error.
 pub fn image_drv(release: &ReleaseManifest, host: &str, kind: ImageKind) -> Result<String> {
     let resolved = &release.resolved_fleet;
     let Some(entry) = resolved.hosts.get(host) else {
@@ -1394,12 +1157,7 @@ pub fn image_drv(release: &ReleaseManifest, host: &str, kind: ImageKind) -> Resu
 }
 
 impl Builder<'_> {
-    /// Build one medium of one host, and say exactly what came out.
-    ///
-    /// The derivation is the one the RELEASE names, for the same reason
-    /// `build` uses the manifest's: a medium that was built from a fresh
-    /// evaluation would be a medium nobody can bind to the release an
-    /// operator is holding. Nothing is evaluated here.
+    /// Build and locate one release-defined medium without reevaluating the flake.
     pub fn image(
         &self,
         release: &ReleaseManifest,
@@ -1472,13 +1230,7 @@ impl Builder<'_> {
         })
     }
 
-    /// The one file inside a medium's output directory, by extension.
-    ///
-    /// Named rather than guessed: an ISO derivation puts its result in
-    /// `iso/` beside a `nix-support/` directory, so "the only file in there"
-    /// is not an answer, and a tool that printed the wrong path would send
-    /// somebody to write a text file to a USB stick. Two candidates is an
-    /// error that names both.
+    /// Find exactly one matching medium by extension; reject absent or ambiguous candidates.
     fn medium_in(&self, out: &str, kind: ImageKind) -> Result<Option<String>> {
         let extensions = kind.extensions();
         if extensions.is_empty() {
@@ -1488,10 +1240,7 @@ impl Builder<'_> {
         let mut stack = vec![PathBuf::from(out)];
         while let Some(dir) = stack.pop() {
             for entry in self.files.list_dir(&dir)? {
-                // `Entry::Other` is everything that is neither a regular
-                // file nor a symlink, which inside a store output is a
-                // directory. A fifo would be walked into and the listing
-                // would say so, which is a better answer than a silent skip.
+                // Within ordinary store outputs, non-file entries are directories to traverse.
                 match self.files.entry(&entry)? {
                     crate::effects::Entry::Other => stack.push(entry),
                     _ => {
@@ -1536,15 +1285,9 @@ pub const STAMP: &str = ".created";
 pub struct RootDir {
     pub release_id: String,
     pub path: PathBuf,
-    /// When the release was made, from the stamp. `None` for a directory
-    /// that carries none — which is never removed, because a directory this
-    /// tool cannot date is one it does not know enough about.
+    /// Release timestamp from the stamp; undated root directories are retained.
     pub created_at: Option<DateTime<Utc>>,
-    /// Why there is no date, for the sentence `gc` prints. A directory with
-    /// NO stamp and one whose stamp cannot be read are both kept, and they
-    /// are not the same thing to an operator: the first is a release from
-    /// before this tool wrote stamps, the second is a file somebody edited.
-    /// `None` when there IS a date.
+    /// Diagnostic explaining a missing or invalid stamp; None when a date was parsed.
     pub undated_because: Option<String>,
     pub links: Vec<PathBuf>,
 }
@@ -1639,14 +1382,7 @@ mod tests {
         files.given("/keys/fleet.sec", b"fleet-1:c2VjcmV0\n".to_vec())
     }
 
-    /// Every command a green build of `box` runs, in order.
-    ///
-    /// `sign` says whether a signing command is expected; `signed` says
-    /// whether the store reports a signature afterwards. They are two
-    /// arguments and not one because the interesting failure is a sign that
-    /// ran and left nothing behind.
-    /// The four outputs of the one-host fixture, in the order
-    /// [`derivations`] lists their derivations: the host, then the packages.
+    /// Fixture outputs in derivation order: one system followed by its packages.
     fn outputs_in_derivation_order() -> Vec<String> {
         vec![
             TOPLEVEL.to_string(),
@@ -1679,11 +1415,7 @@ mod tests {
         expect_build_into(fleet, sign, signed, None, None)
     }
 
-    /// The same, for a build that verifies its own reproducibility and/or
-    /// pushes its release into a cache. Both steps sit at fixed points of
-    /// the order `realise` walks — the rebuild right after the build, the
-    /// push right after the measurement — and the strict fake is in that
-    /// order, which is what makes these tests statements about the order.
+    /// Expected build sequence with optional rebuild and cache-copy steps.
     fn expect_build_into(
         fleet: &ResolvedFleet,
         sign: bool,
@@ -1700,10 +1432,7 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        // ONE build over the whole list, answered the way nix answers
-        // `--json`: an object per derivation, naming its own `drvPath`.
-        // Sorted, because `build_artifacts` sorts and deduplicates what it
-        // hands nix.
+        // Match a single sorted artifact build; return output mappings keyed by drvPath.
         let mut sorted: Vec<(String, String)> = drvs
             .iter()
             .cloned()
@@ -1724,11 +1453,11 @@ mod tests {
             ),
             Output::stdout(build_json(&sorted)),
         );
-        // --- lane 4C: the rebuild is next to the build it is about ---
+
         if let Some(reply) = rebuild {
             fake = fake.expect(Matcher::prefix("nix", ["build", "--rebuild"]), reply);
         }
-        // --- end lane 4C ---
+
         if sign {
             fake = fake.expect(
                 Matcher::prefix("nix", ["store", "sign", "--recursive", "--key-file"]),
@@ -1753,14 +1482,14 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json", "--closure-size"]),
             Output::stdout(serde_json::to_string(&info).unwrap()),
         );
-        // --- lane 4C: after the measurement, before `build_env` ---
+
         if let Some(cache) = cache {
             fake = fake.expect(
                 Matcher::prefix("nix", ["copy", "--to", cache]),
                 Output::stdout(""),
             );
         }
-        // --- end lane 4C ---
+
         fake.expect(
             Matcher::exact("nix", ["--version"]),
             Output::stdout("nix (Nix) 2.35.2\n"),
@@ -1780,9 +1509,7 @@ mod tests {
         let fleet = onebox_enrolled();
         let hosts = fleet.evaluated_hosts.clone();
         let drvs = derivations(&fleet, &hosts);
-        // Three hosts, then the packages. No check derivation in the
-        // fixture: its required checks are `units`, `session`, `mounts`,
-        // which are about a running host.
+        // Runtime checks in this fixture add no build-check derivations.
         assert_eq!(
             drvs.iter()
                 .filter(|d| d.kind == DrvKind::Toplevel)
@@ -1807,9 +1534,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------
-    // The bundle and the verb `image` (M3A position 3)
-    // ---------------------------------------------------------------
+    // Image and direct-boot bundle tests.
 
     #[test]
     fn a_direct_host_gets_its_bundle_built_right_after_its_own_system() {
@@ -1880,9 +1605,7 @@ mod tests {
         assert!(err.contains("direct-boot"), "{err}");
     }
 
-    /// The image inside a nixpkgs image output, which is never the out path
-    /// itself: an ISO derivation puts its result in `iso/` beside a
-    /// `nix-support/` directory full of text files.
+    /// Run medium discovery against an in-memory store output directory.
     fn medium_of(files: &MemFiles, out: &str, kind: ImageKind) -> Result<Option<String>> {
         let runner = StrictFake::new();
         let clock = FakeClock::fixed();
@@ -1901,9 +1624,7 @@ mod tests {
     #[test]
     fn the_medium_is_the_one_file_with_the_right_ending() {
         let out = "/nix/store/iiii-nixos-iso";
-        // The directories are registered as well: a walk asks what each
-        // entry IS, and a test store where nothing is a directory would be
-        // a test of a shape no store has.
+        // Register directories explicitly so traversal sees the same entry types as the store.
         let files = MemFiles::new()
             .given_other(format!("{out}/iso"))
             .given_other(format!("{out}/nix-support"))
@@ -1920,7 +1641,7 @@ mod tests {
         // A bundle is three files and stays a directory.
         assert_eq!(medium_of(&files, out, ImageKind::DirectBoot).unwrap(), None);
 
-        // Nothing that could be one is a sentence, not an empty answer.
+        // Reject outputs with no candidate medium.
         let empty = MemFiles::new()
             .given_other(format!("{out}/nix-support"))
             .given(format!("{out}/nix-support/x"), "x");
@@ -1929,7 +1650,7 @@ mod tests {
             .to_string();
         assert!(err.contains("holds no file ending in iso"), "{err}");
 
-        // And two is a sentence that names both rather than a coin toss.
+        // Reject multiple candidates and report their paths.
         let two = MemFiles::new()
             .given_other(format!("{out}/iso"))
             .given(format!("{out}/iso/a.iso"), "a")
@@ -1984,7 +1705,7 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
-    // --- lane 4C: the cache ---------------------------------------------
+
 
     #[test]
     fn a_cache_without_a_signing_key_is_refused_before_anything_is_built() {
@@ -2037,9 +1758,7 @@ mod tests {
         let calls = runner.calls();
         let copies: Vec<&String> = calls.iter().filter(|c| c.starts_with("nix copy")).collect();
         assert_eq!(copies.len(), 1, "one push for the whole release: {calls:?}");
-        // And it names every path the release names — the systems AND the
-        // packages, because a host that fetches a system from a cache that
-        // lacks half its closure has fetched nothing.
+        // The cache copy includes system and package roots.
         for path in measured_paths(&fleet_paths) {
             assert!(copies[0].contains(&path), "{path} is not in {}", copies[0]);
         }
@@ -2201,9 +1920,7 @@ mod tests {
     #[test]
     fn a_rebuild_that_could_not_be_made_says_so_instead_of_answering_false() {
         let fleet = one_host();
-        // Built by hand and not from `expect_build_into`: this build stops
-        // AT the rebuild, so a fake that expected the steps after it would
-        // fail on the unused expectations rather than on the finding.
+        // Stop fake expectations at rebuild failure; later signing must not run.
         let mut pairs: Vec<(String, String)> = derivations(&fleet, &["box".to_string()])
             .into_iter()
             .map(|d| d.drv)
@@ -2251,7 +1968,7 @@ mod tests {
         );
     }
 
-    // --- end lane 4C ----------------------------------------------------
+
 
     #[test]
     fn a_green_build_binds_what_the_manifest_promised() {
@@ -2332,9 +2049,7 @@ mod tests {
 
     #[test]
     fn a_context_host_needs_no_signature_because_no_closure_travels() {
-        // The legacy push copies binaries into a running appliance; there
-        // is no `nix copy` and nothing checks a signature. So a build of a
-        // context-only fleet without a key is not refused.
+        // Context deployment transfers files rather than a Nix closure, so signing is optional.
         let mut fleet = one_host();
         fleet.hosts.get_mut("box").unwrap().deployment = Deployment::Context;
         fleet.manifest_id =
@@ -2369,9 +2084,7 @@ mod tests {
 
     #[test]
     fn a_managed_system_that_carries_no_signature_after_signing_is_refused() {
-        // A key WAS given and the store has no signature afterwards: a
-        // `nix store sign` that signed something else, a key nix did not
-        // accept. The release would name a path no managed host will take.
+        // Simulate successful signing with no signature reported for the system.
         let fleet = one_host();
         let runner = expect_build(&fleet, true, false);
         let files = files_with_config(&fleet);
@@ -2387,9 +2100,7 @@ mod tests {
             state: None,
         };
         let err = builder.realise(fleet).unwrap_err().to_string();
-        // The three `nix config show` expectations are deliberately left
-        // unused: the refusal came before a `build_env` was gathered, which
-        // is where it should come.
+        // Unused build-environment expectations show refusal happened before those queries.
         assert!(runner.verify().is_err());
         assert!(err.contains("holds no signature for"), "{err}");
         assert!(err.contains("--sign-key"), "{err}");
@@ -2587,8 +2298,7 @@ mod tests {
     fn a_configuration_file_that_is_not_in_the_store_is_a_sentence() {
         let fleet = one_host();
         let runner = expect_build(&fleet, false, false);
-        // The store has no agent.toml: a build whose closure does not carry
-        // the file a unit reads is a build nobody can apply.
+        // A missing configuration file prevents release measurement.
         let files = MemFiles::new().given("/keys/fleet.sec", b"fleet-1:c2VjcmV0\n".to_vec());
         let clock = FakeClock::fixed();
         let builder = Builder {
@@ -2656,9 +2366,7 @@ mod tests {
             },
             state: None,
         };
-        // A dry run is supposed to print the list and stop, which `main`
-        // does. If somebody ever calls `realise` under a dry-run policy
-        // anyway, the door refuses the build rather than reporting one.
+        // The CLI exits before realise in dry-run mode; policy also blocks accidental builds.
         let err = builder.realise(fleet).unwrap_err().to_string();
         runner.verify().unwrap();
         assert!(err.contains("--dry-run"), "{err}");
@@ -2741,9 +2449,7 @@ mod tests {
         assert_eq!(all[0].links.len(), 1, "the stamp is not a root");
         assert!(all[0].links[0].ends_with("box"));
 
-        // What is DONE with them is `state::sweep` / `state::carry_out`,
-        // which is where the whole retention decision lives; here it is
-        // driven directly so that this test stays about the reader.
+        // Exercise retention separately; this test’s main contract is root discovery.
         let sweep = crate::state::sweep(
             &files,
             &state,

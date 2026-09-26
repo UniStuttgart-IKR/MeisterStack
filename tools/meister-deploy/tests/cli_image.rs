@@ -2,16 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What `meister-deploy image` does to the machine it runs on — measured.
-//!
-//! The same instrument as `cli_plan.rs`: `PATH` holds a shim called `nix`
-//! that records its argv and exits 97, so "nothing was built" is a log file
-//! somebody read rather than a promise in a comment.
-//!
-//! Every case in here is a refusal or a dry run, and that is the whole
-//! point: the one thing this verb does when it is NOT refused is spend an
-//! hour building an ISO, and that belongs in a VM test with a real nix
-//! (`checks.vm-install-blank-disk`), not in a unit test with a fake one.
+//! Image CLI refusal and dry-run tests using a logging Nix shim.
+//! Real media builds and boot behavior require the separate Nix VM tests.
 
 mod support;
 
@@ -29,8 +21,7 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    /// A directory with one release in it, and a `nix` that refuses to be
-    /// anything but a witness.
+    /// Temporary release directory with a logging Nix shim that refuses builds.
     fn new() -> Sandbox {
         use std::os::unix::fs::PermissionsExt;
         let shims = tempfile::tempdir().unwrap();
@@ -65,8 +56,7 @@ impl Sandbox {
             .expect("the binary was just built")
     }
 
-    /// Every command line that reached a shim. Empty is a verb that started
-    /// no program at all.
+    /// Logged shim invocations; empty means no subprocess was started.
     fn calls(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -163,8 +153,7 @@ fn a_kind_that_is_not_one_lists_the_three_that_are() {
 
 #[test]
 fn a_medium_a_host_does_not_have_says_which_one_it_does() {
-    // Every host of the fixture boots itself, so none of them has a bundle —
-    // and the sentence says why rather than printing `null`.
+    // Self-booting fixture hosts have no direct-boot bundle.
     let sandbox = Sandbox::new();
     let out = sandbox.run(&[
         "image",

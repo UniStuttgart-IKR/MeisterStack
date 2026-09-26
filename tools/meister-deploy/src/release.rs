@@ -2,28 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The third contract: what was actually built, bound to the manifest that
-//! asked for it.
+//! Built artifacts bound to an unchanged resolved manifest.
 //!
-//! A [`crate::manifest::ResolvedFleet`] is a promise — it names derivations
-//! and the output paths they WILL have, because it comes out of `nix eval`
-//! and an evaluation builds nothing. A [`ReleaseManifest`] is what exists:
-//! store paths that are there, their nar hashes, their closure sizes, the
-//! signatures they carry. Everything a rollout copies and everything a
-//! rollout compares is named here and nowhere else.
-//!
-//! The one rule that makes this a binding and not a second derivation:
-//! **a release binds, it does not replace.** [`bind`] refuses an artifact
-//! whose store path is not the one the manifest said it would be, refuses an
-//! artifact for a host the manifest does not know, and refuses to leave out
-//! a host the manifest evaluated. A build that produced something else is a
-//! build of something else, and the honest answer is an error rather than a
-//! release that quietly points somewhere new.
-//!
-//! The manifest is embedded UNCHANGED. Its `manifest_id` is a hash over its
-//! own content, so a release that altered one byte of it would carry an id
-//! that no longer matches — which is exactly how [`ReleaseManifest::
-//! manifest_is_intact`] can say so in one line.
+//! `bind` requires exactly the evaluated hosts and matching declared output
+//! paths. Releases record NAR hashes, sizes, signatures and boot artifacts;
+//! embedded manifest and release IDs provide content-integrity checks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,11 +21,7 @@ use crate::manifest::ResolvedFleet;
 
 pub const RELEASE_SCHEMA: &str = "meister-deploy/release/1";
 
-/// Where the build happened. Recorded, and deliberately NOT part of the
-/// `release_id`: the same closures built on a laptop and on a build farm are
-/// the same release, and a rollout that refused one of them because the
-/// machine had a different `nix --version` would be refusing over the one
-/// thing a content-addressed store makes irrelevant.
+/// Build provenance excluded from release identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuildEnv {
@@ -62,14 +41,8 @@ pub struct BuildEnv {
     /// host runs with `require-sigs = true`, so an unsigned closure is one
     /// `nix copy` will refuse at the far end (M0 S12).
     pub signing_key_name: Option<String>,
-    /// Where this release's closures were pushed after they were signed
-    /// (`build --cache <store>`), or null for a release that lives only in
-    /// the store it was built in.
-    ///
-    /// It is a statement about what HAPPENED and not an instruction: a
-    /// target fetches from the substituters its own configuration names
-    /// (`meisterstack.managed.substituters`), never from a url it was handed
-    /// with a closure.
+    /// Cache receiving the signed build outputs, if any. This is provenance;
+    /// targets use substituters configured on the target itself.
     pub cache_url: Option<String>,
     pub sandbox: bool,
 }
@@ -89,10 +62,7 @@ pub struct StoreArtifact {
     pub signatures: Vec<String>,
 }
 
-/// A FILE this release names: an installer ISO, a disk image, a kernel, an
-/// initrd. Named by its sha256 rather than a nar hash, because what is
-/// written to a USB stick or handed to a hypervisor is the file, not the
-/// store object that holds it.
+/// Boot or installer file identified by its byte SHA256 rather than a NAR hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImageArtifact {
@@ -101,18 +71,9 @@ pub struct ImageArtifact {
     pub size: u64,
 }
 
-/// What a provider is handed to start a `boot = "direct"` host.
-///
-/// Three values and no derivation: the provider loads the kernel, the initrd
-/// and this command line, and the machine comes up running the system the
-/// `init=` in it names. The store paths are the SAME ones
-/// `crate::manifest::Boot` promised — many hosts of a fleet share one
-/// kernel and one initrd, and the store is what deduplicates them — so what
-/// is per host is the command line alone.
-///
-/// meister-deploy never uploads any of this anywhere. Putting the bundle
-/// where a hypervisor can reach it is the provider adapter's job; this
-/// record is what tells the adapter which bytes it is.
+/// Kernel, initrd and command line for provider-managed direct boot.
+/// The paths must match the manifest. Uploading and booting this bundle remain
+/// provider responsibilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DirectBoot {
@@ -127,10 +88,7 @@ pub struct DirectBoot {
     pub bundle_store_path: String,
 }
 
-/// What this release makes a host boot. Kept beside the toplevel because a
-/// changed kernel is a reboot and a changed userland is not — the planner
-/// decides the reboot class from exactly these three fields and never by
-/// opening a closure.
+/// Boot artifact identities used by the planner to classify required reboots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BootArtifacts {
@@ -155,16 +113,10 @@ pub struct ConfigArtifact {
 #[serde(deny_unknown_fields)]
 pub struct HostArtifacts {
     pub toplevel: StoreArtifact,
-    /// Null unless an installer was asked for. The manifest has to have
-    /// promised one: `build.installer_drv` is what says a host HAS an
-    /// installer, and an ISO for a host that declared none is an ISO for a
-    /// different fleet.
+    /// Optional installer image, permitted only when declared by the manifest.
     pub installer_iso: Option<ImageArtifact>,
     pub disk_image: Option<ImageArtifact>,
-    /// Present for exactly the hosts the manifest calls `direct`: a release
-    /// for such a host without its bundle is a release its provider cannot
-    /// boot, and one for a uefi host with a bundle is a bundle nothing
-    /// loads. [`bind`] holds both directions.
+    /// Required exactly when the manifest specifies direct boot.
     pub direct_boot: Option<DirectBoot>,
     pub boot: BootArtifacts,
     /// Keyed as `config_artifacts` in the manifest: `agent_toml_out`, …
@@ -179,10 +131,7 @@ pub struct PackageArtifact {
     pub nar_hash: String,
 }
 
-/// A guest artifact a verification suite boots — `guest-tiny`'s kernel and
-/// initrd. Not part of any host's closure: it is what `verify` copies to a
-/// host to start a VM with, and a suite that cannot name the exact bytes it
-/// booted is a suite whose green run proves nothing.
+/// Guest boot artifact used by verification suites, separate from host closures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuestArtifact {
@@ -191,13 +140,7 @@ pub struct GuestArtifact {
     pub sha256: String,
 }
 
-/// Whether this release could be built again and get the same bytes.
-///
-/// `bit_identical_verified` is false until somebody ran `nix build --rebuild`
-/// and compared (M4C). It is a separate field from `inputs_pinned` because
-/// pinned inputs are a reason to EXPECT reproducibility and not evidence of
-/// it, and folding the two would let a release claim something nobody
-/// checked.
+/// Separate pinned inputs from a measured bit-identical rebuild result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Reproducibility {
@@ -205,13 +148,7 @@ pub struct Reproducibility {
     pub bit_identical_verified: bool,
     /// How it was verified, when it was. Null otherwise.
     pub method: Option<String>,
-    /// The systems that did NOT come out the same, one sentence each, with
-    /// what nix said about them.
-    ///
-    /// Empty when nothing was checked — which `method: null` already says —
-    /// and empty when everything matched. A list rather than a count,
-    /// because "the release is not reproducible" is a thing somebody has to
-    /// act on and the first question is always which host.
+    /// Per-system rebuild mismatches; an empty list alone does not prove verification.
     pub differences: Vec<String>,
 }
 
@@ -281,11 +218,7 @@ impl ReleaseManifest {
         Ok(content_id(IdKind::Release, self)? == self.release_id)
     }
 
-    /// Whether the embedded manifest still hashes to the id it carries.
-    ///
-    /// This is what "embedded unchanged" means in practice: the manifest's
-    /// id is a hash over its own content, so anything that edited the fleet
-    /// on the way into a release breaks it.
+    /// Check the embedded manifest content against its own ID.
     pub fn manifest_is_intact(&self) -> Result<bool> {
         self.resolved_fleet.id_matches()
     }
@@ -296,10 +229,7 @@ impl ReleaseManifest {
     }
 }
 
-/// Bind what was built to the manifest that asked for it.
-///
-/// Pure: `now` is handed in like everywhere else in this tool, so that two
-/// binds of the same build are the same release and a test can say so.
+/// Bind build artifacts to declared manifest outputs, using the supplied timestamp.
 #[allow(clippy::too_many_arguments)]
 pub fn bind(
     resolved: ResolvedFleet,
@@ -320,10 +250,7 @@ pub fn bind(
         );
     }
 
-    // Exactly the evaluated hosts: not fewer, because a release that covers
-    // three of four hosts would let a plan quietly leave one behind; not
-    // more, because an artifact for a host nobody evaluated belongs to a
-    // different manifest.
+    // Require exactly the evaluated host set.
     let wanted: BTreeSet<&String> = resolved.evaluated_hosts.iter().collect();
     let built: BTreeSet<&String> = artifacts.keys().collect();
     let missing: Vec<&str> = wanted.difference(&built).map(|s| s.as_str()).collect();
@@ -380,12 +307,7 @@ pub fn bind(
             &built.boot.kernel_params_sha256,
         )?;
 
-        // The bundle exists for exactly the hosts that boot `direct`, and in
-        // both directions: a release for such a host without one is a
-        // release its provider cannot boot, and one for a uefi host is a
-        // directory nothing ever loads. Unlike the images below, this is not
-        // optional work — `build` makes it, because it is part of how the
-        // host is started at all.
+        // Require a direct-boot bundle exactly for direct-boot hosts.
         match (&built.direct_boot, host.build.boot.mode) {
             (Some(bundle), crate::manifest::BootMode::Direct) => {
                 expect_same(
@@ -414,8 +336,7 @@ pub fn bind(
                  command line, and a release that names none of them is a release nobody can \
                  boot that host from."
             ),
-            // --- lane 5C: and the same for grub, which also reads its own
-            // menu — somebody else's menu, on the machine's own disk.
+            // GRUB also uses a menu from the host disk.
             (Some(_), mode) => bail!(
                 "a direct-boot bundle was built for {id} and its manifest says it boots \
                  {mode}. Such a host reads a boot menu of its own; the bundle would be a \
@@ -439,10 +360,7 @@ pub fn bind(
             );
         }
 
-        // Same rule for the rendered configuration: the manifest named every
-        // file this host's units read, and the release records exactly those.
-        // Compared as a set of store paths rather than by key, because the
-        // key is a name and the path is the content.
+        // Compare rendered configuration as a set of store paths; keys are labels.
         let promised: BTreeSet<&String> = host.config_artifacts.values().collect();
         let delivered: BTreeSet<&String> =
             built.config_files.values().map(|c| &c.store_path).collect();
@@ -555,7 +473,6 @@ mod tests {
         );
     }
 
-    // --- lane 5C ---
 
     /// One required check, as `build` writes it: a derivation that built.
     fn a_check(duration_ms: u64) -> CheckResult {
@@ -592,15 +509,7 @@ mod tests {
 
     #[test]
     fn two_builds_of_one_manifest_are_one_release() {
-        // L2 finding N12, measured. Two `build` runs over the same manifest
-        // in the lab gave `release-76b31c11…` and `release-e375e654…`, and
-        // a plan names the release it was made for — so a freshly built
-        // plan was unusable against the release beside it.
-        //
-        // The field that moved is the one below, and it is the only one
-        // that can: everything else in a release is a store path, a nar
-        // hash, a signature or a flag. `created_at` and `build_env` were
-        // already out.
+        // Check durations are execution metadata and must not change release identity.
         let first = release_with(vec![a_check(1_204)], "2026-09-21T11:00:00Z");
         let second = release_with(vec![a_check(973)], "2026-09-23T06:31:00Z");
         assert_eq!(
@@ -637,7 +546,6 @@ mod tests {
         );
     }
 
-    // --- end lane 5C ---
 
     // ---------------------------------------------------------------
     // The bundle of a direct-boot host (M3A position 3)
@@ -785,10 +693,7 @@ mod tests {
 
     #[test]
     fn a_signature_is_part_of_what_a_release_is() {
-        // The counterpart to the test above: `build_env.signing_key_name`
-        // says which key was offered, and that is provenance; the signature
-        // in the artifact is what a target with `require-sigs = true` will
-        // accept, and that is content.
+        // Signing-key provenance is excluded from identity; artifact signatures remain.
         let resolved = onebox();
         let first = release_of(resolved.clone());
         let mut artifacts = artifacts_for(&resolved);

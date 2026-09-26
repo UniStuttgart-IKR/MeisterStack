@@ -2,25 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What the reading verbs do to the machine they run on, and to the
-//! machines they ask — measured through the real binary.
-//!
-//! The unit tests pin the parser, the probe script and the readiness rules.
-//! This pins the PROGRAM: `PATH` holds nothing but a directory of shims, so
-//! whatever `meister-deploy status`, `check`, `plan` or `build --dry-run`
-//! runs is in a log, and whatever the log does not have they did not run.
-//! Two of the shims answer rather than fail — `ssh-keygen` hands back a
-//! `known_hosts` line and `ssh` hands back a probe answer read from a file
-//! — so the whole path from "ask the fleet" to "a snapshot on disk and a
-//! verdict on stderr" runs here, with no host and no network anywhere.
-//!
-//! The working directory is compared byte for byte before and after, so
-//! "wrote nothing" is a comparison and not a claim.
-//!
-//! What this cannot show is a syscall that reaches the network without one
-//! of the shimmed programs. There is no socket in this crate; the `unshare
-//! -rn` proof of that belongs to lane 2C, which is the one that gets a verb
-//! with something to hide.
+//! CLI tests for status, check, plan and build dry runs.
+//! A shim-only PATH records subprocesses and supplies key/probe answers.
+//! Directory snapshots detect writes. These tests do not isolate direct socket syscalls.
 
 mod support;
 
@@ -38,9 +22,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
 /// Every program these verbs are allowed to know about.
 const SHIMS: [&str; 5] = ["nix", "git", "rsync", "ssh", "ssh-keygen"];
 
-/// An ed25519 public key of all zeroes, and the fingerprint `ssh-keygen -lf`
-/// computes for it. The fleet in this test is enrolled with exactly this
-/// key, so the identity check has something true to compare.
+/// Fixture ed25519 public key and its computed SSH fingerprint.
 const ENROLLED_KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const ENROLLED_FINGERPRINT: &str = "SHA256:kmYcvdi2GkPeWxB6XLjrZB8JHsy2Hm8luHMFp9GMvqk";
 
@@ -67,9 +49,7 @@ impl Sandbox {
 
         for name in SHIMS {
             let body = match name {
-                // Hands back the `known_hosts` line of the key the fleet is
-                // enrolled with. The tool computes the fingerprint from it
-                // rather than believing a host that claims one.
+                // Return the enrolled key; the tool computes its fingerprint locally.
                 "ssh-keygen" => format!(
                     "#!/bin/sh\nline=\"{name}\"\n\
                      for a in \"$@\"; do line=\"$line [$a]\"; done\n\
@@ -77,10 +57,7 @@ impl Sandbox {
                      printf '# Host found: line 1\\n10.0.0.10 ssh-ed25519 {ENROLLED_KEY}\\n'\n\
                      exit 0\n"
                 ),
-                // Reads the answer prepared for the address in the argv. No
-                // external program in the body: PATH holds only this
-                // directory while the binary runs, so the file is read with
-                // shell builtins.
+                // Return the address-specific probe response using shell builtins only.
                 "ssh" => format!(
                     "#!/bin/sh\nline=\"{name}\"\naddr=\n\
                      for a in \"$@\"; do line=\"$line [$a]\"; \
@@ -103,9 +80,7 @@ impl Sandbox {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // The fleet, enrolled with the key the shim hands back, and a
-        // release of it. Both go through the public API, so a change to a
-        // contract breaks this at the contract.
+        // Construct an enrolled fleet and release through the public API.
         let mut fleet = onebox();
         for host in fleet.hosts.values_mut() {
             host.ssh.host_key_fingerprint = Some(ENROLLED_FINGERPRINT.to_string());
@@ -141,8 +116,7 @@ impl Sandbox {
         }
     }
 
-    /// What one host says: the shared builder, so that the two test
-    /// binaries that shim `ssh` answer with the same shape.
+    /// Shared probe response shape used by both SSH-shim test binaries.
     fn healthy_answer(&self, id: &str) -> String {
         support::probe_answer(&self.fleet, &self.release, id)
     }
@@ -170,13 +144,7 @@ impl Sandbox {
             .expect("the binary was just built")
     }
 
-    /// One entry per invocation.
-    ///
-    /// The probe script is a multi-line argument, so a shim's single
-    /// `printf` still lands as several LINES in the log. A line that does
-    /// not begin with the name of a shim is therefore a continuation of the
-    /// invocation above it, and is joined back on — otherwise "one round
-    /// trip per host" would be counted in lines of shell.
+    /// Group log lines by invocation; probe scripts contain embedded newlines.
     fn calls(&self) -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(&self.log) else {
             return Vec::new();
@@ -253,8 +221,7 @@ fn a_dry_run_of_build_prints_the_derivations_and_builds_none_of_them() {
         "--dry-run",
     ]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    // The list, one derivation per line, and every one of them is a path
-    // the manifest wrote down.
+    // List exactly the derivations recorded in the manifest.
     let printed = stdout(&out);
     let lines: Vec<&str> = printed.lines().collect();
     assert_eq!(lines.len(), 6, "three hosts and three packages: {lines:?}");
@@ -264,7 +231,7 @@ fn a_dry_run_of_build_prints_the_derivations_and_builds_none_of_them() {
         assert!(!what.is_empty());
     }
     assert!(stdout(&out).contains(&sandbox.fleet.hosts["box"].build.toplevel_drv));
-    // And nothing happened: no program, no file.
+    // Require no subprocesses or filesystem changes.
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
     assert_eq!(snapshot_of(sandbox.cwd.path()), before);
     assert!(!sandbox.cwd.path().join("release-2.json").exists());
@@ -393,7 +360,7 @@ fn status_asks_every_host_once_over_ssh_and_nothing_else() {
     assert!(table.contains("0 fail, 0 unknown"), "{table}");
     assert!(!table.contains("REQUIRED"), "nothing failed:\n{table}");
 
-    // And the snapshot is on disk, twice, as the contract object.
+    // Persist both the timestamped snapshot and latest snapshot.
     let latest = sandbox.state().join("observations/latest.json");
     let text = std::fs::read_to_string(&latest).expect("latest.json was written");
     let snapshot = meister_deploy::observation::Observations::from_json(&text, "latest.json")
@@ -438,16 +405,14 @@ fn status_offline_answers_from_the_last_snapshot_and_asks_nobody() {
         "an offline status asks nobody: {:?}",
         sandbox.calls()
     );
-    // It wrote nothing either: the directory is byte for byte what the
-    // first run left.
+    // Offline reads leave the directory unchanged.
     assert_eq!(snapshot_of(sandbox.cwd.path()), after_first);
     assert!(
         stderr(&out).contains("nothing was asked of any host"),
         "{}",
         stderr(&out)
     );
-    // And what came out is the contract object, with the snapshot whole
-    // inside it.
+    // JSON output embeds the complete snapshot.
     let report = meister_deploy::readiness::StatusReport::from_json(&stdout(&out), "stdout")
         .expect("a status/1");
     assert_eq!(report.observation.hosts.len(), 3);
@@ -499,8 +464,7 @@ fn a_host_that_says_nothing_is_unreachable_and_the_others_are_still_read() {
         "{:?}",
         snapshot.hosts["n1"].unknown_reason
     );
-    // The other two were read anyway: one host that is gone does not take
-    // the snapshot with it.
+    // Continue probing the other hosts after one fails.
     assert!(snapshot.hosts["box"].reachable);
     assert!(snapshot.hosts["n2"].reachable);
     assert!(stdout(&out).contains("REQUIRED"), "{}", stdout(&out));
@@ -532,7 +496,7 @@ fn check_is_exit_two_when_the_fleet_is_not_ready_and_says_why() {
     );
     sandbox.answer("n1", &broken);
     let out = sandbox.run(&["check", "--release", "release.json", "--repo", "."]);
-    // Two and not one: the tool worked, and the answer is no.
+    // Exit 2 reports failed acceptance, rather than a CLI error.
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     let why = stderr(&out);
     assert!(why.contains("blocked: units on n1"), "{why}");
@@ -544,15 +508,11 @@ fn check_is_exit_two_when_the_fleet_is_not_ready_and_says_why() {
     );
 }
 
-// --- lane 5C ---
+
 
 #[test]
 fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
-    // L2 §10, findings 4 and 14. `check --inventory fleet.toml` was
-    // `error: unexpected argument`, and `check` says nothing about D7: a
-    // fleet that is green here can still be one no rollout may drain,
-    // because the `[operator] cli_config` reference is what a cordon goes
-    // through and `check` never read it.
+    // Readiness does not exercise the operator control-plane reference needed for cordon.
     let sandbox = Sandbox::new();
     let out = sandbox.run(&[
         "check",
@@ -569,13 +529,10 @@ fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
         "{}",
         stderr(&out)
     );
-    // The fixture HAS `[operator] cli_config`, so there is nothing to warn
-    // about and this verb stays quiet.
+    // Configured operator access needs no warning.
     assert!(!stderr(&out).contains("D7"), "{}", stderr(&out));
 
-    // And the case the lab was in: an inventory without that reference.
-    // The checks still pass — they are about the machines — and the note
-    // says what they do not cover.
+    // Without operator access, checks still pass but report the missing coverage.
     let quiet = std::fs::read_to_string(sandbox.cwd.path().join("fleet.toml"))
         .unwrap()
         .replace("cli_config = \"cli.toml\"\n", "")
@@ -597,7 +554,7 @@ fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
     assert!(why.contains("n1"), "{why}");
 }
 
-// --- end lane 5C ---
+
 
 #[test]
 fn a_suite_that_does_work_on_the_fleet_is_not_something_check_does() {
@@ -649,7 +606,7 @@ fn a_dry_run_of_plan_asks_the_fleet_and_keeps_nothing() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     // It asked: one lookup and one probe per host.
     assert_eq!(sandbox.calls().len(), 6, "{:?}", sandbox.calls());
-    // And kept nothing at all — not the plan, not the snapshot.
+    // Dry runs persist neither plan nor snapshot.
     assert_eq!(snapshot_of(sandbox.cwd.path()), before);
     assert!(!sandbox.cwd.path().join("plan.json").exists());
     assert!(!sandbox.state().exists(), "no state directory was made");
@@ -658,8 +615,7 @@ fn a_dry_run_of_plan_asks_the_fleet_and_keeps_nothing() {
         "{}",
         stderr(&out)
     );
-    // The plan itself came out on stdout and carries the snapshot it was
-    // made from.
+    // Stdout contains the plan and its observation snapshot.
     let plan: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("a plan");
     assert_eq!(plan["observation"]["provisional"], serde_json::json!(false));
     assert_eq!(
@@ -685,8 +641,7 @@ fn a_plan_that_asked_keeps_its_snapshot_and_names_it() {
         "plan.json",
     ]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    // Only the selected host was asked. A plan over one host that probed
-    // three would be a plan that looked at two machines nobody named.
+    // Probe only the selected host.
     let calls = sandbox.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(calls.iter().all(|c| c.contains("10.0.0.11")), "{calls:?}");
@@ -699,8 +654,7 @@ fn a_plan_that_asked_keeps_its_snapshot_and_names_it() {
     assert_eq!(plan.plan_id, plan_id);
     assert_eq!(plan.selection.targets, vec!["n1".to_string()]);
     assert_eq!(plan.observation.hosts.len(), 1);
-    // The snapshot is in the state directory as well, so that `status
-    // --offline` and a later `plan` can read it.
+    // Save the snapshot for offline status and subsequent planning.
     let latest = sandbox.state().join("observations/latest.json");
     assert!(latest.exists(), "latest.json");
     assert!(stderr(&out).contains("observations/"), "{}", stderr(&out));
@@ -713,8 +667,7 @@ fn a_plan_that_asked_keeps_its_snapshot_and_names_it() {
 #[test]
 fn report_reads_a_journal_and_a_plan_and_asks_nobody_anything() {
     let sandbox = Sandbox::new();
-    // A run that got as far as staging n1 and then stopped, written the way
-    // lane 2C will write it.
+    // Write a run journal ending after n1 was staged.
     let out = sandbox.run(&[
         "plan",
         "--release",
@@ -851,11 +804,11 @@ fn gc_keeps_the_newest_and_removes_no_store_path() {
         "{}",
         stderr(&out)
     );
-    // And it ran no nix: dropping a root is a file operation.
+    // Removing workstation roots requires no Nix command.
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
 }
 
-// --- lane 4C: the other two things that pile up ---------------------------
+
 
 #[test]
 fn gc_leaves_the_snapshots_and_the_runs_alone_unless_it_is_asked() {
@@ -871,8 +824,7 @@ fn gc_leaves_the_snapshots_and_the_runs_alone_unless_it_is_asked() {
         std::fs::write(observations.join(name), b"{}").unwrap();
     }
 
-    // Nothing asked for: the snapshots are untouched and the note says
-    // which flag would have touched them.
+    // Observation retention is opt-in.
     let out = sandbox.run(&["gc", "--keep", "1", "--repo", "."]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(observations.join("20260901T000000Z.json").exists());
@@ -883,7 +835,7 @@ fn gc_leaves_the_snapshots_and_the_runs_alone_unless_it_is_asked() {
     );
     assert!(stderr(&out).contains("--runs"), "{}", stderr(&out));
 
-    // Asked for: the oldest goes and `latest.json` never does.
+    // Explicit retention removes the oldest snapshot and preserves `latest.json`.
     let out = sandbox.run(&["gc", "--keep", "1", "--observations", "1", "--repo", "."]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(!observations.join("20260901T000000Z.json").exists());
@@ -941,8 +893,7 @@ fn gc_never_removes_a_run_that_did_not_end_success() {
 fn an_age_guard_keeps_what_the_count_would_have_taken() {
     let sandbox = Sandbox::new();
     let roots = sandbox.state().join("gcroots");
-    // Both made just now: `--keep 0` alone would take both, and
-    // `--older-than 14` says neither is old enough to go at all.
+    // The age guard retains fresh roots even when the count limit is zero.
     for release in ["release-aaa", "release-bbb"] {
         let dir = roots.join(release);
         std::fs::create_dir_all(&dir).unwrap();
@@ -960,7 +911,7 @@ fn an_age_guard_keeps_what_the_count_would_have_taken() {
     assert!(stderr(&out).contains("14 day(s)"), "{}", stderr(&out));
 }
 
-// --- end lane 4C ----------------------------------------------------------
+
 
 // ---------------------------------------------------------------------------
 // the whole way through
@@ -969,8 +920,7 @@ fn an_age_guard_keeps_what_the_count_would_have_taken() {
 #[test]
 fn a_fleet_that_moved_is_planned_and_the_plan_is_read_back() {
     let sandbox = Sandbox::new();
-    // n1 runs something else: the shape of a host that has not had this
-    // release yet.
+    // n1 runs a previous release.
     let moved = sandbox.healthy_answer("n1").replace(
         &sandbox.release.artifacts["n1"].toplevel.store_path,
         "/nix/store/previous-nixos-system-n1-25.11",
@@ -996,14 +946,12 @@ fn a_fleet_that_moved_is_planned_and_the_plan_is_read_back() {
     assert_eq!(plan.hosts["n1"].verdict.as_str(), "change");
     assert_eq!(plan.hosts["box"].verdict.as_str(), "unchanged");
     assert_eq!(plan.hosts["n2"].verdict.as_str(), "unchanged");
-    // The snapshot in the plan is the one that was taken, and it is the one
-    // on disk.
+    // The plan embeds the same snapshot persisted on disk.
     let latest = std::fs::read_to_string(sandbox.state().join("observations/latest.json")).unwrap();
     let on_disk =
         meister_deploy::observation::Observations::from_json(&latest, "latest.json").unwrap();
     assert_eq!(plan.observation, on_disk);
-    // A `status` of the same fleet says the same thing about n1, and says
-    // it as a check rather than as a verdict.
+    // Status reports the same mismatch as a readiness check.
     sandbox.forget_calls();
     let out = sandbox.run(&["status", "--release", "release.json", "--repo", "."]);
     assert!(
@@ -1013,10 +961,9 @@ fn a_fleet_that_moved_is_planned_and_the_plan_is_read_back() {
     );
 }
 
-// --- lane 5B: a host that left the inventory (V25) -------------------------
 
-/// The inventory of the fixture fleet, with `n2` left out — what an operator
-/// has after deleting a host's lines and before resolving again.
+
+/// Fixture inventory with n2 removed.
 const INVENTORY_WITHOUT_N2: &str = r#"
 schema = 2
 [fleet]
@@ -1055,8 +1002,7 @@ fn a_host_that_is_no_longer_in_the_inventory_is_unmanaged_and_is_not_asked() {
     ]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 
-    // It is in the table, and it is the third word rather than "no": a
-    // machine nobody asked is not a machine that did not answer.
+    // Inventory removal is reported as unmanaged, rather than unreachable.
     assert!(stdout(&out).contains("n2"), "{}", stdout(&out));
     assert!(stdout(&out).contains("unmanaged"), "{}", stdout(&out));
     assert!(
@@ -1065,7 +1011,7 @@ fn a_host_that_is_no_longer_in_the_inventory_is_unmanaged_and_is_not_asked() {
         stderr(&out)
     );
 
-    // And nothing was asked of it. The other two were.
+    // Probe only the two remaining managed hosts.
     let calls = sandbox.calls();
     let n2 = &sandbox.fleet.hosts["n2"].address;
     assert!(
@@ -1092,9 +1038,7 @@ fn an_unmanaged_host_blocks_nothing_and_says_whether_it_was_retired() {
     )
     .unwrap();
 
-    // No record: the sentence has to say that, because "somebody deleted a
-    // line" and "somebody retired a machine" are not the same event and only
-    // one of them took the certificates back.
+    // Distinguish inventory removal from explicit retirement with certificate revocation.
     let out = sandbox.run(&[
         "check",
         "--release",
@@ -1118,7 +1062,7 @@ fn an_unmanaged_host_blocks_nothing_and_says_whether_it_was_retired() {
         stderr(&out)
     );
 
-    // With one, the same host is named with the day it left.
+    // Report an existing retirement record and date.
     let dir = sandbox.state().join("retired");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -1150,9 +1094,7 @@ fn an_unmanaged_host_blocks_nothing_and_says_whether_it_was_retired() {
 #[test]
 fn an_inventory_of_another_fleet_is_not_read_as_this_ones() {
     let sandbox = Sandbox::new();
-    // The fixture inventory beside the release is `uni-lab`; the release is
-    // of `one-box`. Reading it would declare every host of this release
-    // unmanaged on the strength of a file about something else.
+    // Ignore an inventory from another fleet rather than marking all release hosts unmanaged.
     let out = sandbox.run(&[
         "status",
         "--release",

@@ -2,49 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What runs ON the installer medium, and the one question it has to get
-//! right: **is this the disk?**
+//! Installer-medium target validation and installation.
 //!
-//! Everything else about a first installation is recoverable. A wrong
-//! toplevel is a second `apply`; a missing certificate is a bootstrap; a
-//! host that does not come up is a console away. A disk that was partitioned
-//! by mistake is somebody's data, and there is no verb for that. So this
-//! module is five refusals and one action, in that order:
+//! The medium binds one host, disk serial and layout. Preparation resolves the disk,
+//! checks layout coverage, probes for an installation mark and checks preservation
+//! references. It may mount partitions read-only, including during dry-run.
 //!
-//! 1. the medium says which host it is for, and `--host` has to agree;
-//! 2. exactly ONE disk carries the serial that was typed, and its size is
-//!    the size the inventory declared;
-//! 3. that disk is the device the LAYOUT names — the bridge between a
-//!    serial (which a person reads off a sticker) and a
-//!    `/dev/disk/by-id/...` (which depends on the transport and the model,
-//!    M0 probe S7, and cannot be derived from the serial);
-//! 4. no partition of it already carries an installation mark, unless
-//!    `--reinstall` says so on purpose;
-//! 5. nothing this host preserves lives on it.
-//!
-//! Only then does anything happen, and what happens is printed first —
-//! [`Installer::prepare`] does the five refusals and returns the summary,
-//! [`Installer::execute`] is the only thing that may run a command that
-//! changes the machine, and a caller has to have the first before it can
-//! call the second (Astra finding F17, 2026-09-23: the two used to be one
-//! function that returned the summary only after already running those
-//! commands, which is the opposite of this sentence).
-//!
-//! **Preserve means "not touched", not "copied".** This program moves no
-//! data anywhere. A path in `install.preserve` that turns out to be on the
-//! disk about to be formatted is a refusal, because the alternative —
-//! copying it somewhere and putting it back — is a backup tool, and a
-//! backup tool that only runs during an install is a backup nobody tested.
-//!
-//! **It reboots nothing.** The last thing it prints is what to do next, and
-//! a person does it. A medium that rebooted into the machine it just
-//! installed would be a medium that decides when a data centre's power draw
-//! changes.
-//!
-//! Everything goes through [`Runner`], [`Files`] and [`Clock`], like the
-//! rest of this crate, so that the command lines that destroy a partition
-//! table can be read in a unit test — which is the only place they can be
-//! read at all.
+//! Execution runs the baked disko script, installs the system, generates host identity,
+//! writes the installation mark and unmounts the target. Callers must print and flush
+//! the preparation summary before execution. No automatic reboot is performed.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -65,15 +31,11 @@ pub const INSTALL_TARGET_SCHEMA: &str = "meister-deploy/install-target/1";
 /// What an installed disk carries so that the next medium can tell.
 pub const INSTALLED_SCHEMA: &str = "meister-deploy/installed/1";
 
-/// Where the medium keeps its answer, and where the mark goes on the
-/// installed system. The same directory on both sides on purpose: a person
-/// who knows one knows the other.
+/// Medium target description and installation mark path, relative to the target root.
 pub const TARGET_PATH: &str = "/etc/meister-install/target.json";
 pub const MARK_PATH: &str = "etc/meister-install/installed.json";
 
-/// Where the target is mounted while it is being installed. disko's own
-/// `rootMountPoint` default, because the script this program runs is the
-/// one the host's layout built and it mounts there.
+/// Installation mount root; the baked disko script uses its own configured mount point.
 pub const ROOT: &str = "/mnt";
 
 /// Where a partition is mounted for a moment to look for the mark.
@@ -89,14 +51,7 @@ const DISKO: Duration = Duration::from_secs(900);
 /// this copies FROM is on the medium and a slow usb stick is a real thing.
 const INSTALL: Duration = Duration::from_secs(3600);
 
-/// How far a disk's real size may be from the one the inventory declared.
-///
-/// Two percent. Disks are sold in decimal gigabytes and the inventory
-/// records `size_gb * 10^9`, but a vendor's "960 GB" is 960 197 124 096
-/// bytes on one model and 960 000 000 000 on the next, and a partition table
-/// or a host protected area takes a little more off. What this check is for
-/// is the case where somebody typed the serial of the 480 GB disk while
-/// meaning the 960 — and that is a factor of two, not two percent.
+/// Maximum relative difference between observed and declared whole-disk sizes: 2%.
 pub const SIZE_TOLERANCE: f64 = 0.02;
 
 // ---------------------------------------------------------------------------
@@ -123,13 +78,8 @@ pub struct Persistence {
     pub required: bool,
 }
 
-/// `/etc/meister-install/target.json`: which machine this medium installs.
-///
-/// There is deliberately no `release_id` in it. An ISO derivation is fixed
-/// before any release exists — it is named by the manifest, and the release
-/// is made later out of the same evaluation — so a release id here would be
-/// either absent or a lie. The honest back-reference is the toplevel path,
-/// which a release names too.
+/// Host-specific installation contract embedded in `/etc/meister-install/target.json`.
+/// It binds system and disko store paths without requiring a later release ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InstallTarget {
@@ -173,12 +123,7 @@ impl InstallTarget {
     }
 }
 
-/// `/etc/meister-install/installed.json` on the installed system: what was
-/// put on this disk, when, and which identity came out of it.
-///
-/// It is the reason a second boot of the same medium does not format the
-/// machine again, and it is the reason an operator can tell an installed
-/// disk from a blank one without booting it.
+/// Installed-system identity and provenance, used to require explicit reinstall consent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledMark {
@@ -222,9 +167,7 @@ pub struct BlockDevice {
     pub serial: Option<String>,
     #[serde(default)]
     pub wwn: Option<String>,
-    /// `-b`, so bytes — but older util-linux answers with a string and
-    /// newer with a number, and a tool that only read one of them would
-    /// break on whichever installer medium it was not tested on.
+    /// `lsblk -b` size; accept both numeric and string encodings.
     #[serde(default)]
     pub size: Option<serde_json::Value>,
     #[serde(rename = "type", default)]
@@ -254,11 +197,7 @@ struct Lsblk {
     blockdevices: Vec<BlockDevice>,
 }
 
-/// `lsblk -J -b -o NAME,PATH,SERIAL,WWN,SIZE,TYPE,MODEL`.
-///
-/// `MODEL` is one column more than the brief asked for, and it is in the
-/// summary a person confirms: "1 disk, 960 GB" is a sentence about any disk,
-/// and "SAMSUNG MZQL2960 / MEISTERBOX0001, 960 GB" is a sentence about one.
+/// Read disk identity and direct child partitions in bytes with JSON output.
 pub fn lsblk_cmd() -> Cmd {
     Cmd::new(Effect::Read, "lsblk", QUICK).args([
         "-J",
@@ -296,7 +235,7 @@ pub struct Outcome {
     pub plan_id: Option<String>,
     /// Null for a dry run, which is the whole difference between the two.
     pub installed: Option<InstalledMark>,
-    /// What a person is to do next, in one sentence.
+    /// Next operator step after installation.
     pub next: String,
 }
 
@@ -310,17 +249,9 @@ pub struct Chosen {
     pub partitions: Vec<BlockDevice>,
 }
 
-/// Everything decided before anything is allowed to change the machine, and
-/// the summary that has to reach the operator before it does.
-///
-/// Astra finding F17, 2026-09-23: `Installer::confirm` used to do the five
-/// refusals, build the summary, run the four destructive commands (unless
-/// `--dry-run`) and only THEN return one `(Outcome, String)` — so a caller
-/// could not print the summary until the disk was already gone, and never
-/// printed it at all when the install failed partway. `Prepared` is the
-/// boundary: everything up to [`Installer::prepare`] changes nothing, and a
-/// caller shows the summary it returns and flushes it before calling
-/// [`Installer::execute`].
+/// Validated target and summary inputs. Only prepare constructs this value; execute
+/// consumes it after the caller has printed and flushed the summary.
+/// Validation may mount partitions read-only; destructive commands start in execute.
 pub struct Prepared {
     target: InstallTarget,
     chosen: Chosen,
@@ -401,12 +332,7 @@ impl<'a> Installer<'a> {
     /// (b) Exactly one disk with that serial, and it is the size it should
     /// be.
     pub fn disk(&self, target: &InstallTarget, serial: &str, wwn: Option<&str>) -> Result<Chosen> {
-        // (b0) The serial that was typed IS the consent, so it has to be a
-        // serial, and it has to be the one this medium was made for. Found
-        // by the review (F19): the typed value was only ever used to pick a
-        // device and never compared with `target.disk.serial` — an empty
-        // string matched nothing and said so, but the serial of another
-        // disk in the same machine would have chosen that disk.
+        // Require the typed serial to match the medium before inspecting local disks.
         if serial.trim().is_empty() {
             bail!(
                 "--disk needs the serial of the disk to install onto; an empty serial is not \
@@ -477,14 +403,7 @@ impl<'a> Installer<'a> {
             }
         };
 
-        // Astra finding F18, 2026-09-23: `target.disk.wwn` — what the
-        // INVENTORY declared, baked into this medium when it was built —
-        // used to be carried in the struct and never read again; only an
-        // operator-TYPED `--wwn` ever filtered a candidate. A serial alone
-        // is not always unique (the two-disks-one-serial case a few lines
-        // above is exactly that), so a declared wwn is enforced the same
-        // way the declared serial already is: it has to match the disk that
-        // was found, not sit unread in `target.json`.
+        // Enforce the inventory WWN even when no operator WWN filter was supplied.
         if let Some(declared_wwn) = &target.disk.wwn
             && chosen.wwn.as_deref() != Some(declared_wwn.as_str())
         {
@@ -527,16 +446,8 @@ impl<'a> Installer<'a> {
         })
     }
 
-    /// (c) The disk the serial found is the disk the layout names.
-    ///
-    /// This is the bridge the whole verb stands on. An operator types a
-    /// SERIAL, because that is what is printed on the disk and what the
-    /// inventory records; the layout binds a `/dev/disk/by-id/...` name,
-    /// because that is what disko writes a partition table to. The by-id
-    /// name carries the transport and the model as well as the serial
-    /// (`nvme-<model>_<serial>` against `virtio-<serial>`, measured in M0
-    /// probe S7), so neither can be derived from the other — they have to be
-    /// compared, through the one thing both resolve to.
+    /// Require every layout device to resolve to the selected disk.
+    /// Compare real paths because transport-specific by-id names cannot be inferred from serials.
     pub fn layout_device(
         &self,
         target: &InstallTarget,
@@ -551,13 +462,7 @@ impl<'a> Installer<'a> {
                 target.layout
             );
         }
-        // Astra finding F02, 2026-09-23: this used to return as soon as ONE
-        // resolved device equalled the consented disk. `install()` then runs
-        // the whole `disko_script`, which disko builds from every disk the
-        // layout names — so a layout naming two disks would destroy the
-        // second one on consent for the first. Every device the layout names
-        // now has to resolve to the one disk that was consented to, or this
-        // refuses instead of reaching disks nobody typed a serial for.
+        // The baked script acts on the whole layout, so one matching device is insufficient.
         let mut matched = None;
         let mut other: Vec<String> = Vec::new();
         for device in &target.layout_devices {
@@ -602,19 +507,8 @@ impl<'a> Installer<'a> {
         Ok(out.trimmed().to_string())
     }
 
-    /// The same question `real_path` asks, except that "this is not plugged
-    /// in" is a real, distinguishable answer here rather than a case folded
-    /// into every other failure.
-    ///
-    /// Astra finding F03c, 2026-09-23: `preserve` used to read ANY error
-    /// from `real_path` — a timed-out command, a refused policy, `realpath`
-    /// itself not being on PATH — as "not plugged in" and downgrade it to a
-    /// note. `realpath` without `-m` exits 1 exactly when the path does not
-    /// resolve (GNU coreutils), so that one exit code is read as "absent"
-    /// and everything else — a non-1 exit, a spawn failure, a timeout —
-    /// still propagates as the error it is, the same way `ssh.ask` already
-    /// tells "the host said no" (an exit code) apart from "ssh could not
-    /// connect" (an error).
+    /// Resolve an optional device reference. Exit 1 is treated as absent; other command
+    /// failures propagate. This relies on the installed realpath command’s exit semantics.
     fn real_path_if_present(&self, path: &str) -> Result<Option<String>> {
         let cmd = Cmd::new(Effect::Read, "realpath", QUICK)
             .arg(path)
@@ -629,26 +523,12 @@ impl<'a> Installer<'a> {
         }
     }
 
-    /// (d) Whether this disk has been installed before.
-    ///
-    /// Every partition of it is mounted read-only for a moment and looked
-    /// at. Read-only and nosuid/nodev because a disk somebody hands you is
-    /// not a disk you trust.
-    ///
-    /// Astra finding F03b, 2026-09-23: a mount that failed used to be read
-    /// exactly like a mount that succeeded and found nothing — both let this
-    /// loop go on to the next partition, and a disk `meister-install` itself
-    /// put down (an ext4 root, a vfat ESP — both mount read-only without
-    /// trouble) mounting fails only for a reason worth stopping over. A
-    /// mount failure now bails: proceeding past it is how a reinstall could
-    /// silently skip the `--reinstall` consent it exists to require.
+    /// Search direct child partitions for an installation mark using read-only mounts.
+    /// Mount failures or unreadable marks abort preparation. Each successful mount is
+    /// unmounted before processing the mark; this also runs during dry-run.
     pub fn mark(&self, chosen: &Chosen) -> Result<Option<(String, InstalledMark)>> {
         for partition in &chosen.partitions {
-            // Made only when there is something to mount into it, and only
-            // when it is not there already: the medium ships the directory
-            // (a tmpfiles rule in nix/install.nix), and a `--dry-run` must
-            // be able to LOOK for the mark — making a directory is a write,
-            // and a dry run does not write.
+            // Use the medium’s precreated probe directory. Creating a missing one requires a write.
             if !self.files.exists(&self.probe_dir) {
                 self.files.create_dir_all(&self.probe_dir)?;
             }
@@ -670,13 +550,7 @@ impl<'a> Installer<'a> {
                 );
             }
             let path = self.probe_dir.join(MARK_PATH);
-            // Astra finding MD06, 2026-09-25: this was `.ok()`, which made
-            // every failure to read the mark — an I/O error, bytes that are
-            // not utf-8, a directory where the file should be — into "there
-            // is no mark", and "no mark" is what lets `prepare` go on to
-            // the disko script without `--reinstall`. Only "no such file"
-            // means that; the unmount happens first either way, and any
-            // other answer stops here, before anything is written.
+            // Unmount before propagating mark read errors; only an absent file means no mark.
             let found = self.files.read_if_present(&path);
             self.runner.run(
                 &Cmd::new(Effect::Read, "umount", QUICK).arg(self.probe_dir.display().to_string()),
@@ -699,26 +573,15 @@ impl<'a> Installer<'a> {
         Ok(None)
     }
 
-    /// (e) Nothing this host preserves is on the disk about to be formatted.
-    ///
-    /// Preserve means NOT TOUCHED. This program copies nothing anywhere, so
-    /// a preserved path that lives on the target disk is a refusal and not a
-    /// thing to work around: the disk is destroyed whole, and a promise to
-    /// keep something on it would be a promise nobody can keep.
-    ///
-    /// A device reference that resolves to nothing is a note rather than a
-    /// refusal: a disk that is not plugged in is a disk this program is not
-    /// about to format.
+    /// Reject preserved references resolving to the target disk or its direct partitions.
+    /// No data is copied. Missing devices and unresolved non-target serials produce notes.
     pub fn preserve(
         &self,
         target: &InstallTarget,
         chosen: &Chosen,
         disk: &str,
     ) -> Result<Vec<String>> {
-        // The disk's own real path is resolved ONCE, in `confirm`, and
-        // handed down: `realpath` is a command like any other here, and a
-        // test that pins the order of the commands that destroy a partition
-        // table should not have to pin the same question asked twice.
+        // Reuse the selected disk’s resolved path while resolving its partitions once.
         let on_the_disk: Vec<String> = std::iter::once(disk.to_string())
             .chain(
                 chosen
@@ -746,15 +609,8 @@ impl<'a> Installer<'a> {
                      destroyed. Nothing was changed."
                 );
             };
-            // Astra finding F03a, 2026-09-23: `device_of` deliberately
-            // returns `None` for every `serial:` reference — a serial names
-            // a DISK and not the filesystem a path lives on, so which
-            // partition it resolves to is a guess this tool will not make.
-            // But when that serial IS the disk about to be destroyed, no
-            // resolution is needed to know the answer: a textual match on
-            // the target's own serial is compared before the reference is
-            // handed to `device_of`, so this is not folded into the "check
-            // by hand" note below.
+            // The target’s own serial proves a conflict even though serial references do not
+            // identify individual filesystems.
             if entry.device_ref == format!("serial:{}", target.disk.serial) {
                 bail!(
                     "cannot preserve {path}: its device is {} ({}), and that is the disk this \
@@ -774,11 +630,7 @@ impl<'a> Installer<'a> {
                 ));
                 continue;
             };
-            // Astra finding F03c, 2026-09-23: any failure resolving this
-            // device — not only "it does not exist" — used to become this
-            // same "not plugged in" note. `real_path_if_present` tells the
-            // two apart, so only a genuine absence is downgraded to a note;
-            // everything else still propagates as the error it is.
+            // Only the resolver’s absence result becomes a note; other errors abort.
             let Some(real) = self.real_path_if_present(&device)? else {
                 notes.push(format!(
                     "{path} is on {} ({device}), which is not plugged into this machine — so \
@@ -805,7 +657,7 @@ impl<'a> Installer<'a> {
         Ok(notes)
     }
 
-    /// (f) What is about to happen, in the words somebody has to agree with.
+    /// Format the target and preservation summary for operator review.
     pub fn summary(
         &self,
         target: &InstallTarget,
@@ -874,8 +726,8 @@ impl<'a> Installer<'a> {
         out
     }
 
-    /// The five refusals, in order, and the summary of what would happen —
-    /// nothing here changes the machine.
+    /// Validate the target and return its destruction summary.
+    /// Preparation may create a probe directory and mount partitions read-only.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
@@ -946,10 +798,7 @@ impl<'a> Installer<'a> {
         ))
     }
 
-    /// The four commands that change the machine — or, for a dry run,
-    /// nothing. Called only once the summary [`Installer::prepare`] returned
-    /// has reached the operator: nothing before this point may run before
-    /// that happens.
+    /// Run installation after the caller displays the summary; dry-run skips execution.
     pub fn execute(&self, prepared: Prepared) -> Result<Outcome> {
         let Prepared {
             target,
@@ -982,13 +831,7 @@ impl<'a> Installer<'a> {
                  Then enrol it with `meister-deploy keys enroll {} --fingerprint {}`.",
                 target.host, target.host, installed.host_key_fingerprint
             ),
-            // --- lane 5C ---
-            // Unreachable in practice and written out all the same: a grub
-            // host is one this tool deploys TO and never installs, and the
-            // plan refuses `--kind install` for it before anything gets
-            // here (nix/lib/inventory.nix says the same thing to the other
-            // half). A `_ =>` would make the next boot mode somebody adds
-            // silently print a uefi sentence.
+            // Keep boot-mode handling exhaustive; normal install planning refuses GRUB targets.
             BootMode::Grub => format!(
                 "power off and remove the medium. This host is declared `boot = \"grub\"`, \
                  which is a machine that brings its own loader — `meister-install` installed \
@@ -996,15 +839,13 @@ impl<'a> Installer<'a> {
                  enroll {} --fingerprint {}`.",
                 target.host, installed.host_key_fingerprint
             ),
-            // --- end lane 5C ---
+
         };
         outcome.installed = Some(installed);
         Ok(outcome)
     }
 
-    /// `prepare` then `execute`, with no summary shown in between — what
-    /// every test in this module wants, and the one thing a real caller
-    /// (Astra finding F17) must not do.
+    /// Test-only prepare/execute composition. Real callers must display the summary between calls.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn confirm(
@@ -1021,26 +862,20 @@ impl<'a> Installer<'a> {
         Ok((outcome, summary))
     }
 
-    /// The four commands that change the machine, in this order and after
-    /// everything else.
+    /// Install the validated target, generate identity, record provenance and unmount it.
     fn install(
         &self,
         target: &InstallTarget,
         chosen: &Chosen,
         plan_id: Option<&str>,
     ) -> Result<InstalledMark> {
-        // disko: destroy, create, mount. The script is the one the host's
-        // own layout built and it carries its mode and its mount point
-        // baked in — there is no `--mode` to get wrong here, and no
-        // partition table typed by hand.
+        // The baked disko script destroys, creates and mounts its configured layout.
         self.runner.run(
             &Cmd::new(Effect::TargetWrite, &target.disko_script, DISKO)
                 .env("PATH", "/run/current-system/sw/bin"),
         )?;
 
-        // `--no-channel-copy`, because the system is already in this
-        // medium's store (`isoImage.storeContents`) and a channel is the
-        // pre-flake road this fleet does not take.
+        // Install the system already present in the medium’s Nix store without channel copying.
         self.runner.run(
             &Cmd::new(Effect::TargetWrite, "nixos-install", INSTALL).args([
                 "--system".to_string(),
@@ -1052,9 +887,7 @@ impl<'a> Installer<'a> {
             ]),
         )?;
 
-        // The machine's first identity, made HERE and never travelling: the
-        // private half is written onto the disk that was just installed and
-        // the public half is what a person carries to `keys enroll`.
+        // Generate the host key on the target; expose only its public fingerprint for enrollment.
         let key = self.root.join("etc/ssh/ssh_host_ed25519_key");
         self.files.create_dir_all(&self.root.join("etc/ssh"))?;
         self.runner.run(
@@ -1077,9 +910,7 @@ impl<'a> Installer<'a> {
             )
         })?;
 
-        // A machine id per installation, not per image: two machines from
-        // one image that share one id are one machine as far as systemd,
-        // etcd and every log line is concerned (V08/L04).
+        // Create machine identity per installation rather than sharing the image’s identity.
         self.runner.run(
             &Cmd::new(Effect::TargetWrite, "systemd-machine-id-setup", QUICK)
                 .arg(format!("--root={}", self.root.display())),
@@ -1123,14 +954,7 @@ impl<'a> Installer<'a> {
 
 pub const MEDIA_SCHEMA: &str = "meister-deploy/install-media/1";
 
-/// What was built for one host, so that a second `install` says "this is the
-/// medium" instead of building a second one.
-///
-/// It lives beside the medium in the state directory rather than inside the
-/// plan, because a plan is a document about a fleet at a moment and this is a
-/// FILE on this workstation: which iso, of which release, for which plan, and
-/// what its bytes hash to — the last one so that whoever writes it to a stick
-/// can check they wrote the right thing.
+/// Workstation record binding host, plan and release to a rooted ISO and its digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MediaRecord {
@@ -1165,13 +989,7 @@ pub fn media_dir(state: &crate::state::StateDir) -> PathBuf {
     state.root().join("media")
 }
 
-/// The sheet somebody carries to the machine.
-///
-/// Printed rather than written, and written rather than assumed: everything
-/// in it is a fact out of the plan and the release, in the order a person
-/// needs it — which disk, which command, what comes back, and where that
-/// goes. The one thing it must never become is a list of steps somebody can
-/// follow without reading, so the disk's serial is in every one of them.
+/// Render the console installation and enrollment instructions from media and release facts.
 pub fn sheet(record: &MediaRecord, target: &SheetFacts) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1214,13 +1032,13 @@ pub fn sheet(record: &MediaRecord, target: &SheetFacts) -> String {
              … \n--host {} --kind direct-boot`).\n",
             record.host, record.host
         ),
-        // --- lane 5C ---
+
         BootMode::Grub => format!(
             "Afterwards {} has no boot loader from this installer: `boot = \"grub\"` is a\n\
              machine that brings its own, and this flake installs none for it.\n",
             record.host
         ),
-        // --- end lane 5C ---
+
     });
     if !target.preserve.is_empty() {
         out.push_str(&format!(
@@ -1242,16 +1060,9 @@ pub struct SheetFacts {
     pub reinstall: bool,
 }
 
-/// `label:meister-data` -> `/dev/disk/by-label/meister-data`.
-///
-/// `serial:` is not turned into a path on purpose: a serial names a DISK and
-/// what a persistent path lives on is a filesystem, so the answer would be a
-/// guess about which partition. It comes back as `None` and the summary says
-/// so, which is a person's job to check rather than a refusal this tool
-/// cannot justify — except for the one `serial:` this tool does not have to
-/// guess about: `preserve` (Astra finding F03a) compares the reference
-/// against the target's own disk serial before it ever reaches here, and
-/// refuses outright on that one match.
+/// Resolve label, UUID and partition-label references into stable device paths.
+/// A serial identifies a disk, not a filesystem, so it returns None. `preserve`
+/// separately rejects the target disk’s own serial.
 pub fn device_of(device_ref: &str) -> Result<Option<String>> {
     let Some((kind, value)) = device_ref.split_once(':') else {
         bail!(
@@ -1433,8 +1244,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Review finding F19: the typed serial is the consent, so it is compared
-    /// with the one the medium was made for BEFORE any disk is looked at.
+    /// Compare consent with the medium’s serial before reading disks.
     #[test]
     fn a_serial_that_is_not_the_mediums_is_refused_before_any_disk_is_read() {
         let runner = StrictFake::new();
@@ -1492,11 +1302,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding F18, 2026-09-23: a wwn the INVENTORY declares — baked
-    /// into the medium at build time — has to match the disk that was
-    /// found, exactly like the declared serial already must. It used to sit
-    /// in `target.disk.wwn` unread; only an operator-typed `--wwn` was ever
-    /// checked.
+    /// The medium’s declared WWN must match the selected disk independently of `--wwn`.
     #[test]
     fn a_declared_wwn_that_does_not_match_the_disk_is_refused() {
         let mut target = target();
@@ -1537,7 +1343,7 @@ mod tests {
 
     #[test]
     fn a_disk_of_the_wrong_size_is_a_different_disk() {
-        // Half the size: somebody typed the serial of the small one.
+        // Reject a disk with half the declared size.
         let runner =
             StrictFake::new().expect(lsblk_matcher(), Output::stdout(lsblk(&[], SIZE / 2)));
         let files = files_with(&target());
@@ -1582,8 +1388,7 @@ mod tests {
         assert_eq!(device, BY_ID);
         runner.verify().unwrap();
 
-        // The other way round: a host module that binds somebody else's
-        // disk is exactly the mistake this check exists for.
+        // Reject a layout that resolves to another disk.
         let runner = StrictFake::new().expect(realpath(BY_ID), Output::stdout("/dev/vdc\n"));
         let err = installer(&runner, &files, &clock)
             .layout_device(&target(), &chosen, "/dev/vdb")
@@ -1594,11 +1399,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding F02, 2026-09-23: one resolved match used to be the
-    /// whole layout's consent, and `install()` runs the WHOLE `disko_script`
-    /// — every disk the layout names, not just the one that was checked. A
-    /// layout naming a second disk must refuse rather than silently reach
-    /// it.
+    /// Reject a layout that reaches any disk beyond the consented one.
     #[test]
     fn layout_device_refuses_a_layout_that_reaches_a_second_disk() {
         let runner = StrictFake::new().expect(lsblk_matcher(), Output::stdout(lsblk(&[], SIZE)));
@@ -1645,13 +1446,7 @@ mod tests {
     #[test]
     fn a_disk_that_is_already_installed_is_not_installed_again() {
         let mark_json = String::from_utf8(a_mark().to_json().unwrap()).unwrap();
-        // Astra finding F03b, 2026-09-23: this used to give the ESP (the
-        // first partition) a failing mount, to show that `mark` fell
-        // through to the next partition on a mount failure — that fallback
-        // is gone (see `mark`'s doc comment and
-        // `a_partition_that_fails_to_mount_stops_the_look_for_a_mark`
-        // below), so this single partition mounts the way disko's own ext4
-        // root actually does: cleanly.
+        // The marked root partition mounts successfully; a failed mount is a separate refusal.
         let expectations = |fake: StrictFake| {
             fake.expect(lsblk_matcher(), Output::stdout(lsblk(&["/dev/vdb2"], SIZE)))
                 .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
@@ -1680,9 +1475,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding F03b, 2026-09-23: a mount failure on the partition that
-    /// carries the mark must not be read as "no mark" — that would let a
-    /// reinstall skip its own `--reinstall` consent requirement.
+    /// A failed mount must not bypass the reinstall-consent requirement.
     #[test]
     fn a_partition_that_fails_to_mount_stops_the_look_for_a_mark() {
         let runner = StrictFake::new()
@@ -1705,10 +1498,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding MD06, 2026-09-25: the mount succeeds and the mark is
-    /// there and cannot be read. That used to be "no mark", and "no mark"
-    /// is the one answer that lets a disk be formatted without
-    /// `--reinstall`.
+    /// Unreadable installation marks must not be treated as absent.
     fn a_mark_that_cannot_be_read(files: MemFiles) {
         let runner = StrictFake::new()
             .expect(lsblk_matcher(), Output::stdout(lsblk(&["/dev/vdb2"], SIZE)))
@@ -1853,11 +1643,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding F03a, 2026-09-23: `serial:` is never resolved to a
-    /// path, but when it names the disk this installer is about to
-    /// destroy, no resolution is needed to know that — it is compared
-    /// textually against the target's own serial before `device_of` ever
-    /// sees it.
+    /// A preserved reference naming the target serial is a conflict without path resolution.
     #[test]
     fn a_preserved_serial_that_is_the_targets_own_is_a_refusal() {
         let mut target = target();
@@ -1892,9 +1678,7 @@ mod tests {
         runner.verify().unwrap();
     }
 
-    /// Astra finding F03c, 2026-09-23: only a `realpath` exit of 1 ("no such
-    /// path") is read as "not plugged in"; a failure for any other reason
-    /// still propagates as the error it is.
+    /// Non-absence resolution failures must propagate.
     #[test]
     fn a_device_reference_resolution_failure_that_is_not_absence_is_an_error() {
         let mut target = target();
@@ -2040,13 +1824,8 @@ mod tests {
         assert!(outcome.next.contains("keys enroll box"), "{}", outcome.next);
     }
 
-    /// Astra finding F17, 2026-09-23: `prepare` returns the summary using
-    /// only the five refusals' own read-only commands — the runner here has
-    /// none of the four destructive ones to hand out, and verifying it right
-    /// after `prepare` alone still succeeds. `execute` is a second, separate
-    /// call, against a `Prepared` that carries no runner of its own: the one
-    /// used here belongs to a different `Installer`, proving that nothing
-    /// destructive can run before a caller has already seen the summary.
+    /// Preparation of a blank disk returns the summary without destructive commands.
+    /// A separate runner then checks execution’s command sequence.
     #[test]
     fn prepare_hands_back_the_summary_before_execute_runs_anything() {
         let runner = StrictFake::new()
@@ -2067,10 +1846,7 @@ mod tests {
             "{summary}"
         );
 
-        // Only now, with the summary already in hand, does execute get a
-        // chance to run anything — on ITS OWN runner, expecting only the
-        // four commands `execute` itself runs and none of `prepare`'s, so
-        // the assertion below is about execute alone.
+        // Only execute receives expectations for destructive installation commands.
         let runner = StrictFake::new()
             .expect(
                 Matcher::exact(DISKO, Vec::<String>::new()),

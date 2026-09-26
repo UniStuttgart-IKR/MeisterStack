@@ -2,48 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The machine of §6: what `apply` actually does to a fleet.
+//! Execute frozen rollout plans with fresh observations and journaled outcomes.
 //!
-//! Everything about a rollout that is a DECISION was made before this file
-//! runs. The planner said which hosts, in which order, in which wave, with
-//! which approval class and with which way back ([`crate::plan`]); the
-//! release said which bytes ([`crate::release`]); the observation said what
-//! was there. What is left here is execution, and its whole worth is in four
-//! properties:
+//! Hosts execute sequentially within each wave. Failures stop subsequent waves;
+//! provider handoffs stop immediately. Mutating steps revalidate affected hosts,
+//! and activation intent is fsynced before invoking the target helper. Resume
+//! combines local evidence with target transaction state.
 //!
-//! * **Nothing is done to a host that was not just looked at.** Before every
-//!   mutating step the host is probed again and
-//!   [`crate::plan::validate_against`] re-checks what the plan assumed. Not
-//!   once at the start: between the plan and the third host of a wave there
-//!   is a rollout's worth of time.
-//! * **The journal is ahead of the world.** `action.irreversible` is written
-//!   and `fsync`ed BEFORE the activation, so a workstation that dies in the
-//!   middle leaves a file that says "something was started here". What
-//!   happened after it is a question for the target, which keeps a
-//!   transaction record — and [`crate::receipt::next_step`] is the table
-//!   that puts the two answers together (V17). Nothing is ever repeated
-//!   blind.
-//! * **A host that fails does not take the fleet with it, and a host that
-//!   succeeds does not hide one that failed.** A failure ends the run before
-//!   the next wave, every host that was not reached is named in
-//!   `untouched[]`, and a verified rollback is `rolled-back` and never
-//!   `success`.
-//! * **Two operators cannot both be here.** The state directory's lock (2A)
-//!   is the workstation's door; the per-host lock `meister-activate` writes
-//!   is the fleet's, and the control-plane hosts are locked before the first
-//!   step as the fleet anchor (D6).
-//!
-//! **One deliberate departure from the lane brief.** Hosts of one wave are
-//! executed one after another, not in parallel, and there is no `--parallel`
-//! flag. The reason is that the only runner the tests may use is a strict
-//! SEQUENCE of expected commands ([`crate::run::StrictFake`], by design of
-//! lane 1C) — a parallel path could not be pinned by a test at all, and an
-//! untested concurrency in the code that reboots machines is worth less than
-//! a wave that takes longer. The waves are what bound the risk: a raft
-//! group's wave is one host by construction, and a compute group's wave is
-//! at most its `max_unavailable`. Making the hosts of a wave concurrent is
-//! M4A's, together with the measurement over seventy hosts that would
-//! justify it.
+//! Per-host locks and control-plane anchors coordinate operators. Unreachable
+//! anchors are reported but do not prevent execution, so fleet exclusion can be
+//! incomplete. Receipts retain failed and untouched hosts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -71,20 +39,13 @@ use crate::run::{Cancel, Cmd, Effect, Expect, Runner};
 use crate::state::{Journal, StateDir, journal_ref, read_journal, repair_journal};
 use crate::transport::{Ssh, Target};
 
-/// How long a guest-drain may take before the step is refused.
-///
-/// A drain that does not finish is a host with work on it, and the answer is
-/// to leave it alone rather than to interrupt what was being protected.
+/// Drain deadline; a host still carrying work is not advanced.
 pub const DRAIN_WAIT: Duration = Duration::from_secs(600);
 
 /// How long a host may take to come back from a reboot.
 pub const REBOOT_WAIT: Duration = Duration::from_secs(600);
 
-/// How long a host gets to answer again after an activation.
-///
-/// `switch-to-configuration` restarts sshd and the network, so the
-/// connection that started it can die with it — and the first question
-/// asked afterwards can go unanswered without anything being wrong.
+/// Allow SSH and networking to recover before interpreting activation failure.
 pub const SETTLE_WAIT: Duration = Duration::from_secs(120);
 
 /// How often a bounded wait asks again.
@@ -122,8 +83,7 @@ pub struct ApplyOptions {
     /// network.
     pub settle_wait: Duration,
     pub poll: Duration,
-    /// The operator's repository, where `keys issue` wrote the
-    /// certificates this run may have to deliver (lane 3B).
+    /// Operator repository containing locally issued delivery certificates.
     pub repo: PathBuf,
     /// `[operator] ca_dir`, where the files the CA keeps live. `None` when
     /// the inventory names none — and then a plan that needs one has
@@ -159,23 +119,13 @@ pub struct Applied {
     /// Hosts whose steps the plan refused. Not a failure of the run — the
     /// plan said so before it started.
     pub blocked: Vec<String>,
-    // --- lane 3-integration ---
-    /// Set when the run stopped in front of a `provider-reboot`: which host,
-    /// which bytes somebody has to load, and the run to come back to. Not a
-    /// failure — the exit code is 2, the same "this is an answer and not a
-    /// crash" a blocked plan gets.
+    /// Provider handoff details; the CLI returns the waiting outcome with exit code 2.
     pub waiting: Option<ProviderWait>,
-    // --- end lane 3-integration ---
 }
 
-// --- lane 3-integration: the halt ------------------------------------------
 
-/// A run that stopped in front of the one step it may not take.
-///
-/// It is an error type because that is how it travels out of the step it
-/// happened in — but it is not a failure of anything: the rollout did
-/// everything it could do from here, and what is left is a hypervisor
-/// somebody else drives.
+/// Provider handoff carried through the action error path without classifying
+/// it as a host failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWait {
     pub host: String,
@@ -200,11 +150,7 @@ impl ProviderWait {
         )
     }
 
-    /// The same, for the thing that will actually do it. A launcher
-    /// (`lab.py boot publish` + `lab.py reboot` in L2) reads this rather
-    /// than the sentence: three store paths and a command line are what it
-    /// needs, and reading them out of prose is how an adapter breaks the
-    /// first time somebody improves the wording.
+    /// Structured direct-boot bundle for provider adapters.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "waiting_for": "provider-reboot",
@@ -238,20 +184,13 @@ enum Stop {
     Provider(ProviderWait),
 }
 
-// --- end lane 3-integration ------------------------------------------------
 
-/// How this run looks at a host.
-///
-/// One method, because one thing is needed: what this host is, now. The real
-/// implementation is lane 2A's read-only probe over ssh; a test's is a
-/// table, and that is the whole reason this is a trait — a test about an
-/// ORDER must not also be a test about a shell script's parser, which
-/// [`crate::observe`] has twenty of its own for.
+/// Inject fresh host observations independently of execution ordering.
 pub trait Look {
     fn observe(&self, host: &crate::manifest::ResolvedHost, target: &Target) -> HostObservation;
 }
 
-/// The real one: one read-only round trip, the script of lane 2A.
+/// Read-only SSH observation implementation.
 pub struct SshLook<'a> {
     pub prober: &'a dyn Prober,
 }
@@ -280,7 +219,7 @@ pub struct Executor<'a> {
     pub cancel: Cancel,
 }
 
-/// When a lock is being given back (Astra finding MD05).
+/// Lock-release scope: host action or final anchor cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Release {
     /// The host's own `unlock` step: its step lock goes, the anchor stays.
@@ -296,35 +235,17 @@ struct HostRunState {
     txn: Option<String>,
     /// Whether this run holds the target's lock.
     locked: bool,
-    /// Whether that lock is the fleet's anchor (D6): taken before the first
-    /// step and given back after the last one, whatever the host's own
-    /// steps do in between.
-    ///
-    /// Astra finding MD05, 2026-09-25: the anchor and a host's step lock
-    /// were one flag, so the host's own `unlock` step gave the anchor back,
-    /// and a bootstrap, which finishes the control-plane hosts first, had
-    /// released every anchor while the agents were still being brought up.
-    /// A second operator on a second checkout was then kept out by nothing.
+    /// Fleet anchor held until run cleanup, independently of the host Unlock action.
     anchored: bool,
-    /// Whether THIS run has already moved this host's system.
-    ///
-    /// Separate from the state rather than derived from it: the state moves
-    /// on through `verifying` and `committed` and back through `preflight`
-    /// on a resume, and what this flag is for does not — once a rollout has
-    /// activated something here, the plan's idea of what this host runs is
-    /// this run's own doing and must not stop it
-    /// ([`Executor::own_footprints_removed`]).
+    /// Whether this run already changed the system. Unlike HostState, this remains
+    /// true across resumed preflight and identifies the run's own plan differences.
     moved: bool,
 }
 
 impl<'a> Executor<'a> {
-    /// Walk the plan.
-    ///
-    /// Returns `Ok` whenever a receipt could be written, whatever the
-    /// receipt says: a rollout that failed is not this function failing, and
-    /// the caller reads `receipt.outcome` for the exit code. `Err` is for the
-    /// things that make a run impossible before it starts — a missing
-    /// approval, a plan that no longer matches the fleet.
+    /// Execute the plan and return its receipt when persistence succeeds.
+    /// Host failures are outcomes; validation or I/O failures may return Err, including
+    /// after work has begun. The caller also interprets stop and waiting fields.
     pub fn run(&self) -> Result<Applied> {
         let missing = approvals_missing(self.plan, &self.options.approvals);
         if !missing.is_empty() {
@@ -347,14 +268,9 @@ impl<'a> Executor<'a> {
 
         let journal_path = self.state.journal_path(&self.options.run_id);
         let (journal, resumed) = if self.options.resume {
-            // Astra finding F05, 2026-09-23: the torn tail is repaired on
-            // the DISK and not only in this process's memory. Reporting it
-            // and leaving it there meant the next `append_fsync` wrote its
-            // line behind the fragment, and the fragment was then no longer
-            // the last line — which is the one shape `read_journal` refuses
-            // outright. This is the only place that repairs: `report` reads
-            // a journal and says what it found, and a reader does not
-            // rewrite evidence.
+            // Repair a torn final journal line on disk before appending. Otherwise the
+            // next event would turn the tail fragment into interior corruption. Reporting
+            // remains read-only.
             if let Some(torn) = repair_journal(self.files, &journal_path)? {
                 eprintln!("note: {torn}");
             }
@@ -389,17 +305,13 @@ impl<'a> Executor<'a> {
                 &self.plan.to_json()?,
                 0o644,
             )?;
-            // --- lane 5C ---
-            // And the release with it. A resume needs the store paths and
-            // the nar hashes the plan only names by id, and the operator's
-            // own `--out` file is a file the next `build` overwrites (L2
-            // finding N10).
+            // Save the release beside the plan so resume retains its paths and NAR hashes
+            // even if an operator overwrites the original release output.
             self.files.write_atomic(
                 &self.state.release_copy_path(&self.options.run_id),
                 &self.release.to_json()?,
                 0o644,
             )?;
-            // --- end lane 5C ---
             (
                 Journal::new(
                     journal_path.clone(),
@@ -418,9 +330,7 @@ impl<'a> Executor<'a> {
             None,
             serde_json::json!({
                 "operator": self.operator,
-                // The fleet anchor of D6, in the payload rather than as a
-                // `lock.acquire` event: `fold` requires a host for those,
-                // and the anchor is a statement about the run.
+                // Record anchor details in the run payload; lock.acquire requires a host.
                 "anchor": { "control_plane": anchor, "resumed": self.options.resume },
                 "plan_id": self.plan.plan_id,
                 "release_id": self.plan.release_id,
@@ -459,15 +369,12 @@ impl<'a> Executor<'a> {
         }
 
         let mut stopped: Option<String> = None;
-        // The anchor, before the first step. A control-plane host that
-        // cannot be reached leaves the anchor incomplete, which is a
-        // sentence and not a refusal: a fleet whose cloud is down is exactly
-        // a fleet somebody has to be able to roll forward.
+        // Attempt control-plane anchors before host actions. Unreachable anchors
+        // leave exclusion incomplete but do not block recovery work.
         if let Err(e) = self.take_anchor(&journal, &anchor, &mut hosts) {
             stopped = Some(format!("{e:#}"));
         }
 
-        // --- lane 3-integration ---
         let mut waiting: Option<ProviderWait> = None;
         if stopped.is_none() {
             match self.walk_waves(&journal, &mut hosts) {
@@ -479,7 +386,6 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        // --- end lane 3-integration ---
 
         // Whatever happened, the locks this run took go back — otherwise the
         // next run needs `--takeover` for a rollout that simply ended.
@@ -497,9 +403,7 @@ impl<'a> Executor<'a> {
         let folded = fold(&read.events)?;
         let reference = journal_ref(self.files, &journal_path)?;
         let mut built = receipt(self.plan, &folded, &reference, self.clock.now());
-        // Astra finding MD09, 2026-09-25: the run's own two facts go into
-        // the document, so that `apply --json` is one document and not a
-        // receipt with a halt line after it.
+        // Attach stop and provider-handoff details to the single receipt document.
         built.stopped = stopped.clone();
         built.waiting = waiting.as_ref().map(ProviderWait::to_json);
         self.state.write_receipt(self.files, &built)?;
@@ -554,19 +458,12 @@ impl<'a> Executor<'a> {
                 }
                 match self.run_host(journal, id, wave, hosts) {
                     Ok(()) => {}
-                    // --- lane 3-integration ---
-                    // A halt is not a failure and must not be folded into
-                    // one: the run did everything it could from here, and
-                    // what is left is outside this program. It ends the run
-                    // rather than the host, because the fleet's own order
-                    // is what a wave means — taking the next host forward
-                    // while this one runs a kernel nobody arranged yet
-                    // would be a rollout that overtook itself.
+                    // Stop the run at provider handoff to preserve wave order until the
+                    // provider boots the requested bundle.
                     Err(e) => match e.downcast::<ProviderWait>() {
                         Ok(wait) => return Some(Stop::Provider(wait)),
                         Err(e) => failed.push(format!("{id}: {e:#}")),
                     },
-                    // --- end lane 3-integration ---
                 }
             }
             if !failed.is_empty() {
@@ -580,12 +477,7 @@ impl<'a> Executor<'a> {
         None
     }
 
-    /// One host, one wave: the actions the plan wrote for it, in its order.
-    ///
-    /// The plan is the sequence — a host that already runs the release has
-    /// two steps and neither of them touches it (V10), and a host that only
-    /// has to boot has no `activate` and no `confirm`. Nothing here decides
-    /// which steps exist.
+    /// Execute this host's planned actions in order, adjusting only for resume state.
     fn run_host(
         &self,
         journal: &Journal,
@@ -607,12 +499,8 @@ impl<'a> Executor<'a> {
             match self.resume_point(journal, id, hosts)? {
                 Resume::Done => return Ok(()),
                 Resume::Carry => {}
-                // --- lane 3-integration ---
                 Resume::AtTheProviderReboot => {
-                    // The same set as after an activation, plus the
-                    // confirmation: a halt happens AFTER it, so repeating it
-                    // would be confirming a transaction that is already
-                    // confirmed (or none at all).
+                    // Provider handoff follows confirmation; skip preparation and confirmation.
                     skip.extend([
                         ActionKind::Stage,
                         ActionKind::DeliverSecret,
@@ -622,13 +510,9 @@ impl<'a> Executor<'a> {
                         ActionKind::Confirm,
                     ]);
                 }
-                // --- end lane 3-integration ---
-                // --- lane 5A ---
                 Resume::AtKeysPhase(phase) => {
-                    // Everything before this phase is on the host's disk
-                    // already. `prepare` above all: a second one would make
-                    // a second key, and the certificate this plan carries
-                    // is for the first.
+                    // Skip phases already represented by the target rotation state. Preparing
+                    // a second key would invalidate the certificate bound to the first.
                     let reached = crate::receipt::keys_phase_order(phase);
                     for kind in [
                         ActionKind::KeysPrepare,
@@ -642,15 +526,11 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
-                // --- end lane 5A ---
                 Resume::AfterTheActivation {
                     confirmed,
                     rebooted,
                 } => {
-                    // Everything up to and including the activation happened
-                    // on the machine, and the target is what said so. The
-                    // preparation is not repeated — a second `nix copy` would
-                    // be harmless and a second `activate` would not.
+                    // Target evidence confirms activation; do not repeat preparation or activation.
                     skip.extend([
                         ActionKind::Stage,
                         ActionKind::DeliverSecret,
@@ -661,40 +541,17 @@ impl<'a> Executor<'a> {
                     if confirmed {
                         skip.insert(ActionKind::Confirm);
                     }
-                    // --- Astra finding F19, 2026-09-23 ---
-                    //
-                    // The reboot stands between the activation and the
-                    // confirmation and was not in this set, so an operator
-                    // who interrupted a run after the machine had come back
-                    // and before the confirm sent `systemctl reboot` again.
-                    // `wait_for_boot` cannot catch it: it asks whether the
-                    // booted system is the wanted one, which it already is,
-                    // and never whether THIS boot is a new one.
-                    //
-                    // And it is worse than a wasted reboot. In `mode boot`
-                    // the way back is the one-shot boot entry, which the
-                    // first boot consumed, and `confirm` — which has not run
-                    // — is what makes the new generation the default. So the
-                    // second reboot boots the OLD system, `wait_for_boot`
-                    // sits there reading "it booted <other>" until the
-                    // deadline, and a rollout that was one step from done
-                    // has quietly undeployed itself.
-                    //
-                    // Conditioned on the journal and not on the plan: a host
-                    // that was switched and never booted still has to boot.
+                    // Skip a completed reboot using journal evidence. Rebooting again before
+                    // boot-mode confirmation can consume the fallback path and boot the old default.
                     if rebooted {
                         skip.insert(ActionKind::Reboot);
                     }
-                    // --- end Astra finding F19 ---
                 }
             }
         }
 
         if planned.verdict == HostVerdict::Unchanged {
-            // Journalled, not skipped: a host nobody wrote a line about is
-            // `unreached` in the receipt and makes a whole run `partial`
-            // (2A's finding). It already runs the release, and that is an
-            // outcome.
+            // Record unchanged hosts so the receipt distinguishes them from unreached hosts.
             let actions: Vec<Action> = self
                 .plan
                 .actions_for(id)
@@ -706,14 +563,8 @@ impl<'a> Executor<'a> {
             self.guard(&fresh, id, hosts)?;
             for action in &actions {
                 self.begin(journal, id, action)?;
-                // Astra finding MD07, 2026-09-25: the plan's `verify` names
-                // the host's required checks, and this branch skipped it
-                // along with everything else, so "runs the release" stood in
-                // for "is right". A host whose required unit died after the
-                // plan was made passed the identity and plan checks above
-                // and ended the run green. Unchanged means nothing is
-                // installed, activated or delivered; the read-only checks
-                // are still made, and a host that fails them fails.
+                // Unchanged hosts still run required readiness checks; matching system
+                // identity alone does not establish health.
                 if action.kind == ActionKind::Verify {
                     let results = self.verify(id, &fresh);
                     let verdict = checks::acceptance(&results);
@@ -819,19 +670,8 @@ impl<'a> Executor<'a> {
                         .map(|g| g.to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 )];
-                // --- lane 4A: the hardware preflight ---
-                //
-                // The same function the plan was made with, asked again
-                // against the snapshot of THIS minute and before anything
-                // is copied. The plan's answer is a document; this one is
-                // the one that stands between a release and a machine that
-                // stopped being the machine the inventory describes —
-                // a disk that filled up, a card that was pulled, a NIC that
-                // was swapped, a `/dev/kvm` that is not there.
-                //
-                // It fails the step rather than only recording it: this is
-                // the last look before `stage`, and the whole point of a
-                // preflight is that what it finds does not get copied over.
+                // Recheck hardware constraints before staging; stale planned capacity
+                // or hardware evidence must fail the step.
                 if let Some(obs) = seen.as_ref() {
                     let host = &self.release.resolved_fleet.hosts[id];
                     let verdict = crate::plan::hardware_verdict(
@@ -854,7 +694,6 @@ impl<'a> Executor<'a> {
                     }
                     evidence.extend(verdict.met);
                 }
-                // --- end lane 4A ---
                 self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
                 self.move_to(journal, id, hosts, HostState::Preflight, fresh.host(id))?;
             }
@@ -923,21 +762,8 @@ impl<'a> Executor<'a> {
                 )?;
                 self.entry(hosts, id).txn = Some(txn.clone());
                 self.entry(hosts, id).moved = true;
-                // --- lane 5C ---
-                // `move_to` and not `set_state`: the state has to reach the
-                // JOURNAL here, not only this process's memory.
-                //
-                // Measured in every run of lab lane L2 (2026-09-23). The
-                // next `move_to` writes `from: activating`, the replay had
-                // the host in `staged`, and every receipt of that lane ended
-                // with "entry N says box left the state activating and the
-                // journal had it in staged; a line is missing." The §6 table
-                // names this transition and its evidence — `action.
-                // irreversible` written, transaction record on the target —
-                // and both are on the disk one line above this one, so there
-                // is nothing left to wait for.
+                // Journal the Activating transition before later events refer to it.
                 self.move_to(journal, id, hosts, HostState::Activating, None)?;
-                // --- end lane 5C ---
                 let cmd = self.activate_cmd(id, action, &txn)?;
                 let line = cmd.line();
                 let next = if action.rollback.mode == RollbackMode::Boot {
@@ -958,15 +784,8 @@ impl<'a> Executor<'a> {
                         self.move_to(journal, id, hosts, next, None)?;
                     }
                     Err(e) => {
-                        // The connection may have died BECAUSE the activation
-                        // worked: `switch-to-configuration` restarts sshd and
-                        // the network under the very connection that started
-                        // it, and an ssh that comes back 255 with nothing to
-                        // say is not evidence about a machine. Measured in
-                        // nix/tests/update.nix, where the switch had finished
-                        // and the operator called the run failed. So the
-                        // TARGET is asked, and it is asked after it has had
-                        // time to answer again.
+                        // Activation can restart SSH. Wait for target transaction evidence before
+                        // classifying a lost connection as failure.
                         let (seen, view) = self.settled_view(id, Some(&txn));
                         if matches!(view, TxnView::Pending { .. }) {
                             self.end(
@@ -993,10 +812,7 @@ impl<'a> Executor<'a> {
                                 vec![format!("{e:#}")],
                                 vec![line],
                             )?;
-                            // The helper puts the host back itself when its
-                            // own step fails, and it says so in the record.
-                            // What is left is to find out which of the two
-                            // happened, and the target is the one that knows.
+                            // The helper may already have reverted; inspect its recorded outcome.
                             return self
                                 .after_a_failed_activation(journal, id, hosts, e, seen, view);
                         }
@@ -1004,12 +820,8 @@ impl<'a> Executor<'a> {
                 }
             }
             ActionKind::Reboot => {
-                // Astra finding MD04, 2026-09-25: the machine's boot id goes
-                // into the `action.begin`, so that a resume which finds this
-                // step without its end can ask the machine whether it went
-                // round since (`settle_reboot`). Best effort: a probe that
-                // cannot read it leaves the resume with the booted system
-                // alone, which is what it had before.
+                // Record the pre-reboot boot ID for interrupted-command reconciliation.
+                // If unavailable, resume falls back to booted-system evidence.
                 let before = self.observe_one(id).ok().and_then(|o| o.boot_id);
                 let evidence: Vec<String> = before.iter().map(|b| format!("boot_id {b}")).collect();
                 self.begin_with_evidence(journal, id, action, evidence)?;
@@ -1046,25 +858,8 @@ impl<'a> Executor<'a> {
                         payload_checks,
                         Vec::new(),
                     )?;
-                    // A host whose plan has no `confirm` has nothing to
-                    // confirm: nothing was activated, so the way back is
-                    // not a timer on the target and this verify is where
-                    // the host is done. Without this it would end the run
-                    // in whatever state it last moved to, which the receipt
-                    // reads as `skipped` and the run as `aborted`.
-                    //
-                    // Two shapes reach it: a `deliver-secret` only host
-                    // (lane 3B) and a `reboot_only` one (2B) — neither of
-                    // them activates anything.
-                    //
-                    // `a.seq > action.seq` and not "has a confirm at all":
-                    // a direct-boot host verifies TWICE — once for the
-                    // switch, before the confirmation, and once for what
-                    // its provider booted, after the halt. The second one
-                    // is the last word on that host, and a host whose last
-                    // word was never written ends the run in whatever state
-                    // it last moved to, which the receipt reads as
-                    // `unknown` (lane 3-integration).
+                    // Commit when no later Confirm exists. This includes delivery/reboot-only
+                    // plans and the second verify after a direct-boot provider handoff.
                     if !self.plan.actions_for(id).iter().any(|a| {
                         a.kind == ActionKind::Confirm && !a.is_blocked() && a.seq > action.seq
                     }) {
@@ -1083,10 +878,7 @@ impl<'a> Executor<'a> {
                         checks::Acceptance::Blocked { reasons } => reasons.join("; "),
                         checks::Acceptance::Accepted => unreachable!("it was not accepted"),
                     };
-                    // A host that was never activated has nothing to take
-                    // back: the verify of an unchanged or a preflight-only
-                    // host is a report, and a failing one fails the run
-                    // without moving anything.
+                    // Without an activation transaction there is no system rollback to invoke.
                     if self.entry(hosts, id).txn.is_some() {
                         self.take_back(journal, id, hosts, &why)?;
                     }
@@ -1108,12 +900,7 @@ impl<'a> Executor<'a> {
                     vec![line],
                 )?;
                 let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
-                // Committed unless something still has to happen to this
-                // host. On a direct-boot host the confirmation is not the
-                // end: it is what makes the switch survive the wait in
-                // front of the provider's reboot (lane 3-integration).
-                // Calling it committed there would make a resume read
-                // `Done` and skip the reboot the plan exists for.
+                // Keep direct-boot hosts Verifying until the provider handoff completes.
                 let more_to_come = self.plan.actions_for(id).iter().any(|a| {
                     a.kind == ActionKind::ProviderReboot && !a.is_blocked() && a.seq > action.seq
                 });
@@ -1159,44 +946,22 @@ impl<'a> Executor<'a> {
                     )?;
                 }
                 self.end(journal, id, action, ActionResult::Ok, Vec::new(), refs)?;
-                // Astra finding F06, 2026-09-23: the host is where the run
-                // leaves it, and this is where a run leaves a host it took
-                // forward — every path that does not take it forward
-                // (`take_back`, a failed activation, a failed check) ends
-                // the host before this step. On an ordinary rollout it is
-                // already `committed`, because the confirm put it there, and
-                // then nothing is written.
-                //
-                // It matters on a RESUME of a host that was confirmed and
-                // not given back: the confirm is behind us and skipped, and
-                // the `preflight` this resume DOES repeat — it is a read —
-                // moves the host back to `preflight`. Without this line such
-                // a host ended the run there, and the receipt read a resume
-                // that did everything that was left as `skipped`.
+                // Complete resumed cleanup as Committed: repeated preflight may have
+                // reset the local state even though confirmation was already complete.
                 if self.entry(hosts, id).state != HostState::Committed {
                     self.move_to(journal, id, hosts, HostState::Committed, None)?;
                 }
             }
-            // --- lane 3B ----------------------------------------------
             ActionKind::DeliverSecret => {
                 self.begin(journal, id, action)?;
-                // NOT `action.irreversible`: replacing a file can be taken
-                // back by writing the old one, and the journal line that
-                // means "something started that cannot be undone" is worth
-                // exactly as much as the number of times it is true.
+                // File delivery records an action but no activation transaction intent.
                 let evidence = self.deliver(id, action)?;
                 self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
             }
-            // --- end lane 3B ------------------------------------------
-            // --- lane 5A: the five phases of a rotation ------------------
             ActionKind::KeysPrepare => {
                 let rotation = self.rotation(id, action)?;
                 self.begin(journal, id, action)?;
-                // WITHOUT `--replace`: the key was made when the plan was
-                // made, and a second one here would be a second identity —
-                // the certificate in this plan is for the first. So the
-                // host is asked, and what it answers with has to be the key
-                // this plan was made for.
+                // Reuse the prepared key without --replace; the certificate binds that key.
                 let cmd = self.helper_cmd(
                     id,
                     &[
@@ -1243,12 +1008,8 @@ impl<'a> Executor<'a> {
             ActionKind::KeysSwitch => {
                 let rotation = self.rotation(id, action)?;
                 self.begin(journal, id, action)?;
-                // NOT `action.irreversible`: the helper can put the pair
-                // that worked back (`keys revert`), and the record on the
-                // target says which state it is in. What makes a switch
-                // survivable is that record, not a line in this journal —
-                // and the line means exactly as much as the number of times
-                // it is true.
+                // Rotation recovery uses the helper's key-state record, separate from
+                // activation transaction intent.
                 let cmd = self.helper_cmd(
                     id,
                     &[
@@ -1367,32 +1128,9 @@ impl<'a> Executor<'a> {
             ActionKind::KeysRemove => {
                 let rotation = self.rotation(id, action)?;
                 self.begin(journal, id, action)?;
-                // The repository catches up with the host FIRST.
-                //
-                // Until this happens `<kind>.crt` in the repository is the
-                // certificate the host USED to hold, and it is what the
-                // planner compares every host against. Leaving it there
-                // would make the next ordinary plan deliver the old
-                // certificate back over the new one — undoing the rotation,
-                // quietly, in a plan nobody read as a rotation. So the
-                // rotation ends where it began: on this workstation.
-                //
-                // Astra finding F09, 2026-09-23: it used to end there
-                // AFTER the remote step, and a run that died in between
-                // was unrecoverable by resume. The remote `keys remove`
-                // leaves a host with no `.next` and no `.prev`, which
-                // `keys_status` reads as `confirmed` and the resume table
-                // reads as `done` — so the resume returned before it ever
-                // reached this step, the repository kept the old
-                // certificate, and the next plan delivered it back over
-                // the new one.
-                //
-                // The order is the fix, and it is the right order anyway:
-                // what this writes became true at the SWITCH, not at the
-                // removal. Both renames are idempotent — the second run
-                // finds no `source` and does nothing — while the remote
-                // step is the one that cannot be taken back, so it goes
-                // last.
+                // Publish the new active certificate locally before removing target backups.
+                // This prevents later ordinary plans from restoring the old certificate.
+                // Both local publication and target cleanup support repetition on resume.
                 let mut evidence = Vec::new();
                 let active = self
                     .options
@@ -1425,7 +1163,6 @@ impl<'a> Executor<'a> {
                 let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
                 self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
             }
-            // --- end lane 5A ---------------------------------------------
             ActionKind::Install | ActionKind::Revoke | ActionKind::Gc => {
                 bail!(
                     "the step {} on {id} is a {} and this tool cannot do it yet: \
@@ -1435,18 +1172,8 @@ impl<'a> Executor<'a> {
                     action.kind
                 );
             }
-            // --- lane 3-integration: the step this tool does not take -----
-            //
-            // Nothing is started here and nothing is waited for. The machine
-            // is asked one question — have you booted what this plan wants —
-            // and the two answers are "carry on" and "the run ends here,
-            // with the bytes somebody has to load".
-            //
-            // No polling, on purpose: what happens next is a person or an
-            // adapter uploading a kernel and telling a hypervisor to restart
-            // a guest, and a workstation that sat on an ssh connection for
-            // that would be a workstation that has to stay awake for it.
-            // The journal is what carries the run across the gap.
+            // Check whether the provider has booted the requested system. Otherwise
+            // persist a handoff and stop; provider uploads/reboots are not initiated or polled.
             ActionKind::ProviderReboot => {
                 let fresh = fresh.expect("a provider-reboot is validated, so it was looked at");
                 let seen = fresh.host(id);
@@ -1472,10 +1199,7 @@ impl<'a> Executor<'a> {
                 } else {
                     let wait = self.provider_wait(id, action)?;
                     let from = self.entry(hosts, id).state;
-                    // The halt, with the bundle in it: a run that comes back
-                    // tomorrow, or a person reading the journal, gets the
-                    // three values out of the file rather than out of a
-                    // terminal somebody closed.
+                    // Persist the bundle so a later resume or adapter can read the handoff.
                     self.write(
                         journal,
                         EventKind::HostState,
@@ -1504,42 +1228,18 @@ impl<'a> Executor<'a> {
     // the steps
     // -----------------------------------------------------------------
 
-    /// Put one file on a host, and ask the host what it now has (lane 3B).
-    ///
-    /// Three properties, and each one is a line below:
-    ///
-    /// * **The content travels on stdin and is redacted out of everything
-    ///   this run writes down.** `transport::Ssh::put` does both; what
-    ///   reaches the journal is a command line with `***` where the file
-    ///   was. A `secrets.key` in a receipt somebody attaches to a ticket is
-    ///   a secret that has left the building.
-    /// * **The evidence is what the HOST says afterwards, not what this
-    ///   workstation sent.** A public file is hashed there and the digest
-    ///   is the evidence; a private one is described by its mode and owner,
-    ///   which is what its loader refuses it for (M0 probe S11) and which
-    ///   is all that may be said about it.
-    /// * **A unit is poked only if it is running.** In a bootstrap the
-    ///   units are off — they wait on the very file being delivered — and a
-    ///   restart of something that is not running is a restart that starts
-    ///   it before the rest of its configuration is there.
-    ///
-    /// This is also the one action a host without a service identity may
-    /// receive. The planner refuses everything else to an `unenrolled`
-    /// host, and rightly: nothing can be verified about a machine that
-    /// cannot authenticate. But delivering the certificate is how it stops
-    /// being one, so a bootstrap's `deliver-secret` is exactly the step
-    /// that gets it there (2B's N5: the SSH host key is what a bootstrap
-    /// may not invent, the service identity is what it delivers).
+    /// Deliver one planned file and collect target-side evidence. Public files are
+    /// verified by digest; private files record mode/owner without hashing their contents.
+    /// Only running units receive reload/restart actions. SSH enrollment still applies
+    /// when delivery supplies the host's first service certificate.
     fn deliver(&self, id: &str, action: &Action) -> Result<Vec<String>> {
         let target = self.target(id)?;
         let host = self.release.resolved_fleet.hosts.get(id).ok_or_else(|| {
             anyhow::anyhow!("the release describes no host {id}, so it has no secrets either")
         })?;
         let wanted = action.desired.clone().unwrap_or_default();
-        // The plan wrote `<id> at <path>`, so the step is matched back
-        // against the reference it was made from rather than parsed out of
-        // a string: an id that contained the separator would otherwise
-        // deliver the wrong file.
+        // Match the action against its exact secret reference instead of parsing
+        // an ID/path delimiter.
         let secret = host
             .secret_refs
             .iter()
@@ -1575,16 +1275,8 @@ impl<'a> Executor<'a> {
             );
         }
         let bytes = self.files.read(&source)?;
-        // --- lane 3B: Astra finding F10, 2026-09-23 ---
-        // The step is bound to the bytes it was planned with, exactly as a
-        // rotation's overlap is (`Executor::overlap`), and with the same
-        // sentence. Without this the executor re-read the operator's file
-        // and then checked the host's copy against whatever that file now
-        // held, so a plan made with one certificate -- or one revocation
-        // list -- delivered another under its own plan_id, with the
-        // approval, the journal and the receipt all naming the wrong bytes.
-        // The comparison is BEFORE the put: a run that stops here has
-        // changed nothing on the host.
+        // Compare local bytes with the planned digest before upload so changed
+        // credentials cannot be delivered under an approval for different content.
         if let Some(expected) = &action.expected_sha256 {
             let here = format!("sha256:{}", crate::ids::sha256_hex(&bytes));
             if &here != expected {
@@ -1595,7 +1287,6 @@ impl<'a> Executor<'a> {
                 );
             }
         }
-        // --- end lane 3B ---
 
         let put = self.ssh.put(
             &target,
@@ -1607,10 +1298,7 @@ impl<'a> Executor<'a> {
         );
         self.runner.run(&put)?;
 
-        // What the host has now, asked of the host. A public file by its
-        // digest, a private one by its mode and its owner — the same
-        // asymmetry the read-only probe of 2A uses, so the next snapshot
-        // says the same thing about it.
+        // Collect public digests or private-file mode/owner from the target.
         let public = crate::observe::is_certificate(&secret.target_path);
         let question = if public {
             format!(
@@ -1649,13 +1337,7 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // --- lane 5A ---
-        // A revocation list is not poked. The process that reads one looks
-        // at it again on its own clock, within half a minute
-        // (`controller_api::auth::Revocations`), and restarting a controller
-        // to deliver a list it re-reads by itself would be the one avoidable
-        // outage in this design — on every host of the fleet, for every
-        // revocation.
+        // CRL readers refresh on their own interval; delivery needs no unit restart.
         if secret.kind == crate::manifest::SecretKind::Crl {
             evidence.push(
                 "no unit was restarted: a controller re-reads its revocation list within 30 s"
@@ -1663,22 +1345,11 @@ impl<'a> Executor<'a> {
             );
             return Ok(evidence);
         }
-        // --- end lane 5A ---
 
         // And the unit that reads it, if it is running.
         if let Some(reload) = &secret.reload {
-            // `Codes([0, 1, 3, 4])` and not the `ask` default: `systemctl
-            // is-active` answers 3 for a unit that is inactive or failed
-            // and 4 for one this machine does not have, and both are the
-            // answer this question is asked for. 255 stays an error, which
-            // is how "ssh could not connect" is told apart from "the unit
-            // is not running". (Measured twice: the first run of this VM
-            // test ended the whole wave on an exit 3 that said `inactive`,
-            // and the first bootstrap in the lab — 2026-09-23, lane L2 —
-            // ended it on an exit 4, because a fresh host was still running
-            // the generic image and did not HAVE the controller unit yet.
-            // That is what a bootstrap is: the unit arrives with the
-            // closure, after the file it waits for.)
+            // Accept inactive/failed (3) and missing (4) units as probe answers.
+            // SSH transport failure (255) remains an error.
             let active = self.runner.run(
                 &self
                     .ssh
@@ -1712,21 +1383,9 @@ impl<'a> Executor<'a> {
         Ok(evidence)
     }
 
-    // --- lane 5A ---------------------------------------------------------
 
-    /// Whether the certificate this rotation issued is already the
-    /// repository's own `<kind>.crt` for this host.
-    ///
-    /// Astra finding F09, 2026-09-23: the local half of the last phase, and
-    /// the one part of a rotation the target knows nothing about. By the
-    /// hash and not by the file name, because the question is whether THIS
-    /// rotation's certificate is the one that is published — a file of that
-    /// name was there before the rotation too.
-    ///
-    /// A plan without a rotation for this host, or a repository that cannot
-    /// be read, answers "not published": naming a step that does nothing
-    /// twice is cheap, and skipping the one that publishes is what this
-    /// finding is about.
+    /// Check the local active certificate against this rotation's expected digest.
+    /// Missing or unreadable local evidence means publication still needs checking.
     fn rotation_published(&self, id: &str) -> bool {
         let Some(rotation) = self.plan.rotations.get(id) else {
             return false;
@@ -1788,11 +1447,7 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// Put the new certificate beside the one in use.
-    ///
-    /// The same three steps a delivery is — write, ask, compare — against
-    /// `<cert_path>.next`, which nothing reads. A run that stops here has
-    /// changed nothing that is running.
+    /// Write and verify the next certificate without replacing the active one.
     fn overlap(&self, id: &str, rotation: &crate::plan::KeyRotation) -> Result<Vec<String>> {
         let target = self.target(id)?;
         let source = self.options.repo.join(&rotation.source);
@@ -1843,11 +1498,7 @@ impl<'a> Executor<'a> {
         Ok(vec![format!("{next}: {seen}")])
     }
 
-    /// Restart the units that read a pair, the ones that are running.
-    ///
-    /// The same question and the same answer as a delivery's: `systemctl
-    /// is-active` says 3 for a unit that is not running, and 3 is the
-    /// answer this question is asked for.
+    /// Restart only running units that consume the rotated pair.
     fn poke(&self, id: &str, units: &[String], refs: &mut Vec<String>) -> Result<Vec<String>> {
         let target = self.target(id)?;
         let mut evidence = Vec::new();
@@ -1881,7 +1532,6 @@ impl<'a> Executor<'a> {
         }
         Ok(evidence)
     }
-    // --- end lane 5A -------------------------------------------------------
 
     /// Carry the closure, then check at the TARGET that what arrived is what
     /// the release names (V12), then let the helper say it is whole.
@@ -1895,25 +1545,9 @@ impl<'a> Executor<'a> {
             .clone()
             .unwrap_or_else(|| artifacts.toplevel.store_path.clone());
 
-        // --- lane 4C: the cache is a shortcut INSIDE the copy -------------
-        //
-        // `--substitute-on-destination` lets the far store fetch what it can
-        // reach itself and leaves this side to send only what it cannot. It
-        // is asked for when two things are true at once: the release says
-        // its closures were pushed into a cache, and this host's own
-        // configuration names substituters. Without the first there is
-        // nothing out there to fetch; without the second the target fetches
-        // from nowhere and the flag is a round trip for nothing.
-        //
-        // What does NOT change is the command: there is still one `nix
-        // copy`, it still ends with the whole closure on the target, and the
-        // `nix path-info --store ssh-ng://` below still compares what
-        // arrived against the release. A cache that is stale, empty or
-        // unreachable therefore costs time and never correctness — nix falls
-        // back to the bytes on this side. And a path the target pulled out
-        // of a cache carries the same signature requirement as a path this
-        // side pushed: `require-sigs = true` is a property of the target's
-        // store, not of the road.
+        // Enable destination substitution only when the release records a cache
+        // and the target declares substituters. The target chooses its configured
+        // cache sources; copying and remote NAR verification still run.
         let substitute = self.release.build_env.cache_url.is_some()
             && self
                 .release
@@ -1930,17 +1564,11 @@ impl<'a> Executor<'a> {
             .arg("--to")
             .arg(target.store_url())
             .arg(&toplevel)
-            // The one set of ssh options, as the one string nix splits. It
-            // refuses rather than lie when a path cannot be expressed that
-            // way (2A), and then nothing is copied.
+            // Use shared SSH options; reject paths Nix cannot represent before copying.
             .env("NIX_SSHOPTS", self.ssh.nix_sshopts(target.port)?);
         self.runner.run(&copy)?;
-        // --- end lane 4C ---
 
-        // The same question `build` asks of the local store, asked of the
-        // target's. This is V12 at the last possible moment: a path with the
-        // right name and the wrong bytes is caught HERE, after the transfer
-        // and before anything is activated.
+        // Check the target toplevel NAR hash against the release before activation.
         let info =
             crate::nix::path_info_cmd(Some(&target.store_url()), std::slice::from_ref(&toplevel))
                 .env("NIX_SSHOPTS", self.ssh.nix_sshopts(target.port)?);
@@ -1967,7 +1595,6 @@ impl<'a> Executor<'a> {
             format!("{toplevel} is on {id}"),
             format!("nar hash {seen} as the release says"),
         ];
-        // --- lane 4C ---
         if substitute {
             evidence.push(format!(
                 "{id} was allowed to fetch from its own substituters ({})",
@@ -1976,30 +1603,11 @@ impl<'a> Executor<'a> {
                     .join(", ")
             ));
         }
-        // --- end lane 4C ---
         Ok(evidence)
     }
 
-    /// `meister node cordon|drain|uncordon`, on the WORKSTATION, through the
-    /// operator's own cli (D7).
-    ///
-    /// Not over ssh on the node: cordoning is a statement to the control
-    /// plane about a node, and a node is not the authority on whether it may
-    /// be drained.
-    /// Which cli verbs one maintenance step is, in the order they run.
-    ///
-    /// Giving a host back is two things, because taking it was: `node
-    /// drain` sets `spec.drain` and `node cordon` sets `spec.schedulable`,
-    /// and `node uncordon` gives back only the second. A node whose
-    /// `spec.drain` is still true is a node the scheduler never places on
-    /// again — so a rollout that only uncordoned would hand back a machine
-    /// that looks healthy in every check and takes no work. Measured in
-    /// `checks.vm-bootstrap-fleet`: after a green update `meister node ls`
-    /// said `n1  draining  0 moved, 0 leaving, 0 staying (done)`.
-    ///
-    /// The undrain comes FIRST: `node drain` implies the cordon, so undoing
-    /// it and then uncordoning ends with a node that is both schedulable
-    /// and not draining, whichever order the far side applies them in.
+    /// Build workstation CLI maintenance commands. Returning a drained node requires
+    /// undrain before uncordon: clearing schedulable alone leaves spec.drain set.
     fn workload_verbs(&self, id: &str, action: &Action) -> Vec<&'static str> {
         match action.kind {
             ActionKind::Cordon => vec!["cordon"],
@@ -2046,13 +1654,8 @@ impl<'a> Executor<'a> {
             .arg(group))
     }
 
-    /// Wait until the node carries nothing, or refuse the step.
-    ///
-    /// The count comes from the node's own socket through the read-only
-    /// probe (`vms_running`), so "empty" is what the node says rather than
-    /// what a controller believes. `null` is not zero: a node that did not
-    /// answer the question is a node whose guests are unknown, and that is
-    /// not a host to interrupt.
+    /// Wait for an explicit target VM count of zero. Missing evidence is unknown,
+    /// not an empty node.
     fn wait_for_drain(&self, id: &str) -> Result<u32> {
         let started = self.clock.now();
         loop {
@@ -2121,14 +1724,8 @@ impl<'a> Executor<'a> {
         .map(|cmd| cmd.expect(Expect::ExitZero))
     }
 
-    // --- lane 3-integration ---
-    /// What a provider has to be handed for this host, out of the plan and
-    /// with the release as the second reading.
-    ///
-    /// The PLAN first, because the plan is what an approval was given for:
-    /// a bundle read out of the release at this moment could be a bundle
-    /// somebody rebuilt since. They are compared, and a disagreement is a
-    /// sentence rather than a choice.
+    /// Read the approved provider bundle from the plan and check it against
+    /// the release before handoff.
     fn provider_wait(&self, id: &str, action: &Action) -> Result<ProviderWait> {
         let from_plan = action.provider_boot.as_ref();
         let from_release = self
@@ -2159,10 +1756,8 @@ impl<'a> Executor<'a> {
             bundle,
         })
     }
-    // --- end lane 3-integration ---
 
-    /// Tell the host to reboot. The connection dies with it, and that is the
-    /// expected answer rather than an error.
+    /// Request a reboot, accepting connection loss as an expected possibility.
     fn reboot(&self, id: &str) -> Result<Vec<String>> {
         let target = self.target(id)?;
         let mut cmd = self
@@ -2171,37 +1766,17 @@ impl<'a> Executor<'a> {
             // 255 is ssh's own "the connection went away", which is what a
             // machine that is rebooting does to it.
             .expect(Expect::AnyExit);
-        // Astra finding F20, 2026-09-23: `ask` tags every command it builds
-        // Effect::Read, correctly, for the probes it exists for — but a
-        // reboot is not a question, and this is the one call to `ask` in
-        // this crate for which that tag is wrong. Corrected here rather
-        // than in `ask` itself, which every genuinely read-only probe still
-        // depends on being Effect::Read (including `--dry-run`, which
-        // admits Read but must keep refusing this).
+        // Retag this ask-built command as TargetWrite because reboot mutates the host.
         cmd.effect = Effect::TargetWrite;
         let line = cmd.line();
         self.runner.run(&cmd)?;
         Ok(vec![line])
     }
 
-    /// Wait for the host to come back, as the SAME machine, running the
-    /// system it was meant to boot.
-    ///
-    /// The host key is not compared here by hand: every connection this tool
-    /// makes carries `StrictHostKeyChecking=yes` against the repository's
-    /// `known_hosts` (D10), so a machine with another key does not answer at
-    /// all — and the `identity` comparison in
-    /// [`crate::plan::validate_against`] catches the rest.
-    // --- lane 4A ---
-    /// Whether this host is a member of a raft group of this fleet — and
-    /// therefore a host whose etcd is part of what "back" means.
+    /// Whether this host both belongs to a Raft group and runs an etcd member.
     fn is_raft_member(&self, id: &str) -> bool {
         let fleet = &self.release.resolved_fleet;
-        // Both halves, and the second one matters: a host can sit in a raft
-        // group without running a database of its own (the group is the
-        // unit of ROLLOUT, and a fleet may put a host in one for that
-        // reason alone). Waiting for an etcd such a host does not have
-        // would be waiting until the reboot deadline for nothing.
+        // A rollout group can include hosts without their own etcd member.
         let has_etcd = fleet
             .hosts
             .get(id)
@@ -2213,26 +1788,9 @@ impl<'a> Executor<'a> {
             })
     }
 
-    // --- lane L4 ---
-    /// Whether the raft group this host belongs to was SERVING when the plan
-    /// was made.
-    ///
-    /// The wait above exists for a window of seconds: sshd answers before
-    /// etcd does, and a member that is merely still starting must not be
-    /// read as one that is down. That is true of a group that HAS a quorum
-    /// to rejoin. It is not true of a group that is coming into existence:
-    /// the first member of a fresh three-member cluster has no majority to
-    /// elect a leader with, so `etcdctl endpoint health` cannot answer until
-    /// the SECOND member is activated — which is the next wave, which does
-    /// not start until this one finishes. Measured in the lab on 2026-09-23
-    /// (lane L4): the first bootstrap of a three-member control plane sat in
-    /// this loop with "it booted the release and its etcd has not answered
-    /// yet" until the reboot deadline, and the run then failed.
-    ///
-    /// So the question the wait really asks is "is there a database for this
-    /// member to come back to", and the plan already answered it: a group
-    /// whose members were ALL unhealthy when the plan was made is not
-    /// serving, and there is nothing to wait for.
+    /// Whether any member of the host's Raft group was healthy when planned.
+    /// An entirely unhealthy bootstrap group skips the rejoin wait: its first
+    /// member cannot establish quorum before later waves activate peers.
     fn group_was_serving(&self, id: &str) -> bool {
         let fleet = self.fleet();
         fleet
@@ -2245,8 +1803,6 @@ impl<'a> Executor<'a> {
             .filter_map(|(gid, _)| self.plan.groups.get(gid))
             .any(|view| view.unhealthy_now < view.size)
     }
-    // --- end lane L4 ---
-    // --- end lane 4A ---
 
     fn wait_for_boot(&self, id: &str, desired: &str) -> Result<String> {
         let started = self.clock.now();
@@ -2256,28 +1812,17 @@ impl<'a> Executor<'a> {
         loop {
             match self.observe_one(id) {
                 Ok(obs) if obs.reachable => match obs.booted_system.as_deref() {
-                    // --- lane 4A ---
-                    // A controller that has rebooted is not back until its
-                    // database is back. sshd answers seconds before etcd
-                    // does (measured in `vm-kernel-change`: sshd at five
-                    // seconds into the boot, etcd at thirteen), and in that
-                    // window the host's own member list is EMPTY — which
-                    // the quorum arithmetic reads as a member that is down
-                    // and the topology check read as a fleet that has
-                    // changed. Waiting here is cheaper and truer than
-                    // teaching two later rules about a machine that is
-                    // merely still starting.
+                    // Wait for etcd recovery after SSH returns, before quorum and topology
+                    // checks interpret temporarily incomplete membership.
                     Some(booted)
                         if booted == desired
                             && self.is_raft_member(id)
-                            // --- lane L4: only where there is a database to
                             // come back to; see `group_was_serving`.
                             && self.group_was_serving(id)
                             && !obs.etcd.as_ref().is_some_and(|e| e.healthy) =>
                     {
                         last = "it booted the release and its etcd has not answered yet".to_string()
                     }
-                    // --- end lane 4A ---
                     Some(booted) if booted == desired => return Ok(booted.to_string()),
                     Some(other) => last = format!("it booted {other}"),
                     None => last = "it answered and could not say what it booted".to_string(),
@@ -2322,12 +1867,8 @@ impl<'a> Executor<'a> {
         readiness::readiness(id, host, obs, Some(self.release))
     }
 
-    /// Take the host back, and find out whether it went.
-    ///
-    /// A rollback is only a rollback when it was OBSERVED: the record says
-    /// `reverted`, and the machine runs what it ran before. Anything else is
-    /// `recovery-required`, because "we asked it to go back" is not a fact
-    /// about a machine.
+    /// Request rollback and observe the previous current system. Boot-mode rollback
+    /// also reboots and waits; an unverified result requires recovery.
     fn take_back(
         &self,
         journal: &Journal,
@@ -2372,8 +1913,7 @@ impl<'a> Executor<'a> {
         let back = seen.and_then(|o| o.current_system.clone()) == before;
         if back {
             self.move_to(journal, id, hosts, HostState::RolledBack, seen)?;
-            // The record is finished and the host is where it was, so the
-            // next plan may be made freshly rather than needing a resume.
+            // Retire the transaction after observing rollback to permit a fresh plan.
             let retire = self.helper_cmd(
                 id,
                 &[
@@ -2399,12 +1939,7 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// An activation whose own command came back with an error.
-    ///
-    /// The helper takes the host back itself when its switch fails and
-    /// writes the reason into the record (see [`crate::activate`]), so the
-    /// question here is which of the two happened — and the target is the
-    /// one that knows. Nothing is activated again either way.
+    /// Classify target state after failed activation without repeating activation.
     #[allow(clippy::too_many_arguments)]
     fn after_a_failed_activation(
         &self,
@@ -2418,19 +1953,14 @@ impl<'a> Executor<'a> {
         let answered = observed.as_ref().map(|o| o.reachable).unwrap_or(false);
         let state = match view {
             TxnView::Reverted => HostState::RolledBack,
-            // Astra finding F07, 2026-09-23: `confirming` and `reverting`
-            // belong here for the same reason `pending` does. This is an
-            // activation whose OWN command came back with an error, so a
-            // decision in flight on that host is one nothing in this run
-            // began — and a run does not confirm or revert on top of
-            // something it cannot account for.
+            // An unexpected confirming/reverting decision after this activation error
+            // requires recovery; do not advance over an unexplained target transition.
             TxnView::Pending { .. }
             | TxnView::Confirming
             | TxnView::Reverting
             | TxnView::Inconsistent => HostState::RecoveryRequired,
             TxnView::Confirmed => HostState::Committed,
-            // It answered and holds no record: nothing was activated, and
-            // that is a fact rather than a silence.
+            // A responsive target with no transaction is classified as failed activation.
             TxnView::None if answered => HostState::Failed,
             // It did not answer. What happened is what a resume is for, and
             // guessing here would be guessing about a machine that may be
@@ -2452,12 +1982,7 @@ impl<'a> Executor<'a> {
         );
     }
 
-    /// What the target says about a transaction, once it is answering again.
-    ///
-    /// A bounded wait and not one question: the step that just failed is the
-    /// one that restarts the network, so the first answer after it is likely
-    /// to be no answer at all — and reading that as "nothing happened" is
-    /// the worst of the possible wrong readings.
+    /// Poll target transaction state within a bounded network-recovery window.
     fn settled_view(&self, id: &str, txn: Option<&str>) -> (Option<HostObservation>, TxnView) {
         let started = self.clock.now();
         let mut last: Option<HostObservation> = None;
@@ -2487,26 +2012,10 @@ impl<'a> Executor<'a> {
     // resume
     // -----------------------------------------------------------------
 
-    /// Whether this host has been through its reboot, for a resume.
-    ///
-    /// Astra finding MD04, 2026-09-25. The journal knows three shapes: a
-    /// reboot that ended (`rebooted`, the F19 case), no reboot at all, and a
-    /// reboot that BEGAN and has no end, because the run died between
-    /// `systemctl reboot` and the `action.end` that only `wait_for_boot`
-    /// writes. The third shape used to read as "not rebooted", and the
-    /// resume sent the reboot again; in boot mode the one-shot entry was
-    /// spent by the boot that had happened, and the second reboot booted the
-    /// OLD generation.
-    ///
-    /// So the machine is asked. The step wrote the boot id it saw before
-    /// sending the reboot; a different one now is a machine that went round
-    /// since, and what it came up as decides: the release, and the reboot is
-    /// done (the journal gets the end it is missing); anything else, and
-    /// this is a person's problem, because a second reboot would boot the
-    /// fallback and undeploy the host. The same boot id is a machine that
-    /// never went round, and the reboot is still to be sent. Without a boot
-    /// id on either side (a journal from before this, a probe that could not
-    /// read it) the booted system is all there is to go on.
+    /// Reconcile a reboot that may have completed before its journal end event.
+    /// A changed boot ID plus the desired system completes it; a changed ID with
+    /// another system requires recovery. An unchanged ID permits reboot. Without
+    /// boot-ID evidence, fall back to the booted system.
     fn settle_reboot(
         &self,
         journal: &Journal,
@@ -2596,19 +2105,10 @@ impl<'a> Executor<'a> {
             return Ok(Resume::Carry);
         };
         let observed = self.observe_one(id)?;
-        // --- lane 5A: a rotation asks the host a different question ------
-        //
-        // Not the transaction record — a rotation opens none — but the key
-        // files themselves, which is where the five phases leave their
-        // marks. The table is `receipt::next_keys_step`.
+        // Rotations resume from key-state evidence, separate from activation transactions.
         if self.plan.kind == crate::plan::PlanKind::KeysRotate {
             let state = self.keys_state(id)?;
-            // Astra finding F09, 2026-09-23: and the one question the host
-            // cannot answer — whether the certificate this rotation issued
-            // is the repository's own `<kind>.crt` yet. That is the local
-            // half of the last phase, and without it `confirmed` was read
-            // as `done` while the repository still held the certificate the
-            // host used to have.
+            // Check local certificate publication as well as target confirmation.
             let published = self.rotation_published(id);
             return match crate::receipt::next_keys_step(run, state, published) {
                 Step::Done => Ok(Resume::Done),
@@ -2642,30 +2142,18 @@ impl<'a> Executor<'a> {
                 ),
             };
         }
-        // --- end lane 5A -------------------------------------------------
         let view = TxnView::of(&observed, run.txn_id.as_deref());
         match next_step(run, &view) {
             Step::Done => Ok(Resume::Done),
             Step::StartOver | Step::ResumeFromStage => Ok(Resume::Carry),
-            // --- lane 3-integration ---
             Step::AtTheProviderReboot => {
-                // The transaction comes from the JOURNAL, and may be none:
-                // a host that was only waiting for its boot (switched, never
-                // booted) never opened one. What is skipped is the whole
-                // preparation, because it happened.
+                // The journal transaction ID may be absent for reboot-only plans.
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.entry(hosts, id).moved = run.txn_id.is_some();
                 self.set_state(hosts, id, HostState::AwaitingReboot);
                 Ok(Resume::AtTheProviderReboot)
             }
-            // --- end lane 3-integration ---
-            // --- lane 5C ---
-            // `move_to` and not `set_state` in both arms below: a resume
-            // that only remembers where it put a host writes the NEXT line
-            // as a transition out of a state the journal never mentions,
-            // and `fold` reports that as a lost line (L2 finding N7). The
-            // move is real — the target was asked, and its answer is what
-            // decided it — so it belongs in the journal like every other.
+            // Journal resumed state transitions so the next event has a valid predecessor.
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 let rebooted = self.settle_reboot(journal, id, hosts, run, &observed)?;
@@ -2687,7 +2175,6 @@ impl<'a> Executor<'a> {
                     rebooted,
                 })
             }
-            // --- end lane 5C ---
             Step::RolledBack => {
                 self.move_to(journal, id, hosts, HostState::RolledBack, Some(&observed))?;
                 Ok(Resume::Done)
@@ -2702,16 +2189,12 @@ impl<'a> Executor<'a> {
                 )?;
                 bail!("{why}");
             }
-            // --- lane 5A ---
-            // The rotation table is asked above, and only for a rotation
-            // plan. Reaching this with a keys phase would mean the two
-            // tables were crossed.
+            // Rotation states are handled by the separate rotation resume table.
             Step::AtKeysPhase(phase) => bail!(
                 "the resume table answered {phase} for {id}, which is a phase of a key \
                  rotation and this plan is a {}.",
                 self.plan.kind
             ),
-            // --- end lane 5A ---
         }
     }
 
@@ -2719,12 +2202,8 @@ impl<'a> Executor<'a> {
     // locks
     // -----------------------------------------------------------------
 
-    /// Which hosts are the fleet's anchor (D6): every control-plane host of
-    /// the INVENTORY, whether it is in this plan or not.
-    ///
-    /// The point is a second operator in a second repository: the state
-    /// directory's lock keeps two runs out of one checkout, and this keeps
-    /// two checkouts out of one fleet.
+    /// Choose inventory control-plane hosts as cross-checkout lock anchors,
+    /// including those outside the plan selection when reachable via frozen endpoints.
     fn anchor_hosts(&self) -> Vec<String> {
         self.fleet()
             .hosts
@@ -2784,10 +2263,8 @@ impl<'a> Executor<'a> {
                 }
                 Err(e) => {
                     let text = format!("{e:#}");
-                    // A lock somebody else holds is the one thing the anchor
-                    // exists to find. Anything else — a host that is off, a
-                    // host that has no helper yet — leaves the anchor
-                    // incomplete and says so.
+                    // Foreign lock ownership blocks execution; other anchor failures are
+                    // reported as incomplete exclusion.
                     if text.contains("is held by the run") {
                         bail!(
                             "the fleet anchor could not be taken: {text} Nothing was done to \
@@ -2868,9 +2345,8 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// The command that gives this host's lock back, if this run holds it
-    /// and this is the moment to (Astra finding MD05): a host's own `unlock`
-    /// step does not give back the fleet's anchor, the end of the run does.
+    /// Release a held host lock at its action boundary, or an anchor only
+    /// during final run cleanup.
     fn unlock_cmd(
         &self,
         id: &str,
@@ -2891,18 +2367,8 @@ impl<'a> Executor<'a> {
     // looking
     // -----------------------------------------------------------------
 
-    /// Which hosts have to be fresh for a step on this one.
-    ///
-    /// The host itself, plus the members of every RAFT group it is in.
-    /// Not the whole fleet, and the reason is arithmetic rather than
-    /// laziness: [`crate::plan::validate_against`] compares each host
-    /// against what the plan saw and re-does the quorum sum, and the quorum
-    /// sum is the only part that depends on OTHER hosts. It depends on them
-    /// only for raft groups — a compute group's `allowed_unavailable` is its
-    /// `max_unavailable` and does not move with an observation (2B). So a
-    /// fresh look at this host and at its raft peers is exactly what the
-    /// check can use, and a fresh look at sixty compute nodes per step would
-    /// be sixty round trips that change no verdict.
+    /// Refresh the target and available selected Raft peers for quorum-dependent
+    /// validation. Other hosts retain the plan observation.
     fn affected(&self, id: &str) -> Vec<String> {
         let mut out = BTreeSet::new();
         out.insert(id.to_string());
@@ -2926,17 +2392,8 @@ impl<'a> Executor<'a> {
         out.into_iter().collect()
     }
 
-    /// A snapshot in which the named hosts were just asked and the rest is
-    /// what the plan saw.
-    ///
-    /// The mixture is deliberate and is the one place this file trades
-    /// completeness for round trips. What it costs is stated here so that
-    /// nobody has to find it out: a host that was NOT re-asked compares
-    /// equal to itself, so `validate_against` cannot notice that somebody
-    /// deployed to a host of this plan that this step is not about. What it
-    /// buys is that the host about to be changed, and everybody whose quorum
-    /// arithmetic includes it, are facts from seconds ago rather than from
-    /// the plan.
+    /// Merge fresh affected-host observations into the original snapshot. Changes
+    /// on hosts outside this set are not detected by this validation pass.
     fn observe(&self, ids: &[String]) -> Result<Observations> {
         let mut snapshot = self.plan.observation.clone();
         snapshot.taken_at = self.clock.now();
@@ -2959,23 +2416,9 @@ impl<'a> Executor<'a> {
         Ok(self.look.observe(host, &target))
     }
 
-    /// What the plan assumed, re-checked now — minus what THIS run did on
-    /// purpose.
-    ///
-    /// [`crate::plan::validate_against`] asks "is this plan still the truth
-    /// about the fleet?", and the answer it is worth asking for is "did
-    /// anything happen here that this rollout did not do". Its own footprints
-    /// have to come out first, or the second step of every host would stop
-    /// the run:
-    ///
-    /// * the lock this run holds is not a foreign lock;
-    /// * the transaction this run opened is not somebody else's activation;
-    /// * and a host this run has already activated is SUPPOSED to be running
-    ///   something else than the plan saw — that move is in the journal,
-    ///   which is where the evidence for it belongs.
-    ///
-    /// Everything else stays exactly as the host reported it, including the
-    /// identity, the quorum and every other host's system.
+    /// Remove this run's own lock, transaction and system changes before comparing
+    /// against the plan. Preserve identity and quorum evidence so unrelated changes
+    /// still invalidate the step.
     fn own_footprints_removed(
         &self,
         fresh: &Observations,
@@ -3008,7 +2451,6 @@ impl<'a> Executor<'a> {
         hosts: &BTreeMap<String, HostRunState>,
     ) -> Result<()> {
         let fresh = self.own_footprints_removed(fresh, hosts);
-        // --- lane L4: `id` is the host this wave is about to act on, and a
         // group block that says only "this one is down" must not stop the
         // run that is bringing it up.
         match validate_against_next(self.plan, self.release, &fresh, self.clock.now(), Some(id)) {
@@ -3047,12 +2489,7 @@ impl<'a> Executor<'a> {
         Ok(Target::from_endpoint(id, self.endpoint(id)?))
     }
 
-    /// `ssh <host> meister-activate --deploy-dir … <args>`.
-    ///
-    /// The helper is a word on the target's PATH (nix/managed.nix puts the
-    /// package there), and the arguments are separate arguments: a store
-    /// path with a space in it is one argument here and would be two in a
-    /// string.
+    /// Build a target helper command using the configured deploy directory.
     fn helper_cmd(&self, id: &str, args: &[&str]) -> Result<Cmd> {
         let target = self.target(id)?;
         let mut argv = vec!["meister-activate".to_string(), "--json".to_string()];
@@ -3109,11 +2546,7 @@ impl<'a> Executor<'a> {
         self.entry(hosts, id).state = to;
     }
 
-    /// Write a `host.state` line and remember the new state.
-    ///
-    /// `from` is what this run believed, so a line that says a host left a
-    /// state it was not in is a lost line — which is what `fold` reports as
-    /// a break rather than hiding.
+    /// Journal the previous and next host states before updating memory.
     fn move_to(
         &self,
         journal: &Journal,
@@ -3145,8 +2578,7 @@ impl<'a> Executor<'a> {
         self.begin_with_evidence(journal, id, action, Vec::new())
     }
 
-    /// `action.begin` with something the step knew BEFORE it acted, for a
-    /// resume that has to find out what the step did (Astra finding MD04).
+    /// Journal pre-command evidence for interrupted-action reconciliation.
     fn begin_with_evidence(
         &self,
         journal: &Journal,
@@ -3247,42 +2679,26 @@ enum Resume {
     /// Carry on with the plan's steps from the beginning: nothing
     /// irreversible had begun, and everything before it can be done again.
     Carry,
-    /// The activation is behind us. What is left is the verification and,
-    /// unless somebody already confirmed, the confirmation.
-    ///
-    /// `rebooted` is Astra finding F19, 2026-09-23: on a host whose plan
-    /// holds a `reboot`, the reboot happens between the activation and the
-    /// confirmation, and the journal says whether it came through.
+    /// Resume after activation, skipping confirmation or reboot when their
+    /// completion is already supported by evidence.
     AfterTheActivation { confirmed: bool, rebooted: bool },
-    // --- lane 3-integration ---
     /// The run stopped in front of the provider's reboot. Everything before
     /// it happened; the step itself asks the machine again.
     AtTheProviderReboot,
-    // --- end lane 3-integration ---
-    // --- lane 5A ---
-    /// A rotation is open on this host, at this phase. Everything before it
-    /// is on the disk already and is not done again — a second `prepare`
-    /// would be a second key.
+    /// Resume the remaining rotation phases without preparing another key.
     AtKeysPhase(ActionKind),
-    // --- end lane 5A ---
 }
 
-/// Whether a step changes something and therefore has to be preceded by a
-/// fresh look.
-///
-/// `preflight` and `verify` take their own snapshot — they ARE looking —
-/// and `lock`/`unlock` are the door itself: a lock that somebody else holds
-/// refuses, and that refusal is a better check than any comparison.
+/// Actions requiring a fresh guard. Preflight/verify observe directly;
+/// lock/unlock rely on helper ownership checks.
 fn needs_validation(kind: ActionKind) -> bool {
     matches!(
         kind,
         ActionKind::Stage
-            // --- lane 5A: every phase that touches the host ---
             | ActionKind::KeysPrepare
             | ActionKind::KeysOverlap
             | ActionKind::KeysSwitch
             | ActionKind::KeysRemove
-            // --- end lane 5A ---
             | ActionKind::DeliverSecret
             | ActionKind::Cordon
             | ActionKind::Drain

@@ -2,28 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `resolve --from`: an evaluation this tool did not perform.
-//!
-//! There are two roads to a manifest. The usual one is `nix eval` of the
-//! operator's flake, here, now. The other is that somebody else evaluated it
-//! — a build machine, or a test VM that has no nixpkgs and could not
-//! evaluate its own systems if it wanted to — and this tool is handed the
-//! answer.
-//!
-//! Three things have to be true for the second road to be honest, and this
-//! file is what holds them:
-//!
-//! * the SOURCE is still read HERE, with git, so the fingerprint names this
-//!   tree and a dirty tree is refused exactly as it would be;
-//! * the file goes through the same parser `validate --manifest` uses, so a
-//!   file of the wrong kind is a sentence and not a surprise three verbs
-//!   later;
-//! * and the manifest says so: `source.provided_evaluation` names the file
-//!   and its digest, because "were these systems evaluated from this tree?"
-//!   is the one question a later reader cannot answer for themselves.
-//!
-//! `git` is real here and wrapped in a shim that logs it, so that "nix was
-//! never called" is a reading of a log rather than a claim.
+//! Resolve externally provided evaluation output while recording local Git source
+//! and the evaluation-file digest. These checks verify parsing and provenance
+//! recording; they do not establish that the supplied evaluation came from that tree.
+//! Git runs locally in temporary repositories; Nix is replaced by a failing shim.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -32,10 +14,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
 
 struct Sandbox {
     repo: tempfile::TempDir,
-    /// Where the manifests go. Beside the repository and not in it: a
-    /// manifest written into the tree it describes would make that tree
-    /// dirty, and a dirty tree is refused — which is a rule this file is
-    /// about rather than one it should trip over.
+    /// Keep generated manifests outside the repository so output does not dirty
+    /// the source tree under inspection.
     out: tempfile::TempDir,
     shims: tempfile::TempDir,
     log: PathBuf,
@@ -240,8 +220,7 @@ fn an_evaluation_that_was_handed_over_is_read_and_nothing_is_evaluated() {
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
 }
 
-/// Lab finding W3: the evaluation says which inventory it read, by content.
-/// Handed over, an older evaluation is a warning that names both digests.
+/// Warn when supplied evaluation and local inventory digests differ.
 #[test]
 fn an_evaluation_of_another_inventory_is_said_out_loud() {
     let sandbox = Sandbox::new();

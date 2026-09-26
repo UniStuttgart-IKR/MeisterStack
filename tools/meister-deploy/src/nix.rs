@@ -2,31 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Talking to `nix`, and only ever by running it.
-//!
-//! There is no Nix evaluator here and there will not be one. What is here is
-//! the small set of command lines this tool depends on, each built in one
-//! place so that a test can read the argv rather than a lab.
-//!
-//! Two of those command lines carry a decision worth spelling out.
-//!
-//! **`--no-write-lock-file`.** An evaluation that resolves an unlocked input
-//! writes `flake.lock` as a side effect. A tool whose read-only verb changes
-//! a committed file is a tool nobody can run twice and compare. `resolve`
-//! therefore refuses a repository without a lock file (see [`crate::source`])
-//! and forbids nix to write one.
-//!
-//! **The flake reference is never a bare path, and `path:` never points at a
-//! working tree.** A clean tree is addressed as `git+file://`, which copies
-//! what git tracks and nothing else. A `--dev` tree cannot be: git would not
-//! show the untracked files, and seeing them is the whole point of `--dev`.
-//! But `path:` on the working tree would copy the entire directory into the
-//! store — `target/`, `result` symlinks, `keys/`, everything `.gitignore`
-//! excludes — so a signing key would end up world-readable in `/nix/store`
-//! and an ignored-but-imported file would change the evaluation without
-//! changing the fingerprint. So `--dev` points `path:` at the materialized
-//! snapshot [`crate::source`] writes: exactly the files that were listed,
-//! hashed and scanned, and nothing else.
+//! Nix command construction and execution through Runner. Evaluation uses
+//! --no-write-lock-file; callers require an existing lock. Clean trees use git+file
+//! references, optionally pinned to the captured revision. Development evaluations use path
+//! references to the scanned, materialized source snapshot, never the working directory
+//! containing ignored files or keys.
 
 use std::path::Path;
 use std::time::Duration;
@@ -38,24 +18,12 @@ use crate::run::{Cmd, Effect, Runner};
 /// The attribute an operator's flake exports, built by `lib.mkFleet`.
 pub const MANIFEST_ATTR: &str = "meisterDeployment";
 
-/// Ten minutes. A seventy-host evaluation on a cold eval cache is minutes,
-/// not seconds; an evaluation that has not answered in ten is one that never
-/// will, and it is holding a lock while it does not.
+/// Maximum evaluation duration: ten minutes.
 pub const EVAL_DEADLINE: Duration = Duration::from_secs(600);
 
-/// How to address the directory nix is to evaluate. See the module note.
-///
-/// `dir` is the repository itself for a clean tree and the materialized
-/// snapshot for `--dev` — `crate::source::Tree::eval_dir` decides which, and
-/// this function only decides how to spell it.
-///
-/// `rev`, for a clean tree, pins the `git+file://` reference to the exact
-/// commit `crate::source::describe` read (Astra finding F15, 2026-09-23): an
-/// unpinned reference has nix read whatever HEAD is at the moment it runs,
-/// which is not necessarily the rev the caller just captured and is about to
-/// put in the manifest. It is ignored for `--dev`, whose `path:` reference
-/// already names an immutable, content-addressed snapshot directory and
-/// needs no commit to pin it to.
+/// Build the evaluation reference. Clean trees use the captured revision when supplied.
+/// Development trees use the immutable snapshot selected by source::Tree::eval_dir; rev is
+/// ignored.
 pub fn flake_ref(dir: &Path, dev: bool, rev: Option<&str>) -> String {
     let path = dir.display();
     if dev {
@@ -68,10 +36,7 @@ pub fn flake_ref(dir: &Path, dev: bool, rev: Option<&str>) -> String {
     }
 }
 
-/// `nix eval --json --no-write-lock-file <ref>#meisterDeployment`.
-///
-/// Built separately from being run so that `--dry-run` can print exactly the
-/// line a real run would execute, rather than a description of it.
+/// Construct manifest evaluation separately so callers can describe it without executing it.
 pub fn eval_manifest_cmd(flake_ref: &str, hosts: Option<&[String]>) -> Cmd {
     let cmd = Cmd::new(Effect::NixEval, "nix", EVAL_DEADLINE).args([
         "eval".to_string(),
@@ -94,17 +59,8 @@ pub fn eval_manifest(
     Ok(out.stdout)
 }
 
-/// Restrict the manifest to a subset of its hosts, lazily.
-///
-/// Nix only forces what the result mentions, so leaving out a host leaves out
-/// its whole evaluation — which is the point: on seventy hosts the expensive
-/// half is `hosts.<id>.build`, and a change to one host should not cost the
-/// other sixty-nine.
-///
-/// Both halves are restricted, and so are the group memberships and the
-/// services, because `manifest::resolve` requires them to agree. What comes
-/// out is an honest manifest of a SUB-FLEET: it is for inspecting and for
-/// iterating, and a plan over it is a plan over those hosts only.
+/// Lazily restrict both host maps, group memberships, and host-bound services. Excluded
+/// systems are not evaluated; the result describes only the selected subfleet.
 fn restrict_to(hosts: &[String]) -> String {
     let keep = hosts
         .iter()
@@ -128,12 +84,7 @@ fn restrict_to(hosts: &[String]) -> String {
     )
 }
 
-/// `nix eval --json --no-write-lock-file <ref>#meisterDeployment.inventory`.
-///
-/// The CHEAP half of the manifest: `lib.mkFleet` derives it from `fleet.toml`
-/// without evaluating a single module, so `validate --nix` can ask "does the
-/// flake see the fleet I see?" in seconds rather than in the minutes a whole
-/// fleet's systems take.
+/// Evaluate the inventory attribute without evaluating host system modules.
 pub fn eval_inventory_cmd(flake_ref: &str) -> Cmd {
     Cmd::new(Effect::NixEval, "nix", EVAL_DEADLINE).args([
         "eval".to_string(),
@@ -148,22 +99,14 @@ pub fn eval_inventory(runner: &dyn Runner, flake_ref: &str) -> Result<String> {
     Ok(out.stdout)
 }
 
-/// `nix flake lock` in a directory, which is the ONLY way this tool writes a
-/// lock file.
-///
-/// `init` calls it after writing the template, because a flake without a lock
-/// is a repository whose next evaluation writes one as a side effect — and a
-/// tool whose read-only verb changes a committed file is a tool nobody can
-/// run twice and compare (see the module note on `--no-write-lock-file`).
+/// Construct the explicit flake-lock operation used by init after writing the template.
 pub fn flake_lock_cmd(dir: &Path) -> Cmd {
     Cmd::new(Effect::NixEval, "nix", Duration::from_secs(300))
         .args(["flake", "lock"])
         .cwd(dir)
 }
 
-/// `nix path-info --json`, optionally against another store. Reading only:
-/// it says what a path's nar hash and closure size are, and M2's `build` and
-/// `stage` both compare that answer against the release.
+/// Read NAR hashes and closure sizes, optionally from a remote store, for release validation.
 pub fn path_info_cmd(store: Option<&str>, paths: &[String]) -> Cmd {
     let mut cmd = Cmd::new(Effect::Read, "nix", Duration::from_secs(300)).args([
         "path-info",
@@ -209,10 +152,8 @@ mod tests {
         assert!(!flake_ref(&snapshot, true, None).starts_with('/'));
     }
 
-    /// Astra finding F15, 2026-09-23: a clean tree pins the rev `describe`
-    /// captured, so nix reads exactly that commit rather than whatever HEAD
-    /// happens to be when it runs; a dev tree needs no such pin — its
-    /// `path:` reference already names an immutable snapshot.
+    /// A clean reference pins the captured commit; a development reference names its
+    /// materialized snapshot.
     #[test]
     fn a_clean_tree_is_pinned_to_the_rev_it_was_read_at() {
         let repo = Path::new("/home/silas/git/meisterstack-lab");

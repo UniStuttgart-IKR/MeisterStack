@@ -2,39 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a contract object is called, and why it is called that.
+//! Content IDs are prefixed SHA-256 hashes of canonical JSON after removing the fields listed
+//! in IdKind::excluded. The exclusions remove self-references and selected timing, tool, or
+//! location metadata; all remaining fields affect identity.
 //!
-//! Three of the four ids name CONTENT: a `manifest_id`, a `release_id` and a
-//! `plan_id` are a sha256 over the object's canonical JSON with its own id
-//! field removed. Two consequences, and both are the point:
-//!
-//! * The same tree resolved twice is the same `manifest_id`, so an operator
-//!   can say "this is the manifest I reviewed" rather than "this is the
-//!   manifest I resolved at 14:05".
-//! * Any field that changes changes the id, so an approval bound to a
-//!   `plan_id` cannot silently cover a different plan. That is the whole
-//!   mechanism behind `--approve destructive=<plan_id>`.
-//!
-//! The id field is removed before hashing because it cannot be inside its own
-//! input. Removing it rather than setting it to null or to a placeholder
-//! keeps one definition instead of three conventions.
-//!
-//! A few more fields are removed, and for one reason: they say WHERE, WITH
-//! WHAT or HOW LONG, not WHAT. `created_at` is when the question was asked.
-//! `required_checks[].duration_ms` is how long a check derivation took, and
-//! it is the field that made two builds of one manifest two releases until
-//! 2026-09-23 (lab lane L2, finding N12). `source.
-//! repo_path` is the directory the repository happened to be cloned into —
-//! the same commit checked out on a CI runner is the same fleet. `tool` is
-//! which build of this binary did the asking. If any of them were in the
-//! hash, "this is the manifest I reviewed" would only be true on one machine
-//! on one afternoon, and that sentence is the entire point of a content id.
-//! Anything those three actually CHANGE about the manifest changes the
-//! manifest, and therefore the id.
-//!
-//! The fourth id, `run_id`, names an EVENT and not content: two runs of the
-//! same plan are two runs. It is a UUIDv7, so the id sorts by time, which is
-//! what a state directory full of `runs/<run-id>/` wants.
+//! Run IDs are UUIDv7 event identifiers: repeated execution of one plan produces distinct
+//! runs.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -76,45 +49,22 @@ impl IdKind {
     pub fn excluded(self) -> &'static [&'static str] {
         match self {
             IdKind::Manifest => &["manifest_id", "created_at", "tool", "source.repo_path"],
-            // A release and a plan embed a manifest that already carries its
-            // own id, so the same three fields inside it are covered by that.
-            //
-            // --- lane 5C ---
-            // `required_checks[].duration_ms` is the fourth of that kind,
-            // and it was measured rather than reasoned about: two `build`
-            // runs over the same manifest in the lab produced
-            // `release-76b31c11…` and `release-e375e654…` (L2 finding
-            // N12). Every other field of a release is a store path, a nar
-            // hash, a signature or a flag; the one that moved was how many
-            // milliseconds a check derivation took, which says HOW LONG
-            // and not WHAT. A release whose id changes between two
-            // identical builds is a release no plan can be made for twice,
-            // and an approval quotes a plan id.
-            //
-            // The rest of a `CheckResult` stays in: WHICH checks ran and
-            // whether they passed is part of what a release is.
+            // Release identity excludes build-environment metadata and check durations. Check
+            // identities and outcomes remain hashed.
             IdKind::Release => &[
                 "release_id",
                 "created_at",
                 "build_env",
                 "required_checks[].duration_ms",
             ],
-            // --- end lane 5C ---
-            // `expires_at` is `created_at` plus a constant, so it says WHEN
-            // as well — and leaving it in would mean the same release and
-            // the same observation planned twice were two plans, which is
-            // exactly the property an approval quotes.
+            // Plan creation and expiration times do not distinguish otherwise identical
+            // plans.
             IdKind::Plan => &["plan_id", "created_at", "expires_at"],
         }
     }
 }
 
-/// The id of a contract object: `<kind>-<sha256 of its canonical json, with
-/// its own id field removed>`.
-///
-/// The full digest, not a prefix of one. These ids are pasted between a
-/// terminal and an approval, never typed from memory, and a truncated hash is
-/// a hash somebody can eventually collide on purpose.
+/// Return `<kind>-<full SHA-256>` over canonical JSON after the kind-specific exclusions.
 pub fn content_id<T: Serialize>(kind: IdKind, object: &T) -> anyhow::Result<String> {
     let mut value = serde_json::to_value(object)
         .map_err(|e| anyhow::anyhow!("this object could not be written as json: {e}"))?;
@@ -139,13 +89,8 @@ pub fn run_id(now: DateTime<Utc>) -> Uuid {
     Uuid::new_v7(Timestamp::from_unix(NoContext, seconds, nanos))
 }
 
-/// Remove `a.b.c` from a JSON object, if it is there.
-///
-/// One piece of syntax beyond a dotted name, and no more: a segment written
-/// `a[]` is an array, and the rest of the path is removed from every element
-/// of it (lane 5C — `required_checks[].duration_ms`). No index, no filter,
-/// no wildcard; those would be a query language, and the excluded list is
-/// four entries long.
+/// Remove a dotted path when present. An `a[]` segment applies the remaining path to every
+/// array element; indices, filters and wildcards are unsupported.
 fn remove_path(value: &mut serde_json::Value, path: &str) {
     let Some((head, rest)) = path.split_once('.') else {
         if let Some(map) = value.as_object_mut() {
@@ -153,7 +98,7 @@ fn remove_path(value: &mut serde_json::Value, path: &str) {
         }
         return;
     };
-    // --- lane 5C ---
+
     if let Some(name) = head.strip_suffix("[]") {
         if let Some(array) = value.as_object_mut().and_then(|m| m.get_mut(name))
             && let Some(items) = array.as_array_mut()
@@ -164,7 +109,7 @@ fn remove_path(value: &mut serde_json::Value, path: &str) {
         }
         return;
     }
-    // --- end lane 5C ---
+
     if let Some(inner) = value.as_object_mut().and_then(|m| m.get_mut(head)) {
         remove_path(inner, rest);
     }

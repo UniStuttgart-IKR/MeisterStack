@@ -2,14 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The template in the binary and the template in the repository are one set.
-//!
-//! `templates/operator/` is both `templates.operator` of the flake (for
-//! `nix flake new -t`) and the source of what `meister-deploy init` embeds
-//! (`src/template.rs`, `include_str!`). Two roads to one directory is fine;
-//! two DIFFERENT sets of files would mean a repository that is complete when
-//! it is created one way and missing a file the other way — and the missing
-//! file would only be noticed by whoever ran `nix flake check` in it.
+//! Check that the embedded init template and templates/operator have identical file sets and
+//! contents, excluding flake.lock.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

@@ -2,25 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One JSON object, one byte string — whatever the map underneath happens to
-//! be.
-//!
-//! Every id in this tool is a hash over a contract object, so two runs that
-//! mean the same thing have to produce the same bytes. `serde_json` cannot be
-//! trusted with that on its own: its `preserve_order` feature swaps the
-//! `BTreeMap` behind `Value::Object` for an `IndexMap`, key order becomes
-//! insertion order, and feature unification means any crate anywhere in the
-//! workspace can turn it on without this one noticing. An id that changes
-//! because somebody added a dependency is an id nobody can compare against
-//! yesterday's manifest.
-//!
-//! So the structure is written here — sorted keys, no whitespace — and only
-//! the two leaf cases where `serde_json` has no map to reorder are delegated
-//! to it: string escaping and number formatting.
-//!
-//! Contract objects carry no floating point numbers. Integers and strings
-//! have one spelling; `0.1 + 0.2` does not, and an id over one would depend
-//! on which machine computed the field.
+//! Canonical JSON for content IDs: UTF-8-sorted object keys, original array order, and no
+//! whitespace. String escaping and number formatting use serde_json; ordering is independent
+//! of its preserve_order feature. Contract fields should avoid floating-point values.
 
 use serde_json::Value;
 

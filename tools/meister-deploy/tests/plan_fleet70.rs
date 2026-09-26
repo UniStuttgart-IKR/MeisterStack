@@ -2,17 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Seventy hosts, and the properties that have to hold for all of them.
-//!
-//! The unit tests in `plan.rs` pin each rule on the smallest fleet that can
-//! show it. These pin what has to be true of EVERY plan over a fleet big
-//! enough to have shapes nobody wrote down: four hardware classes, three
-//! raft groups, three machines that carry two tiers at once, sixty-one
-//! agents split over two controller groups.
-//!
-//! Each property is one a bug would break quietly. "Two members of a raft
-//! group in one wave" does not fail a test somewhere else; it takes an etcd
-//! cluster down in a lab at four in the afternoon.
+//! Planner properties over seventy synthetic hosts: four hardware classes, three raft groups,
+//! mixed-role hosts, and agents assigned to two controller groups. These tests exercise
+//! ordering, capacity, canaries, determinism, and degraded-fleet behavior without contacting
+//! hosts.
 
 mod support;
 
@@ -380,12 +373,7 @@ fn a_degraded_raft_group_blocks_only_its_own_members() {
     let plan = planned(&release, "all", &observation);
     assert!(plan.groups["cluster-2"].blocked.is_some());
     assert!(plan.groups["cluster-1"].blocked.is_none());
-    // The two HEALTHY members are what the quorum rule protects. The member
-    // that is already down does not go down again by being worked on — it
-    // is the one host a degraded group most needs a plan for (lab finding
-    // W8, 2026-09-23: a bootstrap of three could be started and never
-    // finished, because the third member was refused once the first two
-    // formed a quorum).
+    // Protect serving quorum members while allowing repair of the already-unavailable member.
     for id in ["cluster-2-b", "cluster-2-c"] {
         assert_eq!(plan.hosts[id].verdict, HostVerdict::Blocked, "{id}");
     }

@@ -2,34 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The fourth contract, and the one decision in this tool that is pure.
-//!
-//! A [`DeploymentPlan`] is the answer to one question: given what was built
-//! ([`crate::release::ReleaseManifest`]) and what is there right now
-//! ([`crate::observation::Observations`]), what may happen, to which host,
-//! in which order, and what has to still be true when it does. Nothing in
-//! this module reaches outside the process — no ssh, no nix, no file, no
-//! clock. `now` arrives as a value.
-//!
-//! That is not tidiness. Every safety rule of a rollout lives here — the
-//! quorum arithmetic, the reboot class, the identity check, the frozen
-//! target set — and a rule that can only be exercised against a fleet is a
-//! rule nobody exercises. This way each of them is a table and a test, the
-//! way [`meister_controller_api::drain`] made the drain table one.
-//!
-//! Three properties the tests hold this to:
-//!
-//! * **The selection is frozen.** `selection.targets` is computed once and
-//!   written down. A label added to a host afterwards does not add the host
-//!   to a plan that was already made.
-//! * **Nothing is derived twice.** The desired system is
-//!   `release.artifacts.<h>.toplevel.store_path` and never anything this
-//!   module computed from a fleet.
-//! * **A missing fact is never a pass.** An unreadable kernel, an absent
-//!   etcd answer, a host nobody reached: each of them blocks, and each of
-//!   them says which fact was missing.
-//!
-//! [`meister_controller_api::drain`]: ../../../meister_controller_api/drain/index.html
+//! Pure deployment planning from release artifacts, observations, endpoints, policy, and
+//! supplied time. The plan freezes selection and addresses, records actions and approvals,
+//! and carries evidence for later validation. Missing facts may block actions or appear in
+//! unknowns, depending on the specific check.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -49,10 +25,8 @@ pub const PLAN_SCHEMA: &str = "meister-deploy/plan/1";
 // What kind of plan this is
 // ---------------------------------------------------------------------------
 
-/// What a plan is FOR. The kind changes the order of the actions and which
-/// of them exist at all, so it is a field of the plan and not a flag of the
-/// run: `bootstrap` puts the prerequisite before the dependant and delivers
-/// secrets before it activates anything, `upgrade` does the opposite.
+/// Plan purpose determines action types and dependency order. Bootstrap starts prerequisites
+/// first; upgrade advances dependants first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanKind {
@@ -62,13 +36,13 @@ pub enum PlanKind {
     /// A fleet that is running: a node is taken forward BEFORE the node that
     /// gives it orders.
     Upgrade,
-    /// First installation from a medium. M3.
+    /// First installation from a medium.
     Install,
-    /// M5.
+    /// Replace a prepared key and certificate pair.
     KeysRotate,
-    /// M5.
+    /// Distribute certificate revocation lists.
     KeysRevoke,
-    /// M5.
+    /// Distribute revocations after removing a host from the fleet.
     Retire,
 }
 
@@ -98,12 +72,8 @@ impl std::fmt::Display for PlanKind {
 // Actions
 // ---------------------------------------------------------------------------
 
-/// One step against one host.
-///
-/// `lock` and `unlock` are steps like any other rather than something the
-/// executor does around them: a lock that is not in the plan is a lock
-/// nobody can see in a receipt, and D6 makes the lock the thing that keeps
-/// two operators apart.
+/// One host action. Lock and unlock are explicit so plans and receipts expose ownership
+/// changes.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -117,21 +87,12 @@ pub enum ActionKind {
     Drain,
     Activate,
     Reboot,
-    // --- lane 3-integration: the boot nobody inside the machine owns ------
-    /// The machine has to come up on a kernel its PROVIDER loads.
-    ///
-    /// A `boot = "direct"` host carries no boot loader (3A): its hypervisor
-    /// is handed a kernel, an initrd and a command line, and what the guest
-    /// says about its next boot is a statement about its system profile and
-    /// not about what will actually start. So a reboot that has to take a
-    /// new kernel cannot be `systemctl reboot` — the machine would come back
-    /// on the bytes the provider loaded last time, which are the old ones.
-    ///
-    /// `apply` does not carry this step out. It stops at it, with the bundle
-    /// and with exit 2; whoever arranges the provider does the loading and
-    /// the reboot, and comes back with `apply --resume <run-id>`.
+
+    /// External reboot for a direct-boot host. Apply halts with the required
+    /// kernel/initrd/cmdline bundle and exit 2. After the provider loads it, continue with
+    /// apply --resume.
     ProviderReboot,
-    // --- end lane 3-integration -------------------------------------------
+
     Verify,
     Confirm,
     Uncordon,
@@ -139,12 +100,8 @@ pub enum ActionKind {
     Install,
     Revoke,
     Gc,
-    // --- lane 5A: the five phases of a rotation ---------------------------
-    //
-    // Five steps and not one, because each of them is a point a run can be
-    // interrupted at and picked up from — and because only one of them
-    // interrupts anything. A rotation that were a single action would be a
-    // rotation whose failure left a machine holding half a pair.
+    // Rotation has separate prepare, overlap, switch, verify, and remove actions for
+    // resumability. Only switch is classified as service disruption.
     /// The new key is made on the host, beside the one in use.
     KeysPrepare,
     /// The certificate for it is put there, beside the one in use. Nothing
@@ -157,7 +114,7 @@ pub enum ActionKind {
     KeysVerify,
     /// What the switch replaced goes away.
     KeysRemove,
-    // --- end lane 5A ------------------------------------------------------
+
 }
 
 impl ActionKind {
@@ -179,17 +136,16 @@ impl ActionKind {
             ActionKind::Install => "install",
             ActionKind::Revoke => "revoke",
             ActionKind::Gc => "gc",
-            // --- lane 5A ---
+
             ActionKind::KeysPrepare => "keys-prepare",
             ActionKind::KeysOverlap => "keys-overlap",
             ActionKind::KeysSwitch => "keys-switch",
             ActionKind::KeysVerify => "keys-verify",
             ActionKind::KeysRemove => "keys-remove",
-            // --- end lane 5A ---
+
         }
     }
 
-    // --- lane 5A ---
     /// Is this one of the five steps of a rotation?
     pub fn is_keys(self) -> bool {
         matches!(
@@ -201,16 +157,10 @@ impl ActionKind {
                 | ActionKind::KeysRemove
         )
     }
-    // --- end lane 5A ---
 
-    /// Whether this step, once begun, cannot be taken back by this tool.
-    /// The journal writes `action.irreversible` before exactly these, and a
-    /// resume never repeats one blind (V17).
-    ///
-    /// `provider-reboot` is not one of them, and that is the point of it:
-    /// this tool never starts it, so there is nothing it could half-do. What
-    /// it writes is a halt, and asking the machine again whether it has
-    /// booted the desired system is a question, not a repetition.
+    /// Whether the executor journals an irreversible boundary before this action.
+    /// ProviderReboot is excluded because the tool halts for an external operation rather
+    /// than starting it.
     pub fn is_irreversible(self) -> bool {
         matches!(
             self,
@@ -239,13 +189,8 @@ pub enum Disruption {
     Reboot,
 }
 
-/// Which question an operator has to have answered before a step may run.
-///
-/// One class per action, because that is what `--approve <class>=<plan_id>`
-/// grants. Where a step would need two — the only cloud controller, and it
-/// also needs a reboot — the action carries the HARDEST one and the plan's
-/// `approvals` carries both: the grant list is the gate, and it is the
-/// union. So approving `singleton` never quietly buys a reboot.
+/// Approval classes are bound to a plan ID. Each action displays its highest class;
+/// plan.approvals contains the union, so one grant does not imply another.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -255,12 +200,11 @@ pub enum ApprovalClass {
     None,
     /// Something that is running will be interrupted.
     Disruptive,
-    /// A raft group of one: there is no quorum to keep, and the service is
-    /// gone while this runs.
+    /// Disrupt a non-singleton raft group with members already unavailable.
     Quorum,
     /// The machine reboots.
     Reboot,
-    /// The only member. Whatever it serves is unavailable, full stop.
+    /// Disrupt the sole member of a raft group.
     Singleton,
     /// Data is destroyed: a disk is partitioned, a certificate is revoked.
     Destructive,
@@ -317,12 +261,8 @@ pub enum RollbackMode {
     Boot,
 }
 
-/// How a step takes itself back, and how long the target waits for a word.
-///
-/// The mode is also the mode the activation RUNS in
-/// (`meister-activate --mode switch|boot`): a boot activation is taken back
-/// by a boot entry and a switch activation by a switch, so the two are one
-/// decision and one field.
+/// Activation mode and confirmation timeout. Switch mode reverts userland; boot mode
+/// schedules fallback through the loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Rollback {
@@ -341,11 +281,7 @@ impl Rollback {
     }
 }
 
-/// Why this step waits for another host.
-///
-/// The reason travels with the edge because an order nobody can explain is
-/// an order nobody dares change. "cluster-1 gives orders to this agent" is
-/// checkable against the inventory; "clusters come after agents" is folklore.
+/// Host dependency with the reason that establishes its order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Dependency {
@@ -353,12 +289,8 @@ pub struct Dependency {
     pub reason: String,
 }
 
-/// One fact that has to still be true when the step actually runs.
-///
-/// Separate from `preconditions`, which are the sentences the planner
-/// checked when it planned. These are re-evaluated by
-/// [`validate_against`] immediately before every mutation, which is the
-/// difference between "it was safe when I looked" and "it is safe now".
+/// Machine-readable condition recorded for execution-time validation. Preconditions are
+/// explanatory evidence captured during planning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "check", rename_all = "kebab-case")]
 pub enum Validity {
@@ -453,47 +385,17 @@ pub struct Action {
     /// out what it refused is a plan that looks smaller than the job.
     pub blocked: Option<String>,
 
-    // --- lane 3-integration: what a provider is handed --------------------
-    /// The three values a hypervisor has to load for an
-    /// [`ActionKind::ProviderReboot`], and nothing on any other step.
-    ///
-    /// In the plan and not only in the release, for the same reason the
-    /// observation is in the plan: the halt is read by an adapter that has a
-    /// plan and a run id, and a step that says "reboot it" without saying
-    /// WITH WHAT is a step nobody can carry out. It is part of the
-    /// `plan_id`, so an approval for a reboot into one kernel can never be
-    /// carried over to a reboot into another.
-    ///
-    /// Absent — not null — on every other step and in every plan without a
-    /// direct-boot host, so that a plan of an all-uefi fleet hashes to
-    /// exactly what it hashed to before this field existed.
+    /// Provider-loaded boot bundle, present only on ProviderReboot actions and included in
+    /// the plan ID. Omitted rather than null elsewhere to preserve existing plan hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_boot: Option<crate::release::DirectBoot>,
-    // --- end lane 3-integration -------------------------------------------
 
-    // --- lane 3B: what a delivery is made of ------------------------------
-    /// The digest of the file a `deliver-secret` step was planned with.
-    ///
-    /// Astra finding F10, 2026-09-23: the step used to say only
-    /// `<id> at <path>`, and the executor re-read the operator's file and
-    /// then checked the host's copy against whatever that file now held. So
-    /// a plan made with the certificate C1 delivered C2, or a plan made with
-    /// one revocation list delivered an older one, under its own `plan_id` --
-    /// and the approval bound to that id, the journal and the receipt all
-    /// named bytes nobody had looked at. A rotation has been bound to its
-    /// file this way from the start (`KeyRotation::cert_sha256`); this is
-    /// the ordinary delivery catching up with it.
-    ///
-    /// PUBLIC files only: a certificate, a CA bundle, a revocation list. A
-    /// private file is compared by existence and nothing else
-    /// (`crate::pki::needs_delivery`), so no digest of a key is written into
-    /// a plan that goes on disk.
-    ///
-    /// Absent -- not null -- on every other step, so a plan without deliveries
-    /// hashes to exactly what it hashed to before this field existed.
+    /// Expected public-file digest for DeliverSecret. Execution rejects content changed after
+    /// planning. Private files use presence checks and carry no digest. Omission on other
+    /// actions preserves existing plan hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
-    // --- end lane 3B ------------------------------------------------------
+
 }
 
 impl Action {
@@ -603,11 +505,7 @@ pub struct Unknown {
     pub reason: String,
 }
 
-/// An approval this plan needs, and — once granted — who granted it.
-///
-/// `bound_plan_id` is the point: an approval is for THIS plan. A grant
-/// carried over from a plan somebody read yesterday approves yesterday's
-/// plan, and the ids make that unmistakable rather than a matter of care.
+/// Required approval class, binding to this plan, and optional grant attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Approval {
@@ -644,10 +542,8 @@ pub struct Selection {
 #[serde(deny_unknown_fields)]
 pub struct DeploymentPlan {
     pub schema: String,
-    /// sha256 over everything below except this field, `created_at` and
-    /// `expires_at`. The last two say WHEN the question was asked; the same
-    /// release and the same observation asked twice are the same plan, and
-    /// that is what makes an approval quotable.
+    /// Content ID excludes plan_id, created_at, and expires_at. Approval bindings are cleared
+    /// by content_id before hashing.
     pub plan_id: String,
     pub release_id: String,
     pub manifest_id: String,
@@ -660,22 +556,9 @@ pub struct DeploymentPlan {
     /// The snapshot this plan was made from, embedded. A plan that does not
     /// carry its facts cannot be argued with afterwards.
     pub observation: Observations,
-    /// What each selected host's secrets SHOULD be, read off the
-    /// OPERATOR's disk when the plan was made: `secret_refs[].id` to
-    /// `sha256:<hex>` for a file whose content may be compared, and
-    /// `present` for one whose may not (lane 3B).
-    ///
-    /// The second half of the comparison the action `deliver-secret` comes
-    /// out of; the first half is `observation.hosts.<id>.credentials`. It
-    /// is in the plan rather than only in the planner's head for the same
-    /// reason the observation is: a plan that says a file has to be
-    /// delivered and does not say what it compared is a plan nobody can
-    /// argue with. It is part of the `plan_id`, so a plan made before a
-    /// certificate was issued and one made after are two plans.
-    ///
-    /// A host with nothing to compare is simply absent, and so is a secret
-    /// whose local file is not there — which is what the planner turns into
-    /// a blocked host with `keys csr` and `keys issue` in the sentence.
+    /// Local credential evidence at planning time, keyed by host and secret reference:
+    /// sha256:<hex> for public files, present for private files. Missing local files are
+    /// omitted. This evidence participates in the plan ID.
     #[serde(default)]
     pub expected_credentials: BTreeMap<String, BTreeMap<String, String>>,
     /// Where each selected host is reached, frozen with the selection. A
@@ -689,36 +572,18 @@ pub struct DeploymentPlan {
     /// `--approve <class>=<plan_id>`.
     pub approvals: Vec<Approval>,
 
-    // --- lane 3A: first installation ------------------------------------
-    /// Whether an `install` plan may act on a disk that already carries an
-    /// installation.
-    ///
-    /// Part of the plan and therefore part of the `plan_id`, which is the
-    /// whole point: an approval is bound to a plan id, so approving a plan
-    /// that installs two blank machines can never be carried over to one
-    /// that reinstalls a running host. Always false for every other kind.
+    /// Allow install over an existing installation. Included in plan identity and false for
+    /// other plan kinds.
     pub reinstall: bool,
-    // --- end lane 3A ----------------------------------------------------
 
-    // --- lane 5A: what a rotation is about ------------------------------
-    /// The key rotation this plan carries out, per host.
-    ///
-    /// It is in the plan and therefore in the `plan_id`, and that is the
-    /// point: `keys rotate` prepares the key on the HOST and issues the
-    /// certificate on the WORKSTATION before there is anything to plan, so
-    /// the plan is the document that says which key and which certificate
-    /// those were. A plan made for one prepared key can never be applied
-    /// against another — the host would answer `prepare` with a different
-    /// public key and the run would stop there.
-    ///
-    /// Absent on every plan that is not a rotation, so no other plan's id
-    /// changed when this field arrived.
+    /// Prepared key rotations keyed by host. Public-key and certificate digests bind
+    /// execution to the prepared pair. Empty maps are omitted to preserve non-rotation plan
+    /// hashes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rotations: BTreeMap<String, KeyRotation>,
-    // --- end lane 5A ----------------------------------------------------
+
 }
 
-// --- lane 5A -----------------------------------------------------------
 /// One key rotation: which key, which certificate, and what the host has to
 /// answer with at each phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -752,7 +617,6 @@ pub struct KeyRotation {
     /// The units that read this pair and are restarted by the switch.
     pub units: Vec<String>,
 }
-// --- end lane 5A -------------------------------------------------------
 
 impl DeploymentPlan {
     pub fn from_json(text: &str, origin: &str) -> Result<DeploymentPlan> {
@@ -779,14 +643,8 @@ impl DeploymentPlan {
         Ok(self.content_id()? == self.plan_id)
     }
 
-    /// What this plan hashes to.
-    ///
-    /// Computed over a copy whose approvals carry no `bound_plan_id`: an
-    /// approval is bound to the plan it belongs to, so that binding cannot
-    /// be part of what the plan hashes to — the id would have to contain
-    /// itself. Everything else about an approval, the class above all, is in
-    /// the hash, because a plan that needs one more of them is a different
-    /// plan.
+    /// Hash a copy with approval bound_plan_id values cleared to avoid a self-reference.
+    /// Approval classes and grant fields remain in the hash.
     pub fn content_id(&self) -> Result<String> {
         let mut unbound = self.clone();
         for approval in &mut unbound.approvals {
@@ -829,15 +687,9 @@ impl DeploymentPlan {
 /// them.
 const SELECTOR_KEYS: &[&str] = &["host", "group", "role", "profile", "site"];
 
-/// Work out which hosts an expression means.
-///
-/// `all` · `host=<id>` · `group=<g>` · `role=<r>` · `profile=<p>` ·
-/// `site=<s>`; a comma is a union; a leading `!` takes away. An exclusion
-/// needs something to take away from, so it may not come first.
-///
-/// Every unknown name is an error with the list of known ones. A selector
-/// that silently matches nothing is how a rollout quietly skips the host it
-/// was written for.
+/// Resolve all, host, group, role, profile, or site selectors. Commas form ordered unions;
+/// leading ! removes matches after an inclusion. Unknown values and an empty final selection
+/// are errors.
 pub fn select(resolved: &ResolvedFleet, expr: &str) -> Result<Vec<String>> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -920,9 +772,7 @@ fn match_term(resolved: &ResolvedFleet, term: &str) -> Result<Vec<String>> {
                     list(resolved.groups.keys())
                 );
             }
-            // From the hosts, not from `group.members`: the two agree by
-            // construction (`resolve` checks it), and taking it from the
-            // hosts means a group is whatever the hosts say it is.
+            // Selection uses each host's groups; resolve validates references, not reciprocal membership.
             Ok(hosts_where(resolved, |h| {
                 h.groups.iter().any(|g| g == value)
             }))
@@ -1030,11 +880,8 @@ pub const CONFIRM_WITHIN_SWITCH_SECS: u64 = 300;
 /// before anybody can confirm anything.
 pub const CONFIRM_WITHIN_BOOT_SECS: u64 = 900;
 
-/// The reference to the operator's own CLI that cordon and drain need.
-///
-/// Never a secret — the inventory is committed. Without it there is no
-/// fallback: an agent's guests would be interrupted without being moved, and
-/// D7 says such a step is blocked with a sentence rather than taken anyway.
+/// Workstation CLI configuration used to cordon and drain enrolled agents before
+/// interruption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadControl {
     pub cli_config: String,
@@ -1046,38 +893,24 @@ pub struct WorkloadControl {
 pub struct PlanPolicy {
     pub kind: PlanKind,
     pub valid_for_secs: u64,
-    // --- lane 3A: first installation ---
+
     /// `plan --kind install --reinstall`: act on a disk that already
     /// carries an installation. Ignored by every other kind.
     pub reinstall: bool,
-    // --- end lane 3A ---
-    /// `[operator] cli_config` / `cli_profile` from the inventory. `None`
-    /// blocks every interrupting step on a host with the agent role.
-    ///
-    /// It arrives here rather than out of the manifest because it is a
-    /// property of the WORKSTATION and not of the fleet: the same release
-    /// planned by somebody who has no cli is a different, more careful plan,
-    /// and the plan says so.
+
+    /// Operator CLI configuration supplied separately from the release. Missing control
+    /// blocks required agent maintenance.
     pub workload_control: Option<WorkloadControl>,
     pub confirm_within_switch_secs: u64,
     pub confirm_within_boot_secs: u64,
-    /// What the operator's own disk holds for each host's secrets
-    /// (`crate::pki::expected_credentials`), host id to
-    /// `secret_refs[].id` to `sha256:<hex>` or `present`.
-    ///
-    /// It arrives with the policy rather than out of the release for the
-    /// same reason `workload_control` does: it is a property of the
-    /// WORKSTATION. The same release planned on a machine that has not
-    /// issued the certificates yet is a different, more careful plan, and
-    /// the plan says so.
+    /// Local credential evidence supplied by the caller: host ID to secret ID to public
+    /// digest or private-file presence.
     pub expected_credentials: BTreeMap<String, crate::pki::ExpectedCredentials>,
-    // --- lane 5A ---
-    /// What `keys rotate` prepared, per host. A property of the WORKSTATION
-    /// like the two above: the key was made on the host and the certificate
-    /// was issued here, and a planner that had to go and look would be a
-    /// planner with a socket in it.
+
+    /// Prepared host keys and locally issued certificates. Preparation occurs before this
+    /// pure planning step.
     pub rotations: BTreeMap<String, KeyRotation>,
-    // --- end lane 5A ---
+
 }
 
 impl PlanPolicy {
@@ -1090,26 +923,24 @@ impl PlanPolicy {
             confirm_within_switch_secs: CONFIRM_WITHIN_SWITCH_SECS,
             confirm_within_boot_secs: CONFIRM_WITHIN_BOOT_SECS,
             expected_credentials: BTreeMap::new(),
-            // --- lane 5A ---
+
             rotations: BTreeMap::new(),
-            // --- end lane 5A ---
+
         }
     }
 
-    // --- lane 5A ---
     /// What `keys rotate` prepared, per host.
     pub fn with_rotations(mut self, rotations: BTreeMap<String, KeyRotation>) -> PlanPolicy {
         self.rotations = rotations;
         self
     }
-    // --- end lane 5A ---
 
     pub fn with_workload_control(mut self, control: Option<WorkloadControl>) -> PlanPolicy {
         self.workload_control = control;
         self
     }
 
-    /// What the operator has on disk for each host's secrets (lane 3B).
+    /// Local credential evidence for each host.
     pub fn with_expected_credentials(
         mut self,
         expected: BTreeMap<String, crate::pki::ExpectedCredentials>,
@@ -1117,12 +948,12 @@ impl PlanPolicy {
         self.expected_credentials = expected;
         self
     }
-    // --- lane 3A: first installation ---
+
     pub fn with_reinstall(mut self, reinstall: bool) -> PlanPolicy {
         self.reinstall = reinstall;
         self
     }
-    // --- end lane 3A ---
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,42 +976,16 @@ struct HostDecision {
     /// Switched and never booted: nothing to stage, nothing to activate, and
     /// a reboot is the whole job.
     reboot_only: bool,
-    /// The reboot this host needs is one only its provider can do
-    /// (`boot = "direct"`, lane 3A): there is no boot loader in the machine,
-    /// so the kernel that starts is the one the hypervisor was handed.
-    ///
-    /// Derived rather than asked twice: it decides the STEP
-    /// (`provider-reboot` instead of `reboot`) and it decides the way back
-    /// of the activation before it (`switch`, never `boot` — the helper
-    /// refuses boot mode on a machine with no boot menu, measured in 3A).
+    /// Use a provider reboot for direct-boot hosts. Their activation uses switch rollback
+    /// because no local loader can provide boot fallback.
     provider_reboot: bool,
-    // --- lane 5C ---
-    /// This host boots itself out of a loader this flake did not install
-    /// (`boot = "grub"`), so it has the switch rollback and no other.
-    ///
-    /// Separate from `provider_reboot`, because the two differ in who does
-    /// the rebooting: a grub host reboots itself (`systemctl reboot`), a
-    /// direct host waits for its provider. What they share is the ONE
-    /// consequence below — the activation runs `--mode switch`, because
-    /// `bootctl set-oneshot` is what a boot-mode rollback is made of and
-    /// neither machine has it.
-    ///
-    /// Found in the lab (L2, 2026-09-23): every VM from
-    /// `packages.managed-disk-image` is a legacy-MBR grub guest, the
-    /// inventory had no word for one, calling it `uefi` made `apply` pass
-    /// `--mode boot`, and the helper refused — "there is no boot fallback
-    /// on this host: bootctl says systemd-boot is not installed". Such a
-    /// host was not deployable at all as soon as a release touched its
-    /// kernel.
+
+    /// GRUB hosts reboot locally but support only switch rollback; their loader is not
+    /// managed by this tool.
     switch_only: bool,
-    // --- end lane 5C ---
-    /// The system is what the release says and a file on it is not: nothing
-    /// to stage, nothing to activate, and putting the file there is the
-    /// whole job (lane 3B).
-    ///
-    /// A shape of its own rather than an ordinary `change`, because an
-    /// activation of the system a host already runs would take its lock,
-    /// drain its guests and move its profile for a certificate.
+
+    /// Only credential delivery is needed; skip staging and activation of an already-current
+    /// system.
     secrets_only: bool,
     /// Whether this host needs its guests got out of the way first.
     needs_maintenance: bool,
@@ -1200,13 +1005,8 @@ impl HostDecision {
     }
 }
 
-/// What may happen, to which host, in which order, and what has to still be
-/// true when it does.
-///
-/// Pure. `now` is a value, the release is the intent, the observation is the
-/// fact, the targets say where, and the policy is what the operator brought.
-/// The same five produce the same `plan_id` — which is what makes an
-/// approval quotable, and what the seventy-host test pins.
+/// Build deterministic host decisions, dependency order, waves, actions, and approvals from
+/// supplied values. The planner performs no I/O.
 pub fn plan(
     release: &ReleaseManifest,
     expr: &str,
@@ -1368,13 +1168,10 @@ pub fn plan(
                 granted_at: None,
             })
             .collect(),
-        // --- lane 3A ---
-        // Only an install can reinstall; saying `false` anywhere else keeps
+                // Only an install can reinstall; saying `false` anywhere else keeps
         // the field from being a switch somebody could flip on an upgrade.
         reinstall: policy.kind == PlanKind::Install && policy.reinstall,
-        // --- end lane 3A ---
-        // --- lane 5A ---
-        // Only a rotation rotates, and only for the hosts it is about.
+                // Only a rotation rotates, and only for the hosts it is about.
         rotations: if policy.kind == PlanKind::KeysRotate {
             policy
                 .rotations
@@ -1385,7 +1182,7 @@ pub fn plan(
         } else {
             BTreeMap::new()
         },
-        // --- end lane 5A ---
+
     };
     plan.plan_id = plan.content_id()?;
     for approval in &mut plan.approvals {
@@ -1394,23 +1191,9 @@ pub fn plan(
     Ok(plan)
 }
 
-/// The first host of each class IN THE ORDER, among the hosts that are
-/// actually going to move. A canary that changes nothing is evidence of
-/// nothing.
-///
-/// Taken from the order rather than from the ids, and that is the whole
-/// point. A class is a kernel and the hardware under it, so it can perfectly
-/// well span two tiers — the `controller` class of a fleet whose cluster and
-/// cloud hosts are the same shape does. The tier order is a safety rule: a
-/// node goes forward before the node that gives it orders. A canary is risk
-/// reduction. When the two disagree the order wins, and the canary is chosen
-/// from what the order permits; the alternative would be a plan that either
-/// breaks the tier rule or promises a canary that in fact rolls ninth.
-///
-/// The operator's own choice still counts, because `canary_rank` is part of
-/// how [`topological`] breaks a tie: among hosts the order leaves free, a
-/// host whose inventory names its class comes before one that only derived
-/// the same class.
+/// Choose the first changing host of each class in dependency order. Tier ordering takes
+/// precedence over canary preference; explicit class declarations break ties among eligible
+/// hosts.
 fn canaries_of(order: &[String], decisions: &BTreeMap<String, HostDecision>) -> BTreeSet<String> {
     let mut first: BTreeMap<&str, &String> = BTreeMap::new();
     for id in order {
@@ -1427,22 +1210,9 @@ fn canaries_of(order: &[String], decisions: &BTreeMap<String, HostDecision>) -> 
 // Groups: what the OBSERVATION says a group can afford
 // ---------------------------------------------------------------------------
 
-// --- lane L4 ---
-/// Is this host already counted among the unavailable members of its raft
-/// group — by exactly the arithmetic `group_views` uses?
-///
-/// The quorum rule asks "how many MORE members may become unavailable". A
-/// member that is already unavailable does not become more so by being acted
-/// on: the group is at the same number before and after. Blocking it is
-/// therefore not a protection, it is a deadlock — and it is the sharp end of
-/// it, because the one host a degraded group most needs a plan for is the one
-/// that is down.
-///
-/// Measured in the lab on 2026-09-23 (lane L4), bootstrapping a three-member
-/// control plane: as soon as the first two members were up and formed a
-/// quorum, the third — which had never been touched — was refused with
-/// "group cp is at 2 of 3; no further member may go down. It could when this
-/// plan was made." A raft group could be started and never finished.
+/// Use the same unavailable-member predicate as quorum accounting: absent, unreachable, or
+/// missing/unhealthy local etcd. Working on such a member does not consume another healthy
+/// member.
 fn already_unavailable(observation: &Observations, id: &str) -> bool {
     match observation.host(id) {
         None => true,
@@ -1453,7 +1223,6 @@ fn already_unavailable(observation: &Observations, id: &str) -> bool {
         },
     }
 }
-// --- end lane L4 ---
 
 fn group_views(
     fleet: &ResolvedFleet,
@@ -1483,10 +1252,8 @@ fn group_views(
                         Some(obs) if !obs.reachable => down += 1,
                         Some(obs) => match &obs.etcd {
                             None => {
-                                // D8: no etcd answer from a member is not
-                                // "it is fine", it is "nobody knows", and a
-                                // quorum worked out from a guess is worse
-                                // than no quorum arithmetic at all.
+                                // Missing local etcd evidence counts as unavailable and is
+                                // recorded in unknowns.
                                 down += 1;
                                 unknowns.push(Unknown {
                                     host: Some(member.clone()),
@@ -1504,10 +1271,8 @@ fn group_views(
                 }
                 down
             }
-            // No quorum to lose. A member that is down is recorded and does
-            // NOT eat into what the rollout may take down: `max_unavailable`
-            // is a statement about the rollout, and there is no invariant
-            // here that one more outage would break.
+            // Compute/custom groups record outages but do not subtract them from rollout
+            // concurrency.
             GroupKind::Compute | GroupKind::Custom => group
                 .members
                 .iter()
@@ -1517,36 +1282,15 @@ fn group_views(
 
         let allowed_unavailable = match group.kind {
             GroupKind::Raft => {
-                // The raft rule and nothing else: a cluster of n survives the
-                // loss of floor((n-1)/2), and whoever is already down has
-                // spent that budget.
+                // Subtract current outages from the floor((n-1)/2) failure budget.
                 let budget = size.saturating_sub(1) / 2;
                 let left = budget.saturating_sub(unhealthy_now);
                 if singleton {
-                    // A group of one has no budget and is not in trouble: it
-                    // is the case where an interruption IS an outage, which
-                    // is what `approval_class: singleton` says out loud.
+                    // A singleton interruption requires its explicit approval class.
                     0
                 } else if unhealthy_now == size {
-                    // --- lane L4: a group that is not serving has no quorum
-                    // to protect.
-                    //
-                    // Measured in the lab on 2026-09-23: three fresh VMs,
-                    // a `bootstrap` plan, and all three blocked with "group
-                    // cp is at 0 of 3; no further member may go down."
-                    // Nothing could go down, because nothing was up — the
-                    // rule that exists to keep a live raft alive was
-                    // forbidding the plan that brings one into existence.
-                    // A THREE-member raft could therefore never be
-                    // bootstrapped by this tool; L2 never saw it because its
-                    // group had one member and `singleton` short-circuits.
-                    //
-                    // The rule is about an INVARIANT, and there is none
-                    // here: a group where no member answers is not serving,
-                    // so an interruption interrupts nobody. Whether that is
-                    // a bootstrap or an outage does not change the
-                    // arithmetic, and it must not: a plan is also how a
-                    // group that is completely down gets repaired.
+                    // When every member is unavailable, use rollout capacity so bootstrap and
+                    // recovery remain possible.
                     group.rollout.max_unavailable
                 } else if left == 0 {
                     blocked = Some(format!(
@@ -1607,16 +1351,9 @@ fn group_views(
     (views, unknowns)
 }
 
-/// Compare the etcd membership the fleet declares with the one etcd reports.
-///
-/// The declaration comes from `effective_settings.etcd.initial_cluster` —
-/// etcd's own `name=peer-url,…` spelling, rendered by the one derivation, so
-/// comparing against it compares against what the fleet actually configures.
-/// Where a fleet renders no such key only the member NAMES can be compared
-/// (against a host's id or its name), and the returned note says so rather
-/// than letting half a check look like a whole one.
-///
-/// Returns `(why the group is blocked, a note about how it was compared)`.
+/// Compare the union of reported etcd membership with rendered initial_cluster names and peer
+/// URLs. Without rendered peers, compare host IDs/names only; a mismatch includes a note
+/// describing that limited comparison.
 fn topology_verdict(
     fleet: &ResolvedFleet,
     id: &str,
@@ -1629,29 +1366,12 @@ fn topology_verdict(
         let Some(etcd) = observation.host(member).and_then(|o| o.etcd.as_ref()) else {
             continue;
         };
-        // --- lane 4A (and lane L2, which found the same thing in the lab) ---
-        // An EMPTY member list is not an answer. `etcdctl member list` on
-        // a member that is running always names at least itself, so an
-        // empty list means the probe could not ask — the unit is down, or
-        // the machine has just rebooted and etcd has not started yet.
-        // Reading that as "the membership is empty" turns a member that is
-        // down into a MEMBERSHIP CHANGE, which is a different and much
-        // worse verdict, and it blocks the whole group.
-        //
-        // Measured in `vm-kernel-change`: a host came back from the reboot
-        // this very rollout asked for, sshd answered at five seconds and
-        // etcd at thirteen, and the run stopped with "the etcd membership
-        // of group cp is nothing and the fleet declares target". The
-        // `anybody_answered` guard below was meant for exactly this case
-        // and did not catch it, because a member whose unit is down still
-        // produces a view (`observe::etcd_view`). Lane L2 hit the same
-        // shape in the lab on 2026-09-23: a fresh managed image carries the
-        // etcd unit without starting it, so `plan --kind bootstrap` blocked
-        // its own control plane with "etcd does not know box".
+        // An empty member list provides no topology evidence, as during startup or an
+        // unavailable local etcd probe.
         if etcd.members.is_empty() {
             continue;
         }
-        // --- end lane 4A ---
+
         anybody_answered = true;
         for m in &etcd.members {
             observed
@@ -1683,10 +1403,7 @@ fn topology_verdict(
                 ));
             }
             for (name, urls) in &declared {
-                // Exactly, not "contains": a member that some peers still
-                // report at the old address and one peer reports somewhere
-                // else is a controller in the middle of moving, and that is
-                // the case this check exists for.
+                // Require exact peer URL sets so mixed old/new addresses also block.
                 let seen = &observed[name];
                 if seen != urls {
                     return Some((
@@ -1804,13 +1521,7 @@ fn names(set: &BTreeSet<&String>) -> String {
 // The hardware preflight
 // ---------------------------------------------------------------------------
 
-// --- lane 4A ---
-
-/// What the preflight found out about the machine under the closure.
-///
-/// Three lists and not a bool, because the three are read by different
-/// people: `met` is evidence a reader wants in the plan, `blocked` is what
-/// stops the rollout, and `unknown` is the probe admitting it could not ask.
+/// Hardware preflight evidence, blocking findings, and unresolved observations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HardwareVerdict {
     pub met: Vec<String>,
@@ -1824,22 +1535,10 @@ impl HardwareVerdict {
     }
 }
 
-/// Is this machine the machine the fleet says it is, and will the release
-/// fit on it?
-///
-/// Pure, and deliberately called TWICE: [`decide_host`] asks it while the
-/// plan is made, so that the answer is part of the plan's contract (the
-/// `preconditions[]` of the `preflight` step, or the sentence that blocks
-/// the host), and `execute`'s preflight asks it again against a FRESH
-/// snapshot immediately before the first copy. One implementation, because
-/// a second one here would be a second answer somebody has to keep in step
-/// with the first.
-///
-/// What it does NOT do is guess. An empty `pci` list means the probe found
-/// no way to ask, not that the machine has no cards — so a declared GPU
-/// against an empty list blocks with a sentence that says which of the two
-/// happened, rather than reporting a card as missing that nobody looked
-/// for.
+/// Compare declared hardware and optional closure size with observed capabilities, PCI
+/// addresses, NIC MACs, and free space. Planning and execution preflight share this pure
+/// check. Missing hardware inventories block declared devices; missing free-space evidence is
+/// recorded as unknown.
 pub fn hardware_verdict(
     id: &str,
     host: &crate::manifest::ResolvedHost,
@@ -1848,19 +1547,8 @@ pub fn hardware_verdict(
 ) -> HardwareVerdict {
     let mut v = HardwareVerdict::default();
 
-    // --- will it fit -------------------------------------------------------
-    //
-    // The whole closure against the free space, which is the conservative
-    // comparison and says so in the sentence: most of a fleet's closure is
-    // shared with what the host already runs, so this number is an upper
-    // bound on what the copy really needs. The alternative — asking the
-    // target which paths it is missing — is a second round trip per host
-    // before the one `nix copy` that would tell us anyway, and it would
-    // tell us at the moment the disk is already filling up.
-    // `None` means nothing is going to be copied onto this host — it runs
-    // what the release says, or it only needs a file — and then its free
-    // space is nobody's business. A host that needs no closure must not be
-    // blocked by a disk nothing is going to be written to.
+    // Compare the full closure size with free space, conservatively ignoring paths already
+    // present. None skips the space check when no closure copy is needed.
     match (closure_size, obs.disk_free_nix_bytes) {
         (Some(closure_size), Some(free)) if free < closure_size => v.blocked.push(format!(
             "{id} has {free} byte(s) free on the filesystem that carries /nix and the closure \
@@ -1879,14 +1567,8 @@ pub fn hardware_verdict(
         (None, _) => {}
     }
 
-    // --- a node that is supposed to run guests ------------------------------
-    //
-    // Not part of `capabilities`, and on purpose: `kvm` there is an
-    // operator's CLAIM about a machine, and a fleet is allowed not to make
-    // it. The agent's own code refuses to start without the device ("a node
-    // whose whole purpose is running guests would answer every create with
-    // the same error", drivers.rs), so for the agent role this is a fact
-    // about the role and not about the inventory.
+    // The agent requires /dev/kvm regardless of whether the inventory declares that
+    // capability explicitly.
     if host.roles.iter().any(|r| r == "agent") {
         if obs.has_capability("kvm") {
             v.met
@@ -1901,7 +1583,7 @@ pub fn hardware_verdict(
         }
     }
 
-    // --- the cards the inventory names --------------------------------------
+    // the cards the inventory names
     for gpu in &host.hardware.gpus {
         if obs.pci.is_empty() {
             v.blocked.push(format!(
@@ -1925,11 +1607,7 @@ pub fn hardware_verdict(
         }
     }
 
-    // --- the interfaces the inventory names ---------------------------------
-    //
-    // By MAC and never by name: `hardware.nics[].name` is what the operator
-    // calls it, and what the kernel calls it depends on where it is
-    // plugged in.
+    // Match declared NICs by MAC; kernel interface names can change with placement.
     for nic in &host.hardware.nics {
         if obs.nics.is_empty() {
             v.blocked.push(format!(
@@ -1954,12 +1632,8 @@ pub fn hardware_verdict(
         }
     }
 
-    // --- what the fleet declared it can do ----------------------------------
-    //
-    // V19, and the sentence is the one the planner has had since 2B: a
-    // capability that is declared and not found is a machine that cannot
-    // run what was built for it. It moved here so that the preflight of
-    // `apply` asks it again with the same words.
+    // Every explicitly declared capability must be observed. Execution preflight repeats this
+    // same check.
     for capability in &host.hardware.capabilities {
         if obs.has_capability(capability) {
             v.met.push(format!("{id} has {capability}"));
@@ -1975,17 +1649,8 @@ pub fn hardware_verdict(
     v
 }
 
-/// Every systemd unit a MeisterStack module declares, by name.
-///
-/// The list is a constant and not a prefix rule, because half of these are
-/// not called `meister-*`: `etcd`, `alloy` and the six addons are upstream
-/// NixOS services that `nix/{etcd,observability,addons}.nix` configure, and
-/// an operator's own `etcd.service` would be a different thing with the
-/// same name (which is exactly why the test below holds the constant
-/// against a real manifest instead of trusting this comment).
-///
-/// Sorted, so that a reader of the file and a reader of the diff see the
-/// same order.
+/// Known stack unit names, including upstream services configured by MeisterStack modules.
+/// Keep sorted for comparison with manifest inventories.
 pub const STACK_UNITS: &[&str] = &[
     "alloy.service",
     "etcd.service",
@@ -2003,32 +1668,9 @@ pub const STACK_UNITS: &[&str] = &[
     "tempo.service",
 ];
 
-/// What this release brings to a host that this tool cannot model.
-///
-/// The useful question is the DIFF BETWEEN TWO GENERATIONS and not a diff
-/// against an allowlist (lane 4C measured why: of the seventy-five units an
-/// agent's generation carries, exactly one is ours — the other
-/// seventy-four are NixOS' own, and "everything that is not meister" would
-/// be seventy-four unknowns per host, every run, for ever).
-///
-/// So: the units the release builds, minus the units the running
-/// generation already has, minus the ones this stack declares itself. What
-/// is left is a unit an operator's own module brings with this release, and
-/// what it does when it starts or restarts is not something a plan can
-/// predict.
-///
-/// Two limits, both deliberate and both in the report:
-///
-/// * A unit BOTH generations have can still have changed its contents. The
-///   manifest carries names and not texts (4C: the texts would be a
-///   megabyte of shell in a file that is committed and diffed), so this
-///   sees what appears and not what changed.
-/// * A unit the previous generation had and this one drops cannot be named.
-///   The probe lists the whole unit directory of the running system, which
-///   also holds the units systemd's own package ships, while the manifest
-///   lists only what NixOS was configured with — so a name in the first and
-///   not in the second is usually an upstream unit and not a removal. One
-///   side of the diff is sound; the other would be a guess.
+/// Report units newly introduced by the desired generation, excluding known stack units.
+/// Names cannot reveal changed unit contents. Removed names are not reported because the
+/// observed directory also includes upstream systemd units absent from the manifest.
 fn operator_unit_unknowns(
     id: &str,
     host: &crate::manifest::ResolvedHost,
@@ -2097,8 +1739,6 @@ fn macs(nics: &[crate::observation::NetworkInterface]) -> String {
         .join(", ")
 }
 
-// --- end lane 4A ---
-
 // ---------------------------------------------------------------------------
 // One host
 // ---------------------------------------------------------------------------
@@ -2115,38 +1755,23 @@ fn decide_host(
     let artifacts = &release.artifacts[id];
     let desired = &artifacts.toplevel.store_path;
 
-    // --- lane 3A: first installation ---
-    // An install asks a different question of the same facts, so it gets
-    // its own function rather than five `if kind == Install` scattered
-    // through this one: here an unreachable host is the NORMAL case and a
-    // host that answers is the one that has to be argued about.
+    // Install uses separate eligibility rules: an unreachable host is expected, while an
+    // existing installation requires explicit permission.
     if policy.kind == PlanKind::Install {
         return decide_install_host(release, id, observation, policy);
     }
-    // --- end lane 3A ---
-    // --- lane 5A: a list, and nothing else ---
-    // A revocation is not a rollout. What this plan may do to a host is put
-    // one public file on it; whether that host also owes a kernel is not
-    // this plan's business, and answering it here would turn "take a
-    // certificate back" into "roll the fleet forward".
+    // Revocation plans deliver CRLs without upgrading systems or unrelated credentials.
     if policy.kind == PlanKind::KeysRevoke {
         return decide_revoke_host(release, id, observation, policy);
     }
     if policy.kind == PlanKind::KeysRotate {
         return decide_rotate_host(release, id, observation, policy);
     }
-    // --- end lane 5A ---
-    // --- lane 5B: a host that leaves ---
-    // A retirement is a revocation seen from the other side. The host that
-    // is going is not in this selection at all (`retire` writes
-    // `all,!host=<id>`); what the plan does is carry the list that says so
-    // to everybody who reads one. Nothing is deleted anywhere, and the
-    // machine itself is never touched: it keeps its disk, its data and its
-    // files, and what it loses is the right to be believed.
+    // Retirement distributes revocation to the remaining selection. It does not erase the
+    // retiring host or its data.
     if policy.kind == PlanKind::Retire {
         return decide_revoke_host(release, id, observation, policy);
     }
-    // --- end lane 5B ---
 
     let mut d = HostDecision {
         verdict: HostVerdict::Change,
@@ -2217,22 +1842,9 @@ fn decide_host(
         return settle(d, HostVerdict::Unreachable);
     }
 
-    // --- identity, which is two things and not one ------------------------
-    //
-    // SSH enrollment is the host key in the operator's `known_hosts` (D10).
-    // Every connection this tool makes runs with `StrictHostKeyChecking=yes`
-    // against that file, so a host the fleet has no key for cannot be talked
-    // to AT ALL — not by an upgrade and not by a bootstrap either. A
-    // bootstrap does not create it: `keys enroll` does, from a fingerprint a
-    // person read off a console or an installer's output.
-    //
-    // The SERVICE identity is a certificate, and that is what a bootstrap
-    // delivers. A host that answers on a known key and carries no
-    // certificate yet is exactly what `--kind bootstrap` is for.
-    //
-    // Conflating the two would make a bootstrap plan steps over a transport
-    // that cannot open, and the failure would arrive as an ssh error in the
-    // middle of a rollout rather than as a sentence before it.
+    // SSH host-key enrollment and service certificates are separate. Every connection
+    // requires an enrolled transport key. Bootstrap delivers service identities; it does not
+    // establish SSH trust.
     match (
         &host.ssh.host_key_fingerprint,
         &obs.identity.host_key_fingerprint,
@@ -2282,22 +1894,12 @@ fn decide_host(
         }
     }
 
-    // --- lane 3B: what a bootstrap has to be able to deliver -------------
-    //
-    // Only in a bootstrap, and only for a file the host has NOT got. An
-    // upgrade acts on a host that already carries its identity (the check
-    // above refuses one that does not), and a certificate the operator
-    // keeps somewhere this tool was never told about is not a reason to
-    // refuse to roll a running fleet forward. A bootstrap is the other
-    // case: its whole job is to put the files there, and a bootstrap that
-    // cannot is a bootstrap that would leave the host half made.
+    // Bootstrap must have a local source for each missing deliverable file. Upgrade may
+    // retain credentials managed outside this workstation.
     if policy.kind == PlanKind::Bootstrap {
         let expected = policy.expected_credentials.get(id);
-        // One sentence per FILE, not per reference. The one derivation
-        // writes a `secret_refs` entry per file AND unit (the id is
-        // `<file>-<role>`), so a host with two controller tiers has two
-        // references to one `identity.crt` — and saying the same thing
-        // twice is how a blocked plan becomes unreadable.
+        // Deduplicate missing-source diagnostics by target path: multiple consuming roles can
+        // reference one file.
         let mut said: BTreeSet<&str> = BTreeSet::new();
         for secret in &host.secret_refs {
             if secret.source.kind == crate::manifest::SecretSourceKind::TargetGenerated {
@@ -2339,7 +1941,7 @@ fn decide_host(
         }
     }
 
-    // --- somebody else is already here -----------------------------------
+    // somebody else is already here
     if !obs.open_txns.is_empty() {
         let ids: Vec<&str> = obs.open_txns.iter().map(|t| t.id.as_str()).collect();
         d.stop_all.push(format!(
@@ -2358,7 +1960,7 @@ fn decide_host(
         ));
     }
 
-    // --- what has to be there --------------------------------------------
+    // what has to be there
     for entry in host.persistence.iter().filter(|p| p.required) {
         if obs.is_mounted(&entry.path) {
             d.preconditions.push(format!(
@@ -2374,7 +1976,7 @@ fn decide_host(
             ));
         }
     }
-    // --- what runs, what should run, and what booted ----------------------
+    // what runs, what should run, and what booted
     d.current_system = obs.current_system.clone();
     let Some(current) = obs.current_system.as_ref() else {
         d.stop_all.push(format!(
@@ -2402,22 +2004,8 @@ fn decide_host(
             ),
         });
     }
-    // --- lane 4A: the machine under the closure ---------------------------
-    //
-    // Room, /dev/kvm, the cards, the interfaces and the declared
-    // capabilities (V19), all from the one function `execute`'s preflight
-    // asks again with a fresh snapshot. `stop_all` and not
-    // `stop_disruptive`: a machine that is not the machine the fleet
-    // describes is not a machine to stage a closure onto either — and the
-    // preflight step itself stays free, so the finding is REPORTED rather
-    // than only refused.
-    //
-    // Here and not further up, because the ROOM question needs to know
-    // whether anything is going to be copied at all: a host that already
-    // runs the release is not blocked by a full disk nothing would be
-    // written to. Everything else about the machine is asked either way —
-    // a card that is gone is worth saying even about a host that needs
-    // nothing.
+    // Check hardware for every host. Check closure capacity only when the system is not
+    // settled; blocking hardware findings also prohibit staging.
     let hardware = hardware_verdict(
         id,
         host,
@@ -2432,7 +2020,6 @@ fn decide_host(
             reason,
         });
     }
-    // --- end lane 4A ---
 
     d.reboot_only = !unchanged && current_is_desired && next_is_desired && !booted_is_desired;
     if d.reboot_only {
@@ -2441,7 +2028,7 @@ fn decide_host(
         ));
     }
 
-    // --- the reboot class --------------------------------------------------
+    // the reboot class
     if !unchanged {
         match &obs.kernel_booted {
             None => {
@@ -2491,16 +2078,8 @@ fn decide_host(
         }
     }
 
-    // --- the guests, and whether they can be got out of the way -----------
-    //
-    // `obs.enrolled` is in this condition and not only the role, and the
-    // case it is about is a BOOTSTRAP: a host that carries no identity of
-    // its own has never been able to authenticate to the cluster that hands
-    // out work, so there is nothing on it to move. Asking a cluster to
-    // cordon a node it has never seen is asking for an error message in the
-    // middle of a rollout instead of a rollout. Everywhere else this changes
-    // nothing — an upgrade of a host without an identity is `unenrolled` and
-    // blocked several screens above.
+    // Skip maintenance for an unenrolled bootstrap agent, which has no authenticated cluster
+    // registration. Enrolled agents require workload control before changes.
     d.needs_maintenance = !unchanged && host.roles.iter().any(|r| r == "agent") && obs.enrolled;
     if d.needs_maintenance && policy.workload_control.is_none() {
         d.stop_disruptive.push(format!(
@@ -2511,13 +2090,12 @@ fn decide_host(
         ));
     }
 
-    // --- what the groups allow --------------------------------------------
+    // what the groups allow
     for group in &host.groups {
         if let Some(view) = groups.get(group)
             && let Some(why) = &view.blocked
         {
-            // --- lane L4: not for a member that is already down; see
-            // `already_unavailable`.
+            // Exempt unavailable members from group blocking to permit repair.
             if view.kind == GroupKind::Raft && already_unavailable(observation, id) {
                 continue;
             }
@@ -2525,7 +2103,7 @@ fn decide_host(
         }
     }
 
-    // --- operator modules: not analysed, and it says so --------------------
+    // operator modules: not analysed, and it says so
     if !host.modules.is_empty() {
         d.unknowns.push(Unknown {
             host: Some(id.to_string()),
@@ -2537,17 +2115,10 @@ fn decide_host(
         });
     }
 
-    // --- lane 4A: the units the operator owns -----------------------------
     d.unknowns.extend(operator_unit_unknowns(id, host, obs));
-    // --- end lane 4A ---
 
-    // --- lane 3B: a file that is not what it should be ------------------
-    //
-    // A host whose SYSTEM is what the release says can still be missing a
-    // certificate, or be holding one that has been renewed here. That is
-    // not "unchanged" — something has to happen to it — and it is not an
-    // ordinary change either: staging and activating a system the host
-    // already runs would take its lock and move its profile for a file.
+    // Credential drift on a settled system creates a delivery-only plan, without staging or
+    // activation.
     let deliveries = pending_deliveries(host, obs, policy.expected_credentials.get(id));
     if unchanged && deliveries > 0 {
         d.secrets_only = true;
@@ -2558,33 +2129,19 @@ fn decide_host(
     }
     let settled = unchanged && !d.secrets_only;
 
-    // --- lane 3-integration: a kernel this machine does not choose --------
-    //
-    // On a `boot = "direct"` host the boot half of a release is loaded from
-    // OUTSIDE: `next_boot_system` is the system profile, and the hypervisor
-    // is what decides which kernel actually starts (3A measured exactly
-    // that). So every reboot such a host needs — a new kernel, a new
-    // initrd, a new command line, or a switch that was never booted — is a
-    // `provider-reboot` and never a `systemctl reboot`, which would bring
-    // the machine back on the bytes the provider loaded last time.
+    // Direct-boot kernel changes and pending boots require the provider to load the new
+    // bundle; a local reboot would reuse the provider's old inputs.
     d.provider_reboot = !settled
         && !d.secrets_only
         && (d.reboot_required || d.reboot_only)
         && host.build.boot.mode == crate::manifest::BootMode::Direct;
-    // --- lane 5C ---
-    // A grub host reboots itself, so the STEP is an ordinary `reboot`. What
-    // it cannot do is take a boot back, so the activation in front of that
-    // reboot runs in switch mode (`rollback_for` below). Unconditional on
-    // the boot mode and not on whether this release reboots: the way back
-    // of an activation is a property of the machine.
+    // GRUB hosts reboot locally but always activate in switch mode because automated boot
+    // fallback is unavailable.
     d.switch_only = host.build.boot.mode == crate::manifest::BootMode::Grub;
-    // --- end lane 5C ---
+
     if d.provider_reboot && artifacts.direct_boot.is_none() {
-        // `release::bind` will not make such a release — it refuses a direct
-        // host without a bundle in both directions (3A). This is the second
-        // door all the same: a plan is the document an adapter acts on, and
-        // a `provider-reboot` whose payload is missing is a step whose whole
-        // content would be missing.
+        // Defensively reject a provider reboot with no bundle, even if a release bypassed
+        // normal binding validation.
         d.stop_all.push(format!(
             "the release carries no direct-boot bundle for {id}, and {id} boots through its \
              provider: taking it forward needs a kernel, an initrd and a command line for \
@@ -2593,13 +2150,8 @@ fn decide_host(
         ));
     }
     if d.provider_reboot && host.checks.required.iter().any(|c| c == "booted") {
-        // Between the switch and the provider's reboot this host RUNS the
-        // release and has BOOTED the previous one — that is what a direct
-        // boot mode means, and it is the state the plan asks its operator
-        // to confirm in. A required `booted` check makes the verify before
-        // that confirmation fail, which would take the switch back and
-        // leave the rollout exactly where it started. Saying so here is
-        // cheaper than letting a fleet roll itself back once per kernel.
+        // A required booted check cannot pass between switch and provider reboot. Reject this
+        // policy before it causes pre-confirmation verification to roll the switch back.
         d.stop_disruptive.push(format!(
             "{id} boots through its provider and its inventory requires the check `booted`. \
              Between the switch and the provider's reboot this host runs the release and has \
@@ -2631,9 +2183,7 @@ fn decide_host(
     settle(d, verdict)
 }
 
-/// How many of this host's secrets are not what the operator's disk says
-/// they should be (lane 3B). The same predicate the steps are built from,
-/// asked once before the verdict.
+/// Count credential deliveries using the same predicate as action generation.
 fn pending_deliveries(
     host: &crate::manifest::ResolvedHost,
     obs: &crate::observation::HostObservation,
@@ -2651,14 +2201,8 @@ fn pending_deliveries(
         .count()
 }
 
-// --- lane 5A: the rotation plan --------------------------------------------
-
-/// What a `keys-rotate` plan says about one host.
-///
-/// The preparation has already happened when this runs: `keys rotate` made
-/// the key ON THE HOST and had the certificate issued HERE, and what is
-/// planned is the five steps that put them in. So the first question is not
-/// "what does this host run" but "is this the host that key was made on".
+/// Check host identity and prepared rotation evidence. Preparation already occurred on the
+/// host and workstation; this plan installs the pair.
 fn decide_rotate_host(
     release: &ReleaseManifest,
     id: &str,
@@ -2674,8 +2218,7 @@ fn decide_rotate_host(
         stop_disruptive: Vec::new(),
         current_system: None,
         reboot_required: false,
-        // A grub host has no boot-mode rollback (lane 5C, N4); a key plan
-        // activates nothing, so the flag only has to be the truth about the host.
+        // Record the host's rollback capability even though this plan does not activate a system.
         switch_only: host.build.boot.mode == crate::manifest::BootMode::Grub,
         reboot_only: false,
         provider_reboot: false,
@@ -2823,8 +2366,6 @@ fn rotate_specs(id: &str, rotation: &KeyRotation) -> Vec<StepSpec> {
     ]
 }
 
-// --- lane 5A: the revocation plan ------------------------------------------
-
 /// Every `crl` reference of this host. Empty for a host that reads no list —
 /// which is every host of a fleet that has not named `auth.crl`, and is a
 /// statement about the fleet rather than about this host.
@@ -2835,12 +2376,7 @@ fn crl_refs(host: &crate::manifest::ResolvedHost) -> Vec<&crate::manifest::Secre
         .collect()
 }
 
-/// What a `keys-revoke` plan says about one host.
-///
-/// The same facts as an upgrade's, read for one question: has this host got
-/// the list that is on this workstation. Everything else it might owe —
-/// a system, a kernel, a certificate — is another plan's business, and
-/// mixing them would make a revocation the most dangerous verb in the tool.
+/// Plan CRL delivery independently of system, kernel, or other credential updates.
 fn decide_revoke_host(
     release: &ReleaseManifest,
     id: &str,
@@ -2856,8 +2392,7 @@ fn decide_revoke_host(
         stop_disruptive: Vec::new(),
         current_system: None,
         reboot_required: false,
-        // A grub host has no boot-mode rollback (lane 5C, N4); a key plan
-        // activates nothing, so the flag only has to be the truth about the host.
+        // Record the host's rollback capability even though this plan does not activate a system.
         switch_only: host.build.boot.mode == crate::manifest::BootMode::Grub,
         reboot_only: false,
         provider_reboot: false,
@@ -2873,12 +2408,8 @@ fn decide_revoke_host(
     };
 
     if crl_refs(host).is_empty() {
-        // Not a failure and not a gap in this plan: this host's rendered
-        // configuration names no revocation list, so there is no file to
-        // put anywhere and nothing on it would read one.
-        // A precondition and not a `reason`: `settle` keeps the reasons for
-        // what STOPS a host, and this host is not stopped — it simply has
-        // nothing to read a list with. The sentence travels on its preflight.
+        // Hosts with no CRL reference need no delivery. Keep the explanation on preflight
+        // rather than marking the host blocked.
         d.preconditions.push(format!(
             "{id} reads no revocation list: its configuration names no `auth.crl`, so a list \
              delivered to it would be a file nobody opens. Name it in the inventory (the \
@@ -2959,10 +2490,7 @@ fn decide_revoke_host(
     }
 
     let expected = policy.expected_credentials.get(id);
-    // Before the comparison and not after it: a workstation with no list has
-    // nothing that DIFFERS from what the host holds, so the comparison would
-    // come out "nothing to do" — which is the one answer a revocation must
-    // never give by accident.
+    // Require a local CRL before comparing: an absent source must not look like no change.
     if expected.is_none_or(|e| crl_refs(host).iter().all(|s| !e.contains_key(&s.id))) {
         d.stop_all.push(format!(
             "{id} reads a revocation list and this workstation has none to deliver. \
@@ -2998,23 +2526,10 @@ fn decide_revoke_host(
     };
     settle(d, verdict)
 }
-// --- end lane 5A -----------------------------------------------------------
 
-// --- lane 3A: first installation ------------------------------------------
-
-/// What an `install` plan says about one host.
-///
-/// The facts are the same as an upgrade's; the reading of them is not. A
-/// host nobody can reach is exactly what an install is FOR, so it is a
-/// `change` here and an `unreachable` there. A host that answers and runs a
-/// system is the dangerous case — the disk of a running machine is somebody's
-/// data — so it is blocked unless the plan says `--reinstall` out loud, and
-/// that word is part of the plan id (which is what an approval is bound to).
-///
-/// What this never does is decide that a disk is blank. Nobody can decide
-/// that from a workstation: the serial, the size, the layout's device and
-/// the installation mark are all facts about a machine somebody is standing
-/// in front of, and `meister-install confirm` is what reads them there.
+/// Plan target-side installation. Absent/unreachable hosts are eligible; responding hosts
+/// require reinstall. This does not prove the disk is blank: meister-install confirm checks
+/// disk identity, size, layout, and installation marks on the target.
 fn decide_install_host(
     release: &ReleaseManifest,
     id: &str,
@@ -3029,16 +2544,12 @@ fn decide_install_host(
         stop_all: Vec::new(),
         stop_disruptive: Vec::new(),
         current_system: None,
-        // A machine that is being installed comes up from nothing. Saying
-        // "no reboot needed" about it would be a sentence about a machine
-        // that is not running yet.
+        // Installation requires booting the provisioned system.
         reboot_required: true,
-        // An install is a whole system, never just a file (lane 3B's form).
+        // Installation provisions a complete system.
         secrets_only: false,
         reboot_only: false,
-        // An install has no way back and no way forward through a provider
-        // either: the machine is not running, and what starts it afterwards
-        // is the medium's own business (3A prints the sentence).
+        // The installer medium handles the first boot; this plan has no provider-reboot step.
         provider_reboot: false,
         switch_only: false,
         needs_maintenance: false,
@@ -3115,10 +2626,8 @@ fn decide_install_host(
         }
     }
 
-    // An install never asks a group for permission: nothing of this host is
-    // running, so there is no quorum to keep and no guest to move. What
-    // protects the fleet here is that the disk is destroyed by a person
-    // standing in front of one machine.
+    // Group health is not used for install eligibility. Target-side confirmation controls
+    // disk destruction, including an explicitly requested reinstall.
     let verdict = if d.stop_all.is_empty() {
         HostVerdict::Change
     } else {
@@ -3127,16 +2636,9 @@ fn decide_install_host(
     settle(d, verdict)
 }
 
-/// The steps of an install: what the plan can say about a person in front of
-/// a machine.
-///
-/// Three, and only the middle one does anything. There is no `stage` (the
-/// closure travels in the medium), no `lock` (nothing on that host could be
-/// holding one), no `activate` (`nixos-install` is the activation) and no
-/// `confirm` (a machine with no previous generation has nothing to fall back
-/// to). `apply` refuses to carry an `install` action out at all — the
-/// destruction happens at the target, by a person, through
-/// `meister-install confirm` — and the plan is the sheet they work from.
+/// Produce preflight, install, and verify actions. The medium carries the closure; apply
+/// refuses installation, which requires meister-install confirm on the target. No
+/// previous-generation rollback is promised.
 fn install_specs(release: &ReleaseManifest, id: &str, decision: &HostDecision) -> Vec<StepSpec> {
     let fleet = &release.resolved_fleet;
     let host = &fleet.hosts[id];
@@ -3147,13 +2649,8 @@ fn install_specs(release: &ReleaseManifest, id: &str, decision: &HostDecision) -
             .to(desired.clone()),
     ];
     if let Some(install) = &host.install {
-        // What this step does to what is RUNNING, which on a machine nobody
-        // can reach is nothing. A blank box that is about to be installed
-        // interrupts no service and moves no guest, so its plan asks for
-        // `destructive` and nothing else; a reinstall over a host that
-        // answers interrupts everything on it, and its plan says so by
-        // asking for `disruptive` as well. The disk is destroyed either
-        // way, and that is the class both of them share.
+        // Classify reinstall disruption when a current system was observed. Both initial
+        // install and reinstall require destructive approval.
         let disruption = if decision.current_system.is_some() {
             Disruption::Reboot
         } else {
@@ -3190,8 +2687,6 @@ fn install_specs(release: &ReleaseManifest, id: &str, decision: &HostDecision) -
     );
     specs
 }
-
-// --- end lane 3A ----------------------------------------------------------
 
 /// The verdict, and the sentences behind it. An unchanged host keeps its
 /// group's troubles out of its own reasons: nothing is being done to it, so
@@ -3251,10 +2746,8 @@ fn class_of(host: &crate::manifest::ResolvedHost) -> String {
 // Order
 // ---------------------------------------------------------------------------
 
-/// Which tier a role belongs to. An agent takes orders from a cluster, a
-/// cluster from a cloud, and both authenticate against the addons. A host is
-/// placed at its HIGHEST tier, because a host with three roles is one
-/// machine and one interruption.
+/// Rank hosts by their highest role: agent, cluster, cloud, addons. A host with several roles
+/// remains one interruption unit.
 fn tier_of_role(role: &str) -> u8 {
     match role {
         "agent" => 0,
@@ -3315,14 +2808,8 @@ fn dependencies(
         if dependant == on {
             return;
         }
-        // An edge only ever goes from a host that comes LATER in the tier
-        // order to one that comes earlier. Without this, three machines that
-        // each carry the cloud and the cluster role would each wait for the
-        // other two — a cycle made out of a fleet that is simply symmetric.
-        // A host is placed at its highest tier and is one interruption
-        // there, so two hosts of the same tier are peers with nothing to
-        // order between them, and the group's own capacity is what keeps
-        // them apart.
+        // Add only edges crossing tier ranks. Same-tier peers are ordered by rollout
+        // capacity, avoiding cycles among hosts sharing several roles.
         let (Some(later), Some(earlier)) = (fleet.hosts.get(dependant), fleet.hosts.get(on)) else {
             return;
         };
@@ -3402,15 +2889,8 @@ fn dependencies(
     edges
 }
 
-/// Kahn's algorithm with a deterministic tie-break, so the same fleet always
-/// comes out in the same order — and a cycle is an error rather than a host
-/// that quietly never gets a wave.
-///
-/// The tie-break is the rollout's own priority: the tier, then the canary
-/// class, then the marked canary, then the id. The cycle check is here
-/// rather than nowhere even though [`dependencies`] cannot build one today
-/// (edges only ever go between different tiers): it is what makes the next
-/// edge somebody adds safe.
+/// Topologically sort with deterministic ties: tier, class, explicit canary preference, then
+/// host ID. Refuse cycles.
 fn topological(
     selection: &[String],
     decisions: &BTreeMap<String, HostDecision>,
@@ -3627,7 +3107,7 @@ fn steps_for(
     let obs = observation.host(id);
 
     let mut specs: Vec<StepSpec> = Vec::new();
-    // --- lane 5A: a rotation is its own five steps ---
+
     if policy.kind == PlanKind::KeysRotate && decision.verdict == HostVerdict::Change {
         specs.push(
             step(ActionKind::Preflight, Disruption::None)
@@ -3652,15 +3132,11 @@ fn steps_for(
                 .to("free"),
         );
     } else
-    // --- end lane 5A ---
-    // --- lane 3A: first installation ---
+
     if policy.kind == PlanKind::Install {
         specs = install_specs(release, id, decision);
     } else if decision.verdict == HostVerdict::Unchanged {
-        // --- end lane 3A ---
-        // Two steps, and neither of them touches anything. A host that
-        // already runs what the release says is not staged, not activated
-        // and not handed a secret (V10).
+        // Unchanged hosts receive preflight and verify only.
         specs.push(
             step(ActionKind::Preflight, Disruption::None)
                 .maybe_from(decision.current_system.clone())
@@ -3690,58 +3166,31 @@ fn steps_for(
                 ),
         );
 
-        // --- lane 3B: what has to be put there, and only that ----------
-        //
-        // One step per secret whose WANTED state and whose SEEN state
-        // differ, in either kind of plan. A bootstrap is not special here:
-        // what makes it a bootstrap is that everything differs, because
-        // nothing is there yet.
-        //
-        // The comparison is `crate::pki::needs_delivery`, and its asymmetry
-        // is the point. A public file — a certificate, a CA bundle, a CRL —
-        // is compared by CONTENT, because the probe may hash it and the
-        // operator's copy may be hashed here. A private file is compared
-        // only by EXISTENCE: the probe answers `mode:… owner:…` for one, and
-        // a digest of a private key would be a digest of a private key,
-        // travelling into a journal and a receipt. So a `secrets.key` that
-        // is there stays; replacing it does not rotate anything, it makes
-        // what the cloud encrypted with it unreadable. That is `keys rotate`
-        // (M5) and it is a plan of its own.
+        // Deliver only references whose expected and observed values differ. Public files
+        // compare by digest; private files compare by presence and never publish key digests.
+        // Target-generated keys have no transferable source.
         let expected_here = policy.expected_credentials.get(id);
         for secret in &host.secret_refs {
-            // --- lane 5A ---
-            // A revocation plan carries ONE kind of file. A certificate that
-            // happens to differ as well is a different decision, made by a
-            // different verb, on a day somebody chose.
-            // --- lane 5B: and a retirement is one of those plans ---
+            // Revocation and retirement plans deliver CRLs only.
             if matches!(policy.kind, PlanKind::KeysRevoke | PlanKind::Retire)
                 && secret.kind != crate::manifest::SecretKind::Crl
             {
                 continue;
             }
-            // --- end lane 5A/5B ---
+
             let seen = obs.map(|o| o.credentials.get(&secret.id));
             let want = expected_here.and_then(|e| e.get(&secret.id));
             if !crate::pki::needs_delivery(secret, want, seen.flatten()) {
                 continue;
             }
-            // A restart is an interruption only of something that is
-            // running. In a bootstrap the units are off — they wait on a CA
-            // certificate that has not arrived — and calling that step
-            // disruptive would ask for an approval to interrupt nothing.
-            // --- lane 5A ---
-            // A revocation list is the one file in this fleet that is
-            // re-read by the process that uses it, on its own clock and
-            // within half a minute (`controller_api::auth::Revocations`).
-            // Restarting a controller to hand it one would be the single
-            // avoidable outage in the whole design, so this step interrupts
-            // nothing and the executor pokes nothing.
+            // A configured restart is disruptive only if its unit is active. CRL delivery
+            // does not restart readers; controllers periodically reload the file.
             let restarts = secret.kind != crate::manifest::SecretKind::Crl
                 && secret
                     .reload
                     .as_ref()
                     .is_some_and(|r| r.action == "restart");
-            // --- end lane 5A ---
+
             let unit_running = secret.reload.as_ref().is_some_and(|r| {
                 obs.is_some_and(|o| o.units.get(&r.unit).map(String::as_str) == Some("active"))
             });
@@ -3759,19 +3208,13 @@ fn steps_for(
                         .flatten(),
                 )
                 .to(format!("{} at {}", secret.id, secret.target_path))
-                // --- lane 3B: Astra finding F10, 2026-09-23 ---
-                // The planner already read this file to decide the step, so
-                // the digest it decided on travels with the step. `want` is
-                // the word `crate::pki::expected_for_host` wrote down: a
-                // `sha256:...` for a public file, `present` for a private one,
-                // `unreadable` for a file that is there and cannot be read.
-                // Only the first of those three is a binding, which is also
-                // how a private key stays out of a plan on disk.
+                // Bind public-file delivery to the expected sha256 digest. Presence and
+                // unreadable markers do not become content bindings.
                 .of_bytes(
                     want.filter(|w| w.starts_with("sha256:"))
                         .map(|w| w.to_string()),
                 )
-                // --- end lane 3B ---
+
                 .because(match seen.flatten() {
                     Some(None) | None => format!(
                         "{id} has no {} and the fleet says it needs one",
@@ -3858,29 +3301,22 @@ fn steps_for(
                         decision.provider_reboot,
                         decision.switch_only,
                     ) {
-                        // Direct boot: the activation is the USERLAND half
-                        // and runs in switch mode, because the way back a
-                        // boot-mode activation needs is a boot menu and this
-                        // machine has none (3A: the helper refuses it).
+                        // Direct boot switches userland now; the provider supplies the next
+                        // kernel.
                         (_, true, _) => {
                             "this host boots through its provider, so the activation moves the \
                              userland at once (--mode switch) and the kernel follows when the \
                              provider loads the new bundle"
                         }
-                        // --- lane 5C ---
-                        // And a grub host, which reboots itself but cannot
-                        // take a boot back: no `bootctl set-oneshot`, so
-                        // the machine is switched now and rebooted after,
-                        // and a boot that does not come up is grub's own
-                        // menu and a person at a console (D5's documented
-                        // limit, L2 finding N4).
+                        // GRUB supports a local reboot but no automated boot fallback, so
+                        // activate in switch mode.
                         (true, false, true) => {
                             "the boot half of this release changed and this host boots itself \
                              out of grub, which has no one-shot entry: the profile is moved at \
                              once (--mode switch) and the reboot below starts it. There is no \
                              way back from a boot that does not come up except grub's own menu"
                         }
-                        // --- end lane 5C ---
+
                         (true, false, false) => {
                             "the boot half of this release changed, so the profile is moved and \
                              the new system takes over at the next boot (--mode boot)"
@@ -3922,18 +3358,8 @@ fn steps_for(
                     ),
             );
         }
-        // --- lane 3-integration: the step this tool stops at ---------------
-        //
-        // LAST, and after the confirmation on purpose. The machine's own way
-        // back is a timer of five minutes; arranging a provider — uploading
-        // a kernel, editing a template, telling a hypervisor to restart a
-        // guest — is a thing that takes as long as it takes. A halt in front
-        // of an unconfirmed activation would therefore be a halt in front of
-        // a machine that takes itself back while somebody works.
-        //
-        // The order costs one honest oddity, and the sentence below says it:
-        // between the switch and the provider's reboot the host RUNS the
-        // release and has BOOTED the one before it.
+        // Confirm the switch before halting for an unbounded external provider operation.
+        // Until that reboot, current userland and booted generation intentionally differ.
         if decision.provider_reboot {
             let bundle = release.artifacts[id].direct_boot.as_ref();
             specs.push(
@@ -3947,10 +3373,8 @@ fn steps_for(
                              with them",
                             b.kernel.store_path, b.initrd.store_path, b.cmdline
                         ),
-                        // The host's own decision has blocked it already —
-                        // `decide_host` refuses a direct host whose release
-                        // carries no bundle. The step still says what is
-                        // missing rather than saying nothing.
+                        // The host decision already blocks a missing bundle; retain the
+                        // diagnostic on this action.
                         None => format!(
                             "this release carries no direct-boot bundle for {id}, so there is \
                              nothing a provider could be handed"
@@ -3971,7 +3395,7 @@ fn steps_for(
                     ),
             );
         }
-        // --- end lane 3-integration ----------------------------------------
+
         if decision.needs_maintenance {
             specs.push(
                 step(ActionKind::Uncordon, Disruption::None)
@@ -3990,13 +3414,12 @@ fn steps_for(
     // the edges; everything else on the host is ordered by the wave and by
     // the host being its own parallel group.
     let carries_edges = if policy.kind == PlanKind::Install {
-        // --- lane 3A ---
+
         ActionKind::Install
-        // --- end lane 3A ---
-        // --- lane 5A ---
+
     } else if policy.kind == PlanKind::KeysRotate {
         ActionKind::KeysSwitch
-    // --- end lane 5A ---
+
     } else if decision.reboot_only {
         ActionKind::Reboot
     } else {
@@ -4041,54 +3464,35 @@ fn steps_for(
             reboot_required,
             approval_class: classes.iter().copied().max().unwrap_or(ApprovalClass::None),
             rollback: rollback_for(spec.kind, decision, policy),
-            // --- lane 3A ---
-            // An install has nothing a workstation can re-check before the
-            // step runs: the machine is not reachable (that is the point),
-            // the fleet has no host key for it yet, and what has to still
-            // be true when a partition table is destroyed — the serial, the
-            // size, the layout's device, the absence of an installation
-            // mark — is checked by `meister-install confirm` standing in
-            // front of it. A `Reachable` condition here would be a plan
-            // that contradicts its own purpose.
+            // Install conditions are checked by the target medium. A workstation reachability
+            // condition would exclude new machines.
             validity: if policy.kind == PlanKind::Install {
                 Vec::new()
             } else {
                 validity_for(spec.kind, id, host, obs, artifacts, groups)
             },
-            // --- end lane 3A ---
+
             blocked,
-            // --- lane 3-integration ---
-            // On the one step that is carried out somewhere else, and
-            // nowhere else: every other step of this plan is something this
-            // tool does itself and needs no payload to do it.
+            // Only the external provider reboot carries a boot bundle.
             provider_boot: if spec.kind == ActionKind::ProviderReboot {
                 artifacts.direct_boot.clone()
             } else {
                 None
             },
-            // --- end lane 3-integration ---
-            // --- lane 3B: Astra finding F10, 2026-09-23 ---
-            // Only a delivery carries one, and only when the planner had a
-            // digest of its own to write down.
+            // Only public-file delivery carries its planned content digest.
             expected_sha256: if spec.kind == ActionKind::DeliverSecret {
                 spec.expected_sha256
             } else {
                 None
             },
-            // --- end lane 3B ---
+
         });
     }
     (actions, needed)
 }
 
-/// Which sentence forbids this step, if one does.
-///
-/// `preflight` and `verify` only look, and they are never forbidden: a
-/// blocked host is exactly the host somebody wants a preflight to report
-/// on. Everything else falls to the host's own troubles. The group's
-/// troubles — a lost quorum, a membership that moved — only reach the steps
-/// that interrupt something, plus the two that follow such a step and would
-/// be nonsense without it.
+/// Preflight and verify remain reportable on blocked hosts. Host-wide failures block other
+/// steps; disruption failures also block cordon, uncordon, and confirm.
 fn blocked_by(kind: ActionKind, disruption: Disruption, decision: &HostDecision) -> Option<String> {
     if matches!(kind, ActionKind::Preflight | ActionKind::Verify) {
         return None;
@@ -4096,11 +3500,8 @@ fn blocked_by(kind: ActionKind, disruption: Disruption, decision: &HostDecision)
     if !decision.stop_all.is_empty() {
         return Some(decision.stop_all.join(" "));
     }
-    // Three steps interrupt nothing themselves and are part of an
-    // interruption all the same: a cordon is what makes a drain possible, an
-    // uncordon takes it back, and a confirm keeps an activation. None of
-    // them means anything on its own, so what forbids the interruption
-    // forbids them.
+    // Cordon, uncordon, and confirm belong to the disruption they surround, although they are
+    // not themselves classified as disruptive.
     let belongs_to_a_disruption = matches!(
         kind,
         ActionKind::Cordon | ActionKind::Uncordon | ActionKind::Confirm
@@ -4113,9 +3514,8 @@ fn blocked_by(kind: ActionKind, disruption: Disruption, decision: &HostDecision)
     None
 }
 
-/// Every approval this step needs. The action shows the hardest of them and
-/// the plan's `approvals` is the union, so approving `singleton` never
-/// quietly buys a reboot.
+/// Compute the required approval classes; the action displays their maximum and the plan
+/// retains their union.
 fn approval_classes(
     kind: ActionKind,
     disruption: Disruption,
@@ -4153,8 +3553,7 @@ fn approval_classes(
             // from "may a member go down".
             out.insert(ApprovalClass::Singleton);
         } else if view.unhealthy_now > 0 {
-            // Still allowed, and this is the last margin: a member is
-            // already down and this takes a second one with it.
+            // Require approval for disruption while this group already has unavailable members.
             out.insert(ApprovalClass::Quorum);
         }
     }
@@ -4165,12 +3564,8 @@ fn rollback_for(kind: ActionKind, decision: &HostDecision, policy: &PlanPolicy) 
     if kind != ActionKind::Activate {
         return Rollback::none();
     }
-    // A machine with no boot menu has no boot-mode way back: `bootctl
-    // set-oneshot` is what a boot rollback IS, and a direct-boot guest has
-    // no ESP to write it into (3A measured the helper refusing it). What is
-    // left is the userland half, and that is exactly what a switch takes
-    // back.
-    // --- lane 5C: and a grub host, for the same reason and its own ---
+    // Direct and GRUB hosts lack the systemd-boot fallback required for boot rollback; use
+    // switch rollback.
     if decision.provider_reboot || decision.switch_only {
         return Rollback {
             mode: RollbackMode::Switch,
@@ -4209,13 +3604,10 @@ fn validity_for(
             fingerprint: fingerprint.clone(),
         });
     }
-    // --- lane 5A ---
-    // The same two facts every changing step is validated against: it is
-    // reachable, and it is the machine the fleet enrolled. A rotation adds
-    // no system facts, because it changes no system.
+    // Rotation actions validate machine identity without binding a system they do not change.
     let wants_identity =
         matches!(kind, Preflight | DeliverSecret | Activate | Install) || kind.is_keys();
-    // --- end lane 5A ---
+
     if wants_identity && let Some(machine_id) = obs.and_then(|o| o.identity.machine_id.clone()) {
         out.push(Validity::MachineId {
             host: id.to_string(),
@@ -4268,11 +3660,8 @@ fn validity_for(
 // What `apply` asks immediately before it changes anything
 // ---------------------------------------------------------------------------
 
-/// The answer to "is this plan still the truth?".
-///
-/// Three answers and not two, because "do not do this" and "ask again" call
-/// for different things from an operator. A quorum that got worse is a fleet
-/// to look at; a generation that moved is a plan to make again.
+/// Validation outcome: proceed, stop for a blocking condition, or replan after expiration or
+/// generation drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Proceed,
@@ -4299,17 +3688,9 @@ impl Verdict {
     }
 }
 
-/// Re-check everything a plan assumed, against a snapshot taken just now.
-///
-/// This is the question `apply` asks before EVERY mutation, not once at the
-/// start: between the plan and the third host of a wave there is a rollout's
-/// worth of time, and a fleet does not hold still for it. Pure, like the
-/// planner — `now` arrives as a value and the snapshot arrives as data.
-///
-/// Only the hosts the plan may actually act on are re-checked. A host the
-/// plan already blocked is not re-examined: it was down when the plan was
-/// made, it is down now, and stopping the whole run over a fact the plan
-/// already wrote down would make every degraded fleet unrollable.
+/// Recheck actionable hosts and relevant groups against fresh observations. Already-blocked
+/// hosts are skipped; release, identity, system, generation, locks, and transactions are
+/// compared.
 pub fn validate_against(
     plan: &DeploymentPlan,
     release: &ReleaseManifest,
@@ -4319,13 +3700,8 @@ pub fn validate_against(
     validate_against_next(plan, release, fresh, now, None)
 }
 
-/// The same check, told which host is about to be acted on.
-///
-/// --- lane L4 --- A group's quorum verdict is about how many MORE members
-/// may become unavailable, and a member that is already unavailable does not
-/// become more so. `next` is that member when the caller knows it — the
-/// executor always does — and then a group block that names only this host's
-/// own absence does not stop the run. See `already_unavailable`.
+/// Validate with the next host identified. A currently unavailable raft member does not
+/// consume another serving member when acted on; see already_unavailable.
 pub fn validate_against_next(
     plan: &DeploymentPlan,
     release: &ReleaseManifest,
@@ -4475,37 +3851,16 @@ pub fn validate_against_next(
         }
     }
 
-    // The quorum arithmetic again, on the fresh facts and with the same
-    // function — a second implementation here would be a second answer to
-    // keep in step.
+    // Recompute group capacity from fresh observations with the planner's shared rules.
     let selected: BTreeSet<String> = plan.selection.targets.iter().cloned().collect();
     let (now_groups, _) = group_views(&release.resolved_fleet, fresh, &selected);
     for (id, planned) in &plan.groups {
         let Some(current) = now_groups.get(id) else {
             continue;
         };
-        // --- lane L4, reworked for Astra finding F01, 2026-09-23 ---
-        // Astra finding F01, 2026-09-23: the question this re-check has to
-        // answer is not "are more members down than the plan assumed" but
-        // "can this group still afford what is about to be done to it", and
-        // a count made those two one question when they are two. Take a raft
-        // a, b, c planned while a was down: the plan is FOR a, because the
-        // one host a degraded group needs a plan for is the one that is down
-        // (see `already_unavailable`). If a comes back and b falls over
-        // before the run, exactly as many members are down as the plan wrote
-        // down and none of the safety is left -- the step would interrupt a,
-        // which is now one of the two that serve, and leave c alone with
-        // itself. The old guard read the equal count and skipped the whole
-        // group, `current.blocked` included.
-        //
-        // So the verdict is about the members this run may still disrupt. A
-        // member that is unavailable right now does not become more so by
-        // being worked on, and that exemption is also what keeps a bootstrap
-        // running: once two of three are up the group reads `blocked`, and
-        // the third member -- the one the wave is for -- is still allowed.
-        // Measured in the lab on 2026-09-23 (lane L4): without it every
-        // three-member bootstrap stopped after its second member came up,
-        // with "group cp is at 2 of 3 ... It could when this plan was made."
+        // Assess the next disruption against current member identities, not only outage
+        // counts. An outage moving from one member to another can invalidate the plan without
+        // changing the count.
         let members: &[String] = release
             .resolved_fleet
             .groups
@@ -4515,10 +3870,8 @@ pub fn validate_against_next(
         // Does working on this host cost the group an available member?
         let costs_a_member =
             |host: &str| !(current.kind == GroupKind::Raft && already_unavailable(fresh, host));
-        // The executor names the host that is next, and then that step is
-        // the only disruption in flight. `validate_against` is told no such
-        // host, so it asks the same of every member this plan takes forward
-        // -- a member it blocked, or one it found settled, disrupts nobody.
+        // When next is absent, consider every changing member. Otherwise assess the named
+        // host in its group.
         let imminent: Option<&str> =
             next.filter(|host| members.iter().any(|m| m.as_str() == *host));
         let disrupts_a_serving_member = match imminent {
@@ -4537,11 +3890,8 @@ pub fn validate_against_next(
             Some(why) if planned.blocked.is_none() => {
                 Some(format!("{why} It could when this plan was made."))
             }
-            // It could not, and in a raft group that was blocked already the
-            // only reason this plan may act at all is that the host it is
-            // for was the member that was down (`blocked_by`). That is not
-            // true any more -- and "it could when this plan was made" would
-            // be a sentence that is not true either.
+            // An exemption granted to an unavailable member no longer applies after that
+            // member begins serving.
             Some(why) if current.kind == GroupKind::Raft => Some(match imminent {
                 Some(host) => format!(
                     "{why} This plan may work on {host} only because {host} was itself the \
@@ -4552,12 +3902,8 @@ pub fn validate_against_next(
                      it may still take forward are serving now rather than down."
                 ),
             }),
-            // Anything else is a group that was blocked when the plan was
-            // made and is blocked now for a reason that cannot have moved --
-            // a `rollout.max_unavailable` of 0 is the whole of it outside a
-            // raft. The plan wrote that down and blocked the steps it
-            // forbids; stopping the rest of the run over it again is what
-            // makes a fleet unrollable.
+            // Non-raft capacity blocks already represented in the plan do not block unrelated
+            // work again.
             _ => None,
         };
         if let Some(line) = group_moved {
@@ -4584,12 +3930,7 @@ fn option(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "nothing".to_string())
 }
 
-/// Which approvals this plan needs and nobody has granted for THIS plan.
-///
-/// A grant is a class and a plan id. The id is the whole mechanism: a
-/// `--approve reboot=<some other plan>` copied out of yesterday's terminal
-/// approves yesterday's plan, and it is not going to be mistaken for this
-/// one.
+/// Return required classes without an explicit grant naming this exact plan ID.
 pub fn approvals_missing(
     plan: &DeploymentPlan,
     granted: &[(ApprovalClass, String)],
@@ -4783,12 +4124,8 @@ mod tests {
             .unwrap_or_else(|| panic!("{host} has no {kind} in this plan"))
     }
 
-    // --- lane 3B: deliver-secret out of wanted against seen -----------
-
-    /// A fleet nobody has bootstrapped: nothing is on any host, everything
-    /// has been issued here. Every deliverable secret is delivered, in tier
-    /// order, before the system that reads it is activated — and the key
-    /// the target made itself never travels.
+    /// Bootstrap delivers available public/private source files before activation;
+    /// target-generated keys stay on the target.
     #[test]
     fn a_bootstrap_delivers_what_the_hosts_have_not_got_and_nothing_else() {
         let base = onebox_enrolled();
@@ -4858,15 +4195,7 @@ mod tests {
         assert!(plan.hosts["box"].wave < plan.hosts["n1"].wave);
     }
 
-    /// A delivery says WHICH bytes, and a private file still says nothing.
-    ///
-    /// Astra finding F10, 2026-09-23: the step used to carry only
-    /// `<id> at <path>`, and the executor then checked the host's copy
-    /// against a file it had just re-read -- which always agreed. The digest
-    /// the planner decided the step from travels with the step now, so the
-    /// executor can refuse a file that changed underneath it. Only public
-    /// files have one: a digest of a private key is not something this tool
-    /// writes into a plan that goes on disk.
+    /// Public deliveries bind the planned bytes; private-file deliveries carry no digest.
     #[test]
     fn a_delivery_names_the_bytes_it_was_planned_with_and_round_trips() {
         let base = onebox_enrolled();
@@ -4922,11 +4251,7 @@ mod tests {
         assert!(back.id_matches().unwrap());
     }
 
-    /// A plan that delivers nothing gains no field and keeps its id.
-    ///
-    /// Astra finding F10, 2026-09-23: the digest is absent rather than null
-    /// everywhere else, so adding it did not rename every plan in every
-    /// operator's repository.
+    /// Omitting unused digest fields preserves plan IDs without deliveries.
     #[test]
     fn a_plan_without_a_delivery_hashes_to_what_it_always_did() {
         let (release, observation) = upgrade(&["n1"], false);
@@ -4991,12 +4316,8 @@ mod tests {
             assert_eq!(delivered.len(), 1, "{id}: {delivered:?}");
             assert!(delivered[0].starts_with("ca-bundle "), "{delivered:?}");
         }
-        // Even a host whose system does not change is handed the new
-        // certificate — and it stops being `unchanged`, because something
-        // has to happen to it. What happens is exactly that: no stage, no
-        // activate, no confirm, nothing rebooted. Activating a system the
-        // host already runs would take its lock and move its profile for a
-        // file.
+        // Credential-only drift must not stage, activate, confirm, or reboot an unchanged
+        // system.
         assert_eq!(plan.hosts["n2"].verdict, HostVerdict::Change);
         assert_eq!(
             kinds(&plan, "n2"),
@@ -5127,8 +4448,6 @@ mod tests {
         assert_eq!(upgrade.hosts["box"].verdict, HostVerdict::Change);
     }
 
-    // --- lane 3B: the new field of the contract -----------------------
-
     /// A new field of the plan is a new field of the `plan_id` and a new
     /// field of the round trip, or it is a field that quietly does nothing.
     #[test]
@@ -5170,10 +4489,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // lane 3A: first installation
+    // First installation
     // -----------------------------------------------------------------
-
-    // --- lane 5A: the rotation plan -----------------------------------
 
     /// A host with a certificate beside its key, and a rotation prepared
     /// for it.
@@ -5212,12 +4529,8 @@ mod tests {
             ]
         );
         for action in plan.actions.iter().filter(|a| a.kind.is_keys()) {
-            // Only the switch interrupts anything, and the class it asks
-            // for is the one the HOST's situation deserves: `box` is a raft
-            // group of one, so restarting what reads the pair takes the
-            // whole control plane away for a moment and the plan says
-            // `singleton` rather than `disruptive`. The four other phases
-            // interrupt nothing and ask nobody.
+            // Only key switch is disruptive; the singleton host requires both disruptive and
+            // singleton approvals.
             let expected = if action.kind == ActionKind::KeysSwitch {
                 (Disruption::Service, ApprovalClass::Singleton)
             } else {
@@ -5308,8 +4621,6 @@ mod tests {
         assert!(why.contains("--kind bootstrap"), "{why}");
     }
 
-    // --- lane 5A: the revocation plan ---------------------------------
-
     /// A fleet whose controller host reads a revocation list, and a snapshot
     /// in which it holds the one it was given.
     fn revoking() -> (ReleaseManifest, Observations) {
@@ -5398,13 +4709,7 @@ mod tests {
         }
     }
 
-    // --- lane 5B: retiring a host --------------------------------------
-
-    /// A retirement is a revocation that leaves the machine out.
-    ///
-    /// Two things have to be true and they are the whole of V25's first
-    /// half: the host that is going is not in the plan at all, and what the
-    /// rest of the fleet gets is the list and nothing else.
+    /// Retirement excludes the retiring host and distributes only CRLs to the remainder.
     #[test]
     fn a_retirement_carries_the_list_to_the_others_and_never_touches_the_host() {
         let fleet = crate::fixtures::with_crl(onebox_enrolled(), &["box", "n1"]);
@@ -5477,8 +4782,6 @@ mod tests {
         }
         assert!(plan.approvals.is_empty(), "{:?}", plan.approvals);
     }
-
-    // --- end lane 5B ----------------------------------------------------
 
     /// A host that already holds this list is not written to twice.
     #[test]
@@ -5576,8 +4879,6 @@ mod tests {
         );
         assert!(!plan.hosts["box"].reboot_required);
     }
-
-    // --- end lane 5A ---------------------------------------------------
 
     /// A fleet nobody has ever reached: no host answered when the snapshot
     /// was taken, which is what a rack of new machines looks like.
@@ -5973,10 +5274,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_does_not_cordon_a_node_the_cluster_has_never_seen() {
-        // The first `apply` of an agent's life: it has a host key, it has no
-        // certificate, and the cluster it will report to does not know it
-        // exists. `meister node cordon n1 --cluster …` would be a command
-        // about a node nobody ever registered.
+        // An unenrolled bootstrap agent has no registered node to cordon.
         let base = onebox_enrolled();
         let running = release_of(base.clone());
         let mut observation = observed(&running, at(TAKEN));
@@ -6009,8 +5307,6 @@ mod tests {
         assert!(steps.contains(&ActionKind::Drain), "{steps:?}");
     }
 
-    // --- lane 3-integration: the boot nobody inside the machine owns ---
-
     /// The same fleet with `n1` turned into a guest whose hypervisor loads
     /// its kernel, and a release that moves it.
     fn upgrade_direct(new_kernel: bool) -> (ReleaseManifest, Observations) {
@@ -6024,8 +5320,6 @@ mod tests {
         ));
         (release, observation)
     }
-
-    // --- lane 5C ---
 
     fn upgrade_grub(new_kernel: bool) -> (ReleaseManifest, Observations) {
         let base = crate::fixtures::with_grub_host(onebox_enrolled(), "n1");
@@ -6041,13 +5335,7 @@ mod tests {
 
     #[test]
     fn a_kernel_change_on_a_grub_host_is_switched_and_rebooted_by_the_machine_itself() {
-        // L2 finding N4. Every guest built from
-        // `packages.managed-disk-image` is a legacy-MBR grub machine. The
-        // inventory had no word for one, so the lab called it `uefi`,
-        // `apply` passed `--mode boot`, and the helper refused: "there is
-        // no boot fallback on this host: bootctl says systemd-boot is not
-        // installed". Such a host was not deployable at all as soon as a
-        // release touched its kernel.
+        // A GRUB host must use switch activation even when the kernel changes.
         let (release, observation) = upgrade_grub(true);
         let plan = planned(&release, "host=n1", &observation);
 
@@ -6093,8 +5381,6 @@ mod tests {
             RollbackMode::Switch
         );
     }
-
-    // --- end lane 5C ---
 
     #[test]
     fn a_kernel_change_on_a_direct_host_is_a_provider_reboot_with_the_bundle() {
@@ -6222,10 +5508,8 @@ mod tests {
 
     #[test]
     fn switched_and_never_booted_on_a_direct_host_waits_for_its_provider() {
-        // The shape a halt leaves behind when somebody re-plans instead of
-        // resuming: the host runs the release and booted the one before it.
-        // `systemctl reboot` here would bring it back on the old kernel and
-        // the run would wait ten minutes for a boot that already happened.
+        // Replanning a pending direct boot must still request the provider, not a local
+        // reboot.
         let (release, observation) = upgrade_direct(true);
         let desired = release.artifacts["n1"].toplevel.store_path.clone();
         let mut observation = observation;
@@ -6282,11 +5566,8 @@ mod tests {
 
     #[test]
     fn a_required_booted_check_on_a_direct_host_is_said_before_it_rolls_back() {
-        // Between the switch and the provider's reboot such a host runs the
-        // release and has booted the one before it. A required `booted`
-        // therefore fails the verify in front of the confirmation, and the
-        // switch would be taken back once per kernel — so the plan says so
-        // instead of doing it.
+        // Requiring booted before provider reboot would prevent confirmation of the preceding
+        // switch.
         let base = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
         let running = crate::fixtures::direct_release_of(base.clone());
         let observation = observed(&running, at(TAKEN));
@@ -6446,7 +5727,7 @@ mod tests {
         n2.enrolled = false;
         // And a host that has no identity has not been given the fleet's CA
         // certificate either: that is the file it would check one against,
-        // and it is what this bootstrap has to deliver (lane 3B).
+        // and bootstrap must deliver it.
         n2.credentials.insert("ca-bundle".to_string(), None);
         let release = with_new_systems(base, &["n2"], false);
 
@@ -6542,8 +5823,6 @@ mod tests {
             plan.hosts["n1"].reasons
         );
     }
-
-    // --- lane 4A: the hardware preflight ------------------------------------
 
     /// The one sentence a blocked host gives, joined, so that a test can
     /// look for a number in it.
@@ -6735,12 +6014,8 @@ mod tests {
 
     #[test]
     fn a_member_that_could_not_be_asked_is_not_an_empty_membership() {
-        // What `vm-kernel-change` found: a host came back from the reboot
-        // this rollout asked for, sshd answered before etcd did, and its
-        // member list was empty. An empty list is "nobody could ask" — a
-        // live member always names at least itself — and reading it as a
-        // membership change blocks the whole group for a machine that is
-        // merely still starting.
+        // An empty etcd member list during startup is missing evidence, not a membership
+        // change.
         let release = release_of(onebox_enrolled());
         let mut observation = observed(&release, at(TAKEN));
         let etcd = observation.hosts.get_mut("box").unwrap().etcd.as_mut();
@@ -6786,15 +6061,9 @@ mod tests {
         assert!(why.contains("membership"), "{why}");
     }
 
-    // --- lane 4A: the units the operator owns -------------------------------
-
     #[test]
     fn the_units_this_stack_owns_are_the_ones_a_role_adds() {
-        // The constant, held against a real manifest rather than against
-        // this file: `box` carries four roles and `n1` one, so every unit
-        // `box` has and `n1` has not is a unit some MeisterStack module
-        // brought. If a module ever grows a unit and nobody adds it here,
-        // this test names it.
+        // Compare the unit allowlist with roles represented by the fixture.
         let fleet = crate::fixtures::onebox();
         let box_units: BTreeSet<&str> = fleet.hosts["box"]
             .units
@@ -6936,9 +6205,7 @@ mod tests {
 
     #[test]
     fn what_the_preflight_found_is_part_of_the_plan_and_not_only_of_the_run() {
-        // The lane brief's point: the verdict is a contract, so it is in
-        // `preconditions[]` of the `preflight` step where a reader and a
-        // reviewer both find it.
+        // Preserve preflight evidence in the serialized plan's preconditions.
         let (release, observation) = upgrade(&["n1"], false);
         let plan = planned(&release, "host=n1", &observation);
         let said = action(&plan, "n1", ActionKind::Preflight)
@@ -7009,11 +6276,8 @@ mod tests {
         let plan = planned(&release, "host=n2", &observation);
         let why = &plan.hosts["n2"].reasons[0];
         assert!(why.contains("deployed as `context`"), "{why}");
-        // The sentence has to name where the push lives NOW. `src/legacy/`
-        // and the verb `legacy push` went with M5B; a host of the context
-        // fleet is served from the lab repository, and a refusal that
-        // pointed at a verb this binary no longer has would send an
-        // operator looking for it.
+        // The context-host diagnostic must name the external legacy adapter, not a removed
+        // verb.
         assert!(why.contains("meisterstack-lab/legacy/push.sh"), "{why}");
     }
 
@@ -7100,12 +6364,7 @@ mod tests {
 
     #[test]
     fn a_raft_group_where_nothing_is_up_has_no_quorum_to_protect() {
-        // --- lane L4 ---
-        // Three fresh machines, none of them serving: this is what a
-        // `bootstrap` looks like, and what a group that is completely down
-        // looks like. Blocking here protects nothing and forbids the only
-        // plan that would bring the group back — measured in the lab, where
-        // three fresh VMs could not be bootstrapped at all.
+        // An entirely unavailable raft group must remain eligible for bootstrap or repair.
         let (release, observation) = three_member_cloud(3);
         let plan = planned(&release, "group=cloud", &observation);
         let view = &plan.groups["cloud"];
@@ -7135,13 +6394,8 @@ mod tests {
 
     #[test]
     fn a_group_that_got_healthier_has_not_moved_under_the_plan() {
-        // --- lane L4 ---
-        // `blocked` is a derived word. During the bootstrap of a three-member
-        // raft it flips from "not blocked" (nothing was up, nothing to
-        // protect) to "blocked" (two are up, the third is not) BECAUSE the
-        // rollout is working. The guard that exists to catch a new outage
-        // stopped the run at that moment, every time. Measured in the lab on
-        // 2026-09-23.
+        // After two members form quorum, allow bootstrap of the still-unavailable third
+        // member.
         let (release, planned_obs) = three_member_cloud(3);
         let plan = planned(&release, "group=cloud", &planned_obs);
         assert_eq!(plan.groups["cloud"].unhealthy_now, 3);
@@ -7158,13 +6412,8 @@ mod tests {
             views["cloud"].blocked.is_some(),
             "two of three is a degraded quorum, and it says so"
         );
-        // Astra finding F01, 2026-09-23: this used to be asked of the whole
-        // plan, because the exemption was "fewer members are down than the
-        // plan assumed" -- a count. A count cannot tell an outage that moved
-        // from one that healed, so the exemption is now the host that is
-        // NEXT, which is what the lab measured: the third member of the
-        // bootstrap, the one the wave is for, is the one that must get
-        // through.
+        // The next host identifies whether the operation consumes a serving member; outage
+        // counts alone cannot.
         assert!(
             matches!(
                 validate_against_next(&plan, &release, &better, at(NOW), Some("cloud-c")),
@@ -7201,15 +6450,7 @@ mod tests {
 
     #[test]
     fn a_member_that_is_already_down_is_not_blocked_by_its_own_absence() {
-        // --- lane L4 ---
-        // The rule asks "how many MORE members may become unavailable", and a
-        // member that is already unavailable does not become more so. Measured
-        // in the lab while a three-member control plane was being bootstrapped:
-        // as soon as two members were up and had a quorum, the THIRD — which
-        // had never been touched — was refused with "group cloud is at 2 of 3;
-        // no further member may go down." A raft group could be started and
-        // never finished; a degraded one could never be repaired, because the
-        // one host it needs a plan for is the one that is down.
+        // Repairing an unavailable member does not consume additional quorum capacity.
         let (release, observation) = three_member_cloud(1);
         // `raft_cloud` makes the LAST member the unhealthy one.
         let down = "cloud-c";
@@ -7264,16 +6505,7 @@ mod tests {
 
     #[test]
     fn an_etcd_that_is_not_running_yet_does_not_block_a_bootstrap() {
-        // Found in the lab (lane L2, 2026-09-23): a fresh managed image
-        // carries the etcd unit without starting it, so the probe answered
-        // `EtcdView { healthy: false, members: [] }` for every host of the
-        // group — `observe::etcd_view`'s deliberate shape for "this member
-        // is down". `topology_verdict` read that as "etcd answered and does
-        // not know you" and blocked activate, reboot and confirm on the one
-        // box the bootstrap was supposed to bring up.
-        //
-        // A view with no members at all says nothing about membership, and
-        // a bootstrap is precisely the case where nothing can have.
+        // An unhealthy etcd view with no members supplies no topology comparison.
         let (release, mut observation) = three_member_cloud(0);
         for host in observation.hosts.values_mut() {
             if let Some(etcd) = host.etcd.as_mut() {
@@ -7901,13 +7133,8 @@ mod tests {
 
     #[test]
     fn an_outage_that_moved_to_another_member_stops_the_run() {
-        // Astra finding F01, 2026-09-23: the plan is made while cloud-c is
-        // down, so cloud-c is the host it is FOR (W8). Before it runs,
-        // cloud-c comes back and cloud-a falls over. The NUMBER of members
-        // that are down has not changed, and everything the plan relied on
-        // has: its one step would now interrupt cloud-c, which is serving,
-        // and leave cloud-a and cloud-b to hold a quorum of two that is
-        // already one short.
+        // Move an outage between members without changing its count; disruption of the
+        // recovered member must stop.
         let (release, planned_obs) = three_member_cloud(1);
         let plan = planned(&release, "group=cloud", &planned_obs);
         assert_eq!(plan.groups["cloud"].unhealthy_now, 1);
@@ -7937,11 +7164,8 @@ mod tests {
 
     #[test]
     fn the_member_that_is_down_now_is_still_worked_on() {
-        // Astra finding F01, 2026-09-23, the other half: the same moved
-        // outage, asked about the member that is down NOW. Working on a host
-        // that is already unavailable costs the group nothing, so this is
-        // the one step the fleet can still afford -- and refusing it is the
-        // deadlock W8 is about.
+        // The member that is unavailable now remains eligible for repair after an outage
+        // moves.
         let (release, planned_obs) = three_member_cloud(1);
         let plan = planned(&release, "group=cloud", &planned_obs);
         let mut fresh = planned_obs.clone();
@@ -7953,12 +7177,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_still_gets_to_its_third_member() {
-        // Astra finding F01, 2026-09-23, against lane L4: the guard that
-        // catches the moved outage must not catch this. Three fresh members
-        // are planned while none of them serves; by the time the third wave
-        // comes round two are up, the group reads `blocked`, and the third
-        // member -- the one that wave is for -- is still unavailable and
-        // must go through. This is the lab measurement of 2026-09-23.
+        // Allow the final unavailable bootstrap member after the first two form quorum.
         let (release, planned_obs) = three_member_cloud(3);
         let plan = planned(&release, "group=cloud", &planned_obs);
         assert!(plan.groups["cloud"].blocked.is_none());
@@ -7969,10 +7188,7 @@ mod tests {
 
     #[test]
     fn a_group_that_got_healthier_stops_nothing() {
-        // Astra finding F01, 2026-09-23: the check is about what the group
-        // can afford now, so a group that can afford MORE than the plan
-        // assumed is not the fleet moving under the plan -- not even when
-        // the host that is next is one of the members that came back.
+        // Additional healthy capacity does not invalidate the original plan.
         let (release, planned_obs) = three_member_cloud(1);
         let plan = planned(&release, "group=cloud", &planned_obs);
         assert_eq!(plan.groups["cloud"].allowed_unavailable, 0);

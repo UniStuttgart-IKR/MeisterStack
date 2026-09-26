@@ -2,21 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-install` — the one command somebody types on an installer
-//! medium, standing in front of a machine.
-//!
-//! It is the third binary of the `meister-deploy` crate: the workstation
-//! half plans and builds, `meister-activate` moves a system that is already
-//! there, and this one turns an empty disk into a host. It knows no fleet,
-//! no network and no manifest — what it knows is
-//! `/etc/meister-install/target.json`, which the medium was built with
-//! ([`meister_deploy::install`] says what is in it and why).
-//!
-//! Nothing here runs by itself. There is no unit, no timer and no autostart
-//! on the medium (D9): a person boots it, reads `/etc/issue`, and types the
-//! serial of the disk. That is the whole safety model, and it is the right
-//! one — an installer that formats a disk because a stick was left in a
-//! drive is the failure this verb exists to prevent.
+//! Interactive target installer for the embedded /etc/meister-install/target.json.
+//! A person must name the host and disk serial; no boot-time installer runs
+//! automatically. See [`meister_deploy::install`] for validation and disk effects.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -48,8 +36,7 @@ struct Cli {
     #[arg(long, default_value = install::ROOT, global = true)]
     root: PathBuf,
 
-    /// Where a partition is mounted for a moment while the installation
-    /// mark is looked for
+    /// Temporary mountpoint used to inspect installation marks.
     #[arg(long, default_value = install::PROBE_DIR, global = true)]
     probe_dir: PathBuf,
 
@@ -69,27 +56,19 @@ struct Cli {
 enum Verb {
     /// Install this medium's host onto the disk with this serial.
     Confirm {
-        /// The host, as the inventory calls it. It has to be the one this
-        /// medium was built for — the flag is there so that a person types
-        /// it and reads it back, not so that the medium can be pointed
-        /// somewhere else.
+        /// Host ID embedded in this installer; cannot select a different target.
         #[arg(long)]
         host: String,
 
-        /// The disk's own serial, as `lsblk -o SERIAL` prints it and as the
-        /// inventory records it. Never a device path: `/dev/sda` is a name
-        /// the kernel hands out in boot order.
+        /// Disk serial from lsblk and inventory, not an unstable device path.
         #[arg(long)]
         disk: String,
 
-        /// The disk's wwn, for the case where two disks carry one serial.
-        /// A virtio disk has none (M0 probe S7), so this is optional.
+        /// Optional WWN to distinguish disks sharing a serial.
         #[arg(long)]
         wwn: Option<String>,
 
-        /// Install over a disk that already carries an installation mark.
-        /// This destroys that machine's identity along with everything else
-        /// on the disk.
+        /// Allow replacing an existing installation, including its data and identity.
         #[arg(long)]
         reinstall: bool,
 
@@ -97,7 +76,7 @@ enum Verb {
         #[arg(long)]
         plan: Option<String>,
 
-        /// Check everything and print the summary — and destroy nothing.
+        /// Validate and print the summary without formatting; may mount partitions read-only.
         #[arg(long)]
         dry_run: bool,
     },
@@ -107,8 +86,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // Diagnostics on stderr, always: stdout carries the answer, and
-            // `--json` has to stay machine-readable even when it is empty.
+            // Keep diagnostics on stderr and structured output on stdout.
             eprintln!("meister-install: {e:#}");
             ExitCode::FAILURE
         }
@@ -117,13 +95,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    // A `nixos-install` can take half an hour, and a Ctrl-C has to reach it
-    // rather than leave a half-copied store on a half-mounted disk.
+    // Propagate cancellation to installer subprocesses.
     Cancel::on_sigint()?;
-    // `--dry-run` is a POLICY here, like everywhere else in this crate: the
-    // commands that look are `read` and the four that change the machine are
-    // `target-write` and `key`, so a dry run is refused by the runner rather
-    // than by somebody remembering an `if`.
+    // Dry-run rejects target-write/key commands; read-class probes may still mount partitions.
     let dry_run = match &cli.cmd {
         Verb::Confirm { dry_run, .. } => *dry_run,
     };
@@ -156,15 +130,7 @@ fn run() -> Result<()> {
                 plan.as_deref(),
                 *dry_run,
             )?;
-            // The summary on stderr and the answer on stdout, so that a
-            // person reads the first and a script reads the second.
-            //
-            // Astra finding F17, 2026-09-23: printed and FLUSHED here, before
-            // `execute` runs a single command — `confirm` used to build this
-            // same summary and hand it back only after the disko script had
-            // already run (or, on a failure partway through, never hand it
-            // back at all). The operator now sees exactly what is about to
-            // happen before anything does.
+            // Flush the destructive-action summary before executing any installation step.
             eprint!("{summary}");
             io::stderr()
                 .flush()
@@ -174,8 +140,7 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
                 if let Some(mark) = &outcome.installed {
-                    // The one line somebody has to carry away from this
-                    // console, in the shape `keys enroll` takes, and loud.
+                    // Print the host fingerprint needed for trusted enrollment.
                     println!();
                     println!("    HOST KEY FINGERPRINT  {}", mark.host_key_fingerprint);
                     println!("    machine-id            {}", mark.machine_id);

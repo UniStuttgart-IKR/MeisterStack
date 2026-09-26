@@ -2,23 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a rollout does, pinned command by command.
+//! Execution ordering and journal checks with StrictFake, MemFiles and FakeClock.
 //!
-//! The runner is the strict fake: an unexpected command is an error and an
-//! expectation nobody used is an error. So these tests are not "the code ran
-//! and did not fall over" — they are the command lines a machine would have
-//! received, in order, and the journal that was written around them.
-//!
-//! Two pieces of scaffolding, and both exist for the same reason: a test
-//! about an ORDER must not be a test about a parser or about how many times
-//! somebody looked.
-//!
-//! * [`World`] wraps the strict fake and moves the fleet the way the command
-//!   that just ran would have moved it — an `activate` puts the host on the
-//!   new system, a `revert` puts it back, a reboot takes it away for two
-//!   looks. So an observation is a consequence rather than a number of
-//!   entries in a queue somebody has to keep in step with the code.
-//! * [`TableLook`] is the [`Look`] of that world.
+//! World updates synthetic host state in response to commands; TableLook reads
+//! that state. These tests cover executor decisions without live target effects.
 
 use super::*;
 
@@ -56,25 +43,19 @@ struct TableLook {
     phase: RefCell<BTreeMap<String, Phase>>,
     /// Hosts whose new system has a unit that did not come up.
     broken: RefCell<BTreeSet<String>>,
-    /// Hosts whose required unit is down NOW, before anything is done to
-    /// them (Astra finding MD07): what an unchanged host looks like when a
-    /// service died after the plan was made.
+    /// Required units that failed after planning, including unchanged hosts.
     broken_now: RefCell<BTreeSet<String>>,
     /// The transaction each host holds, as `meister-activate status` would
     /// report it.
     txns: RefCell<BTreeMap<String, Txn>>,
     /// Hosts that never come back from their reboot.
     lost: RefCell<BTreeSet<String>>,
-    /// How many more looks this host's etcd needs before it answers, the
-    /// way a real one does after a reboot (lane 4A).
+    /// Observation count until simulated etcd recovery.
     etcd_late: RefCell<BTreeMap<String, u32>>,
     /// Hosts whose activation leaves the record a real one leaves: pending,
     /// waiting for a word.
     keeps_the_record: RefCell<BTreeSet<String>>,
-    /// Hosts whose kernel comes from OUTSIDE (lane 3-integration): an
-    /// activation moves their userland and leaves what they booted exactly
-    /// where it was, because the thing that decides that is a hypervisor.
-    /// [`TableLook::provider_boots`] is the test playing that hypervisor.
+    /// Direct-boot hosts retain their booted kernel until provider_boots runs.
     from_outside: RefCell<BTreeSet<String>>,
     asked: RefCell<Vec<String>>,
 }
@@ -102,8 +83,7 @@ impl TableLook {
         }
     }
 
-    /// This host has no boot loader: what it RUNS follows an activation and
-    /// what it BOOTED does not (lane 3-integration).
+    /// Model direct boot: activation changes current system but not booted system.
     fn boots_from_outside(self, id: &str) -> TableLook {
         self.from_outside.borrow_mut().insert(id.to_string());
         self
@@ -128,10 +108,7 @@ impl TableLook {
         self
     }
 
-    // --- lane 4A ---
-    /// Between the plan and the run, this host's store filled up. The plan
-    /// was made when there was room; the preflight is the look that finds
-    /// out there is none.
+    /// Simulate store exhaustion after planning, detected by fresh preflight.
     fn ran_out_of_room(mut self, id: &str) -> TableLook {
         for map in [&mut self.before, &mut self.after] {
             if let Some(obs) = map.get_mut(id) {
@@ -140,7 +117,6 @@ impl TableLook {
         }
         self
     }
-    // --- end lane 4A ---
 
     /// This host's activation leaves a pending transaction behind, as a
     /// real one does until somebody confirms it.
@@ -159,15 +135,11 @@ impl TableLook {
         self
     }
 
-    // --- lane 4A ---
-    /// This host's etcd answers only after `looks` more looks — which is
-    /// what a controller does after a reboot: sshd is up seconds before
-    /// the database is.
+    /// Delay etcd recovery after SSH becomes available.
     fn etcd_late(self, id: &str, looks: u32) -> TableLook {
         self.etcd_late.borrow_mut().insert(id.to_string(), looks);
         self
     }
-    // --- end lane 4A ---
 
     /// This host is told to reboot and never comes back.
     fn never_returns(self, id: &str) -> TableLook {
@@ -243,10 +215,7 @@ impl Look for TableLook {
             obs.units
                 .insert("meister-agent.service".to_string(), "failed".to_string());
         }
-        // --- lane 4A ---
-        // A member that has not answered yet reports no members at all,
-        // which is what `observe::etcd_view` makes of a unit that is not
-        // active.
+        // An unavailable etcd unit reports no members.
         if let Some(left) = self.etcd_late.borrow_mut().get_mut(&id)
             && *left > 0
         {
@@ -257,7 +226,6 @@ impl Look for TableLook {
                 members: Vec::new(),
             });
         }
-        // --- end lane 4A ---
         if let Some(txn) = self.txns.borrow().get(&id) {
             obs.open_txns = vec![txn.clone()];
         }
@@ -288,10 +256,7 @@ impl<'a> World<'a> {
 impl Runner for World<'_> {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         let out = self.inner.run(cmd);
-        // A command whose CONNECTION dropped — ssh's own 255 — still
-        // happened on the far side. That is the case this fake exists to be
-        // able to show, and it is what an activation over ssh does to its
-        // own connection.
+        // Model a successful remote activation whose SSH connection returns 255.
         let happened = match &out {
             Ok(_) => true,
             Err(e) => format!("{e:#}").contains("exited 255"),
@@ -305,10 +270,7 @@ impl Runner for World<'_> {
             .iter()
             .find_map(|a| a.strip_prefix("root@"))
             .and_then(address_to_host);
-        // The quotes come off first: an argument that crosses an ssh is
-        // quoted for the shell on the other side, so the reboot arrives
-        // here as `'systemctl reboot'`. Whole words all the same —
-        // `meister-activate` is not an `activate`.
+        // Remove remote-shell quoting before matching whole helper arguments.
         let says = |word: &str| cmd.args.iter().any(|a| a.trim_matches('\'') == word);
         if let Some(host) = host {
             if says("activate") {
@@ -395,9 +357,7 @@ impl Fixture {
             &["n1"],
             new_kernel,
         ));
-        // The whole fleet, not only `n1`: the control-plane host is the
-        // fleet's anchor (D6) whether it changes or not, and a selection
-        // that leaves it out leaves the anchor out with it.
+        // Include the control-plane endpoint so the run can acquire its anchor.
         Fixture::of(release, observation, "all")
     }
 
@@ -588,10 +548,7 @@ fn kinds(plan: &DeploymentPlan, id: &str) -> Vec<ActionKind> {
 
 // ---------------------------------------------------------------------------
 
-/// Astra finding F20, 2026-09-23: `reboot`'s command has to carry
-/// `Effect::TargetWrite`, not the `Effect::Read` every other `ssh.ask`
-/// caller gets — a `--dry-run` run's policy admits `Offline` and `Read`
-/// only, and a reboot tagged `Read` would have slipped through it.
+/// Reboot commands must be TargetWrite so dry-run policy refuses them.
 #[test]
 fn reboot_is_a_target_write_and_a_dry_run_refuses_it() {
     let fx = Fixture::unchanged();
@@ -646,8 +603,7 @@ fn a_host_that_already_runs_the_release_is_journalled_and_not_touched() {
         );
     }
     assert!(applied.receipt.untouched.is_empty());
-    // It is in the journal, which is what makes the receipt `success`
-    // rather than `partial` (2A's finding).
+    // Record unchanged hosts so the receipt includes their forward outcome.
     let states: Vec<String> = fx
         .journal_lines("run-1")
         .into_iter()
@@ -661,8 +617,7 @@ fn a_host_that_already_runs_the_release_is_journalled_and_not_touched() {
         })
         .collect();
     assert_eq!(states, ["box:unchanged", "n1:unchanged", "n2:unchanged"]);
-    // Astra finding MD07, 2026-09-25: "unchanged" still made its required
-    // checks, and the journal carries their results.
+    // Unchanged hosts retain required-check evidence.
     for id in ["n1", "n2"] {
         let verify = applied.receipt.hosts[id]
             .actions
@@ -682,9 +637,7 @@ fn a_host_that_already_runs_the_release_is_journalled_and_not_touched() {
     );
 }
 
-// Astra finding MD07, 2026-09-25: a host that runs the release and whose
-// required service is down is not "unchanged" — it is wrong, and the run
-// says so instead of ending green.
+// An unchanged system with a failed required service fails the run.
 #[test]
 fn an_unchanged_host_whose_required_unit_is_down_fails_its_checks() {
     let fx = Fixture::unchanged();
@@ -729,7 +682,7 @@ fn an_unchanged_host_whose_required_unit_is_down_fails_its_checks() {
     );
 }
 
-// Astra finding MD05, 2026-09-25: the anchor is not a host's step lock.
+// Host Unlock must retain the fleet anchor.
 #[test]
 fn a_hosts_own_unlock_step_does_not_give_back_the_fleet_anchor() {
     let fx = Fixture::changing(&["n1"], false);
@@ -900,10 +853,7 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     assert!(at_of("ActionBegin:activate") < at_of("ActionIrreversible:activate"));
     assert!(at_of("ActionIrreversible:activate") < at_of("ActionEnd:activate"));
 
-    // --- lane 4A ---
-    // And the preflight wrote down WHAT it checked, so that a receipt read
-    // a week later says which machine this release went onto and not only
-    // that somebody looked.
+    // Retain hardware preflight evidence in the receipt.
     let preflight = applied.receipt.hosts["n1"]
         .actions
         .iter()
@@ -912,14 +862,8 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     let evidence = preflight.evidence.join(" ");
     assert!(evidence.contains("free for a closure of"), "{evidence}");
     assert!(evidence.contains("has /dev/kvm"), "{evidence}");
-    // --- end lane 4A ---
 
-    // --- lane 5C ---
-    // And the journal replays into itself. Every run of lab lane L2 ended
-    // with "entry N says box left the state activating and the journal had
-    // it in staged; a line is missing", because `activating` only ever
-    // reached this process's memory. A journal that cannot be folded
-    // without a break is a journal a resume cannot trust.
+    // Every host transition must replay without a journal break.
     let states: Vec<String> = fx
         .journal_lines("run-1")
         .into_iter()
@@ -944,17 +888,10 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
         "a finished rollout left a hole in its own journal: {:?}",
         folded.breaks
     );
-    // --- end lane 5C ---
 }
 
-// --- lane 4C: the cache is a shortcut inside the copy --------------------
 
-/// The fleet, changed on `n1`, with a release that was pushed into a cache.
-///
-/// `build_env` is NOT part of `release_id` (a release built on a laptop and
-/// one built on a farm are the same release), so saying where the closures
-/// went afterwards is a statement about this release and not a different
-/// one — which is what makes this two lines instead of a second fixture.
+/// Add cache provenance without changing release identity.
 fn changing_with_a_cache(cache: Option<&str>) -> Fixture {
     let mut fx = Fixture::changing(&["n1"], false);
     fx.release.build_env.cache_url = cache.map(str::to_string);
@@ -1103,14 +1040,11 @@ fn a_target_that_names_no_substituter_is_pushed_to_even_when_there_is_a_cache() 
     a_plain_copy_is_what_happens(fx, "n2", "10.0.0.12");
 }
 
-// --- end lane 4C ---------------------------------------------------------
 
 #[test]
 fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
-    // The case the VM test found: `switch-to-configuration` restarts sshd
-    // and the network under the very connection that started it, so the
-    // activation succeeds and the ssh comes back 255 with nothing to say.
-    // What decides is the transaction record on the target.
+    // A dropped SSH connection can follow successful activation; target
+    // transaction evidence determines the result.
     let fx = Fixture::changing(&["n1"], false);
     let look = TableLook::new(&fx).keeps_the_record("n1", "run-1", &fx.top("n1"));
     let runner = World::new(
@@ -1148,7 +1082,7 @@ fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
     assert_eq!(applied.stopped, None, "{:?}", applied.stopped);
     runner.verify().expect("every expectation was used");
     assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
-    // And the receipt says what happened rather than hiding it.
+    // Retain the failure in the receipt.
     let evidence: Vec<String> = applied.receipt.hosts["n1"]
         .actions
         .iter()
@@ -1232,10 +1166,8 @@ fn a_fleet_that_moved_under_the_plan_stops_before_anything_is_done() {
         "{stopped}"
     );
     assert!(stopped.contains("somebody deployed to it"), "{stopped}");
-    // box and n2 already ran the release and were journalled as unchanged
-    // before n1 was reached, so the run did move forward — for two hosts
-    // that needed nothing. `partial` is that, and `aborted` would claim
-    // nothing at all had happened.
+    // Previously unchanged hosts count as forward outcomes, making this
+    // interrupted run partial rather than aborted.
     assert_eq!(applied.receipt.outcome, Outcome::Partial);
     assert!(
         applied.receipt.untouched.contains(&"n1".to_string()),
@@ -1484,7 +1416,6 @@ fn a_resume_whose_target_knows_nothing_repeats_nothing_and_asks_for_a_person() {
     assert!(stopped.contains("no transaction record"), "{stopped}");
 }
 
-// --- lane 5C ---
 
 /// A journal of a run in which `n1` went all the way through and gave its
 /// lock and its transaction record back — which is what the `unlock` step
@@ -1552,16 +1483,9 @@ fn write_finished_host_journal(fx: &Fixture, run: &str, given_back: bool) {
             .transition(from, to)
             .payload(serde_json::json!({})));
     }
-    // The `unlock` step: the record is retired on the target and the lock
-    // goes back. After this the target has NO transaction for this run.
-    //
-    // Astra finding F06, 2026-09-23: this used to be the `lock.release`
-    // line alone, which is not what the executor writes — every step
-    // carries an `action.begin` and an `action.end` around what it does.
-    // The difference matters now, because "did this run give the host back"
-    // is read off the `unlock` step's own end: the bare `lock.release` that
-    // the safety net `release_locks` writes at the end of EVERY run cannot
-    // tell a finished host from an abandoned one.
+    // Record the successful Unlock action, including retirement. A bare final
+    // lock.release event also occurs during failure cleanup and does not prove
+    // that host actions completed.
     if given_back {
         let unlock = fx
             .plan
@@ -1583,18 +1507,13 @@ fn write_finished_host_journal(fx: &Fixture, run: &str, given_back: bool) {
             .host("n1")
             .payload(serde_json::json!({"action": unlock, "kind": "unlock", "result": "ok"})));
     }
-    // And here the run stopped, before its `run.end` — a halt in front of
-    // another host's provider reboot, which is how lab lane L2 got here.
+    // Interrupt before run.end during another host's provider handoff.
 }
 
 #[test]
 fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
-    // L2 finding N7, second half. A run over two hosts that boot through
-    // their provider halts once per host. At the second resume `n1` was
-    // `committed` and its record was gone, and the table read that as "an
-    // irreversible step began and the target has no transaction record for
-    // it" — so the second resume refused the whole run and there was no
-    // supported way to finish it.
+    // A host unlocked before a later provider halt remains complete after
+    // its transaction record is retired.
     let fx = Fixture::changing(&["n1"], false);
     write_finished_host_journal(&fx, "run-1", true);
     let look = TableLook::new(&fx);
@@ -1623,15 +1542,9 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
     );
 }
 
-// Astra finding F06, 2026-09-23.
 #[test]
 fn a_resume_of_a_confirmed_but_uncleaned_host_uncordons_and_retires() {
-    // The host is `committed` — the confirm put it there — and the run
-    // stopped before its `uncordon` and its `unlock`. That was read as a
-    // host with nothing left to do, so the resume walked past both: the
-    // machine stayed cordoned, so nothing was scheduled onto it, and its
-    // transaction record stayed open, which is what makes the NEXT plan
-    // refuse to start.
+    // Resume after confirmation must still uncordon and retire the transaction.
     let fx = Fixture::changing(&["n1"], false);
     write_finished_host_journal(&fx, "run-1", false);
     let look = TableLook::new(&fx).carrying(
@@ -1677,16 +1590,10 @@ fn a_resume_of_a_confirmed_but_uncleaned_host_uncordons_and_retires() {
     }
 }
 
-// Astra finding F19, 2026-09-23.
 #[test]
 fn a_resume_after_a_completed_reboot_does_not_reboot_again() {
-    // The machine went round and came back as the system the plan wants,
-    // and the run stopped before the confirm. `reboot` was not in the set a
-    // resume skips, and `wait_for_boot` only asks whether the booted system
-    // is the wanted one — which it is — so the resume sent `systemctl
-    // reboot` again. In `mode boot` that boots the OLD generation, because
-    // the one-shot is spent and the confirm that makes the new one the
-    // default has not run: a rollout one step from done undeployed itself.
+    // Resume after a completed reboot must not reboot again before confirmation;
+    // boot mode would otherwise fall back after consuming its one-shot entry.
     let fx = Fixture::changing(&["n1"], true);
     assert!(
         kinds(&fx.plan, "n1").contains(&ActionKind::Reboot),
@@ -1737,9 +1644,7 @@ fn a_resume_after_a_completed_reboot_does_not_reboot_again() {
     );
 }
 
-// Astra finding F19, 2026-09-23.
-// Astra finding MD04, 2026-09-25: the journal has the reboot's beginning,
-// with the boot id the step saw, and not its end.
+// The journal records reboot intent and its prior boot ID without completion.
 fn write_reboot_in_flight_journal(fx: &Fixture, run: &str, boot_id_before: Option<&str>) {
     fx.state
         .begin_run(&fx.files, run)
@@ -1837,7 +1742,6 @@ fn after_an_in_flight_reboot(fx: &Fixture, phase: Phase, boot_id_now: &str) -> T
     look
 }
 
-// Astra finding MD04, 2026-09-25.
 #[test]
 fn a_resume_that_finds_the_machine_went_round_does_not_reboot_again() {
     let fx = Fixture::changing(&["n1"], true);
@@ -1891,7 +1795,6 @@ fn a_resume_that_finds_the_machine_went_round_does_not_reboot_again() {
     );
 }
 
-// Astra finding MD04, 2026-09-25.
 #[test]
 fn a_resume_that_finds_the_same_boot_still_sends_the_reboot() {
     let fx = Fixture::changing(&["n1"], true);
@@ -1923,7 +1826,6 @@ fn a_resume_that_finds_the_same_boot_still_sends_the_reboot() {
     assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
 }
 
-// Astra finding MD04, 2026-09-25.
 #[test]
 fn a_resume_that_finds_the_machine_went_round_onto_the_wrong_system_asks_for_a_person() {
     let fx = Fixture::changing(&["n1"], true);
@@ -1967,8 +1869,7 @@ fn a_resume_that_finds_the_machine_went_round_onto_the_wrong_system_asks_for_a_p
     );
 }
 
-// Astra finding MD04, 2026-09-25: a journal from before the boot id was
-// recorded, or a probe that cannot read one, falls back to the booted system.
+// Missing boot-ID evidence falls back to the booted system.
 #[test]
 fn a_resume_without_a_boot_id_goes_by_what_the_machine_booted() {
     let fx = Fixture::changing(&["n1"], true);
@@ -2016,9 +1917,7 @@ fn a_resume_without_a_boot_id_goes_by_what_the_machine_booted() {
 
 #[test]
 fn a_resume_of_a_host_that_was_switched_and_never_booted_still_boots_it() {
-    // The other side of the same condition, and the reason it is read off
-    // the journal rather than set for every resume: a host whose run died
-    // between the activation and the reboot still has to go round.
+    // An interrupted activation that has not rebooted must still reboot.
     let fx = Fixture::changing(&["n1"], true);
     write_interrupted_journal(&fx, "run-1");
     let look = TableLook::new(&fx).carrying(
@@ -2058,17 +1957,9 @@ fn a_resume_of_a_host_that_was_switched_and_never_booted_still_boots_it() {
 
 #[test]
 fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
-    // The shape behind L2 finding N8, pinned where it is decided rather
-    // than by walking a whole rollout: `box` is a control-plane host, so
-    // it is the fleet anchor (D6) AND — when the release changes it — a
-    // host with a `lock` step of its own. Both go through `lock_cmd`, so
-    // under `--takeover` the SAME `lock take-over --of-run <old>` reaches
-    // that host twice.
-    //
-    // The second call finds the host held by the run that is doing the
-    // taking. In the lab that was the end of the rollout: "this host is
-    // held by the run <new>, not by <old>. Nothing was taken over."
-    // tools/meister-deploy/src/activate.rs answers yes to it now.
+    // A control-plane host can receive takeover twice: once for its anchor and
+    // once for its host action. The helper must accept the second call by the
+    // new owner.
     let fx = Fixture::changing(&["box"], false);
     let look = TableLook::new(&fx);
     let runner = World::new(StrictFake::new(), &look);
@@ -2093,7 +1984,6 @@ fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
     );
 }
 
-// --- end lane 5C ---
 
 #[test]
 fn a_resume_of_another_plan_is_refused_by_name() {
@@ -2328,10 +2218,7 @@ fn an_unknown_number_of_guests_is_not_an_empty_host() {
 
 #[test]
 fn the_anchor_says_when_it_could_not_hold_a_control_plane_host() {
-    // The selection is n1 alone; the anchor still wants box, because a
-    // second operator in a second checkout is what it is for (D6). box has
-    // no frozen endpoint in this plan, so the anchor is incomplete and says
-    // so rather than pretending.
+    // An unselected anchor without a frozen endpoint leaves exclusion incomplete.
     let release = with_new_systems(onebox_enrolled(), &["n1"], false);
     let before = release_of(onebox_enrolled());
     let observation = observed(&before, at(NOW));
@@ -2402,11 +2289,7 @@ fn write_interrupted_journal(fx: &Fixture, run: &str) {
     // And here the workstation went away: no `action.end`, no `run.end`.
 }
 
-/// A reboot-class host that activated, went round, came back — and then the
-/// run stopped, before the verify and before the confirm.
-///
-/// Astra finding F19, 2026-09-23: this is the window in which a resume used
-/// to send `systemctl reboot` a second time.
+/// Fixture interrupted after activation and reboot, before verify/confirm.
 fn write_rebooted_journal(fx: &Fixture, run: &str) {
     fx.state
         .begin_run(&fx.files, run)
@@ -2492,7 +2375,7 @@ fn write_rebooted_journal(fx: &Fixture, run: &str) {
 
 #[test]
 fn every_mutating_step_is_preceded_by_a_fresh_look() {
-    // The rule of §6, read off the list rather than trusted.
+    // Check the permitted step set directly.
     for kind in [
         ActionKind::Stage,
         ActionKind::Cordon,
@@ -2518,17 +2401,10 @@ fn every_mutating_step_is_preceded_by_a_fresh_look() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// lane 3B: deliver-secret
-// ---------------------------------------------------------------------------
+// Credential delivery.
 
-/// One host, one file to put there, and the operator's own copy of it on a
-/// fake disk.
-///
-/// `host=n1` and not the whole fleet: what these tests are about is the
-/// step, and a plan over one host is a plan whose every command is one of
-/// its own. The identity key of the fixture is `target-generated` and never
-/// travels, which is half of what is being shown.
+/// One-host delivery fixture with local public bytes and a target-generated
+/// identity key that must never be uploaded.
 fn delivering() -> (Fixture, String) {
     let release = release_of(onebox_enrolled());
     let mut observation = observed(&release, at(NOW));
@@ -2540,11 +2416,7 @@ fn delivering() -> (Fixture, String) {
     n1.credentials.insert("ca-bundle".to_string(), None);
     let contents = "a certificate authority\n".to_string();
     let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
-    // Astra finding F10, 2026-09-23: the planner writes down the digest of
-    // the file it decided the step from, and the step carries it. The shared
-    // fixture uses the word `fingerprint-of-<id>` for a public file, which is
-    // not a digest and binds nothing, so this one host's CA bundle gets the
-    // real one -- what an operator's plan holds.
+    // Use a real content digest so the action binds the exact delivery bytes.
     expected.entry("n1".to_string()).or_default().insert(
         "ca-bundle".to_string(),
         format!("sha256:{}", crate::ids::sha256_hex(contents.as_bytes())),
@@ -2742,17 +2614,8 @@ fn a_digest_the_host_does_not_agree_with_fails_the_step() {
     assert!(why.contains("Something is between the two"), "{why}");
 }
 
-/// The plan named the bytes, and the file on the workstation is not those
-/// bytes any more.
-///
-/// Astra finding F10, 2026-09-23: a `deliver-secret` step used to say only
-/// "<id> at <path>", so the executor re-read the operator's file and checked
-/// the host's copy against whatever it had just read -- which always agreed.
-/// A certificate re-issued, or a revocation list rolled back, between the
-/// plan and the run was therefore delivered under the plan_id of a plan that
-/// was about a different file. A rotation has refused this from the start;
-/// so does an ordinary delivery now, with the same sentence and before
-/// anything is sent.
+/// Refuse changed local credential bytes before uploading anything under
+/// the old plan digest.
 #[test]
 fn a_deliver_of_a_file_that_changed_after_the_plan_is_refused() {
     let (fx, planned_contents) = delivering();
@@ -2819,16 +2682,8 @@ fn a_key_the_target_made_is_never_delivered_even_if_a_plan_asks() {
     runner.verify().unwrap();
 }
 
-/// A unit that is running is restarted; one that is not is left alone —
-/// which is what a bootstrap is, because the unit is waiting for the very
-/// file being delivered.
-///
-/// Three cases and not two, and the third one was paid for in the lab
-/// (lane L2, 2026-09-23): a fresh host still runs the generic image, which
-/// has no roles and therefore does NOT HAVE the unit. `systemctl is-active`
-/// answers 4 for a unit this machine does not know, prints `inactive`, and
-/// the whole wave ended there — on the one host the bootstrap was about to
-/// give that unit to.
+/// Restart running units only. Inactive and missing units are valid probe
+/// answers during bootstrap.
 #[test]
 fn a_unit_is_poked_only_when_it_is_running() {
     for (running, code) in [(true, 0), (false, 3), (false, 4)] {
@@ -2947,9 +2802,7 @@ fn a_unit_is_poked_only_when_it_is_running() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// lane 3-integration: the step this tool does not take
-// ---------------------------------------------------------------------------
+// Provider reboot handoff.
 
 /// Everything a direct-boot host's rollout runs BEFORE the halt, in order.
 /// The halt itself is what each of the three tests below does differently.
@@ -3019,10 +2872,7 @@ fn a_direct_host_stops_in_front_of_its_provider_and_writes_the_bundle_down() {
     // while somebody arranges a hypervisor would be holding it for hours.
     let runner = World::new(
         up_to_the_halt(&fx)
-            // In host order, because that is the order the run gives the
-            // doors back in when it ends rather than when a host's own
-            // `unlock` step runs — and this run's last host never got that
-            // far.
+            // Final cleanup releases remaining locks in host order.
             .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok())
             .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok()),
         &look,
@@ -3104,9 +2954,7 @@ fn a_direct_host_stops_in_front_of_its_provider_and_writes_the_bundle_down() {
 
 #[test]
 fn a_resume_before_the_provider_has_been_halts_again_and_changes_nothing() {
-    // The counter-probe the lane brief asks for: `apply --resume` BEFORE the
-    // provider did its half is the same answer again, not a reboot and not a
-    // failure.
+    // Resume before provider completion returns the handoff again.
     let fx = Fixture::changing_direct(true);
     let look = TableLook::new(&fx).boots_from_outside("n1");
     let runner = World::new(
@@ -3221,10 +3069,7 @@ fn a_resume_after_the_provider_has_been_asks_the_machine_and_finishes() {
 
 #[test]
 fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
-    // The table itself, which is what a resume of a host that never opened a
-    // transaction stands on: a `reboot_only` direct host is switched,
-    // unbooted and holds no record at all, and asking the txn view first
-    // would call that `recovery-required`.
+    // Provider handoff on a reboot-only host is valid without a transaction.
     use crate::receipt::{HostRun, Step, next_step};
 
     let mut run = HostRun::new("n1");
@@ -3253,7 +3098,6 @@ fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
     assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
 }
 
-// --- lane 4A: the preflight at the run ------------------------------------
 
 #[test]
 fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {
@@ -3309,13 +3153,8 @@ fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {
 
 #[test]
 fn a_raft_member_is_not_back_until_its_database_is() {
-    // What `vm-kernel-change` found on a machine that had just rebooted:
-    // sshd answered at five seconds into the boot and etcd at thirteen,
-    // and in that window the host's own member list is EMPTY. The quorum
-    // arithmetic reads that as a member that is down and the topology
-    // check read it as a fleet that had changed — so the rollout stopped
-    // in the middle of the reboot it had asked for. `wait_for_boot` now
-    // waits for the database of a raft member, not only for the machine.
+    // Wait for etcd after SSH returns so temporary empty membership is not
+    // misclassified as a topology change.
     let fx = Fixture::changing(&["box"], true);
     let look = TableLook::new(&fx).etcd_late("box", 2);
     let runner = World::new(StrictFake::new(), &look);
@@ -3375,16 +3214,8 @@ fn a_raft_member_is_not_back_until_its_database_is() {
 
 #[test]
 fn a_member_of_a_group_that_was_not_serving_is_back_when_the_machine_is() {
-    // --- lane L4 ---
-    // The wait above is for a window of SECONDS. A group that is coming
-    // into existence has no such window: the first member of a fresh
-    // three-member cluster has no majority to elect a leader with, so
-    // `etcdctl endpoint health` cannot answer until the SECOND member is
-    // activated — which is the next wave, which does not start until this
-    // one finishes. Measured in the lab on 2026-09-23: the first bootstrap
-    // of a three-member control plane sat in this loop with "it booted the
-    // release and its etcd has not answered yet" until the reboot deadline,
-    // and the run failed.
+    // Do not wait for quorum on the first member of an entirely unhealthy
+    // bootstrap group; later waves must activate peers first.
     let fx = Fixture::changing(&["box"], true);
     // What the plan says about the group is what decides it. `box` is the
     // raft group of this fixture; make it a group that was NOT serving when
@@ -3428,9 +3259,7 @@ fn a_member_of_a_group_that_was_not_serving_is_back_when_the_machine_is() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// lane 5A: the revocation list
-// ---------------------------------------------------------------------------
+// CRL delivery.
 
 const CRL_PUT: &str = "set -e; d=$(dirname /var/lib/meisterstack/pki/crl.pem); mkdir -p \"$d\"; \
                        t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; chown root:root \"$t\"; \
@@ -3473,12 +3302,7 @@ fn revoking() -> (Fixture, String) {
     (fx, contents)
 }
 
-/// The whole step, and the one thing that must NOT be in it: a restart.
-///
-/// A controller re-reads its revocation list within half a minute. Poking
-/// the unit would be the single avoidable outage in this design — on every
-/// host of the fleet, for every revocation — so the list is written, the
-/// host is asked what it now has, and nothing else happens.
+/// CRL delivery verifies the file without restarting readers that refresh it.
 #[test]
 fn a_revocation_list_is_delivered_and_no_unit_is_restarted() {
     let (fx, contents) = revoking();
@@ -3488,9 +3312,7 @@ fn a_revocation_list_is_delivered_and_no_unit_is_restarted() {
     // is what the one derivation writes.
     let runner = World::new(
         StrictFake::new()
-            // Twice: the fleet anchor holds every control-plane host of the
-            // inventory (D6), and this host is one — and it is also the
-            // host of this plan, so its own `lock` step takes it as well.
+            // Acquire both the control-plane anchor and its planned host lock.
             .expect(helper("box", &["lock", "acquire"]), ok())
             .expect(helper("box", &["lock", "acquire"]), ok())
             .expect(shell_on("box", CRL_PUT), ok())
@@ -3548,9 +3370,7 @@ fn a_revocation_list_is_delivered_and_no_unit_is_restarted() {
     assert!(evidence.contains(&format!("sha256:{digest}")), "{evidence}");
 }
 
-// ---------------------------------------------------------------------------
-// lane 5A: the rotation
-// ---------------------------------------------------------------------------
+// Key rotation.
 
 const NEW_CERT: &str = "-----BEGIN CERTIFICATE-----\nthe new one\n-----END CERTIFICATE-----\n";
 
@@ -3995,11 +3815,8 @@ fn a_resume_carries_a_rotation_on_from_the_phase_the_host_is_at() {
 #[test]
 fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
     let (fx, _) = rotating();
-    // Astra finding F09, 2026-09-23: the run being resumed here ran its
-    // whole `keys remove` step, and the LOCAL half of that step is what
-    // makes the certificate this rotation issued the repository's own. A
-    // resume asks for that half now — the host cannot answer it — so the
-    // fixture says what a finished run leaves behind.
+    // Represent local publication as well as remote cleanup in a completed
+    // rotation fixture.
     fx.files
         .write_atomic(
             &PathBuf::from("/repo/pki/issued/box/identity.crt"),
@@ -4052,16 +3869,10 @@ fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
     assert_eq!(applied.receipt.outcome, Outcome::Success);
 }
 
-// Astra finding F09, 2026-09-23.
 #[test]
 fn a_resume_after_the_remote_removal_still_publishes_the_new_cert() {
-    // The last phase has two halves: the old pair goes on the host, and the
-    // certificate this rotation issued becomes the repository's own — which
-    // is what the planner compares every host against. The host answers
-    // `confirmed` for the first half alone, and that was read as `done`, so
-    // a run that died between the two left the OLD certificate in the
-    // repository and the next ordinary plan delivered it back over the new
-    // one, undoing the rotation in a plan nobody read as one.
+    // Target confirmation alone cannot establish local certificate publication.
+    // Resume must publish the new active certificate before later plans compare it.
     let (fx, digest) = rotating();
     write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
     let look = TableLook::new(&fx);
@@ -4132,29 +3943,11 @@ fn a_resume_after_the_remote_removal_still_publishes_the_new_cert() {
     }
 }
 
-// --- lane 5B: what `scripts/check-push-pki.sh` asked ----------------------
-//
-// The pre-v1 road delivered certificates with `deploy/push.sh pki`: an rsync
-// of a staging directory under FIXED file names, followed by `chown` and
-// `chmod` at the far end. Four questions decided whether that was safe, and
-// a 264-line shell script with ssh and rsync stubs on `PATH` answered them
-// (28 checks). The script goes with M5B. These four tests are the same four
-// questions, asked of the road that replaced it — the plan's
-// `deliver-secret` steps and the executor that carries them out.
-//
-// They are stronger than the script was in one place and weaker in none:
-// question B used to be a fixed order (agents, clusters, clouds) and is now
-// the DIRECTION of the plan, which is the reverse for a bootstrap — and the
-// reason it is reversed is a fact about the fleet rather than a constant in
-// a script.
+// Delivery contracts: host-specific references, rollout direction, file modes
+// and inactive-unit handling.
 
-/// A: every host gets the files its own roles name, and nobody else's.
-///
-/// This is the question the script existed for: two clusters with different
-/// names, and an rsync that puts one cluster's `identity.crt` on the other
-/// host. Here there is no staging directory and no fixed name to get wrong —
-/// a delivery step names the secret reference of ONE host, and the executor
-/// looks it up in that host's own `secret_refs` (`Executor::deliver`).
+/// Deliver only references declared by the target host, including the correct
+/// cluster identity when multiple clusters exist.
 #[test]
 fn every_host_gets_the_files_its_roles_name_and_no_others() {
     let release = release_of(onebox_enrolled());
@@ -4210,10 +4003,7 @@ fn every_host_gets_the_files_its_roles_name_and_no_others() {
                     .collect::<Vec<_>>()
             );
         }
-        // And nothing of another host's is in there. A cluster identity
-        // belongs to the GROUP, so two hosts may legitimately be handed the
-        // same file — what may not happen is a host being handed a
-        // reference it does not declare, which is what the loop above holds.
+        // Shared group identities are valid; undeclared host references are not.
         assert_eq!(
             steps.len(),
             steps.iter().collect::<BTreeSet<_>>().len(),
@@ -4222,14 +4012,8 @@ fn every_host_gets_the_files_its_roles_name_and_no_others() {
     }
 }
 
-/// B: the order, and why it is not a constant.
-///
-/// `push.sh` went agents, then clusters, then clouds, always. That is right
-/// for an UPGRADE — the tier below is taken forward first, so a controller
-/// never issues a command the tier under it does not understand yet — and
-/// it is exactly wrong for a BOOTSTRAP, where a node has nothing to dial
-/// until the thing it dials exists. The planner derives the direction from
-/// the kind; these two assertions are the two directions.
+/// Upgrade order advances lower tiers first; bootstrap order establishes
+/// controllers before their dependents.
 #[test]
 fn the_order_is_the_bottom_tier_first_and_a_bootstrap_is_the_other_way_round() {
     // A release in which every host has a new system, because a plan only
@@ -4287,14 +4071,7 @@ fn the_order_is_the_bottom_tier_first_and_a_bootstrap_is_the_other_way_round() {
     );
 }
 
-/// C: the modes, and who owns the file.
-///
-/// The script ran a real `chmod` in a temporary tree and read the result
-/// back. Here the mode is not something a step decides at all: it is a field
-/// of the secret reference the FLEET derived, and the executor passes it
-/// through to the far end verbatim. So there are two things to hold: the
-/// derivation gives a private file 0600 and a public one 0644, and the put
-/// carries exactly what the reference says.
+/// Check public/private reference modes and their exact propagation into upload.
 #[test]
 fn a_private_file_is_0600_at_the_far_end_and_a_public_one_0644() {
     let release = release_of(onebox_enrolled());
@@ -4388,5 +4165,3 @@ fn a_secret_that_is_not_here_names_the_host_and_the_file_and_sends_nothing() {
         runner.calls()
     );
 }
-
-// --- end lane 5B ---------------------------------------------------------

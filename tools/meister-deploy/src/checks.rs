@@ -2,19 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A check is a data object, not a line of output.
-//!
-//! One shape for every check in this tool — the readiness checks a rollout
-//! runs, the `nix flake check` results a release records, the verification
-//! suites of M4 — because they all end up in the same three places: a
-//! release, a receipt, and a report somebody reads afterwards. A check that
-//! only exists as a printed line cannot be any of those.
-//!
-//! The important part is [`Status`] having five values rather than two. "I
-//! could not tell" and "I did not look" are not passes, and the difference
-//! between them is the difference between a broken probe and a machine that
-//! was never reachable. A tool that folds them into `fail` makes people
-//! ignore failures; one that folds them into `pass` ships.
+//! Shared check results for releases, readiness, verification, and receipts. Required Fail,
+//! Unknown, and Skipped results block acceptance; Pass and NotApplicable do not.
 
 use serde::{Deserialize, Serialize};
 
@@ -157,10 +146,7 @@ impl Acceptance {
     }
 }
 
-/// Required checks decide. A required check that did not pass — including one
-/// that could not tell and one that never ran — blocks, and the reason names
-/// the check, its subject and what it expected, because "readiness failed" is
-/// not something anybody can act on.
+/// Collect blocking required checks with their subject, expectation, observation, and reason.
 pub fn acceptance(results: &[CheckResult]) -> Acceptance {
     let reasons: Vec<String> = results
         .iter()

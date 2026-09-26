@@ -2,18 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The fleet the unit tests of this crate argue about.
-//!
-//! One fixture, built from the file lane 1B has to produce —
-//! `tests/fixtures/nix-manifest-onebox.json`, read through the real
-//! [`crate::manifest::NixManifest`] parser and the real
-//! [`crate::manifest::resolve`]. So a test about a plan is a test about a
-//! manifest that would actually validate, and a change to the contract
-//! breaks these tests where it should: at the contract.
-//!
-//! Three hosts: `box` (cloud, cluster, agent, addons — a raft group of ONE,
-//! which is the singleton case), `n1` and `n2` (agents in the `compute`
-//! group). Compiled only for tests.
+//! Test-only fleet and evidence builders using the real manifest parser and resolver. The
+//! base fixture has box (four roles, singleton raft) and n1/n2 (compute). Artifacts and
+//! observations are synthetic, not deployment evidence.
 
 use std::collections::BTreeMap;
 
@@ -148,13 +139,8 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     .expect("the fixture binds")
 }
 
-/// The same fleet with every host enrolled.
-///
-/// `n2` has no host key in the file on purpose — it is the fixture's
-/// unenrolled host — and most tests about a rollout are not about that, so
-/// they start from here. The manifest id is recomputed, because a fleet
-/// whose content was edited and whose id was not is a fleet
-/// `validate` refuses.
+/// Enroll every fixture host and recompute the manifest ID. The base fixture deliberately
+/// leaves n2 unenrolled.
 pub fn onebox_enrolled() -> ResolvedFleet {
     let mut fleet = onebox();
     for (id, host) in fleet.hosts.iter_mut() {
@@ -167,14 +153,7 @@ pub fn onebox_enrolled() -> ResolvedFleet {
     fleet
 }
 
-/// The same fleet with one host turned into a direct-boot guest.
-///
-/// The fixture's three hosts all boot themselves, which is the common case
-/// and the one most tests are about. A test about the OTHER boot mode needs
-/// a host whose kernel comes from outside, and building a second fixture
-/// file for one field would be two fixtures to keep in step. The manifest id
-/// is recomputed, because a fleet whose content was edited and whose id was
-/// not is a fleet `validate` refuses.
+/// Convert one fixture host to direct boot, update its artifacts, and recompute identity.
 pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
     {
         let host = fleet
@@ -193,7 +172,6 @@ pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
     fleet
 }
 
-// --- lane 5C ---
 /// The same for a host that boots itself out of grub: no ESP, no bundle,
 /// and no way back from a boot (L2 finding N4).
 pub fn with_grub_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
@@ -212,7 +190,6 @@ pub fn with_grub_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
         crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
     fleet
 }
-// --- end lane 5C ---
 
 /// The bundle that belongs to such a host: the paths its own manifest
 /// promised, plus the directory that holds them.
@@ -239,13 +216,8 @@ pub fn bundle_for(fleet: &ResolvedFleet, id: &str) -> crate::release::DirectBoot
     }
 }
 
-/// The same fleet after a new evaluation: the named hosts got a new system —
-/// which is what a changed profile or a changed input actually looks like: a
-/// new evaluation, a new manifest, a new set of store paths.
-///
-/// Separate from [`with_new_systems`] because a fleet with a direct-boot host
-/// cannot become a release without its bundles ([`direct_release_of`]), and a
-/// test about the second boot mode needs the fleet in between.
+/// Change selected toplevels and optionally their boot artifacts, then recompute identity.
+/// Return the fleet so direct-boot tests can bind matching bundles separately.
 pub fn with_new_toplevels(
     mut fleet: ResolvedFleet,
     hosts: &[&str],
@@ -264,10 +236,7 @@ pub fn with_new_toplevels(
             host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
             host.build.boot.kernel_version = "6.12.48".to_string();
         }
-        // The command line of a direct-boot host names the system its kernel
-        // is to start, so a new toplevel is a new command line. A fixture
-        // that kept the old one would describe a guest booting the system
-        // before the one this release builds.
+        // Direct-boot command lines must select the new toplevel through init=.
         if host.build.boot.mode == crate::manifest::BootMode::Direct {
             host.build.boot.cmdline =
                 Some(format!("loglevel=4 init={}/init", host.build.toplevel_out));
@@ -318,11 +287,8 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
     for (id, host) in &fleet.hosts {
         let artifacts = &release.artifacts[id];
         let system = artifacts.toplevel.store_path.clone();
-        // Every unit the probe of this host asks about, so that a fixture
-        // is what a real snapshot of a healthy host looks like: a unit the
-        // probe asked about and nobody answered is `unknown` to the
-        // readiness checks, and a fixture that left half of them out would
-        // make a healthy host look half-read.
+        // Populate every unit requested by the real probe; missing answers would produce
+        // Unknown readiness.
         let units: BTreeMap<String, String> = crate::observe::ProbeSpec::for_host(host)
             .units
             .into_iter()
@@ -373,11 +339,8 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 lock: None,
                 capabilities: host.hardware.capabilities.clone(),
                 enrolled: true,
-                // --- lane 4A: a machine that is what the fleet says ---
-                // Forty gigabytes against a two-gigabyte closure: a healthy
-                // fixture is one where the preflight has nothing to say, so
-                // every test about a hardware finding has to put the
-                // finding there itself.
+                // Provide ample free space by default; hardware-failure tests override this
+                // evidence.
                 disk_free_nix_bytes: Some(40_000_000_000),
                 pci: host
                     .hardware
@@ -401,7 +364,7 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 // units are the release's units and the planner has nothing
                 // to call new.
                 generation_units: host.units.clone(),
-                // --- end lane 4A ---
+
                 unknown_reason: None,
             },
         );
@@ -452,13 +415,8 @@ fn etcd_view(fleet: &ResolvedFleet, id: &str) -> Option<EtcdView> {
     })
 }
 
-/// What the operator's own disk holds when every certificate of this fleet
-/// has been issued — and it matches, secret for secret, what
-/// [`observed`] puts on the hosts.
-///
-/// The public files by content (the same string the snapshot carries), the
-/// private ones by existence. A key the target made itself has no local
-/// half at all and is not in here, which is the whole point of it.
+/// Synthetic local credentials matching observed(). Public files compare by content; private
+/// files by presence. Target-generated keys have no local source.
 pub fn expected_credentials(
     fleet: &ResolvedFleet,
 ) -> BTreeMap<String, crate::pki::ExpectedCredentials> {
@@ -496,18 +454,8 @@ pub fn plan_policy_with_certificates(kind: PlanKind, fleet: &ResolvedFleet) -> P
     plan_policy(kind).with_expected_credentials(expected_credentials(fleet))
 }
 
-// --- lane 5A ---------------------------------------------------------------
-
-/// The same fleet, with the hosts that carry a controller reading a
-/// revocation list.
-///
-/// A separate helper rather than a line in the fixture file, for the reason
-/// `with_direct_host` is one: `auth.crl` is not rendered by the one
-/// derivation today (a controller refuses to start without a file it names,
-/// and no fleet has been delivered one yet), so a fixture that carried it
-/// everywhere would describe a fleet that does not exist. The manifest id is
-/// recomputed, because a fleet whose content was edited and whose id was not
-/// is a fleet `validate` refuses.
+/// Add CRL references for selected controller roles and recompute the manifest ID. Tests opt
+/// into revocation independently of the base fixture.
 pub fn with_crl(mut fleet: ResolvedFleet, hosts: &[&str]) -> ResolvedFleet {
     for id in hosts {
         let host = fleet
@@ -537,10 +485,8 @@ pub fn with_crl(mut fleet: ResolvedFleet, hosts: &[&str]) -> ResolvedFleet {
                 owner: "root".to_string(),
                 mode: "0644".to_string(),
                 delivery: crate::manifest::Delivery::File,
-                // What the one derivation renders: a unit per file. The
-                // planner and the executor are what decide that a list is
-                // not poked, and a test that left this out would be a test
-                // of a manifest nobody writes.
+                // Retain the rendered reload metadata; CRL delivery deliberately avoids
+                // restarting its reader.
                 reload: Some(crate::manifest::Reload {
                     unit: format!("meister-{role}-controller.service"),
                     action: "restart".to_string(),
@@ -553,13 +499,9 @@ pub fn with_crl(mut fleet: ResolvedFleet, hosts: &[&str]) -> ResolvedFleet {
     fleet
 }
 
-/// The same fleet, with a certificate beside the key a host makes itself.
-///
-/// The checked-in manifest is older than the shape `nix/lib/manifest.nix`
-/// renders today: it carries `identity.key` but no `identity.crt`, and a
-/// rotation is about the pair. Rather than rewrite a fixture every other
-/// test's ids are computed from, this adds the reference the way the one
-/// derivation writes it — one per file AND unit.
+/// Add certificate references beside target-generated keys, one per file and consuming role.
+/// This extends the historical fixture without changing every test using its original content
+/// ID.
 pub fn with_cert(mut fleet: ResolvedFleet, hosts: &[&str], kind: &str) -> ResolvedFleet {
     for id in hosts {
         let host = fleet

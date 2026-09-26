@@ -2,47 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One truth about ssh, and it is written down once.
+//! SSH command construction with repository-owned host-key trust.
 //!
-//! The pre-v1 tool had three: `remote.rs` offered
-//! `StrictHostKeyChecking=accept-new` when it was being careful and
-//! `StrictHostKeyChecking=no` plus `UserKnownHostsFile=/dev/null` when it
-//! was not, and `nixos-rebuild --target-host` got no ssh options at all —
-//! so the closure that changed a machine travelled over a connection nobody
-//! had told anything about which machine it was. Three answers to one
-//! question is how a fleet ends up trusting whoever answers on the address.
-//!
-//! Here there is one answer (D10):
-//!
-//! * `StrictHostKeyChecking=yes` against a `known_hosts` FILE IN THE
-//!   OPERATOR'S REPOSITORY — public, committed, reviewed in a diff. A host
-//!   that is not in it is not reachable, and the sentence says to run
-//!   `keys enroll`. `accept-new` is trust-on-first-use, which is trust in
-//!   whoever is faster; it appears nowhere outside `legacy/`, and
-//!   `tests/ssh_is_strict.rs` reads the source to keep that true.
-//! * `GlobalKnownHostsFile=/dev/null`, because the fleet's trust is the
-//!   file in the repository and not whatever `/etc/ssh` on this workstation
-//!   has collected.
-//! * `BatchMode=yes` and `IdentitiesOnly=yes`: no prompt can hang a rollout,
-//!   and the key that is used is the one that was named rather than whatever
-//!   an agent happens to hold.
-//! * `ConnectTimeout` and `ServerAlive*`, so that a host which stops
-//!   answering mid-command ends the command instead of holding a lock on a
-//!   fleet. (M0's own two-VM probe hung until a 3600-second test timeout for
-//!   exactly the want of `BatchMode` and a deadline.)
-//!
-//! The same options are also what `nix copy --to ssh-ng://` must use, and
-//! nix takes them through the environment variable `NIX_SSHOPTS` as ONE
-//! string which it splits on white space. There is no quoting in that
-//! splitting — nix's tokenizer does not remove quotes and neither does the
-//! shell for an unquoted expansion — so a path with a space in it cannot be
-//! passed that way at all. [`Ssh::nix_sshopts`] says so in a sentence
-//! rather than producing a string that means something else than the
-//! argument vector beside it.
-//!
-//! What is NOT here: anything that changes a target. [`Ssh::put`] builds the
-//! command and is used by lane 2C and by `keys deliver` in M3; this lane
-//! only ever asks.
+//! Connections require existing known_hosts entries, batch mode and explicit
+//! timeouts. Global host keys and X11/agent forwarding are disabled. The same
+//! options reach Nix through NIX_SSHOPTS, whose whitespace splitting requires
+//! paths representable without shell quoting. Other SSH configuration may apply.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,16 +21,11 @@ use crate::run::{Cmd, Effect, Expect, Runner, is_bare, shell_quote};
 /// How long a connection attempt may take before it is not a connection.
 pub const CONNECT_TIMEOUT: u32 = 10;
 
-/// How long a read-only probe may take. Generous on purpose: a host that is
-/// busy booting answers slowly and is not a host that is gone.
+/// Read-only probe deadline, including slow responses during boot.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Where one host is reached, by the id the fleet knows it under.
-///
-/// Built from the manifest, or from the manifest reconciled with a provider's
-/// target file ([`crate::observation::bind_targets`]) — never from a DNS
-/// lookup here: a rollout that resolves a name itself is a rollout whose
-/// answer to "which machine did you change" is "whatever the resolver said".
+/// Host endpoint from a manifest or provider binding. Name resolution, if
+/// needed, is performed by SSH rather than this constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub host_id: String,
@@ -89,10 +49,7 @@ impl Target {
         }
     }
 
-    /// From a frozen endpoint of a plan, which is where every real run gets
-    /// its targets: the plan froze the address with the selection, so a
-    /// second `apply` of the same plan cannot talk to a machine that has
-    /// since taken over the name.
+    /// Use the address, port and user frozen in the plan endpoint.
     pub fn from_endpoint(host_id: &str, endpoint: &Endpoint) -> Target {
         Target {
             host_id: host_id.to_string(),
@@ -117,13 +74,7 @@ impl Target {
         }
     }
 
-    /// The store url `nix copy --to` and `nix path-info --store` use.
-    ///
-    /// `ssh-ng` and never `ssh`: the old protocol accepts an unsigned
-    /// closure from a trusted user, which is how the pre-v1 push worked and
-    /// is precisely the guarantee `require-sigs = true` exists to give
-    /// (M0 probe S12). A store url that takes unsigned closures would make
-    /// the signing in `build` decoration.
+    /// Use the ssh-ng store protocol for Nix copy and path-info operations.
     pub fn store_url(&self) -> String {
         format!("ssh-ng://{}", self.destination())
     }
@@ -135,9 +86,7 @@ pub struct Ssh {
     /// `<repo>/known_hosts`: public, committed, written only by
     /// `keys enroll`.
     pub known_hosts: PathBuf,
-    /// The private key to offer, or none to let ssh use its configured
-    /// default. Named rather than searched, because `IdentitiesOnly=yes`
-    /// means the named one is the only one tried.
+    /// Optional identity file; SSH configured identities apply when none is supplied.
     pub identity: Option<PathBuf>,
     pub connect_timeout: u32,
 }
@@ -165,12 +114,7 @@ impl Ssh {
         self
     }
 
-    /// The options, as separate arguments — so a key path with a space in it
-    /// stays one argument.
-    ///
-    /// `-p <port>` is in here rather than at the call site because a host on
-    /// 2222 has to be the same host in `known_hosts`, in `ssh` and in
-    /// `NIX_SSHOPTS`, and three call sites are three chances to forget one.
+    /// Shared SSH option argv, including the port and optional identity path.
     pub fn opts(&self, port: u16) -> Vec<String> {
         let mut out = vec![
             "-o".to_string(),
@@ -188,10 +132,7 @@ impl Ssh {
             "IdentitiesOnly=yes".to_string(),
             "-o".to_string(),
             format!("ConnectTimeout={}", self.connect_timeout),
-            // A host that stops answering in the middle of a command: three
-            // missed probes fifteen seconds apart end the connection, so the
-            // command ends too. Without this, a rollout waits on a TCP
-            // timeout while holding a lock.
+            // Three missed keepalives at 15-second intervals end an unresponsive session.
             "-o".to_string(),
             "ServerAliveInterval=15".to_string(),
             "-o".to_string(),
@@ -200,15 +141,7 @@ impl Ssh {
             // parsed answer.
             "-o".to_string(),
             "LogLevel=ERROR".to_string(),
-            // This workstation's own ssh habits are not this fleet's.
-            // Measured in the lab (lane L2, 2026-09-23): an operator whose
-            // ssh config forwards X11 got
-            // "X11 forwarding request failed on channel 0" on the stderr of
-            // EVERY command, and therefore in the one sentence a failed wave
-            // prints — where it said nothing about the failure and hid what
-            // did. An agent is worse than noise: a rollout that carries a
-            // forwarded key into seventy hosts is a rollout that lends them
-            // the operator's identity.
+            // Disable X11 and agent forwarding, including inherited client defaults.
             "-o".to_string(),
             "ForwardX11=no".to_string(),
             "-o".to_string(),
@@ -225,14 +158,8 @@ impl Ssh {
         out
     }
 
-    /// The same options as the ONE string nix expects in `NIX_SSHOPTS`.
-    ///
-    /// Refuses rather than lies: nix splits this variable on white space and
-    /// removes no quotes, so a `known_hosts` or key path containing a space —
-    /// or a quote, a backslash, a newline — cannot be expressed here. The
-    /// alternative would be a `nix copy` that trusts a different file than
-    /// the `ssh` beside it, which is the class of bug this module exists to
-    /// remove.
+    /// Encode options for Nix whitespace splitting. Reject paths requiring quoting
+    /// so Nix and direct SSH cannot interpret different trust or identity paths.
     pub fn nix_sshopts(&self, port: u16) -> Result<String> {
         let opts = self.opts(port);
         for arg in &opts {
@@ -251,43 +178,16 @@ impl Ssh {
         Ok(opts.join(" "))
     }
 
-    /// Ask a host something. Read-only by construction: the effect class is
-    /// [`Effect::Read`], so an `--offline` run refuses it before the spawn.
-    ///
-    /// `Expect::Codes([0, 1])`: the script may answer "no" — a unit that is
-    /// inactive, a file that is not there — and that is an answer. 255 stays
-    /// an error, which is how "ssh could not connect" is told apart from
-    /// "the host said no".
+    /// Build a command classified Read; callers must supply a read-only script.
+    /// Remote statuses 0 and 1 are answers; SSH status 255 remains an error.
     pub fn ask(&self, target: &Target, script: &str, deadline: Duration) -> Cmd {
-        // `sh -c` explicitly rather than relying on the remote login shell:
-        // the probe is POSIX sh and a host whose root shell is fish would
-        // run it as something else.
+        // Run the probe explicitly under POSIX sh.
         self.exec(target, ["sh", "-c", script], Effect::Read, deadline)
             .expect(Expect::Codes(vec![0, 1]))
     }
 
-    /// A command on the far side, quoted for the shell that will read it.
-    ///
-    /// **ssh does not carry an argument vector.** It JOINS what it is given
-    /// with spaces and hands the result to the remote login shell, which
-    /// splits it again by its own rules. So arguments that are separate
-    /// here arrive as different arguments there the moment one of them
-    /// holds a space, a quote or a newline — and two of the things this
-    /// tool sends do: the read-only probe, which is a whole shell script in
-    /// one argument, and every `--because <sentence>` a revert carries.
-    ///
-    /// Measured rather than reasoned about: the first run of
-    /// nix/tests/update.nix against a real sshd got an empty answer from
-    /// every host, because `ssh host sh -c '<script>'` reached the target as
-    /// `sh -c printf` with the rest of the script as positional arguments.
-    /// Every fake runner and every PATH shim in this crate had been happy
-    /// with it, because both of them receive an argv.
-    ///
-    /// So each argument is quoted HERE, by the same rule
-    /// [`crate::run::shell_quote`] uses everywhere else. They stay separate
-    /// arguments of the local `ssh` — which is what keeps a command line
-    /// readable in a log and matchable in a test — and they are already the
-    /// words the remote shell will read back.
+    /// Quote each remote argument for the POSIX login shell. SSH joins arguments
+    /// with spaces instead of preserving the local argv boundaries.
     pub fn exec<I, S>(&self, target: &Target, argv: I, effect: Effect, deadline: Duration) -> Cmd
     where
         I: IntoIterator<Item = S>,
@@ -299,20 +199,9 @@ impl Ssh {
             .args(argv.into_iter().map(|a| shell_quote(a.as_ref())))
     }
 
-    /// Put bytes on a host, at a path, with an owner and a mode.
-    ///
-    /// Built here and used by lane 2C and by `keys deliver` (M3); nothing in
-    /// this lane calls it. Three properties it has to have, and all three
-    /// are the reason it is a command builder rather than an `scp`:
-    ///
-    /// * The content travels on **stdin**, never in the argv, because an
-    ///   argv is world-readable in `/proc` on the target for as long as the
-    ///   command runs.
-    /// * The content is **redacted** out of every place this command is
-    ///   printed — the log line, the error, the journal.
-    /// * The file is created with the mode it is to have, and `install -m`
-    ///   does that in one step rather than creating it readable and fixing
-    ///   it afterwards.
+    /// Upload stdin bytes through a same-directory temporary, set owner and mode,
+    /// then rename into place. The command redacts exact whole-content matches;
+    /// fragments are not redacted. Remote file and directory writes are not fsynced.
     pub fn put(
         &self,
         target: &Target,
@@ -323,9 +212,7 @@ impl Ssh {
         deadline: Duration,
     ) -> Cmd {
         let text = String::from_utf8_lossy(bytes).into_owned();
-        // `install` creates the temporary with the final mode, and the move
-        // is atomic within the directory: a service that reads the file
-        // while this runs reads the old one or the new one.
+        // mktemp creates a private temporary; rename publishes it after owner/mode setup.
         let script = format!(
             "set -e; d=$(dirname {path}); mkdir -p \"$d\"; \
              t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; \
@@ -352,13 +239,8 @@ impl Ssh {
             .expect(Expect::Codes(vec![0, 1]))
     }
 
-    /// The fingerprint `known_hosts` holds for this host, or `None`.
-    ///
-    /// This is where an observation's `host_key_fingerprint` comes from: the
-    /// entry that `StrictHostKeyChecking=yes` accepted the connection
-    /// against. Not from `ssh-keyscan`, which reports whatever answers on
-    /// the address — that is the one thing an observation must not do,
-    /// because it would make an impersonating host self-certifying.
+    /// Fingerprint the first matching key returned from the repository known_hosts.
+    /// This records configured trust, not proof of which key SSH negotiated.
     pub fn enrolled_fingerprint(
         &self,
         runner: &dyn Runner,
@@ -371,13 +253,7 @@ impl Ssh {
         Ok(fingerprint_of(&out.stdout))
     }
 
-    /// Refuse to connect to a host the fleet has not enrolled.
-    ///
-    /// Checked BEFORE the first connection attempt on purpose. ssh would
-    /// also refuse — that is what `StrictHostKeyChecking=yes` is — but it
-    /// would refuse with "Host key verification failed", and the operator
-    /// would then go looking for a broken host rather than for the enrolment
-    /// step that never happened.
+    /// Report a missing enrollment before attempting a connection.
     pub fn require_enrolled(&self, runner: &dyn Runner, target: &Target) -> Result<String> {
         match self.enrolled_fingerprint(runner, target)? {
             Some(fingerprint) => Ok(fingerprint),
@@ -396,18 +272,8 @@ impl Ssh {
     }
 }
 
-/// The `SHA256:…` fingerprint out of what `ssh-keygen -F` printed.
-///
-/// `-F` prints the matching `known_hosts` line — `host keytype base64key` —
-/// possibly behind a `# Host … found:` comment. The fingerprint of a key is
-/// the sha256 of its wire bytes, base64 without padding, which is exactly
-/// what `ssh-keygen -l` computes; doing it here rather than in a second
-/// round trip keeps the enrolment check at one command.
-///
-/// Public because `keys enroll` fingerprints what `ssh-keyscan` answered
-/// with in exactly this way. A second implementation of "what a host key
-/// hashes to" would be a second answer to the one question this fleet's
-/// trust hangs on.
+/// Compute SHA256 over the first key wire blob in ssh-keygen/keyscan output.
+/// Ignore comments and optional entry markers; marker policy is enforced by SSH.
 pub fn fingerprint_of(keygen_output: &str) -> Option<String> {
     for line in keygen_output.lines() {
         let line = line.trim();
@@ -416,10 +282,7 @@ pub fn fingerprint_of(keygen_output: &str) -> Option<String> {
         }
         let mut fields = line.split_whitespace();
         let mut first = fields.next()?;
-        // A `@cert-authority` or `@revoked` marker sits in FRONT of the host
-        // and shifts every field by one. Reading past it rather than
-        // fingerprinting the marker; which of the two it is does not change
-        // where the key is.
+        // Optional entry markers precede the host field.
         if first.starts_with('@') {
             first = fields.next()?;
         }
@@ -499,10 +362,7 @@ mod tests {
         assert!(opts.contains(&"ServerAliveInterval=15".to_string()));
         assert!(opts.contains(&"ServerAliveCountMax=3".to_string()));
         assert!(opts.contains(&"LogLevel=ERROR".to_string()));
-        // Nothing of this workstation's own ssh habits rides along. The X11
-        // pair was measured in the lab: an operator whose config forwards it
-        // got "X11 forwarding request failed on channel 0" on the stderr of
-        // every command, including the one sentence a failed wave prints.
+        // Disable inherited X11 and agent forwarding settings.
         assert!(opts.contains(&"ForwardX11=no".to_string()));
         assert!(opts.contains(&"ForwardX11Trusted=no".to_string()));
         assert!(opts.contains(&"ForwardAgent=no".to_string()));
@@ -603,10 +463,7 @@ mod tests {
         // which is what `--because` carries.
         let script = "printf 'a b\n' ; printf 'c\n'";
         let cmd = ssh().ask(&target(), script, PROBE_DEADLINE);
-        // ssh joins everything after the destination with spaces and hands
-        // it to the remote login shell. So THAT is what has to parse back
-        // into the words that were meant: let a real shell do the parsing
-        // and print what it got, one argument per line.
+        // Model SSH joining argv, then let a real shell parse the remote words.
         let after = cmd
             .args
             .iter()
@@ -714,13 +571,8 @@ mod tests {
         );
         // The bytes travel on stdin, which is the only place they may be.
         assert!(cmd.stdin.as_ref().unwrap().starts_with(b"-----BEGIN"));
-        // And a target that echoes the content back — `sh: cannot create
-        // …: <the whole thing>` — gets redacted too, because the same list
-        // is applied to stderr. The limit: it is a substring match on the
-        // WHOLE secret, so a target that echoed one line of a key back
-        // would not be caught. Nothing in this tool sends a key anywhere
-        // that echoes, and a fragment is not something a replace list can
-        // find.
+        // Whole-content echoes are redacted. Partial secret echoes do not match
+        // the exact-substring redaction list.
         let echoed = format!(
             "sh: cannot write: {}",
             String::from_utf8_lossy(cmd.stdin.as_ref().unwrap())

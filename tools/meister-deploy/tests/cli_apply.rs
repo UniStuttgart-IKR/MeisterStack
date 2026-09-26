@@ -2,20 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What `apply` does to the machine it runs on, measured through the real
-//! binary — including the one thing a shim cannot show.
+//! CLI apply checks with isolated PATH shims and temporary state.
 //!
-//! `PATH` is a directory of shims, so every program the run starts is in a
-//! log and whatever the log does not have it did not run. That pins the
-//! command lines. What it cannot pin is a syscall that reaches the network
-//! without one of those programs, and `apply` is the verb with something to
-//! hide: it is the one that changes machines. So the last test here runs the
-//! whole thing inside `unshare -rn` — a network namespace with a single
-//! `lo` that is DOWN — and a run that behaves identically there is a run
-//! that opened no socket of its own (V20).
-//!
-//! The working directory is compared byte for byte before and after, so
-//! "wrote nothing" is a comparison rather than a claim.
+//! Command logs and before/after file digests measure subprocess and write effects.
+//! A network-namespace comparison checks the exercised apply path without external
+//! connectivity; it does not prove the absence of all socket syscalls.
 
 mod support;
 
@@ -73,12 +64,8 @@ impl Sandbox {
                      printf '# Host found: line 1\\n10.0.0.10 ssh-ed25519 {ENROLLED_KEY}\\n'\n\
                      exit 0\n"
                 ),
-                // Answers a probe from the file prepared for the address in
-                // its argv. An invocation of the HELPER — `meister-activate`
-                // as an argument of its own, rather than a word inside the
-                // probe script — answers with the exit code the test asked
-                // for. No external program in the body: PATH holds only this
-                // directory while the binary runs.
+                // Answer probes from prepared fixtures and helper calls with the chosen
+                // exit code. The shim uses shell builtins because PATH contains only shims.
                 "ssh" => format!(
                     "#!/bin/sh\nline=\"{name}\"\naddr=\nhelper=\n\
                      for a in \"$@\"; do line=\"$line [$a]\"; \
@@ -121,14 +108,7 @@ impl Sandbox {
         // The fleet runs the release: so the plan is a no-op plan, which is
         // the one an `apply` may carry out without any approval at all.
         let release = release_of(fleet.clone());
-        // The clock of the MACHINE, not a literal: a plan carries an
-        // `expires_at` (`created_at` plus an hour) and the binary under test
-        // reads the real clock to compare against it. A fixture pinned to a
-        // date is a test that passes until that hour goes by and is red for
-        // ever after — measured: this file went red on the afternoon of the
-        // day its literal named. What the other tests of this crate pin with
-        // a fake clock is the CONTENT of a plan; what is pinned here is what
-        // a program does against a fleet right now.
+        // Use the real current time because the binary enforces plan expiry.
         let now = chrono::Utc::now();
         let observation = observed(&release, now);
         let the_plan = plan::plan(
@@ -307,9 +287,7 @@ fn a_dry_run_asks_the_hosts_and_writes_nothing_at_all() {
             call.starts_with("ssh-keygen") || call.starts_with("ssh "),
             "a dry run ran {call}"
         );
-        // The helper as an INVOCATION — `[meister-activate] [--json]` in
-        // the shim's log — rather than the word inside the probe script,
-        // which asks whether the program is there at all.
+        // Distinguish helper invocations from helper names inside probe scripts.
         assert!(
             !call.contains("[meister-activate] [--json]"),
             "a dry run reached for the helper: {call}"
@@ -406,14 +384,11 @@ fn a_run_that_changes_nothing_still_takes_the_anchor_and_writes_its_receipt() {
     );
 }
 
-// --- lane 5C ---
 
 #[test]
 fn a_resume_finds_the_plan_and_the_release_in_the_run_s_own_directory() {
-    // L2 finding N10. `runs/<id>/` held the plan and not the release, so a
-    // resume needed the operator's own `--out` file — and the next `build`
-    // over the same path took it away. In the lab there was then no
-    // supported way to continue an interrupted run at all.
+    // Persist the release in the run directory so resume survives replacement
+    // of the operator's release output.
     let mut sandbox = Sandbox::new();
     sandbox.ssh_exit = 0;
     let out = sandbox.run(&[
@@ -477,7 +452,6 @@ fn apply_without_a_plan_and_without_a_resume_says_which_one_is_missing() {
     );
 }
 
-// --- end lane 5C ---
 
 #[test]
 fn a_second_operator_is_refused_by_the_state_directory() {
@@ -599,17 +573,11 @@ fn an_approval_is_a_class_and_a_plan_id_and_nothing_else() {
     assert!(stderr(&out).contains("singleton"), "{}", stderr(&out));
 }
 
-/// V20, and the only test in this crate that can show it.
-///
-/// `unshare -rn` gives the process a network namespace with one interface,
-/// `lo`, and it is DOWN. Anything that opens a socket to an address fails
-/// there. A run whose output is identical inside and outside it is a run
-/// whose entire reach outside this process goes through the programs on
-/// `PATH` — which the log then names, one by one.
+/// Compare this apply path inside and outside an isolated network namespace.
+/// Requires working unprivileged user/network namespaces.
 #[test]
 fn a_dry_run_behaves_the_same_with_the_network_taken_away() {
-    // M0 probe S13 measured that this is allowed on this machine. If it
-    // ever is not, the test says so instead of passing quietly.
+    // Require namespace support explicitly; do not silently skip this check.
     let unshare = ["/usr/bin/unshare", "/bin/unshare", "/usr/sbin/unshare"]
         .into_iter()
         .find(|p| Path::new(p).exists())
@@ -684,17 +652,10 @@ fn a_dry_run_behaves_the_same_with_the_network_taken_away() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// lane 3-integration: the halt, at the real binary
-// ---------------------------------------------------------------------------
+// Provider handoff through the real CLI.
 
-/// A sandbox whose `n1` is a guest with no boot loader, switched to the
-/// release and still running the kernel its provider last handed it.
-///
-/// The shortest road to a `provider-reboot` that the shims can walk: nothing
-/// is staged (the closure is there), nothing is activated (the profile
-/// already points at it), and what is left is the boot — which is the one
-/// step this tool does not take.
+/// Direct-boot fixture already switched to the desired system, awaiting
+/// its provider-managed boot.
 fn waiting_for_a_provider() -> Sandbox {
     let mut sandbox = Sandbox::new();
     let base = support::with_direct_host(sandbox.fleet.clone(), "n1");
@@ -804,8 +765,7 @@ fn a_halt_in_front_of_a_provider_is_exit_two_a_sentence_and_one_line_of_json() {
     assert!(said.contains(&bundle.cmdline), "{said}");
     assert!(said.contains("apply --resume"), "{said}");
 
-    // The line, for the thing that will do it: one JSON object on stdout,
-    // parsed here rather than grepped.
+    // Parse the structured handoff from stdout.
     let line = stdout(&out)
         .lines()
         .find(|l| l.starts_with('{') && l.contains("waiting_for"))
@@ -879,10 +839,7 @@ fn a_halt_in_front_of_a_provider_is_exit_two_a_sentence_and_one_line_of_json() {
     assert_ne!(receipt["outcome"], "success");
 }
 
-// Astra finding MD09, 2026-09-25: `--json` promised one json document and
-// printed the run id as a bare line in front of it, and the halt for a
-// provider as a second document after it. A parser fed the whole of stdout
-// failed on the first byte.
+// JSON mode emits one parseable document, including provider handoff details.
 #[test]
 fn apply_json_is_one_document_that_carries_the_run_id_the_halt_and_the_stop() {
     let sandbox = waiting_for_a_provider();

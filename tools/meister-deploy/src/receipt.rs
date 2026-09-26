@@ -2,29 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The last contract: what happened, and how a run that was cut in half
-//! finds out where it was.
+//! Journal events, deployment receipts and pure resume decisions.
 //!
-//! Two files. The **journal** is append-only JSONL, one line per event,
-//! `fsync`ed before the next line is written and — this is the whole point —
-//! written BEFORE anything irreversible, never after. The **receipt** is the
-//! fold of that journal into the answer somebody attaches to a ticket: which
-//! host ended where, what it ran before, what it runs now, which certificate
-//! it carries.
-//!
-//! [`fold`] and [`next_step`] are pure, and they are the two functions that
-//! decide what a resume does. The V17 matrix — the thing that decides
-//! whether an interrupted run repeats a step, continues past it, or refuses
-//! to touch the host at all — is a table here and a test beside it, because
-//! the alternative is discovering the rule on a machine that is halfway
-//! through an activation.
-//!
-//! The rule that shapes the whole table: **an irreversible step that began
-//! and has no end in the journal is never repeated.** The journal cannot say
-//! what happened after the line it managed to write; the TARGET can, because
-//! `meister-activate` keeps a transaction record. So the answer is always to
-//! ask the target, and to say `recovery-required` when the target has
-//! nothing to say — never to activate again and hope.
+//! The append-only JSONL journal records intent before activation and results
+//! after actions. Receipts fold that evidence for the frozen host selection.
+//! Unfinished activation is reconciled with target transaction state instead of
+//! blindly repeated; missing or inconsistent evidence requires recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -162,8 +145,7 @@ struct StatePayload {
     booted: Option<String>,
 }
 
-/// The keys [`fold`] reads out of an `action.*` payload. This is the
-/// contract lane 2C writes against.
+/// Payload keys consumed by fold for action events.
 #[derive(Debug, Clone, Deserialize)]
 struct ActionPayload {
     /// The `seq` of the action IN THE PLAN, which is what lines a receipt up
@@ -432,7 +414,7 @@ pub struct ActionRun {
     pub cmd_refs: Vec<String>,
 }
 
-/// A reboot that began and has no end in the journal (Astra finding MD04).
+/// Unfinished reboot and its pre-command evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebootInFlight {
     pub seq: u32,
@@ -467,19 +449,8 @@ pub struct HostRun {
 }
 
 impl HostRun {
-    // --- lane 3-integration ---
-    /// The `provider-reboot` this run stopped in front of, if it did.
-    ///
-    /// In a journal a halt looks exactly like an interruption — a step that
-    /// began and has no end — and it is the one place where that is not a
-    /// question about what happened. This tool never starts a provider's
-    /// reboot, so a `provider-reboot` with no end means the run reached it,
-    /// wrote the bundle down and stopped; nothing was half-done, because
-    /// nothing was done.
-    ///
-    /// The LAST one and only then whether it ended: a resume that halted
-    /// again writes a second beginning, and a resume that got through wrote
-    /// an end after the first one.
+    /// Latest unfinished provider-reboot action. It records a handoff without
+    /// initiating a provider reboot; later attempts supersede earlier ones.
     pub fn open_provider_reboot(&self) -> Option<&ActionRun> {
         self.actions
             .iter()
@@ -487,20 +458,8 @@ impl HostRun {
             .find(|a| a.kind == ActionKind::ProviderReboot)
             .filter(|a| a.ended.is_none())
     }
-    // --- end lane 3-integration ---
 
-    /// Whether the machine has already been round: a `reboot` step of this
-    /// run that came through.
-    ///
-    /// Astra finding F19, 2026-09-23. The reboot sits between the activation
-    /// and the confirmation, and a resume skipped neither of the two — so an
-    /// operator who stopped a run in that window sent `systemctl reboot` a
-    /// second time. The evidence was always in the journal: the step writes
-    /// its `action.end` only after `wait_for_boot` has seen the machine come
-    /// back as the system the plan wants.
-    ///
-    /// The LAST one, like `open_provider_reboot`: a resume that did have to
-    /// reboot writes a second pair of lines.
+    /// Whether the latest reboot completed successfully according to the journal.
     pub fn rebooted(&self) -> bool {
         self.actions
             .iter()
@@ -509,15 +468,8 @@ impl HostRun {
             .is_some_and(|a| a.result == Some(ActionResult::Ok))
     }
 
-    /// A reboot this run began and never wrote the end of, with what the
-    /// step wrote down before it sent it.
-    ///
-    /// Astra finding MD04, 2026-09-25: `rebooted` is the reboot that
-    /// finished; this is the one whose outcome the journal does not know,
-    /// because the run died between `systemctl reboot` and the `action.end`
-    /// that `wait_for_boot` writes. The `action.begin` carries the boot id
-    /// the machine had before, and a resume compares the machine's current
-    /// one against it (`Executor::settle_reboot`).
+    /// Latest unfinished reboot and its pre-command evidence. Resume compares
+    /// the recorded boot ID with the target to detect an already completed reboot.
     pub fn reboot_in_flight(&self) -> Option<RebootInFlight> {
         let last = self
             .actions
@@ -537,18 +489,8 @@ impl HostRun {
         })
     }
 
-    /// Whether this run gave the host back: the `unlock` step, which retires
-    /// the transaction record on the target and releases the host's lock.
-    ///
-    /// Astra finding F06, 2026-09-23. A host becomes `committed` at its
-    /// CONFIRM, and the plan puts `uncordon` and `unlock` after that. So
-    /// "committed" means the system is kept, not that the run has finished
-    /// with the machine — and reading it as finished is what made a resume
-    /// skip the uncordon and the retire. The host then stayed cordoned, so
-    /// nothing was scheduled onto it, and its record stayed open, which is
-    /// what makes the NEXT plan refuse to start. The journal says which of
-    /// the two it is, in the `action.end` of the step that does the giving
-    /// back, so it is asked.
+    /// Whether this run completed Unlock, including transaction retirement.
+    /// Committed alone only records confirmation; uncordon/unlock may remain.
     pub fn was_given_back(&self) -> bool {
         self.actions
             .iter()
@@ -583,10 +525,7 @@ pub struct RunState {
     pub hosts: BTreeMap<String, HostRun>,
     pub last_seq: u64,
     pub checks: Vec<CheckResult>,
-    /// Places where the journal does not add up: a gap in the sequence, a
-    /// transition out of a state the host was not in. Not an error — a
-    /// journal with a hole in it is evidence about a machine that went away
-    /// — but never silence either.
+    /// Recorded sequence gaps and inconsistent transitions retained as evidence.
     pub breaks: Vec<String>,
 }
 
@@ -807,16 +746,12 @@ pub enum TxnView {
     Pending {
         deadline: Option<DateTime<Utc>>,
     },
-    // --- Astra finding F07, 2026-09-23 ---
-    /// A confirmation began on the target and did not finish. The machine
-    /// runs the new system and somebody meant to keep it; what is left is
-    /// to say so, which is a `confirm` and never a repair.
+    /// Confirmation started but did not finish; resume verifies and repeats confirm.
     Confirming,
     /// A revert began on the target and did not finish. Which system the
     /// machine runs is not something this record can say, so nothing here
     /// decides it.
     Reverting,
-    // --- end Astra finding F07 ---
     Confirmed,
     Reverted,
     /// There is a record and it does not say a coherent thing.
@@ -824,13 +759,8 @@ pub enum TxnView {
 }
 
 impl TxnView {
-    /// What an observation of a target says about one transaction id, or —
-    /// when the run has no id yet — about whatever is open there.
-    ///
-    /// A target with more than one record is [`TxnView::Inconsistent`] on
-    /// purpose: `meister-activate` allows one open transaction at a time, so
-    /// two is a state this tool has no rule for, and guessing which one
-    /// matters is how the wrong one gets confirmed.
+    /// Classify target transactions; multiple records are inconsistent because
+    /// the helper permits only one open activation transaction.
     pub fn of(observation: &HostObservation, txn_id: Option<&str>) -> TxnView {
         let open: Vec<&crate::observation::Txn> = match txn_id {
             Some(id) => observation
@@ -847,7 +777,6 @@ impl TxnView {
                 TxnState::Pending => TxnView::Pending {
                     deadline: one.deadline,
                 },
-                // Astra finding F07, 2026-09-23.
                 TxnState::Confirming => TxnView::Confirming,
                 TxnState::Reverting => TxnView::Reverting,
                 TxnState::Confirmed => TxnView::Confirmed,
@@ -881,52 +810,29 @@ pub enum Step {
     RecoveryRequired(String),
     /// There is nothing left to do here.
     Done,
-    // --- lane 3-integration ---
-    // --- lane 5A ---
-    /// A key rotation is open on this host and this is the phase it is at.
-    /// Everything before it happened; nothing after it did.
+    /// Target key-rotation phase used to choose remaining rotation actions.
     AtKeysPhase(ActionKind),
-    // --- end lane 5A ---
-    /// The run stopped in front of a `provider-reboot`. The preparation is
-    /// behind us — staged, delivered, switched and confirmed — and the step
-    /// itself is the question "has the provider been here", which the step
-    /// asks the machine rather than this table.
+    /// Resume a provider-reboot handoff after preparation and confirmation.
     AtTheProviderReboot,
-    // --- end lane 3-integration ---
 }
 
-// --- lane 5A: the resume table of a rotation --------------------------------
 
-/// Where a resume picks a rotation up, asked of the TARGET's own record.
+/// Select remaining rotation actions from the target record and local publication.
+/// Target phases describe file state, not completion of service restarts.
 ///
-/// The five phases leave five different things on a host's disk, and that
-/// is what this reads — not the journal. A journal can stop in the middle
-/// of a line; a pair of files cannot be half renamed. The journal is only
-/// asked one thing, and only in the one case the disk cannot answer: a host
-/// with nothing prepared and nothing replaced either never started or had
-/// its prepared pair taken away, and a run that has already switched is the
-/// difference.
-///
-/// | on the host | what is left to do |
+/// | Target state | Remaining actions |
 /// |---|---|
-/// | `prepared` | the certificate, the switch, the verify, the removal |
-/// | `overlap` | the switch, the verify, the removal |
-/// | `switched` | the verify and the removal |
-/// | `confirmed`, published here | nothing |
-/// | `confirmed`, not published here | the removal, for its local half |
-/// | `reverted` | nothing; the forward attempt stays failed |
-/// | `none`, nothing in the journal | the prepared pair is gone: plan again |
-/// | `none`, a switch in the journal | a person looks |
-/// | `inconsistent` | a person looks |
+/// | prepared | overlap, switch, verify, remove |
+/// | overlap | switch, verify, remove |
+/// | switched | verify, remove |
+/// | confirmed, published locally | done |
+/// | confirmed, not published locally | remove, including local publication |
+/// | reverted | retain failed forward outcome |
+/// | none, no recorded switch | replan |
+/// | none after switch, or inconsistent | recovery |
 ///
-/// Astra finding F09, 2026-09-23: `published` is the one thing the HOST
-/// cannot answer. The last phase has two halves — the old pair goes on the
-/// target, and the certificate the rotation issued becomes the repository's
-/// own `<kind>.crt` — and a host that is `confirmed` says only that the
-/// first half happened. Read without the second, `confirmed` meant `done`,
-/// the repository kept the certificate the host used to hold, and the next
-/// ordinary plan delivered it back over the new one. The step is idempotent
-/// in both halves, so naming it again is safe and is the whole repair.
+/// Local publication is separate evidence: target confirmation cannot prove that
+/// the repository active certificate has been updated.
 pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState, published: bool) -> Step {
     use crate::activate::KeysState;
     match state {
@@ -977,30 +883,15 @@ pub fn keys_phase_order(kind: ActionKind) -> Option<u8> {
         _ => None,
     }
 }
-// --- end lane 5A ------------------------------------------------------------
 
-/// The V17 table.
-///
-/// Read it as three questions in this order: did anything irreversible
-/// begin; if not, how far did the preparation get; if it did, what does the
-/// target say. The one rule the table exists to enforce is in the second and
-/// third arm: an irreversible step with no end in the journal is decided by
-/// the TARGET and never by repeating it.
+/// Resume preparation only before irreversible work. After activation begins,
+/// use target transaction state to choose verification, rollback or recovery.
 pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
-    // --- lane 3-integration: the halt, before anything else -------------
-    //
-    // First, because it is the only case in this table where the journal
-    // KNOWS what happened next: nothing. A halt has no target state to ask
-    // about — the machine may hold a confirmed transaction (a switch that
-    // was kept) or none at all (a host that was only waiting for its boot),
-    // and both are the same answer here. Asking the txn view first would
-    // send the second shape to `recovery-required`, which is what an
-    // irreversible step with no record means and is exactly not what this
-    // is.
+    // Provider handoff precedes transaction inspection: it can legitimately wait
+    // with either a confirmed transaction or no transaction.
     if host.open_provider_reboot().is_some() {
         return Step::AtTheProviderReboot;
     }
-    // --- end lane 3-integration -----------------------------------------
     let began = host.open_irreversible.is_some() || host.state.past_the_point_of_no_return();
 
     if !began {
@@ -1012,10 +903,8 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
                 HostState::Unchanged | HostState::Committed => Step::Done,
                 _ => Step::StartOver,
             },
-            // The local journal says nothing was activated on this host and
-            // the target is carrying a transaction. Either this journal lost
-            // its lines or somebody else was here. Nothing is reissued and
-            // nothing is repeated.
+            // Unexpected target transactions require recovery even when the local
+            // journal records no activation.
             _ => Step::RecoveryRequired(format!(
                 "the journal of this run says nothing was activated on {} and the target has a \
                  transaction. Look at `meister-activate txn list` on the host and decide there; \
@@ -1025,38 +914,9 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
         };
     }
 
-    // --- lane 5C ---
-    // A host this very run already finished is finished, whatever the
-    // target still has — and what it has is nothing, because the `unlock`
-    // step of a successful host RETIRES its transaction record.
-    //
-    // Measured in lab lane L2 (2026-09-23): a run over two direct-boot
-    // hosts stops twice, once in front of each provider reboot. The second
-    // resume folded the journal, read `committed` for the host that was
-    // already through, fell into the `TxnView::None` arm below — because
-    // `committed` is past the point of no return — and refused the whole
-    // run with "an irreversible step began on box and the target has no
-    // transaction record for it". The run was not continuable at all.
-    //
-    // The arm below is for a journal whose lines are MISSING: something
-    // irreversible began and nothing says how it ended. That is not this.
-    // Here the journal says how it ended, in the state the machine reached
-    // and in the `action.end` that closed the step, and both are lines this
-    // run wrote itself. (The `!began` branch above already spells
-    // `HostState::Committed => Step::Done`; it could never fire, because
-    // `committed` makes `began` true.)
-    //
-    // Astra finding F06, 2026-09-23: "committed" is written at the CONFIRM,
-    // and `uncordon` and `unlock` come after it. A run that stopped between
-    // the two was read here as a host with nothing left to do, so the
-    // resume left the machine cordoned and its transaction record open —
-    // and an open record is what makes the next plan refuse to start. The
-    // question is therefore not "is it committed" but "did this run give it
-    // back", which is `was_given_back`. Whatever the target says is asked
-    // only when the answer is no: everything else about this host is
-    // finished, so `VerifyOnly` is the whole of what is left, and it is the
-    // arm that repeats the verify, the uncordon and the unlock and nothing
-    // before them.
+    // A committed host is done only after Unlock completed. Otherwise repeat
+    // verification and remaining cleanup; successful Unlock may already have
+    // retired the target record.
     if host.open_irreversible.is_none() && host.state == HostState::Committed {
         return if host.was_given_back() {
             Step::Done
@@ -1064,7 +924,6 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
             Step::VerifyOnly
         };
     }
-    // --- end lane 5C ---
 
     match target {
         TxnView::Confirmed => {
@@ -1075,20 +934,10 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
             }
         }
         TxnView::Pending { .. } => Step::VerifyAndConfirm,
-        // Astra finding F07, 2026-09-23: a confirmation that began on the
-        // target and did not finish is NOT a recovery case. The host is on
-        // the new system, a confirm was already the decision, and
-        // `meister-activate confirm` finishes the record idempotently — so
-        // the resume does what it would have done anyway, one step earlier
-        // in the sentence: verify, then confirm. Reading it as a case for a
-        // person would strand every host whose operator process died in a
-        // window of two commands.
+        // Finish an interrupted confirmation idempotently after verification.
         TxnView::Confirming => Step::VerifyAndConfirm,
         TxnView::Reverted => Step::RolledBack,
-        // A revert that did not finish is a different thing: the record
-        // cannot say which system the machine is on, so nothing here calls
-        // it rolled back and nothing activates on top of it. The way out is
-        // on the host, where repeating the revert is safe.
+        // An unfinished revert is not evidence of rollback; require target recovery.
         TxnView::Reverting => Step::RecoveryRequired(format!(
             "a revert began on {} and did not finish, so the record cannot say which system \
              that machine is on. Finish it there — `meister-activate revert --txn <id>` \
@@ -1096,21 +945,9 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
              again.",
             host.id
         )),
-        // Astra, alongside finding F19, 2026-09-23: a host that only had to
-        // BOOT never opened a transaction. Its plan has no `activate` and no
-        // `confirm` — the way back from a boot that does not come up is the
-        // boot menu, which is the documented limit of that class — so the
-        // journal records no `action.irreversible` and no txn id for it. A
-        // run that stopped between its `reboot` and its `verify` still
-        // reached `verifying`, which is past the point of no return, and
-        // fell into the arm below: "an irreversible step began and the
-        // target has no transaction record for it". It had not, and those
-        // hosts were not resumable at all.
-        //
-        // The guard is the JOURNAL's own txn id and two states, and it takes
-        // nothing away from the arm below: an activation writes its
-        // `action.irreversible`, with the txn in it, BEFORE the command that
-        // cannot be taken back, so a host that activated always has one.
+        // Reboot-only plans create no activation transaction. Resume their verify
+        // step using the absence of a journal transaction ID, without weakening the
+        // missing-record check for actual activations.
         TxnView::None
             if host.txn_id.is_none()
                 && matches!(host.state, HostState::AwaitingReboot | HostState::Verifying) =>
@@ -1135,10 +972,7 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
 // The receipt
 // ---------------------------------------------------------------------------
 
-/// Where the journal for this run is, and what it hashed to when the receipt
-/// was written. Handed in rather than computed: a fold cannot know what a
-/// file on disk hashes to, and a receipt that names no journal is a summary
-/// rather than evidence.
+/// Journal location and digest supplied by the caller when writing a receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRef {
     pub path: String,
@@ -1182,16 +1016,9 @@ pub struct DeploymentReceipt {
     pub breaks: Vec<String>,
     pub journal_path: String,
     pub journal_sha256: String,
-    // --- Astra finding MD09, 2026-09-25 ---
-    /// Why the RUN stopped, when it did: the sentence `run.end` carries.
-    ///
-    /// `outcome` above is about the hosts and stays that way (Astra finding
-    /// F06): a run that confirmed every host and then failed an `uncordon`
-    /// has forward hosts and is not a run that came through. The exit code
-    /// says so; this field says it in the document, so that a script reads
-    /// both from one place. Absent from a receipt `report` folds out of a
-    /// journal, because the journal of a run that has not ended has no
-    /// `run.end` to take it from.
+    /// Executor stop reason, independent of host-derived outcome. A host may be
+    /// committed while later cleanup fails. Receipts reconstructed solely by
+    /// `receipt` do not populate this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
     /// The `provider-reboot` the run halted in front of, if it did: the
@@ -1199,7 +1026,6 @@ pub struct DeploymentReceipt {
     /// 3-integration), carried here so that `--json` is one document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<serde_json::Value>,
-    // --- end Astra finding MD09 ---
 }
 
 impl DeploymentReceipt {
@@ -1215,11 +1041,8 @@ impl DeploymentReceipt {
     }
 }
 
-/// Fold a run into the thing somebody attaches to a ticket.
-///
-/// Pure. Every host of the plan's frozen selection appears, whether the run
-/// reached it or not: a receipt that lists only what happened cannot be
-/// checked against the plan it claims to be about.
+/// Build a receipt covering every host in the frozen selection, including
+/// hosts the run never reached.
 pub fn receipt(
     plan: &DeploymentPlan,
     state: &RunState,
@@ -1637,12 +1460,7 @@ mod tests {
         run
     }
 
-    /// The `unlock` step of a run that finished with this host: the record
-    /// retired on the target, the lock given back.
-    ///
-    /// Astra finding F06, 2026-09-23: `committed` alone is not that. It is
-    /// written at the CONFIRM, and the uncordon and the unlock come after
-    /// it, so the tests below say which of the two they mean.
+    /// Record successful Unlock; Committed alone does not imply cleanup completed.
     fn given_back(mut run: HostRun) -> HostRun {
         run.actions.push(ActionRun {
             seq: 9,
@@ -1668,7 +1486,6 @@ mod tests {
         run
     }
 
-    // --- lane 5A: the rotation table -----------------------------------
 
     /// The five phases leave five different things on a host's disk, and
     /// that is what a resume reads. The journal is asked one thing only:
@@ -1693,24 +1510,16 @@ mod tests {
             (KeysState::Confirmed, Step::Done),
             (KeysState::Reverted, Step::RolledBack),
         ] {
-            // Astra finding F09, 2026-09-23: `true` is "the certificate
-            // this rotation issued is already the repository's own", which
-            // the host cannot answer and which the case below is about.
+            // Local publication is separate from target confirmation.
             assert_eq!(next_keys_step(&fresh, state, true), want, "{state:?}");
         }
     }
 
-    // Astra finding F09, 2026-09-23.
     #[test]
     fn a_rotation_the_host_has_finished_is_not_finished_here_until_it_is_published() {
         use crate::activate::KeysState;
-        // The remote half of the last phase is done — the old pair is gone
-        // from the host, so `keys status` says `confirmed` — and the local
-        // half is not: the repository still holds the certificate the host
-        // USED to have, and the planner compares every host against it. A
-        // resume that read this as `done` left it there, and the next
-        // ordinary plan delivered the old certificate back over the new
-        // one. Both halves of the step are idempotent, so it is named again.
+        // Target confirmation without local publication must repeat the final
+        // rotation step so later ordinary plans use the new certificate.
         assert_eq!(
             next_keys_step(&HostRun::new("box"), KeysState::Confirmed, false),
             Step::AtKeysPhase(ActionKind::KeysRemove)
@@ -1828,16 +1637,10 @@ mod tests {
         assert!(matches!(step, Step::RecoveryRequired(_)));
     }
 
-    // Astra, alongside finding F19, 2026-09-23.
     #[test]
     fn a_host_that_only_had_to_boot_is_not_a_recovery_case() {
-        // A `reboot_only` host has no `activate` and no `confirm`, so it
-        // opens no transaction and the journal records no txn id for it. A
-        // run that stopped between its `reboot` and its `verify` left it in
-        // `verifying`, which is past the point of no return — and the table
-        // then said "an irreversible step began and the target has no
-        // transaction record for it". It had not, and the host could not be
-        // resumed at all. What is left for it is the verify.
+        // A reboot-only host has no transaction; interruption after reboot leaves
+        // verification to resume.
         for state in [HostState::AwaitingReboot, HostState::Verifying] {
             assert_eq!(
                 next_step(&host_in(state), &TxnView::None),
@@ -1858,8 +1661,7 @@ mod tests {
 
     #[test]
     fn an_empty_journal_and_a_target_with_a_transaction_needs_a_person() {
-        // The half of V17 that is about a lost journal rather than a lost
-        // host. Nothing is reissued.
+        // Missing local journal evidence must not trigger repeated activation.
         let step = next_step(&HostRun::new("n1"), &TxnView::Pending { deadline: None });
         match step {
             Step::RecoveryRequired(why) => {
@@ -1883,29 +1685,18 @@ mod tests {
             next_step(&host_in(HostState::Unchanged), &TxnView::None),
             Step::Done
         );
-        // Astra finding F06, 2026-09-23: and a host that is committed and
-        // was NOT given back has the rest of its own rollout left — the
-        // uncordon and the unlock, which `VerifyOnly` is the arm for. This
-        // used to answer `Done`, and the machine stayed cordoned with an
-        // open record on it.
+        // Committed without Unlock must resume verification and cleanup.
         assert_eq!(
             next_step(&host_in(HostState::Committed), &TxnView::Confirmed),
             Step::VerifyOnly
         );
     }
 
-    // --- lane 5C ---
 
     #[test]
     fn a_host_this_run_already_finished_stays_finished_after_its_record_is_gone() {
-        // The measured shape (lab lane L2, 2026-09-23): a run over two
-        // direct-boot hosts halts twice. By the second halt the first host
-        // is `committed` AND its transaction record has been retired by the
-        // `unlock` step of this very run, so the target has nothing. Before
-        // this arm existed the resume refused the whole run.
-        //
-        // Astra finding F06, 2026-09-23: it is that `unlock` step that says
-        // the host is finished, so the journal is asked for it by name.
+        // A host already unlocked before a later provider handoff remains done,
+        // even though its target transaction was retired.
         assert_eq!(
             next_step(&given_back(host_in(HostState::Committed)), &TxnView::None),
             Step::Done
@@ -1930,16 +1721,10 @@ mod tests {
         ));
     }
 
-    // --- end lane 5C ---
 
-    // Astra finding F07, 2026-09-23.
     #[test]
     fn a_confirmation_that_did_not_finish_resumes_into_the_confirm() {
-        // The host carries a `confirming` record: a confirm began there and
-        // the process that began it is gone. That is not a case for a
-        // person — the machine is on the new system and the decision was
-        // taken — so the resume does what it was going to do anyway, and
-        // the confirm it runs finishes the record.
+        // Interrupted target confirmation resumes through verify and idempotent confirm.
         let mut obs = crate::observation::HostObservation::empty();
         obs.open_txns = vec![Txn {
             id: "txn-1".to_string(),

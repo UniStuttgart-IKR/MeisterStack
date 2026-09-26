@@ -2,50 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Where a run leaves its evidence, and the one file two operators race for.
+//! Repository state paths, operator lock, journal I/O, and retention. Plans, releases,
+//! observations, and receipts are retained under .meister-deploy for inspection and resume.
 //!
-//! The pre-v1 tool had no state at all: no journal, no receipt, no lock. A
-//! rollout that was interrupted left nothing behind, so "what happened?" was
-//! answered by reading a terminal's scrollback and "is somebody else already
-//! doing this?" was not answered at all. Everything in here exists to make
-//! those two questions answerable by a file (D4, D6).
-//!
-//! ```text
-//! <repo>/.meister-deploy/
-//!   lock                        the operator's anchor: one writer per repo
-//!   observations/latest.json    the last snapshot, for `status --offline`
-//!   observations/<ts>.json      the snapshots, by the moment they were taken
-//!   runs/<run-id>/journal.jsonl append-only, one line per event, fsync each
-//!   runs/<run-id>/receipt.json  what happened, once it has
-//!   runs/<run-id>/plan.json     the plan as it was applied, verbatim
-//!   runs/<run-id>/observations/ the snapshots this run took
-//!   gcroots/<release-id>/<host> roots, so a released closure survives a gc
-//!   snapshots/<content-hash>/   `resolve --dev` materialises here (1C)
-//! ```
-//!
-//! Three properties are worth spelling out.
-//!
-//! **The journal is written before the thing it describes.** `append_fsync`
-//! is one `write` to an `O_APPEND` handle followed by `sync_all`, so a line
-//! that says `action.irreversible` is on the disk before the action starts
-//! (lane 2C writes it there). That is the whole mechanism behind a resume
-//! that does not activate twice.
-//!
-//! **A reader tolerates exactly one torn line, at the end, and says so.**
-//! A machine that lost power in the middle of a `write` leaves a partial
-//! last line. Dropping it silently would make a journal that cannot be
-//! trusted look like one that can; refusing to read the file at all would
-//! throw away the ninety-nine lines that are intact. So the last line is
-//! allowed to be broken, it is reported, and a broken line ANYWHERE ELSE is
-//! an error — that is not a power cut, that is a file somebody edited.
-//!
-//! **A lock is never taken by time.** A lock with a dead owner is still a
-//! lock: the run that held it may have got as far as activating a system,
-//! and the only thing that knows is the target. So the sentence says what
-//! is known — including that the process is demonstrably gone, when it can
-//! be checked on this machine — and the operator says `--takeover <run-id>`
-//! or nothing happens. A timeout here would be this tool deciding that
-//! somebody else's rollout is over because it has been quiet.
+//! Journal append fsyncs each serialized event; callers record irreversible actions before
+//! execution. Readers tolerate an unterminated final record and report it. Resume repairs the
+//! tail before appending. Locks have no age-based expiry: a dead local holder can be
+//! succeeded for the same run; other ownership changes require explicit takeover.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,18 +32,10 @@ pub const STATE_DIR: &str = ".meister-deploy";
 
 pub const LOCK_SCHEMA: &str = "meister-deploy/operator-lock/1";
 
-// --- lane 5B: the record of a retirement ---------------------------------
-
 pub const RETIRED_SCHEMA: &str = "meister-deploy/retired/1";
 
-/// What `retire` leaves behind about a host, and all of it.
-///
-/// Deliberately small, and deliberately not a receipt: the run that carried
-/// the revocation to the fleet wrote one of those, and this file is the one
-/// fact that outlives it — that this host was taken out of service on
-/// purpose, on a day, for a reason somebody typed. `last_system` and
-/// `identity_serial` are what a later question needs ("which closure was it
-/// running", "which serial did we take back") and neither is a secret.
+/// Retirement evidence independent of rollout receipts: host, time, observed system, revoked
+/// serials, and optional operator reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Retired {
@@ -95,8 +50,6 @@ pub struct Retired {
     pub identity_serials: Vec<String>,
     pub reason: Option<String>,
 }
-
-// --- end lane 5B ---------------------------------------------------------
 
 /// The state directory of one operator repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,29 +97,13 @@ impl StateDir {
         self.run_dir(run_id).join("plan.json")
     }
 
-    // --- lane 5C ---
-    /// The release the plan was made for, copied in beside it.
-    ///
-    /// A plan names a `release_id` and `apply --resume` needs the release
-    /// itself: the store paths, the nar hashes, the direct-boot bundles.
-    /// Until this existed, the only copy was wherever the operator had put
-    /// `--out`, and a second `build` over the same file took it away — so
-    /// an interrupted run could not be continued at all, and `--resume`
-    /// answered "A resume continues the run it was, not a different
-    /// rollout with the same id." (lab lane L2, 2026-09-23). The run
-    /// directory is the evidence of a run, and the bytes it acted on are
-    /// part of that evidence.
+    /// Save the release beside the plan so resume does not depend on an external build-output
+    /// file that may be overwritten.
     pub fn release_copy_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("release.json")
     }
-    // --- end lane 5C ---
 
-    // --- lane 4B: what a verification leaves behind -------------------
-    //
-    // Beside the journal and the receipt of a rollout, in the same run
-    // directory, because they are the same kind of thing: what this run did
-    // and what it found. `report --run <id>` reads whichever of them is
-    // there.
+    // Verification ledger and report share the run directory with rollout evidence.
 
     /// `runs/<run-id>/ledger.json`: what a verification made, written
     /// before it was made.
@@ -178,8 +115,6 @@ impl StateDir {
     pub fn verify_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("verify.json")
     }
-
-    // --- end lane 4B --------------------------------------------------
 
     pub fn observations_dir(&self) -> PathBuf {
         self.root.join("observations")
@@ -201,15 +136,8 @@ impl StateDir {
         self.root.join("gcroots")
     }
 
-    // --- lane 5B: what is left of a host that left -----------------------
-
-    /// `retired/`: one small file per host that was taken out of service.
-    ///
-    /// It is in the state directory and not in the inventory because the
-    /// inventory is the operator's list of what the fleet IS, and a retired
-    /// host is not on it any more. What this directory answers is the
-    /// question `status` asks about a host that is in a release but not in
-    /// the inventory: was that a retirement, or did somebody delete a line.
+    /// Retirement records used to distinguish deliberate removal from an unexplained
+    /// inventory change.
     pub fn retired_dir(&self) -> PathBuf {
         self.root.join("retired")
     }
@@ -218,11 +146,8 @@ impl StateDir {
         self.retired_dir().join(format!("{host_id}.json"))
     }
 
-    /// The record of one retirement, or `None` for a host that has none.
-    ///
-    /// A file that cannot be read is `None` and not an error: `status` is a
-    /// read-only verb and a broken record is a missing sentence, not a
-    /// reason to refuse to look at the fleet.
+    /// Return a valid retirement record, or None if absent, unreadable, or invalid. Status
+    /// remains available when this evidence is missing.
     pub fn read_retired(&self, files: &dyn Files, host_id: &str) -> Option<Retired> {
         let path = self.retired_path(host_id);
         if !files.exists(&path) {
@@ -246,8 +171,6 @@ impl StateDir {
         files.write_atomic(&path, &bytes, 0o644)?;
         Ok(path)
     }
-
-    // --- end lane 5B -----------------------------------------------------
 
     pub fn gcroot_dir(&self, release_id: &str) -> PathBuf {
         self.gcroots_dir().join(release_id)
@@ -274,11 +197,8 @@ impl StateDir {
         Ok(())
     }
 
-    /// Every run this directory holds, oldest first.
-    ///
-    /// Oldest first because a run id is a uuid v7: it sorts by the time it
-    /// was made, which is what makes a lexical listing a chronological one
-    /// and `gc --keep N` a sentence about the last N runs.
+    /// List run entries in filesystem-provider order. RealFiles returns sorted names; UUIDv7
+    /// names sort by creation time.
     pub fn runs(&self, files: &dyn Files) -> Result<Vec<String>> {
         Ok(files
             .list_dir(&self.runs_dir())?
@@ -290,12 +210,9 @@ impl StateDir {
             .collect())
     }
 
-    /// Write a snapshot, and point `latest.json` at what it says.
-    ///
-    /// Two copies on purpose: `observations/<ts>.json` is the history and
-    /// `latest.json` is what `status --offline` and a `--observation`
-    /// without a path read. A symlink would be cheaper and would break the
-    /// moment somebody copied the directory without `-a`.
+    /// Persist timestamped history plus latest.json; optionally copy it into the run.
+    /// Filenames have second precision, so multiple saves in one second replace the same
+    /// history entry.
     pub fn save_observation(
         &self,
         files: &dyn Files,
@@ -351,23 +268,16 @@ impl StateDir {
 // The operator's lock
 // ---------------------------------------------------------------------------
 
-/// Who holds the state directory.
-///
-/// This is the BOOTSTRAP anchor of D6: the single-writer contract for a fleet
-/// that has no control plane yet. The per-host locks a rollout takes are a
-/// different thing, written by `meister-activate` on the target
-/// ([`crate::observation::Lock`]); this one is about two operators in one
-/// repository.
+/// Repository-level operator lock. Target-side activation locks are separate and represented
+/// by observation::Lock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LockRecord {
     pub schema: String,
     pub run_id: String,
     pub operator: String,
-    /// Which machine the process is on. Without it, a pid is a number that
-    /// means something different on every host that shares the directory —
-    /// and a state directory on a network filesystem is exactly the case
-    /// this field exists for.
+    /// Workstation identity used when determining whether this process can assess the
+    /// recorded PID.
     pub workstation: String,
     pub pid: u32,
     pub acquired_at: DateTime<Utc>,
@@ -397,11 +307,8 @@ impl LockRecord {
         if self.workstation != here.workstation {
             return Liveness::Elsewhere;
         }
-        // A pid that does not fit in a positive `pid_t` is not a process.
-        // It matters more than it looks: `kill` reads 0 as "my process
-        // group" and -1 as "everything I may signal", and 4294967295 cast
-        // to an i32 IS -1 — so a lock record with a nonsense pid would be
-        // reported as a live process rather than as nonsense.
+        // Require a positive pid_t: zero and negative values address process groups, not an
+        // individual holder.
         let Ok(pid) = i32::try_from(self.pid) else {
             return Liveness::Unknown;
         };
@@ -465,11 +372,7 @@ pub enum Liveness {
     Unknown,
 }
 
-/// Who this process is, for a lock record and a receipt.
-///
-/// The user comes from the environment because that is who an operator is
-/// to every other tool they run; the uid is the fallback for a process
-/// started without one (a cron job, a systemd unit).
+/// Describe the operator using USER/LOGNAME with a UID fallback, plus the local hostname.
 pub fn current_operator() -> Operator {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -481,22 +384,9 @@ pub fn current_operator() -> Operator {
     Operator { user, workstation }
 }
 
-/// Take the lock, or say who has it.
-///
-/// A lock this run already holds is not an error: a verb that acquires
-/// twice inside one run — `plan` then `apply --resume` — is asking whether
-/// it may write, and the answer is yes.
-///
-/// Astra finding F04, 2026-09-23: it was the answer to a second LIVE process
-/// of the same run as well, and that is the one reading of it that is wrong.
-/// Two `apply --resume <run>` at once both came through this door, and the
-/// journal is what paid for it: each writer seeds its sequence counter from
-/// the file it read when it started, so both hand out the same numbers and
-/// the next `fold` refuses the whole journal with "this journal goes
-/// backwards". The run is then neither readable nor resumable. So the
-/// shortcut now asks WHICH process is meant — this one, or one that is
-/// demonstrably not on this machine any more, which is what a resume after
-/// a kill is.
+/// Create the operator lock exclusively. Matching run/PID is treated as re-entry; a
+/// demonstrably dead local holder of the same run can be succeeded. Other holders are
+/// refused. No timestamp expires a lock.
 pub fn acquire_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -513,33 +403,18 @@ pub fn acquire_lock(
             // Somebody was faster, or a run is in progress. Which of the two
             // it is, the file says.
             match read_lock(files, state)? {
-                // This very process asking again, or a run whose process is
-                // gone — the shape `apply --resume` has after a kill. A run
-                // id that is the same and a process that is still running is
-                // a SECOND writer, and it is refused like any other.
+                // Treat a matching run and PID as re-entry. Workstation is not compared in
+                // this branch.
                 Some(held) if held.run_id == run_id && held.pid == std::process::id() => Ok(held),
-                // The same run and a process that is demonstrably gone: the
-                // shape `apply --resume` has after a kill.
-                //
-                // Astra finding MD01, 2026-09-25: this arm used to hand back
-                // the OLD record, so the file kept naming the dead process
-                // for as long as the resume ran — and a second resume,
-                // reading the same dead pid, came through the same arm. The
-                // record is now replaced by this process's own, and the
-                // replacement is the one step two resumes cannot both take
-                // (`succeed_dead_holder`). `Gone` and only `Gone`: a lock
-                // taken on another workstation, or a pid this machine
-                // cannot judge, is not known to be dead, and "not known to
-                // be running" was the reading that let it through.
+                // Replace a dead local holder before resuming so another resume sees this
+                // live process. Unknown or remote liveness does not qualify.
                 Some(held)
                     if held.run_id == run_id && held.liveness(operator) == Liveness::Gone =>
                 {
                     succeed_dead_holder(files, state, &held, record, operator)
                 }
-                // The same run, and somebody else is running it right now —
-                // or nobody here can tell. The refusal below would tell this
-                // operator to resume the run they are already resuming, so
-                // it gets a sentence of its own.
+                // A competing or unverifiable holder of the same run cannot be resumed
+                // concurrently.
                 Some(held) if held.run_id == run_id => {
                     let and = match held.liveness(operator) {
                         Liveness::Running => "That process is running.".to_string(),
@@ -579,16 +454,9 @@ pub fn acquire_lock(
     }
 }
 
-/// Put this process's record where a dead process's record of the same run
-/// is, so that the lock names the process that is carrying the run.
-///
-/// Astra finding MD01, 2026-09-25. The same rule `take_over_lock` follows:
-/// the claim is a rename, which exactly one of two takers can succeed at;
-/// only then is the carried-away record read, and one that turns out to be
-/// somebody else's — a resume that succeeded the dead process between this
-/// process's read and its rename — goes back with `create_new`, which cannot
-/// overwrite. The claim's name carries the pid, so two resumes of one run
-/// do not even share a claim.
+/// Claim the lock by renaming it, then verify the carried record. Install this process only
+/// for the expected dead holder. Restore a conflicting record with create_new so it cannot
+/// overwrite a newer lock.
 fn succeed_dead_holder(
     files: &dyn Files,
     state: &StateDir,
@@ -683,28 +551,9 @@ pub fn release_lock(files: &dyn Files, state: &StateDir, run_id: &str) -> Result
     }
 }
 
-/// Take a named run's lock, deliberately.
-///
-/// The run id has to be passed in and has to match what is there: an
-/// operator who types `--takeover` has read the refusal, and quoting the id
-/// out of it is how they say which run they mean. A takeover that accepted
-/// "whatever is in the file" would take over a run that started in the
-/// meantime.
-///
-/// Astra finding F04, 2026-09-23: reading the owner, removing it and
-/// creating a new one is three steps, and two takeovers that both read the
-/// old owner could both go through them. The loser's `remove_file` then took
-/// away the WINNER'S fresh lock — after which both processes believed they
-/// held the repository, which is the state this file exists to make
-/// impossible.
-///
-/// So the claim is a rename and no longer a remove. Every taker renames the
-/// lock to a name of its own (`lock.taken-by-<run>`), and a rename of a file
-/// that is not there fails: of two takers, exactly one carries the old
-/// record away. Only then is it read, and a taker that finds it was not the
-/// run it named puts it back with `create_new` — which cannot overwrite
-/// anything, so a third lock that appeared meanwhile survives and is
-/// reported.
+/// Explicitly replace the named run. Rename the lock to claim its current record, verify its
+/// run ID, then acquire the replacement. A mismatched record is restored with create_new,
+/// preserving any newer lock.
 pub fn take_over_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -743,7 +592,7 @@ pub fn take_over_lock(
             };
             match restored {
                 Ok(()) => {
-                    // It is back where it was, so the claim is rubbish.
+                    // Restoration succeeded; discard the temporary claim.
                     files.remove_file(&claim)?;
                     bail!(
                         "this repository is held {whose}, not by {of_run}. Nothing was taken \
@@ -767,16 +616,8 @@ pub fn take_over_lock(
 // The journal
 // ---------------------------------------------------------------------------
 
-/// The writer of one run's journal.
-///
-/// It owns `seq`, `run_id` and `plan_id` so that no caller can get them
-/// wrong: [`crate::receipt::fold`] refuses a journal whose sequence does not
-/// strictly increase and one that carries two runs, and both of those are
-/// properties of the writer rather than of a convention.
-///
-/// Secrets: everything this writes goes through the same redaction list the
-/// runner uses for a command line. A journal is the file an operator
-/// attaches to a ticket.
+/// Journal writer carrying run ID, plan ID, sequence counter, and redaction values. Callers
+/// must serialize append operations to preserve sequence order on disk.
 pub struct Journal {
     path: PathBuf,
     run_id: String,
@@ -830,22 +671,14 @@ impl Journal {
         self.seq.load(Ordering::SeqCst)
     }
 
-    /// An event of this run, ready to be given a host, a transition and a
-    /// payload. Its `seq` is set when it is written and not before: a
-    /// sequence number that was handed out and never written would be a gap
-    /// [`crate::receipt::fold`] reports as a lost line.
+    /// Construct an event; append assigns its sequence number and overwrites run/plan
+    /// identity.
     pub fn event(&self, kind: EventKind, now: DateTime<Utc>) -> JournalEvent {
         JournalEvent::new(0, now, &self.run_id, &self.plan_id, kind)
     }
 
-    /// Write it, durably, and hand back what was written.
-    ///
-    /// A write that fails keeps its sequence number, and the next line is
-    /// therefore the one after it: `fold` then reports a gap, which is
-    /// exactly what happened — a line was lost. Handing the number back
-    /// would be tidier and would let a retry write a second line with the
-    /// same `seq`, and a journal with two of one number is a journal
-    /// nobody can fold.
+    /// Assign a sequence number, redact the serialized line, and append with fsync. Failed
+    /// writes consume their number so later folding can report missing evidence.
     pub fn append(&self, files: &dyn Files, event: JournalEvent) -> Result<JournalEvent> {
         let mut event = event;
         event.seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -862,11 +695,7 @@ impl Journal {
     }
 }
 
-/// Apply a redaction list to a finished json line.
-///
-/// Both spellings of every secret: the raw one, and the one json escaping
-/// produces. A key with a newline in it appears in a line as `\n`, and a
-/// list that only knew the raw form would leave it there.
+/// Replace registered secrets in both raw and JSON-escaped forms before writing.
 fn redacted(line: &str, secrets: &[String]) -> String {
     let mut out = line.to_string();
     for secret in secrets {
@@ -897,15 +726,8 @@ impl JournalRead {
     }
 }
 
-/// Read a journal, tolerating exactly one torn line at the end.
-///
-/// Astra finding F05, 2026-09-23: the bytes are read and made into text
-/// here rather than by `read_to_string`, because a machine that lost power
-/// in the middle of a line can have cut it inside a multi-byte character,
-/// and `read_to_string` then fails with "stream did not contain valid
-/// UTF-8" before the tail handling below ever runs. A journal that cannot
-/// be read is a run that cannot be resumed, so the bad bytes become
-/// replacement characters and land in the fragment that is dropped anyway.
+/// Read complete records and report an unterminated tail. A valid final record without
+/// newline is retained; an invalid tail is dropped. UTF-8 decoding is lossy before parsing.
 pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
     let text = String::from_utf8_lossy(&files.read(path)?).into_owned();
     let origin = path.display().to_string();
@@ -916,10 +738,7 @@ pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
     let mut torn = None;
 
     if unterminated && let Some(last) = lines.pop() {
-        // It may still parse — a short line can land whole and lose only its
-        // newline. Then it is kept, because it happened, and it is still
-        // reported, because the run that wrote it did not get to the next
-        // one.
+        // Retain a valid record missing only its newline, but report the incomplete append.
         match serde_json::from_str::<JournalEvent>(last) {
             Ok(_) => {
                 lines.push(last);
@@ -942,24 +761,9 @@ pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
     Ok(JournalRead { events, torn })
 }
 
-/// Make the file end where its last whole line ends, and say what was
-/// found. `None` when there was nothing to repair.
-///
-/// Astra finding F05, 2026-09-23: [`read_journal`] tolerated a torn last
-/// line IN MEMORY and nothing ever touched the file. `Journal::resuming`
-/// only set the sequence counter, so the next `append_fsync` — O_APPEND —
-/// wrote its line directly behind the fragment. The result was a line that
-/// is two halves of two entries, and it is no longer the LAST line, so the
-/// tolerance above does not apply to it: the test
-/// `a_broken_line_that_is_not_the_last_one_is_not_a_power_cut` shows what
-/// happens then, which is that the whole journal is refused. One torn write
-/// made the run unreadable and unresumable from the second resume on.
-///
-/// The repair works on the raw text and never re-serialises an entry: the
-/// journal is evidence, and evidence that has been through this tool's
-/// serialiser a second time is a copy. Two shapes, exactly the two
-/// [`read_journal`] distinguishes — a fragment, which goes, and a whole
-/// line that lost only its newline, which gets the newline it is missing.
+/// Repair an unterminated journal before appending: add a newline to a valid last record or
+/// drop an invalid fragment. Complete records are not reserialized; input bytes are decoded
+/// lossily.
 pub fn repair_journal(files: &dyn Files, path: &Path) -> Result<Option<String>> {
     if !files.exists(path) {
         return Ok(None);
@@ -1000,55 +804,17 @@ pub fn journal_ref(files: &dyn Files, path: &Path) -> Result<JournalRef> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// --- lane 4C: what a state directory keeps
-// ---------------------------------------------------------------------------
-//
-// Three kinds of thing pile up in here, and they are not the same kind of
-// thing at all:
-//
-// * `gcroots/<release-id>/` costs DISK — gigabytes of closure the collector
-//   may not take. Dropping a root removes no store path; it only stops this
-//   tool from insisting.
-// * `observations/<ts>.json` costs kilobytes and is a picture of a fleet at
-//   a moment. Old ones answer "when did this host last look healthy".
-// * `runs/<run-id>/` is the EVIDENCE: the journal that was fsynced line by
-//   line before every irreversible step, and the receipt that says what
-//   happened. Some of it is the only record of something that went wrong.
-//
-// So the rules differ, and the differences are the point:
-//
-// * a release loses its roots when it is neither among the newest N NOR
-//   younger than `--older-than` — two guards, both of which have to agree,
-//   because the conservative direction is the one that keeps a rollback
-//   possible;
-// * a directory with no `.created` stamp is never removed, because a
-//   directory this tool cannot date is one it does not know enough about;
-// * `observations/latest.json` is never removed — it is what `status
-//   --offline` answers from;
-// * `runs/` is touched only when `--runs` says so, and NEVER a run whose
-//   receipt is not `success` or that has no receipt at all: a run that
-//   failed, was aborted, ended partial or never ended is the one somebody
-//   has to read;
-// * nothing is deleted recursively. A run directory is emptied of the files
-//   this tool knows it writes, and anything else in it stops the removal
-//   with a sentence rather than a `rm -rf`.
+// Retention separately handles release roots, observation history, and successful completed
+// runs. Count and optional age guards must both permit removal. Undated roots and latest.json
+// are protected; run removal requires explicit opt-in and recognizes only run_contents'
+// allowlist.
 
-/// The recommended retention, as a sentence an operator can copy:
-/// `meister-deploy gc --keep 3 --older-than 14`.
-///
-/// Three, because that is what the target keeps as well
-/// (`meisterstack.managed.keepGenerations`, `meister-activate gc --keep 3`):
-/// the running system, the booted system and three generations back. A
-/// release whose roots are gone while the target still has the generation
-/// is a rollback that works and a rebuild that does not, which is the wrong
-/// way round.
+/// Default retained release count. Removing a root permits later Nix GC; it does not remove a
+/// store path directly.
 pub const DEFAULT_KEEP_RELEASES: usize = 3;
 
-/// Fourteen days, because that is how long "the release from before the
-/// holiday" stays a thing somebody goes back to. It is a SECOND guard and
-/// never the only one: a fleet that has not been rebuilt in a month must
-/// not lose the roots of the release it is running.
+/// Suggested age threshold for CLI guidance; Retention::default does not enable the age
+/// guard.
 pub const DEFAULT_OLDER_THAN_DAYS: i64 = 14;
 
 /// What `gc` was asked to keep.
@@ -1129,11 +895,8 @@ impl Sweep {
     }
 }
 
-/// Decide what this state directory may stop keeping.
-///
-/// Reads the disk and writes nothing: `--dry-run` prints exactly this and a
-/// real run hands the same value to [`carry_out`]. One function, so that the
-/// listing and the doing can never be two different decisions.
+/// Compute removals without changing state. Dry-run displays this result; carry_out applies
+/// it.
 pub fn sweep(
     files: &dyn Files,
     state: &StateDir,
@@ -1148,10 +911,8 @@ pub fn sweep(
     Ok(out)
 }
 
-/// Whether a thing made at `created` is old enough to be allowed to go.
-///
-/// `None` for `older_than_days` means age protects nothing, which is what
-/// keeps `--keep 0` a sentence about counting.
+/// Apply the optional age guard. Without it, retention depends only on count and evidence
+/// protections.
 fn old_enough(created: DateTime<Utc>, retention: &Retention, now: DateTime<Utc>) -> bool {
     match retention.older_than_days {
         None => true,
@@ -1369,14 +1130,9 @@ fn sweep_runs(
     Ok(())
 }
 
-/// Exactly what is in a run directory, or the sentence that says why this
-/// tool will not empty it.
-///
-/// Driven by NAMES and not by file types, and no recursive delete anywhere:
-/// a run directory holds the four things this module writes — `journal.jsonl`,
-/// `receipt.json`, `plan.json` and `observations/` — and anything else in
-/// there is something somebody else put beside their evidence. A `gc` that
-/// removed it would be a `gc` that removed a file on purpose left there.
+/// Collect recognized run files for nonrecursive removal. Unknown entries retain the run. The
+/// allowlist currently excludes release.json and verification files written elsewhere in this
+/// module.
 #[allow(clippy::type_complexity)]
 fn run_contents(
     files: &dyn Files,
@@ -1432,8 +1188,6 @@ pub fn carry_out(files: &dyn Files, sweep: &Sweep) -> Result<()> {
     }
     Ok(())
 }
-
-// --- end lane 4C -----------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1709,10 +1463,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(winner.run_id, "run-second");
-        // The second one read the SAME old owner before any of that and
-        // arrives now. It used to remove the winner's fresh lock and take
-        // the repository as well; now it carries that lock away, sees it is
-        // not the run it named, and puts it back.
+        // A competing takeover must restore a lock belonging to a newer run without
+        // overwriting another lock.
         let err = take_over_lock(
             &files,
             &state,
@@ -1906,10 +1658,8 @@ mod tests {
 
     #[test]
     fn a_pid_that_is_not_a_process_is_not_a_running_one() {
-        // 4294967295 as an i32 is -1, and `kill(-1, 0)` succeeds: a record
-        // with that in it would be read as "the holder is running" — or, if
-        // this were ever a real signal rather than signal 0, as something
-        // far worse. Zero is `kill(0)`, which is this process's own group.
+        // Reject zero and overflowing PIDs so signal-zero checks cannot address a process
+        // group.
         for pid in [0, 4_294_967_295, u32::MAX - 1] {
             let record = LockRecord {
                 schema: LOCK_SCHEMA.to_string(),
@@ -1937,11 +1687,8 @@ mod tests {
 
     #[test]
     fn the_operator_anchor_is_recorded_where_it_belongs() {
-        // 2B's `fold` requires every `lock.acquire` to name a host, because
-        // those are the per-host locks a rollout takes. The operator's
-        // anchor is not one of those — it is about this repository — so it
-        // travels in the `run.start` payload, which `fold` carries through
-        // untouched beside the operator it does read.
+        // Repository lock evidence belongs in run.start; lock.acquire events describe host
+        // locks and require a host.
         let files = MemFiles::new();
         let state = state();
         let run = run_id();
@@ -2206,11 +1953,7 @@ mod tests {
     // Astra finding F05, 2026-09-23.
     #[test]
     fn a_resume_after_a_torn_write_leaves_a_journal_that_folds() {
-        // Both shapes a machine that stopped in the middle leaves behind,
-        // and the same demand on each: after the repair and one more line,
-        // the file reads back whole. Before this it did not — the next
-        // append landed behind the fragment, and from the read after that
-        // on the journal was refused outright.
+        // After repairing either tail shape, another append must leave a readable journal.
         for (what, tail, kept) in [
             ("a fragment", "{\"seq\":3,\"ts\":\"2026-09-2", 2usize),
             ("no newline", "", 2usize),
@@ -2272,10 +2015,8 @@ mod tests {
     // Astra finding F05, 2026-09-23.
     #[test]
     fn a_journal_cut_inside_a_character_is_still_a_journal() {
-        // `read_to_string` refused this file with "stream did not contain
-        // valid UTF-8" before any tail handling ran, so a power cut in the
-        // wrong byte made the run unresumable. The bad bytes are in the
-        // fragment, which is exactly what goes.
+        // Invalid UTF-8 in the torn fragment must reach tail repair instead of failing
+        // decoding first.
         let files = MemFiles::new();
         let state = state();
         let run = run_id();
@@ -2370,8 +2111,7 @@ mod tests {
                         "action": 7,
                         "kind": "deliver-secret",
                         "result": "ok",
-                        // Somebody put the thing itself in the payload. It is
-                        // the writer's job that it does not reach the file.
+                        // Redact secrets embedded directly in the payload.
                         "evidence": [format!("wrote {key}")],
                         "cmd_refs": ["ssh box sh -c …"]
                     })),
@@ -2438,8 +2178,6 @@ mod tests {
                 .is_empty()
         );
     }
-
-    // --- lane 4C: retention ---------------------------------------------
 
     /// A release's roots on the disk: one link per host, plus the stamp.
     fn with_release(files: MemFiles, id: &str, created: &str) -> MemFiles {
@@ -2600,10 +2338,7 @@ mod tests {
 
     #[test]
     fn a_stamp_this_tool_cannot_read_is_not_the_same_as_no_stamp() {
-        // Both are kept, and an operator has to be able to tell them
-        // apart: no stamp is a release from before this tool wrote them,
-        // an unreadable one is a file somebody edited. Found by running
-        // `gc` by hand against a stamp a shell had truncated.
+        // Retain both missing and unreadable stamps, with distinct diagnostics.
         let files = MemFiles::new()
             .given(
                 "/repo/.meister-deploy/gcroots/release-edited/.created",
@@ -2839,7 +2574,7 @@ mod tests {
         assert!(why["0192f0c0-0000-7000-8000-000000000003"].contains("partial"));
         assert!(why["0192f0c0-0000-7000-8000-000000000004"].contains("no receipt"));
 
-        // And what it removes is the four things a run writes, nothing else.
+        // Remove only the files represented in this test run.
         carry_out(&files, &swept).unwrap();
         for leftover in [
             "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000001/journal.jsonl",
