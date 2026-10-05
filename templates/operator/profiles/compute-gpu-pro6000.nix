@@ -36,8 +36,9 @@ let
   # set (passthrough for host-owned devices, translation only for what vfio takes). Intel's
   # driver stays off unless asked: `intel_iommu=on`. AMD's driver starts by itself when the
   # firmware publishes an IVRS table and has no `on` switch (`amd_iommu=` takes tuning
-  # keywords only), so AMD adds nothing. `intel_iommu=on` on an AMD host is an unknown
-  # parameter the kernel hands on to init: harmless, and a lie in the configuration.
+  # keywords only), so AMD adds nothing. `intel_iommu=on` on an AMD host is parsed by the
+  # built-in Intel IOMMU driver and ignored: without a DMAR table that driver never starts.
+  # Harmless, and still a lie in the configuration.
   vendorParams = lib.optional (vendor == "intel") "intel_iommu=on";
 
   # MIG leaves no trace in NixOS options: it is `nvidia-smi -mig 1` plus a partition setup,
