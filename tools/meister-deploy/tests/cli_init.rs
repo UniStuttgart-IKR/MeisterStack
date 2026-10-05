@@ -76,6 +76,7 @@ fn a_fresh_directory_becomes_a_deployment_repository() {
         "fleet.toml",
         "profiles.nix",
         "profiles/base.nix",
+        "profiles/single-node.nix",
         "disko/single-nvme.nix",
         "known_hosts",
         ".gitignore",

@@ -36,6 +36,7 @@ pub const FILES: &[File] = &[
     file!("profiles/compute-cpu.nix"),
     file!("profiles/compute-gpu-pro6000.nix"),
     file!("profiles/observability-local.nix"),
+    file!("profiles/single-node.nix"),
     file!("hosts/cp-1.nix"),
     file!("hosts/a1.nix"),
     file!("disko/single-nvme.nix"),
@@ -64,11 +65,43 @@ mod tests {
             "fleet.toml",
             "profiles.nix",
             "profiles/base.nix",
+            "profiles/single-node.nix",
             "disko/single-nvme.nix",
             "known_hosts",
             ".gitignore",
         ] {
             assert!(paths.contains(&needed), "the template has no {needed}");
+        }
+    }
+
+    /// The file names that `profiles.nix` imports as `import ./profiles/<name>`.
+    fn imported_profiles(profiles_nix: &str) -> Vec<&str> {
+        profiles_nix
+            .split("import ./profiles/")
+            .skip(1)
+            .filter_map(|rest| rest.split([' ', ';']).next())
+            .collect()
+    }
+
+    /// A profile missing from `init`'s output evaluates fine until a host selects it, then
+    /// fails on the missing file.
+    #[test]
+    fn every_profile_that_profiles_nix_imports_is_embedded() {
+        let profiles_nix = FILES
+            .iter()
+            .find(|f| f.path == "profiles.nix")
+            .expect("the template has a profiles.nix");
+        let imported = imported_profiles(profiles_nix.body);
+        assert!(
+            !imported.is_empty(),
+            "no profile import found in profiles.nix"
+        );
+        for name in imported {
+            let path = format!("profiles/{name}");
+            assert!(
+                FILES.iter().any(|f| f.path == path),
+                "profiles.nix imports {path}, which `init` does not write"
+            );
         }
     }
 
