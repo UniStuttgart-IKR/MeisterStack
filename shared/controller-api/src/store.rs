@@ -1016,6 +1016,34 @@ mod tests {
         );
     }
 
+    /// The key a placement claims is one the store takes for a reservation and refuses for a
+    /// migration, so no migration's name can ever be a placement's claim (R2-3).
+    #[test]
+    fn no_migration_can_be_named_like_a_placement_claim() {
+        let vm = crate::resources::new_vm(
+            "web-1",
+            serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap(),
+        );
+        let claim = crate::resources::CapacityReservation::for_placement(&vm, "agent-1");
+        let name = &claim.metadata.name;
+        assert!(
+            EtcdStore::check_name(
+                name,
+                <crate::resources::CapacityReservation as Resource>::NAME_SHAPE
+            )
+            .is_ok(),
+            "{name:?} is stored as a reservation"
+        );
+        assert!(
+            EtcdStore::check_name(
+                name,
+                <crate::resources::VmMigration as Resource>::NAME_SHAPE
+            )
+            .is_err(),
+            "{name:?} is refused as a migration name"
+        );
+    }
+
     #[test]
     fn a_name_that_is_not_one_path_segment_is_refused() {
         assert!(EtcdStore::check_name("web-1", NameShape::DnsLabel).is_ok());

@@ -509,7 +509,7 @@ enum Claimed {
 }
 
 /// Write a create-only claim that this guest goes to `node`: one claim per placement across
-/// replicas (R3-F05). The key is `place-<vm uid>`; anything else under it is refused, not
+/// replicas (R3-F05). The key is `place.<vm uid>`; anything else under it is refused, not
 /// adopted, and left to the reaper.
 async fn claim(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::Result<Claimed> {
     let want = CapacityReservation::for_placement(vm, node);

@@ -11,8 +11,10 @@ use super::*;
 /// (`EtcdStore::update_if_standing`); the bound only delays a crashed placement's room.
 pub const STALE_PLACEMENT_AFTER_SECS: i64 = 60;
 
-/// Prefix of a placement claim's name, followed by the guest's uid.
-const PLACEMENT_CLAIM_PREFIX: &str = "place-";
+/// Prefix of a placement claim's name, followed by the guest's uid. The `.` is what no DNS
+/// label, and so no migration name, can hold: placement and migration claims share one
+/// directory and can never share a key, whatever a user names a migration (R2-3).
+const PLACEMENT_CLAIM_PREFIX: &str = "place.";
 
 /// Which road to a node holds this room; the reaper releases each on a different fact.
 /// `Migration` is the default so objects stored before this field existed stay migrations.
@@ -30,7 +32,7 @@ pub enum Claimant {
 /// (the guest stays bound to the source until settlement) or a placement before binding.
 /// Both roads take the same commit, so neither can overfill a node (R3-F05; S07):
 ///
-///   1. CLAIM: create-only write (key: migration name or `place-<vm uid>`), unique across
+///   1. CLAIM: create-only write (key: migration name or `place.<vm uid>`), unique across
 ///      replicas.
 ///   2. CONFIRM: [`crate::capacity::claim_holds`] reads node, VMs and reservations at one
 ///      revision; the allowance must cover bound guests, earlier claims (etcd
@@ -105,8 +107,8 @@ impl CapacityReservation {
     /// The claim one placement would make at `node` for `vm`.
     ///
     /// Named by the guest's UID, not its name (as `migration_uid`): names are reused, and a
-    /// claim for a deleted VM must not be taken for its namesake's. `place-<uuid>` is a DNS
-    /// label no migration is named like, so the two roads cannot collide on a key.
+    /// claim for a deleted VM must not be taken for its namesake's. `place.<uuid>` is not a
+    /// DNS label, and a migration's name always is, so the two roads cannot collide on a key.
     pub fn for_placement(vm: &Vm, node: &str) -> Self {
         let size = crate::scheduler::Capacity::wanted_by(vm);
         Self::declare(

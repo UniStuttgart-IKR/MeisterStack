@@ -241,7 +241,7 @@ mod tests {
         let claim = CapacityReservation::for_placement(&landing, "agent-2");
         assert_eq!(
             claim.metadata.name,
-            format!("place-{}", landing.metadata.uid)
+            format!("place.{}", landing.metadata.uid)
         );
         assert_eq!(claim.spec.claimant, Claimant::Placement);
         assert_eq!(claim.spec.mem_mib, 4096, "the guest's size travelled");
@@ -260,16 +260,6 @@ mod tests {
             claim.metadata.name
         );
         assert!(!claim.is_placement_of(&again));
-
-        // The name is a label the store accepts: lowercase, digits, dashes.
-        assert!(
-            claim
-                .metadata
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        );
-        assert!(claim.metadata.name.len() <= 63);
     }
 
     /// A placement claim is an orphan once bound, gone, deleting or stale, not before (R3-F05).
