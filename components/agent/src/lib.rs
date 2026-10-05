@@ -907,8 +907,9 @@ async fn say_goodbye(agent: &Arc<Agent>) {
 /// Attempt to silence routers without destroying their namespaces. Called
 /// after the stopping report wait and after controller-session loss. Takes the
 /// bridge, not the agent, so a fake driver can test it.
-/// True only when every active router is verifiably silent (no bridge counts as silent);
-/// a driver error or partial `Silencing` is false so the caller retries (R3-F06).
+/// True only when every router namespace on this node is verifiably silent, whatever its record
+/// says (no bridge counts as silent); a driver error or partial `Silencing` is false so the
+/// caller retries (R3-F06, R2-1).
 async fn stop_speaking_for_every_router(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
 ) -> bool {

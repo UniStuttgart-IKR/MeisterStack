@@ -8,7 +8,7 @@
 //! A JSON spec under run_dir identifies each router across agent restarts. Router
 //! listing skips unreadable records, while overlay ownership checks reject them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -541,6 +541,20 @@ impl crate::LinuxNetworkDriver {
         tokio::fs::rename(&tmp, path).await
     }
 
+    /// Write the record for `spec` under `dir`, atomically: a crash mid-write leaves the old or
+    /// the new record, never a torn one.
+    async fn store_record(dir: &Path, spec: &RouterSpec) -> networking::Result<()> {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| {
+            NetworkError::Backend(anyhow::anyhow!("creating {}: {e}", dir.display()))
+        })?;
+        let record = serde_json::to_vec_pretty(&RouterRecord { spec: spec.clone() })
+            .map_err(|e| NetworkError::Backend(e.into()))?;
+        let path = Self::record_path(dir, &spec.id);
+        Self::publish_record(&path, &record)
+            .await
+            .map_err(|e| NetworkError::Backend(anyhow::anyhow!("writing {}: {e}", path.display())))
+    }
+
     /// One router as it IS: the record says what it should be, the kernel says
     /// whether it is.
     async fn state_of(&self, spec: &RouterSpec, live: &[String]) -> RouterState {
@@ -652,6 +666,14 @@ impl crate::LinuxNetworkDriver {
         // every locally originated probe need it.
         self.ip_again(&["-n", &netns, "link", "set", "lo", "up"])
             .await;
+        // Legs created below are born silent: only the last step of a complete pass lets an
+        // active router answer, so a pass that fails midway leaves no answering namespace (R2-1).
+        self.netns_sysctl(
+            &netns,
+            "net.ipv4.conf.default.arp_ignore",
+            arp_ignore(false),
+        )
+        .await?;
 
         // What the operator's wire takes, read off the interface they gave
         // away. `None` only if that interface has vanished under us, and then
@@ -692,6 +714,10 @@ impl crate::LinuxNetworkDriver {
                     .await;
             }
             self.ip(&["-n", &netns, "link", "set", leg, "up"]).await?;
+        }
+        // A standby falls silent before it is given anything to answer for.
+        if !spec.active {
+            self.set_arp_mode(&netns, false).await?;
         }
 
         for (leg, addr) in [
@@ -744,18 +770,6 @@ impl crate::LinuxNetworkDriver {
 
         self.netns_sysctl(&netns, "net.ipv4.ip_forward", "1")
             .await?;
-        // The standby half, and the only thing that separates it from the
-        // active one on the wire. Both legs, because a standby must be silent
-        // towards the tenant as well as towards the fabric: an ARP reply on
-        // the overlay would make it the tenant's default gateway.
-        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
-            self.netns_sysctl(
-                &netns,
-                &format!("net.ipv4.conf.{leg}.arp_ignore"),
-                arp_ignore(spec.active),
-            )
-            .await?;
-        }
 
         // Skip unchanged rendered rules when the table exists, preserving counters.
         // External rule changes within an existing table are not detected.
@@ -763,21 +777,16 @@ impl crate::LinuxNetworkDriver {
             self.netns_nft(&netns, &rules).await?;
         }
 
-        // Last, and only when everything above worked: a record is this
-        // driver's statement that the namespace beside it is finished. One
-        // written earlier would make the sweep spare a half-built router for
-        // ever.
-        let dir = &self.gateway()?.state_dir;
-        tokio::fs::create_dir_all(dir).await.map_err(|e| {
-            NetworkError::Backend(anyhow::anyhow!("creating {}: {e}", dir.display()))
-        })?;
-        let record = serde_json::to_vec_pretty(&RouterRecord { spec: spec.clone() })
-            .map_err(|e| NetworkError::Backend(e.into()))?;
-        let path = Self::record_path(dir, &spec.id);
-        // Atomic publish: a crash mid-write leaves the old or the new record, never a torn one.
-        Self::publish_record(&path, &record).await.map_err(|e| {
-            NetworkError::Backend(anyhow::anyhow!("writing {}: {e}", path.display()))
-        })?;
+        // Only when everything above worked: a record is this driver's statement that the
+        // namespace beside it is finished. One written earlier would make the sweep spare a
+        // half-built router for ever.
+        Self::store_record(&g.state_dir, spec).await?;
+
+        // Activation last, after the rules and the record: no namespace answers ARP without
+        // its NAT or before its record says active (R2-1).
+        if spec.active {
+            self.set_arp_mode(&netns, true).await?;
+        }
 
         // After the record and not before it: the shout is a statement that
         // this node is carrying the address, and the record is what makes that
@@ -882,10 +891,7 @@ impl crate::LinuxNetworkDriver {
         let dir = self.gateway()?.state_dir.clone();
         let mut swept = Vec::new();
         for netns in self.netns_present().await? {
-            let record_path = netns
-                .strip_prefix(NETNS_PREFIX)
-                .and_then(|id| id.parse::<RouterId>().ok())
-                .map(|id| Self::record_path(&dir, &id));
+            let record_path = netns_router_id(&netns).map(|id| Self::record_path(&dir, &id));
             if let Some(path) = &record_path {
                 match Self::read_record(path).await {
                     Ok(_) => continue,
@@ -914,76 +920,131 @@ impl crate::LinuxNetworkDriver {
         Ok(swept)
     }
 
-    /// Make every active record standby through ensure_router, continuing after failures.
-    /// Walks the record directory so an unreadable record's namespace is silenced by its
-    /// file-name id; reports failures so the dead man can retry a partial pass (R3-F06, R3-F07).
+    /// Silence every router namespace on this node, from the kernel's list as well as the
+    /// records (R2-1, R3-F06, R3-F07).
+    ///
+    /// The kernel is the truth here: a namespace with no record, with one that says standby or
+    /// with one that does not parse can still answer ARP. So every live `meister-rt-` namespace
+    /// gets `arp_ignore=8` on both legs directly, whatever its record says, and a record still
+    /// saying active is rewritten standby so the announcement pass withdraws it. Failures are
+    /// named per router so the dead man retries; a pass that could not list the namespaces or
+    /// the records is an error, after everything it could reach was silenced.
     #[instrument(skip_all)]
     pub(crate) async fn fall_silent_impl(&self) -> networking::Result<networking::Silencing> {
         let dir = self.gateway()?.state_dir.clone();
+        let live = self.netns_present().await;
+        let records = record_files(&dir).await;
+        let (routers, unnamed) = silencing_targets(
+            records.as_deref().unwrap_or_default(),
+            live.as_deref().unwrap_or_default(),
+        );
         let mut outcome = networking::Silencing::default();
-        for path in record_files(&dir).await? {
-            let Some(id) = Self::record_id(&path) else {
-                continue;
-            };
-            match Self::read_record(&path).await {
-                Ok(record) if !record.spec.active => {} // already silent
-                Ok(record) => {
-                    let mut spec = record.spec;
-                    spec.active = false;
-                    match self.ensure_router_impl(&spec).await {
-                        Ok(_) => {
-                            info!(router = %id, "this node is going and its router falls \
-                                                  silent; the standby speaks now");
-                            outcome.silenced.push(id);
-                        }
-                        Err(e) => {
-                            warn!(router = %id, error = %format!("{e:#}"),
-                                  "this router could not be silenced on the way out");
-                            outcome.failed.push(id);
-                        }
-                    }
-                }
-                // Raced with a destroy: nothing left to silence, not a failure of this pass.
-                Err(RecordError::Missing) => {}
-                Err(RecordError::Invalid(e)) => {
+        for id in routers {
+            match self.silence_router(&dir, id, live.as_deref().ok()).await {
+                Ok(()) => outcome.silenced.push(id),
+                Err(e) => {
                     warn!(router = %id, error = %format!("{e:#}"),
-                          "this router's record cannot be read; silencing its namespace \
-                           directly because its target state is unknown");
-                    match self.silence_unknown_router(id).await {
-                        Ok(()) => outcome.silenced.push(id),
-                        Err(e) => {
-                            warn!(router = %id, error = %format!("{e:#}"),
-                                  "this unknown router could not be silenced either");
-                            outcome.failed.push(id);
-                        }
-                    }
+                          "this router could not be silenced");
+                    outcome.failed.push(id);
                 }
             }
         }
+        let unnamed = self.silence_unnamed(&unnamed).await;
+        live?;
+        records?;
+        unnamed?;
         Ok(outcome)
     }
 
-    /// Silence a router by namespace alone, with no record to build a standby spec from: both
-    /// legs stop answering ARP.
-    ///
-    /// A record that cannot be read cannot go through `ensure_router_impl`, but the id in its
-    /// file name is enough for the sysctl pair the dead man exists for. A namespace that is
-    /// already gone has nothing to silence and counts as success (R3-F06, R3-F07).
-    async fn silence_unknown_router(&self, id: RouterId) -> networking::Result<()> {
+    /// Silence one router: its namespace unless the kernel's list proves it absent, and its
+    /// record if that still says active. Both are tried; the first failure is the answer.
+    async fn silence_router(
+        &self,
+        dir: &Path,
+        id: RouterId,
+        live: Option<&[String]>,
+    ) -> networking::Result<()> {
         let netns = router_netns(&id);
-        if !self.netns_present().await?.iter().any(|n| n == &netns) {
+        let kernel = match live.is_some_and(|live| !live.contains(&netns)) {
+            true => Ok(()),
+            false => self.set_arp_mode(&netns, false).await,
+        };
+        let record = Self::record_standby(dir, &id).await;
+        kernel.and(record)
+    }
+
+    /// Rewrite a record that still says active as standby, so the router announces nothing and
+    /// its next activation shouts again. A missing, standby or unreadable record claims nothing
+    /// a rewrite could withdraw and is left as it is.
+    async fn record_standby(dir: &Path, id: &RouterId) -> networking::Result<()> {
+        let Ok(mut record) = Self::read_record(&Self::record_path(dir, id)).await else {
+            return Ok(());
+        };
+        if !record.spec.active {
             return Ok(());
         }
-        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
-            self.netns_sysctl(
-                &netns,
-                &format!("net.ipv4.conf.{leg}.arp_ignore"),
-                arp_ignore(false),
-            )
-            .await?;
-        }
-        Ok(())
+        record.spec.active = false;
+        Self::store_record(dir, &record.spec).await
     }
+
+    /// Silence live namespaces that carry this driver's prefix but no router id. None of them is
+    /// this driver's, but an unknown namespace is no proof of a silent one.
+    async fn silence_unnamed(&self, unnamed: &[String]) -> networking::Result<()> {
+        let mut failed = Vec::new();
+        for netns in unnamed {
+            if let Err(e) = self.set_arp_mode(netns, false).await {
+                warn!(netns = %netns, error = %format!("{e:#}"),
+                      "this namespace carries the router prefix and could not be silenced");
+                failed.push(netns.as_str());
+            }
+        }
+        match failed.is_empty() {
+            true => Ok(()),
+            false => Err(NetworkError::Backend(anyhow::anyhow!(
+                "the namespaces {} carry the router prefix and could not be silenced",
+                failed.join(", ")
+            ))),
+        }
+    }
+
+    /// Set both legs' ARP mode: answering for an active router, `arp_ignore=8` for a standby.
+    ///
+    /// Both legs, because a standby must be silent towards the tenant as well as towards the
+    /// fabric: an ARP reply on the overlay would make it the tenant's default gateway. Both are
+    /// tried even when the first fails, so a silencing pass never leaves a leg it could reach.
+    async fn set_arp_mode(&self, netns: &str, active: bool) -> networking::Result<()> {
+        let mut outcome = Ok(());
+        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
+            let key = format!("net.ipv4.conf.{leg}.arp_ignore");
+            let set = self.netns_sysctl(netns, &key, arp_ignore(active)).await;
+            outcome = outcome.and(set);
+        }
+        outcome
+    }
+}
+
+/// The router id a namespace name carries, if it is one of this driver's.
+fn netns_router_id(netns: &str) -> Option<RouterId> {
+    netns.strip_prefix(NETNS_PREFIX)?.parse().ok()
+}
+
+/// The routers a silencing pass covers: every one a record names and every one a live
+/// namespace names. Live prefixed namespaces whose name carries no router id come back apart.
+fn silencing_targets(records: &[PathBuf], live: &[String]) -> (BTreeSet<RouterId>, Vec<String>) {
+    let mut routers: BTreeSet<RouterId> = records
+        .iter()
+        .filter_map(|path| crate::LinuxNetworkDriver::record_id(path))
+        .collect();
+    let mut unnamed = Vec::new();
+    for netns in live {
+        match netns_router_id(netns) {
+            Some(id) => {
+                routers.insert(id);
+            }
+            None => unnamed.push(netns.clone()),
+        }
+    }
+    (routers, unnamed)
 }
 
 /// Classify namespace absence, inspection failure and missing named legs separately.
@@ -1034,12 +1095,25 @@ mod tests {
     /// `drivers/input/tests/backend.rs` uses, for the same reason: what is
     /// being asserted here is how this driver reads an answer, and an answer
     /// can be written down without the kernel that would otherwise give it.
+    ///
+    /// Written by a child `sh`, not by this process: a test thread forking at the same moment
+    /// would inherit a write descriptor of ours and make executing the fake fail with ETXTBSY.
     fn fake_binary(dir: &Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("a fake binary");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("and it is executable");
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("a shell to write the fake");
+        writer
+            .stdin
+            .take()
+            .expect("its stdin")
+            .write_all(format!("#!/bin/sh\n{body}").as_bytes())
+            .expect("the fake's text");
+        assert!(writer.wait().expect("the shell exits").success());
         path.display().to_string()
     }
 
@@ -1415,6 +1489,125 @@ esac
         assert!(
             path.exists(),
             "the broken record itself is untouched by any of the three passes"
+        );
+    }
+
+    /// A fake `ip` that appends every call to `log`, lists the namespaces `listed` and refuses
+    /// the sysctls inside the namespace `refuse`.
+    fn logging_ip(log: &Path, listed: &[String], refuse: Option<&str>) -> String {
+        let listing = listed
+            .iter()
+            .map(|netns| format!("echo '{netns} (id: 0)'; "))
+            .collect::<String>();
+        let refusal = refuse
+            .map(|netns| {
+                format!("\"netns exec {netns} sysctl \"*) echo 'permission denied' >&2; exit 1;;\n")
+            })
+            .unwrap_or_default();
+        format!(
+            "echo \"$*\" >> '{log}'\ncase \"$*\" in\n\"netns list\") {listing}:;;\n{refusal}esac\nexit 0\n",
+            log = log.display()
+        )
+    }
+
+    /// The legs the fake `ip` was told to silence (`arp_ignore=8`) inside `netns`.
+    fn silenced_legs(log: &Path, netns: &str) -> Vec<&'static str> {
+        let calls = std::fs::read_to_string(log).unwrap_or_default();
+        [LEG_EXTERNAL, LEG_INTERNAL]
+            .into_iter()
+            .filter(|leg| {
+                let call =
+                    format!("netns exec {netns} sysctl -q -w net.ipv4.conf.{leg}.arp_ignore=8");
+                calls.lines().any(|line| line == call)
+            })
+            .collect()
+    }
+
+    fn write_record(dir: &Path, spec: &RouterSpec) -> PathBuf {
+        let path = crate::LinuxNetworkDriver::record_path(dir, &spec.id);
+        let record = serde_json::to_vec(&RouterRecord { spec: spec.clone() }).expect("a record");
+        std::fs::write(&path, record).expect("the record this node wrote");
+        path
+    }
+
+    fn read_spec(path: &Path) -> RouterSpec {
+        let bytes = std::fs::read(path).expect("the record is still there");
+        serde_json::from_slice::<RouterRecord>(&bytes)
+            .expect("and it parses")
+            .spec
+    }
+
+    /// A namespace a failed pass left behind with no record is silenced from the kernel's list
+    /// (R2-1).
+    #[tokio::test]
+    async fn a_live_namespace_with_no_record_is_silenced_by_the_dead_man() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let netns = router_netns(&spec(true).id);
+        let d = fake_driver(dir, &logging_ip(&log, std::slice::from_ref(&netns), None));
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.silenced, [spec(true).id]);
+        assert!(outcome.complete());
+        assert_eq!(silenced_legs(&log, &netns), [LEG_EXTERNAL, LEG_INTERNAL]);
+    }
+
+    /// A record that says standby is no proof the kernel is silent: the namespace is silenced
+    /// all the same (R2-1).
+    #[tokio::test]
+    async fn a_namespace_whose_record_says_standby_is_silenced_all_the_same() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let standby = spec(false);
+        let netns = router_netns(&standby.id);
+        write_record(dir, &standby);
+        let d = fake_driver(dir, &logging_ip(&log, std::slice::from_ref(&netns), None));
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.silenced, [standby.id]);
+        assert_eq!(silenced_legs(&log, &netns), [LEG_EXTERNAL, LEG_INTERNAL]);
+    }
+
+    /// A silenced router's record says standby afterwards, so it announces nothing and its
+    /// next activation shouts again (R2-1).
+    #[tokio::test]
+    async fn an_active_record_is_rewritten_standby_when_its_router_falls_silent() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let active = spec(true);
+        let path = write_record(dir, &active);
+        let d = fake_driver(dir, &logging_ip(&dir.join("ip.log"), &[], None));
+
+        d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert!(!read_spec(&path).active);
+    }
+
+    /// Without the kernel's list the recorded routers are still silenced, and the pass is not
+    /// complete: a namespace no record names may be answering (R2-1).
+    #[tokio::test]
+    async fn a_pass_that_cannot_list_the_namespaces_silences_the_recorded_ones_and_fails() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let active = spec(true);
+        write_record(dir, &active);
+        let ip = format!(
+            "echo \"$*\" >> '{}'\ncase \"$*\" in\n\"netns list\") exit 1;;\nesac\nexit 0\n",
+            log.display()
+        );
+        let d = fake_driver(dir, &ip);
+
+        let err = d.fall_silent_impl().await;
+
+        assert!(err.is_err(), "an unlisted kernel is not a silent one");
+        assert_eq!(
+            silenced_legs(&log, &router_netns(&active.id)),
+            [LEG_EXTERNAL, LEG_INTERNAL]
         );
     }
 

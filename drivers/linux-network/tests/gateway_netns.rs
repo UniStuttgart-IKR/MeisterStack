@@ -18,6 +18,7 @@
 //! `/run` holds test namespace mounts and the planted stale namespace file.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 
 use agent_api::networking::{BridgeDriver, NatKind, NatRule, RouterId, RouterPhase, RouterSpec};
 use meister_linux_network_driver::{
@@ -84,13 +85,21 @@ fn sysctl(netns: &str, key: &str) -> String {
     in_netns(netns, &["sysctl", "-n", key]).trim().to_string()
 }
 
+/// One test at a time in this kernel: a sweep removes every router namespace its driver holds
+/// no record for, the other test's included.
+static KERNEL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn spec(id: RouterId, active: bool) -> RouterSpec {
+    spec_on(PHYSNET, VNI, id, active)
+}
+
+fn spec_on(physnet: &str, vni: u32, id: RouterId, active: bool) -> RouterSpec {
     RouterSpec {
         id,
-        physnet: PHYSNET.into(),
+        physnet: physnet.into(),
         external_addr: "203.0.113.10/24".into(),
         external_gateway: "203.0.113.1".into(),
-        vxlan_id: VNI,
+        vxlan_id: vni,
         internal_addr: "10.7.1.1/24".into(),
         nats: vec![
             NatRule {
@@ -110,18 +119,27 @@ fn spec(id: RouterId, active: bool) -> RouterSpec {
 }
 
 fn driver(state_dir: &std::path::Path) -> LinuxNetworkDriver {
+    driver_on(state_dir, "nft", (PHYSNET, UPLINK, GIVEN_AWAY))
+}
+
+/// A driver with its own `nft` and its own `(physnet, uplink, interface given away)`.
+fn driver_on(
+    state_dir: &std::path::Path,
+    nft: &str,
+    (physnet, uplink, given_away): (&str, &str, &str),
+) -> LinuxNetworkDriver {
     LinuxNetworkDriver::build(
         Some(VxlanConfig {
-            uplink: UPLINK.into(),
+            uplink: uplink.into(),
             mtu: 1450,
             evpn: false,
         }),
         NftConfig {
-            binary: "nft".into(),
+            binary: nft.into(),
             guarded: common::net::Ipv4Ranges::default(),
         },
         Some(GatewayConfig {
-            physnets: BTreeMap::from([(PHYSNET.to_string(), GIVEN_AWAY.to_string())]),
+            physnets: BTreeMap::from([(physnet.to_string(), given_away.to_string())]),
             ip: "ip".into(),
             arping: "arping".into(),
             state_dir: state_dir.to_path_buf(),
@@ -133,6 +151,7 @@ fn driver(state_dir: &std::path::Path) -> LinuxNetworkDriver {
 #[tokio::test]
 #[ignore = "needs its own network and mount namespace; see the module note"]
 async fn a_router_is_built_and_taken_down_again() {
+    let _kernel = KERNEL.lock().await;
     let state = tempfile::Builder::new()
         .prefix("ms-neutron-agent-")
         .tempdir()
@@ -331,9 +350,10 @@ async fn a_router_is_built_and_taken_down_again() {
     );
     let second = d.fall_silent().await.expect("twice is once");
     assert!(
-        second.silenced.is_empty() && second.complete(),
-        "a second farewell has nothing left to silence"
+        second.silenced == [id] && second.complete(),
+        "a second farewell silences the live namespace again, whatever its record says (R2-1)"
     );
+    assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "8");
     // And the promotion back is the one pass it always was.
     let back = d
         .ensure_router(&spec(id, true))
@@ -404,4 +424,64 @@ async fn a_router_is_built_and_taken_down_again() {
     assert!(d.list_routers().await.unwrap().is_empty());
     // Idempotent: one that is not there is done, not an error.
     d.destroy_router(&id).await.expect("twice is once here too");
+}
+
+/// An active router whose rules fail is left silent: activation is the last step of a pass,
+/// after the rules and the record, so no namespace answers ARP that no record names (R2-1).
+#[tokio::test]
+#[ignore = "needs its own network and mount namespace; see the module note"]
+async fn a_router_whose_rules_fail_is_left_silent_not_active() {
+    const SECOND: (&str, &str, &str) = ("ex2", "upl2", "pxlink2");
+    const SECOND_VNI: u32 = 10_008;
+    let _kernel = KERNEL.lock().await;
+    let state = tempfile::Builder::new()
+        .prefix("ms-neutron-agent-r2-1-")
+        .tempdir()
+        .expect("a state directory");
+    let dir = state.path();
+    // `nft`, until the refusal file exists: then it refuses every script, as a kernel without
+    // a NAT module would.
+    let refusal = dir.join("refuse");
+    let nft = dir.join("nft");
+    std::fs::write(
+        &nft,
+        format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then cat > /dev/null; echo refused >&2; exit 1; fi\n\
+             exec nft \"$@\"\n",
+            refusal.display()
+        ),
+    )
+    .expect("an nft wrapper");
+    std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).expect("and it runs");
+    let (physnet, uplink, given_away) = SECOND;
+    for link in [uplink, given_away] {
+        ip(&["link", "add", link, "type", "dummy"]);
+        ip(&["link", "set", link, "up"]);
+    }
+    let d = driver_on(dir, &nft.display().to_string(), SECOND);
+    d.ensure_physnet(physnet, given_away)
+        .await
+        .expect("the interface was given away");
+    let id = RouterId::from_u128(0x6b00_0003);
+    let netns = router_netns(&id);
+
+    std::fs::write(&refusal, b"").expect("nft refuses from now on");
+    d.ensure_router(&spec_on(physnet, SECOND_VNI, id, true))
+        .await
+        .expect_err("a router whose rules were refused is not built");
+
+    assert!(
+        netns_exists(&netns),
+        "the half-built namespace is still there"
+    );
+    assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "8");
+    assert_eq!(sysctl(&netns, "net.ipv4.conf.int.arp_ignore"), "8");
+
+    // The gate is a gate and not a wall: once nft takes the rules the same pass activates.
+    std::fs::remove_file(&refusal).expect("nft takes rules again");
+    d.ensure_router(&spec_on(physnet, SECOND_VNI, id, true))
+        .await
+        .expect("the same router, rules accepted");
+    assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "0");
+    d.destroy_router(&id).await.expect("the router goes");
 }
