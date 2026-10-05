@@ -48,6 +48,11 @@ const DRIVER_OWNED_ENV: [&str; 9] = [
     "LEA_VGPU_ENCODER_CAP",
 ];
 
+/// Leandro's test and diagnostic switches: `LEA_TEST_*` injects faults,
+/// `LEA_TRACE_*` and `LEA_CAPTURE_DIR` write guest requests to files of their
+/// own naming. They are for a lab run by hand, never for a node's backends.
+const DIAGNOSTIC_ENV: [&str; 3] = ["LEA_TEST_", "LEA_TRACE_", "LEA_CAPTURE_DIR"];
+
 /// Only `vgpu_type` may be supplied through tenant device parameters.
 /// Other options come from node defaults or operator-defined profiles.
 /// The agent validates this rule at admission and the driver repeats it at use.
@@ -120,7 +125,16 @@ impl NvrmParams {
     }
 
     fn validate(&self) -> device::Result<()> {
-        self.refuse_two_vram_policies()
+        self.refuse_two_vram_policies()?;
+        self.refuse_reserved_env()
+    }
+
+    /// Checked with the rest of the configuration so a node config naming a
+    /// refused variable fails when the driver is built, not at the first boot.
+    fn refuse_reserved_env(&self) -> device::Result<()> {
+        let mut keys: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys.into_iter().try_for_each(refuse_reserved_env_key)
     }
 
     /// The backend takes one VRAM policy, a cap, a profile size or a vGPU
@@ -373,24 +387,38 @@ impl NvrmDriver {
         let mut extra: Vec<_> = params.env.iter().collect();
         extra.sort_unstable_by_key(|(k, _)| k.as_str());
         for (k, v) in extra {
-            // Reject process-control environment keys such as PATH and LD_PRELOAD.
-            if PROTECTED_ENV.iter().any(|p| k.starts_with(p)) {
-                return Err(DeviceError::InvalidSpec(format!(
-                    "nvrm env {k:?} is part of the process's own environment and cannot be set \
-                     here; [{}] are refused",
-                    PROTECTED_ENV.join(", ")
-                )));
-            }
-            if DRIVER_OWNED_ENV.contains(&k.as_str()) {
-                return Err(DeviceError::InvalidSpec(format!(
-                    "nvrm env {k:?} is written from a typed field; set the field and not the \
-                     variable, so that what this node admitted is what the backend runs with"
-                )));
-            }
+            refuse_reserved_env_key(k)?;
             env.push((k.clone(), v.clone()));
         }
         Ok(env)
     }
+}
+
+/// Refuse an extra backend variable this driver or the process owns, or a
+/// diagnostic switch that does not belong on a production backend.
+fn refuse_reserved_env_key(k: &str) -> device::Result<()> {
+    // Reject process-control environment keys such as PATH and LD_PRELOAD.
+    if PROTECTED_ENV.iter().any(|p| k.starts_with(p)) {
+        return Err(DeviceError::InvalidSpec(format!(
+            "nvrm env {k:?} is part of the process's own environment and cannot be set \
+             here; [{}] are refused",
+            PROTECTED_ENV.join(", ")
+        )));
+    }
+    if DRIVER_OWNED_ENV.contains(&k) {
+        return Err(DeviceError::InvalidSpec(format!(
+            "nvrm env {k:?} is written from a typed field; set the field and not the \
+             variable, so that what this node admitted is what the backend runs with"
+        )));
+    }
+    if DIAGNOSTIC_ENV.iter().any(|p| k.starts_with(p)) {
+        return Err(DeviceError::InvalidSpec(format!(
+            "nvrm env {k:?} is a test or capture switch of the backend; [{}] inject faults \
+             or write guest requests to files, and a node does not run guests with them",
+            DIAGNOSTIC_ENV.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse one more backend of a vGPU type the card already holds `max_instance` of.
@@ -871,6 +899,36 @@ mod tests {
             let said = err.to_string();
             assert!(said.contains(key), "the refusal names it: {said}");
         }
+    }
+
+    /// IKR-B16: fault injection and request capture never reach a backend.
+    #[test]
+    fn diagnostic_switches_are_not_backend_knobs() {
+        for key in [
+            "LEA_TEST_SHMEM_MAP_OOB",
+            "LEA_TRACE_FILE",
+            "LEA_TRACE_DUMP",
+            "LEA_CAPTURE_DIR",
+        ] {
+            let params = p(serde_json::json!({ "env": { key: "1" } }));
+            let said = NvrmDriver::backend_env(&params, None)
+                .err()
+                .unwrap_or_else(|| panic!("{key} must be refused"))
+                .to_string();
+            assert!(said.contains(key), "the refusal names it: {said}");
+        }
+    }
+
+    /// A refused variable in node configuration fails validation, so the
+    /// driver reports it when it is built; an ordinary knob still passes.
+    #[test]
+    fn node_config_with_a_refused_variable_does_not_validate() {
+        let capture = p(serde_json::json!({ "env": { "LEA_CAPTURE_DIR": "/tmp/x" } }));
+        let said = capture.validate().expect_err("capture switch").to_string();
+        assert!(said.contains("LEA_CAPTURE_DIR"), "{said}");
+
+        let debug = p(serde_json::json!({ "env": { "LEA_DEBUG": "1" } }));
+        debug.validate().expect("LEA_DEBUG is an ordinary knob");
     }
 
     /// Tenant parameters accept the vGPU type and reject operator-only keys.
