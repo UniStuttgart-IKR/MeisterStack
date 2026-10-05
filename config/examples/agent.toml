@@ -248,8 +248,10 @@ default_bridge = "meister_br0"
 # Deadline for the backend's Unix socket to appear.
 #socket_timeout_ms = 5000
 
-# Optional hard VRAM admission budget. Per-type max_instance is enforced
-# independently; without a budget, VRAM overcommit is warned about.
+# Optional hard VRAM admission budget. Once a vGPU type is on the card, the
+# card itself is a hard limit too: per-type max_instance, and all admitted
+# sizes together within vgpu_available_mib. Without either, overcommit is
+# only warned about.
 #vram_budget_mib = 8192
 
 # Merge defaults < profile < VM parameters. Avoid combining vgpu_type with

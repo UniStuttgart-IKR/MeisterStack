@@ -80,9 +80,11 @@ context_types = "gfxstream-vulkan"
 binary = "./bin/vhost-user-nvrm"       # symlink to ~/git/Leandro/target/release
 vgpuprofile = "./bin/vgpuprofile"
 
-# Optional hard VRAM admission budget. Per-type max_instance is enforced
-# independently; without a budget, VRAM overcommit is warned about.
-# vram_budget_mib = 8192               # optional hard admission; unset = warn-only (Leandro overprovisions by design)
+# Optional hard VRAM admission budget. Once a vGPU type is on the card, the
+# card itself is a hard limit too: per-type max_instance, and all admitted
+# sizes together within vgpu_available_mib. Without either, overcommit is
+# only warned about.
+# vram_budget_mib = 8192               # optional; unset = no node budget beyond the card rule above
 
 [device.nvrm.profiles.2q]
 vgpu_type = "RTX2070-2Q"
