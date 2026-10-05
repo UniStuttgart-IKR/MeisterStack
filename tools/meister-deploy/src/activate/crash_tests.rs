@@ -208,13 +208,10 @@ fn every_crash_in_keys_switch_is_resolvable() {
 
 #[test]
 fn every_crash_in_keys_revert_is_resolvable() {
-    // Open: after the removes at activate.rs:1687-1688, `.prev` alone reads as
-    // `switched` (:1569) with the current pair half or wholly gone; between
-    // the renames (:1689-1690) no verb can finish the way back; and a revert
-    // that finished its renames but not its record (:1702) reads `none`.
+    // Open: between the renames (:1689-1690) no verb can finish the way
+    // back; and a revert that finished its renames but not its record
+    // (:1702) reads `none`.
     let known = [
-        (1, "frozen: switched without the new pair in use"),
-        (2, "frozen: switched without the new pair in use"),
         (3, "recovered: no whole pair, status inconsistent"),
         (4, "recovered: Old in use, status none"),
         (5, "recovered: Old in use, status none"),

@@ -1552,14 +1552,86 @@ impl<'a> Helper<'a> {
         self.txn_dir().join(format!("keys-{}.json", kind.as_str()))
     }
 
-    /// Infer rotation progress from `.next` and `.prev` files. Completed/reverted records
-    /// resolve the state only when no temporary pairs remain. Partial file layouts become
-    /// inconsistent; the four switch renames are not an atomic pair replacement.
+    /// Which of the six files of this key's rotation are on the disk.
+    fn key_files(&self, kind: KeyKind) -> KeyFiles {
+        let there = |path: PathBuf| self.files.exists(&path);
+        KeyFiles {
+            key: there(self.key_path_with(kind, None)),
+            crt: there(self.cert_path_with(kind, None)),
+            key_next: there(self.key_path_with(kind, Some("next"))),
+            crt_next: there(self.cert_path_with(kind, Some("next"))),
+            key_prev: there(self.key_path_with(kind, Some("prev"))),
+            crt_prev: there(self.cert_path_with(kind, Some("prev"))),
+        }
+    }
+
+    /// The rotation files of this key that are on the disk, for a person.
+    fn key_files_listed(&self, kind: KeyKind) -> String {
+        let listed: Vec<String> = [None, Some("next"), Some("prev")]
+            .into_iter()
+            .flat_map(|suffix| {
+                [
+                    self.key_path_with(kind, suffix),
+                    self.cert_path_with(kind, suffix),
+                ]
+            })
+            .filter(|path| self.files.exists(path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if listed.is_empty() {
+            "none of them".to_string()
+        } else {
+            listed.join(", ")
+        }
+    }
+
+    /// Why a layout other than a whole step is not a state of the rotation,
+    /// and which verb, if any, resolves it.
+    fn key_layout_reason(&self, kind: KeyKind, layout: KeyLayout, on_disk: KeyFiles) -> String {
+        let files = self.key_files_listed(kind);
+        match layout {
+            KeyLayout::SwitchStopped => format!(
+                "the {kind} key files on this host are a switch that stopped in the middle: \
+                 {files}. The pair that was in use is what `.prev` holds; finish it or put it \
+                 back by hand, and this tool will not do either on its own."
+            ),
+            KeyLayout::RevertStopped => format!(
+                "the {kind} key files on this host are a revert that stopped in the middle: \
+                 {files}. The pair that was in use before the switch is whole in `.prev`; \
+                 `meister-activate keys revert --kind {kind}` finishes putting it back."
+            ),
+            KeyLayout::RemoveStopped => format!(
+                "the {kind} key files on this host are a removal that stopped in the middle: \
+                 {files}. The new pair is in use and the old key is gone; \
+                 `meister-activate keys remove --kind {kind}` finishes it."
+            ),
+            _ if on_disk.crt_next && !on_disk.key_next => format!(
+                "{} is there and {} is not: a certificate without the key it belongs to.",
+                self.cert_path_with(kind, Some("next")).display(),
+                self.key_path_with(kind, Some("next")).display()
+            ),
+            _ => format!(
+                "the {kind} key files on this host are {files}, and no step of a rotation \
+                 leaves that. This tool will not touch them; a person has to decide which \
+                 pair belongs in use."
+            ),
+        }
+    }
+
+    /// Read rotation progress off the six files. The record decides only
+    /// where the files cannot: a rotation that was finished or taken back
+    /// leaves the pair in use and nothing beside it either way. Every
+    /// state but `none` needs a whole pair in use or, mid-step, a whole
+    /// pair aside; a layout no step leaves is inconsistent.
     pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
-        let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
-        let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
-        let key_prev = self.files.exists(&self.key_path_with(kind, Some("prev")));
-        let crt_prev = self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let on_disk = self.key_files(kind);
+        let KeyFiles {
+            key_next,
+            crt_next,
+            key_prev,
+            crt_prev,
+            ..
+        } = on_disk;
         let prev = key_prev || crt_prev;
         let record = match self.files.read_to_string(&self.keys_record_path(kind)) {
             Ok(text) => match KeysRecord::from_json(
@@ -1590,42 +1662,32 @@ impl<'a> Helper<'a> {
             .as_ref()
             .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
             .map(|r| r.state);
-        let (state, reason) = match (key_next, crt_next, key_prev, crt_prev) {
+        let layout = on_disk.layout();
+        let (state, reason) = match layout {
+            KeyLayout::Empty => match &record {
+                None => (KeysState::None, None),
+                Some(record) => (
+                    KeysState::Inconsistent,
+                    Some(format!(
+                        "{} says this rotation is {}, and there is no {kind} key or \
+                         certificate on this host at all.",
+                        self.keys_record_path(kind).display(),
+                        record.state
+                    )),
+                ),
+            },
+            KeyLayout::InUse => (finished.unwrap_or(KeysState::None), None),
+            KeyLayout::Prepared => (KeysState::Prepared, None),
+            KeyLayout::Overlap => (KeysState::Overlap, None),
             // The switch, whole: the prepared pair is in and the pair it
             // replaced is beside it.
-            (false, false, true, true) => (KeysState::Switched, None),
-            (true, true, false, false) => (KeysState::Overlap, None),
-            (true, false, false, false) => (KeysState::Prepared, None),
-            (false, true, false, false) => (
+            KeyLayout::Switched => (KeysState::Switched, None),
+            KeyLayout::SwitchStopped
+            | KeyLayout::RevertStopped
+            | KeyLayout::RemoveStopped
+            | KeyLayout::Unknown => (
                 KeysState::Inconsistent,
-                Some(format!(
-                    "{} is there and {} is not: a certificate without the key it belongs to.",
-                    self.cert_path_with(kind, Some("next")).display(),
-                    self.key_path_with(kind, Some("next")).display()
-                )),
-            ),
-            (false, false, false, false) => (finished.unwrap_or(KeysState::None), None),
-            // Other layouts containing `.prev` indicate an interrupted switch requiring inspection.
-            _ => (
-                KeysState::Inconsistent,
-                Some(format!(
-                    "the {kind} key files on this host are a switch that stopped in the \
-                     middle: {}. The pair that was in use is what `.prev` holds; finish it or \
-                     put it back by hand, and this tool will not do either on its own.",
-                    [
-                        self.key_path_with(kind, None),
-                        self.cert_path_with(kind, None),
-                        self.key_path_with(kind, Some("next")),
-                        self.cert_path_with(kind, Some("next")),
-                        self.key_path_with(kind, Some("prev")),
-                        self.cert_path_with(kind, Some("prev")),
-                    ]
-                    .iter()
-                    .filter(|path| self.files.exists(path))
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-                )),
+                Some(self.key_layout_reason(kind, layout, on_disk)),
             ),
         };
         Ok(KeysView {
@@ -1732,15 +1794,27 @@ impl<'a> Helper<'a> {
 
     /// The last step: the pair that was replaced is dropped and the record
     /// says the rotation is over.
+    ///
+    /// Only a whole new pair in use lets the old one go: anywhere else the
+    /// pair in `.prev` may be the only whole one left.
     pub fn keys_remove(&self, kind: KeyKind) -> Result<KeysRecord> {
+        match self.key_files(kind).layout() {
+            KeyLayout::Switched | KeyLayout::RemoveStopped => {}
+            KeyLayout::Empty | KeyLayout::InUse | KeyLayout::Prepared | KeyLayout::Overlap => {
+                bail!(
+                    "there is no replaced {kind} pair on this host, so this rotation has either \
+                     not switched yet or has already been finished."
+                )
+            }
+            KeyLayout::SwitchStopped | KeyLayout::RevertStopped | KeyLayout::Unknown => bail!(
+                "the {kind} pair in use on this host is not the whole new one ({}), so the \
+                 pair in `.prev` may be the only whole one left and nothing was removed. \
+                 `meister-activate keys status --kind {kind}` says what resolves it.",
+                self.key_files_listed(kind)
+            ),
+        }
         let key_prev = self.key_path_with(kind, Some("prev"));
         let crt_prev = self.cert_path_with(kind, Some("prev"));
-        if !self.files.exists(&key_prev) && !self.files.exists(&crt_prev) {
-            bail!(
-                "there is no replaced {kind} pair on this host, so this rotation has either \
-                 not switched yet or has already been finished."
-            );
-        }
         self.files.remove_file(&key_prev)?;
         self.files.remove_file(&crt_prev)?;
         let now = self.clock.now();
@@ -1871,6 +1945,70 @@ pub struct KeysView {
     /// What makes this inconsistent, when it is.
     pub reason: Option<String>,
     pub record: Option<KeysRecord>,
+}
+
+/// Which of the six files of one key's rotation are on the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyFiles {
+    key: bool,
+    crt: bool,
+    key_next: bool,
+    crt_next: bool,
+    key_prev: bool,
+    crt_prev: bool,
+}
+
+/// What the six files say. A layout that one of the three verbs leaves
+/// when it stops between two of its effects has a name here, so that the
+/// verb that resolves it can be named too; anything else is `Unknown`, and
+/// no verb touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyLayout {
+    /// No pair, and no rotation.
+    Empty,
+    /// The pair in use, alone.
+    InUse,
+    Prepared,
+    Overlap,
+    /// `keys switch` stopped between its renames.
+    SwitchStopped,
+    Switched,
+    /// `keys revert` stopped after deleting some of the new pair; the old
+    /// pair is whole.
+    RevertStopped,
+    /// `keys remove` stopped after deleting the old key; the new pair is in use.
+    RemoveStopped,
+    Unknown,
+}
+
+impl KeyFiles {
+    fn layout(self) -> KeyLayout {
+        let KeyFiles {
+            key,
+            crt,
+            key_next,
+            crt_next,
+            key_prev,
+            crt_prev,
+        } = self;
+        match (key, crt, key_next, crt_next, key_prev, crt_prev) {
+            (false, false, false, false, false, false) => KeyLayout::Empty,
+            (true, true, false, false, false, false) => KeyLayout::InUse,
+            (true, true, true, false, false, false) => KeyLayout::Prepared,
+            (true, true, true, true, false, false) => KeyLayout::Overlap,
+            // The certificate went aside; the key too; the new key came in.
+            (true, false, true, true, false, true)
+            | (false, false, true, true, true, true)
+            | (true, false, false, true, true, true) => KeyLayout::SwitchStopped,
+            (true, true, false, false, true, true) => KeyLayout::Switched,
+            // The new certificate is gone; the new key too.
+            (true, false, false, false, true, true) | (false, false, false, false, true, true) => {
+                KeyLayout::RevertStopped
+            }
+            (true, true, false, false, false, true) => KeyLayout::RemoveStopped,
+            _ => KeyLayout::Unknown,
+        }
+    }
 }
 
 /// Host key purpose: identity for outbound authentication, serving for TLS endpoints.
@@ -3602,7 +3740,10 @@ mod tests {
             KeysState::None
         );
 
-        let prepared = MemFiles::new().given(format!("{PKI}/identity.key.next"), "k\n");
+        let prepared = MemFiles::new()
+            .given(format!("{PKI}/identity.key"), "old key\n")
+            .given(format!("{PKI}/identity.crt"), "old certificate\n")
+            .given(format!("{PKI}/identity.key.next"), "k\n");
         assert_eq!(
             helper(&runner, &prepared, &clock)
                 .keys_status(KeyKind::Identity)
@@ -3641,6 +3782,68 @@ mod tests {
             .unwrap();
         assert_eq!(view.state, KeysState::Inconsistent);
         assert!(view.reason.unwrap().contains("without the key"));
+    }
+
+    /// The identity files named by suffix, each holding the pair it belongs
+    /// to: `("crt.prev", "old")` is `identity.crt.prev` with `old crt`.
+    fn key_layout(there: &[(&str, &str)]) -> MemFiles {
+        there.iter().fold(MemFiles::new(), |files, (name, pair)| {
+            let what = name.split('.').next().unwrap_or(name);
+            files.given(format!("{PKI}/identity.{name}"), format!("{pair} {what}\n"))
+        })
+    }
+
+    /// A revert deletes the new pair before it puts the old one back.
+    /// Stopped in between, `.prev` is the only whole pair: not a switch,
+    /// and the reason names the verb that finishes it.
+    #[test]
+    fn a_revert_stopped_after_its_deletions_is_not_read_as_switched() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in [
+            vec![("key", "new"), ("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key.prev", "old"), ("crt.prev", "old")],
+        ] {
+            let files = key_layout(&there);
+            let view = helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap();
+            assert_eq!(view.state, KeysState::Inconsistent, "{there:?}");
+            let reason = view.reason.unwrap_or_default();
+            assert!(reason.contains("keys revert"), "{there:?}: {reason}");
+        }
+    }
+
+    /// `keys remove` deletes `.prev` only behind a whole new pair in use;
+    /// anywhere else `.prev` may hold the only whole pair on the host.
+    #[test]
+    fn remove_never_deletes_the_only_whole_pair() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in [
+            vec![("key", "new"), ("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key", "old"), ("crt.prev", "old")],
+            vec![
+                ("key.next", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+            vec![
+                ("key", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+        ] {
+            let files = key_layout(&there);
+            let before = files.paths();
+            let err = helper(&runner, &files, &clock)
+                .keys_remove(KeyKind::Identity)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("nothing was removed"), "{there:?}: {err}");
+            assert_eq!(files.paths(), before, "{there:?}");
+        }
     }
 
     #[test]
