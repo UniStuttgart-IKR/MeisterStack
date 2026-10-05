@@ -86,6 +86,12 @@ vgpuprofile = "./bin/vgpuprofile"
 # only warned about.
 # vram_budget_mib = 8192               # optional; unset = no node budget beyond the card rule above
 
+# The host's share of the card in MiB that vgpuprofile subtracts before it
+# derives vGPU types. Required once a vgpu_type is configured or requested:
+# measured instead, the running guests would count as the host's share after
+# an agent restart and the same type would resolve to a smaller card.
+# vgpu_host_reserve_mib = 1024        # required for the profiles below; nvrm stays unavailable until set
+
 [device.nvrm.profiles.2q]
 vgpu_type = "RTX2070-2Q"
 

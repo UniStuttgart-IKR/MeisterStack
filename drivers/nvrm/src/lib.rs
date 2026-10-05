@@ -16,6 +16,7 @@ use agent_api::CgroupHandle;
 use agent_api::device::{
     self, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
 };
+use anyhow::Context;
 use backend::{Backend, BackendIo, BackendKind};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
@@ -33,10 +34,13 @@ const NOFILE_LIMIT: u64 = 65536;
 /// Extra backend variables may not override these prefixes.
 const PROTECTED_ENV: [&str; 4] = ["LD_", "PATH", "HOME", "NVIDIA_"];
 
+/// `vgpuprofile`'s host reserve, written from `vgpu_host_reserve_mib`.
+const HOST_RESERVE_ENV: &str = "LEA_VGPU_HOST_RESERVE_MIB";
+
 /// Variables derived from typed parameters or vGPU resolution. Reject them
 /// in the extra environment even when this device did not emit that variable,
 /// so backend settings cannot bypass admission accounting.
-const DRIVER_OWNED_ENV: [&str; 9] = [
+const DRIVER_OWNED_ENV: [&str; 10] = [
     "LEA_VRAM_LIMIT_MIB",
     "LEA_VRAM_PROFILE_MIB",
     "LEA_VRAM_RESERVE_MIB",
@@ -46,6 +50,7 @@ const DRIVER_OWNED_ENV: [&str; 9] = [
     "LEA_VGPU_PROFILE_MIB",
     "LEA_VGPU_FB_MIB",
     "LEA_VGPU_ENCODER_CAP",
+    HOST_RESERVE_ENV,
 ];
 
 /// Leandro's test and diagnostic switches: `LEA_TEST_*` injects faults,
@@ -185,6 +190,10 @@ pub struct NvrmDriverConfig {
     /// Optional VRAM budget over backends in this driver instance's active map.
     /// Surviving backends are not restored to that map after an agent restart.
     pub vram_budget_mib: Option<u64>,
+    /// The host's share of the card in MiB, handed to `vgpuprofile`. Required
+    /// once any vGPU type is configured or requested; see
+    /// [`NvrmDriverConfig::host_reserve`].
+    pub vgpu_host_reserve_mib: Option<u64>,
     pub defaults: NvrmParams,
     pub profiles: HashMap<String, NvrmParams>,
     /// Optional backend user. The account needs access to the configured NVIDIA
@@ -245,37 +254,16 @@ impl NvrmDriver {
             )));
         }
 
-        config
-            .defaults
-            .validate()
-            .map_err(|e| DeviceError::InvalidSpec(format!("nvrm defaults are invalid: {e}")))?;
+        // Configuration first: an error in it names itself without the
+        // driver having asked the card anything.
+        config.validate()?;
 
         host_checks();
 
         // Resolve every configured vGPU type once, fail-fast at agent start:
         // an unknown type is a config error, not something to discover at the
         // first VM boot.
-        let mut cache = HashMap::new();
-        for (name, params) in &config.profiles {
-            let merged = config.defaults.overlay(params);
-            merged.validate().map_err(|e| {
-                DeviceError::InvalidSpec(format!("nvrm profile {name:?} is invalid: {e}"))
-            })?;
-            if let Some(vtype) = &merged.vgpu_type
-                && !cache.contains_key(vtype)
-            {
-                let resolved = resolve_vgpu_type(&config.vgpuprofile_bin, vtype).map_err(|e| {
-                    DeviceError::InvalidSpec(format!(
-                        "nvrm profile {name:?}: vgpu_type {vtype:?}: {e}"
-                    ))
-                })?;
-                info!(profile = %name, vgpu_type = %vtype,
-                          profile_mib = resolved.profile_mib, fb_mib = resolved.fb_mib,
-                          max_instance = resolved.max_instance,
-                          "vgpu type resolved against this card");
-                cache.insert(vtype.clone(), resolved);
-            }
-        }
+        let cache = config.resolve_profile_types()?;
 
         Ok(Self {
             // The name is the backend's own and not the configured binary's:
@@ -291,6 +279,68 @@ impl NvrmDriver {
 }
 
 impl NvrmDriverConfig {
+    /// Check the defaults, every profile layered over them, and that a host
+    /// reserve is configured once any of them names a vGPU type.
+    fn validate(&self) -> device::Result<()> {
+        self.defaults
+            .validate()
+            .map_err(|e| DeviceError::InvalidSpec(format!("nvrm defaults are invalid: {e}")))?;
+        for (name, params) in &self.profiles {
+            self.defaults.overlay(params).validate().map_err(|e| {
+                DeviceError::InvalidSpec(format!("nvrm profile {name:?} is invalid: {e}"))
+            })?;
+        }
+        if self.names_a_vgpu_type() {
+            self.host_reserve()?;
+        }
+        Ok(())
+    }
+
+    fn names_a_vgpu_type(&self) -> bool {
+        self.defaults.vgpu_type.is_some() || self.profiles.values().any(|p| p.vgpu_type.is_some())
+    }
+
+    /// Unset, `vgpuprofile` counts whatever the card holds at that moment as
+    /// the host's share. After an agent restart that includes the backends of
+    /// running guests, so the same type resolves smaller or not at all, and
+    /// admission would measure against another card than the one those guests
+    /// were admitted to. A fixed reserve makes every resolution the same.
+    fn host_reserve(&self) -> device::Result<u64> {
+        self.vgpu_host_reserve_mib.ok_or_else(|| {
+            DeviceError::InvalidSpec(
+                "a vgpu_type needs [device.nvrm].vgpu_host_reserve_mib: without it vgpuprofile \
+                 counts what the card holds at the moment, running guests included, as the \
+                 host's share and resolves a different card after every restart"
+                    .into(),
+            )
+        })
+    }
+
+    /// Resolve the vGPU type of every profile against the card, once per type.
+    fn resolve_profile_types(&self) -> device::Result<HashMap<String, VgpuType>> {
+        let mut cache = HashMap::new();
+        for (name, params) in &self.profiles {
+            let Some(vtype) = self.defaults.overlay(params).vgpu_type else {
+                continue;
+            };
+            if cache.contains_key(&vtype) {
+                continue;
+            }
+            let resolved = resolve_vgpu_type(&self.vgpuprofile_bin, self.host_reserve()?, &vtype)
+                .map_err(|e| {
+                DeviceError::InvalidSpec(format!(
+                    "nvrm profile {name:?}: vgpu_type {vtype:?}: {e:#}"
+                ))
+            })?;
+            info!(profile = %name, vgpu_type = %vtype,
+                  profile_mib = resolved.profile_mib, fb_mib = resolved.fb_mib,
+                  max_instance = resolved.max_instance,
+                  "vgpu type resolved against this card");
+            cache.insert(vtype, resolved);
+        }
+        Ok(cache)
+    }
+
     /// Layer defaults, the named profile and tenant parameters, and validate the result.
     fn effective_params(&self, spec: &DeviceSpec) -> device::Result<NvrmParams> {
         let mut merged = self.defaults.clone();
@@ -313,6 +363,9 @@ impl NvrmDriverConfig {
             merged = merged.overlay(&params);
         }
         merged.validate()?;
+        if merged.vgpu_type.is_some() {
+            self.host_reserve()?;
+        }
         Ok(merged)
     }
 }
@@ -543,32 +596,67 @@ fn host_checks() {
 
 /// Resolve a configured type synchronously during driver construction.
 /// The helper returns KEY=VALUE records on stdout and diagnostics on stderr.
-fn resolve_vgpu_type(bin: &Path, vtype: &str) -> anyhow::Result<VgpuType> {
-    let out = std::process::Command::new(bin)
-        .args(["--select", vtype])
+fn resolve_vgpu_type(bin: &Path, host_reserve_mib: u64, vtype: &str) -> anyhow::Result<VgpuType> {
+    let out = vgpuprofile_select(bin, host_reserve_mib, vtype)
         .output()
-        .map_err(|e| anyhow::anyhow!("running {}: {e}", bin.display()))?;
+        .with_context(|| format!("running {}", bin.display()))?;
     vgpu_from_output(vtype, &out)
 }
 
 /// Resolve vGPU types asynchronously so GPU queries do not block a Tokio worker.
-async fn resolve_vgpu_type_async(bin: &Path, vtype: &str) -> anyhow::Result<VgpuType> {
-    let out = tokio::process::Command::new(bin)
-        .args(["--select", vtype])
+async fn resolve_vgpu_type_async(
+    bin: &Path,
+    host_reserve_mib: u64,
+    vtype: &str,
+) -> anyhow::Result<VgpuType> {
+    let out = tokio::process::Command::from(vgpuprofile_select(bin, host_reserve_mib, vtype))
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("running {}: {e}", bin.display()))?;
+        .with_context(|| format!("running {}", bin.display()))?;
     vgpu_from_output(vtype, &out)
+}
+
+/// `vgpuprofile --select <type>` with the node's host reserve and none of the
+/// agent's own environment, so a type resolves the same way on every start.
+fn vgpuprofile_select(bin: &Path, host_reserve_mib: u64, vtype: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["--select", vtype])
+        .env_clear()
+        .envs(inherited_env())
+        .env(HOST_RESERVE_ENV, host_reserve_mib.to_string());
+    cmd
+}
+
+/// What a helper or backend keeps of the agent's environment: PATH and HOME,
+/// nothing that could steer it.
+fn inherited_env() -> impl Iterator<Item = (String, String)> {
+    std::env::vars().filter(|(k, _)| k == "PATH" || k == "HOME")
 }
 
 fn vgpu_from_output(vtype: &str, out: &std::process::Output) -> anyhow::Result<VgpuType> {
     if !out.status.success() {
         anyhow::bail!(
-            "vgpuprofile --select {vtype} failed ({}): no such type on this card?",
-            out.status
+            "vgpuprofile --select {vtype} failed ({}): {}",
+            out.status,
+            stderr_excerpt(&out.stderr)
         );
     }
     parse_vgpu_select(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The start of what the helper wrote to stderr, which is where its reason
+/// is: a driver-version panic, or the types the card does offer.
+fn stderr_excerpt(stderr: &[u8]) -> String {
+    const LIMIT: usize = 2048;
+    let said = String::from_utf8_lossy(stderr);
+    let said = said.trim();
+    if said.is_empty() {
+        return "it wrote nothing to stderr".into();
+    }
+    match said.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}...", &said[..cut]),
+        None => said.to_string(),
+    }
 }
 
 /// Parse the KEY=VALUE stdout of `vgpuprofile --select`.
@@ -641,9 +729,11 @@ impl DeviceDriver for NvrmDriver {
                     Some(vgpu) => vgpu,
                     // Per-VM params may name a type no profile pre-resolved.
                     None => {
-                        let resolved = resolve_vgpu_type_async(&self.config.vgpuprofile_bin, vtype)
-                            .await
-                            .map_err(|e| DeviceError::InvalidSpec(e.to_string()))?;
+                        let reserve = self.config.host_reserve()?;
+                        let resolved =
+                            resolve_vgpu_type_async(&self.config.vgpuprofile_bin, reserve, vtype)
+                                .await
+                                .map_err(|e| DeviceError::InvalidSpec(format!("{e:#}")))?;
                         self.vgpu_cache
                             .lock()
                             .await
@@ -671,7 +761,7 @@ impl DeviceDriver for NvrmDriver {
         cmd.arg("--nvrm")
             .arg(&socket)
             .env_clear()
-            .envs(std::env::vars().filter(|(k, _)| k == "PATH" || k == "HOME"))
+            .envs(inherited_env())
             .envs(env);
 
         // The backend must be listening before cloud-hypervisor connects.
@@ -836,6 +926,7 @@ mod tests {
             run_dir: PathBuf::from("/nonexistent/run"),
             socket_timeout: Duration::from_millis(DEFAULT_SOCKET_TIMEOUT_MS),
             vram_budget_mib: None,
+            vgpu_host_reserve_mib: None,
             defaults: p(defaults),
             profiles: HashMap::new(),
             vmm_user: None,
@@ -862,6 +953,83 @@ mod tests {
             .expect_err("the backend would not start")
             .to_string();
         assert!(said.contains("mutually exclusive"), "{said}");
+    }
+
+    fn with_profile(mut node: NvrmDriverConfig, name: &str, vgpu_type: &str) -> NvrmDriverConfig {
+        node.profiles.insert(name.into(), configured(vgpu_type));
+        node
+    }
+
+    /// IKR-B15: a node that configures a vGPU type must fix the host's share
+    /// of the card, or every restart beside running guests resolves another card.
+    #[test]
+    fn a_configured_vgpu_type_requires_a_host_reserve() {
+        let node = with_profile(node(serde_json::json!({})), "4q", "4Q");
+        let said = node.validate().expect_err("no reserve").to_string();
+        assert!(said.contains("vgpu_host_reserve_mib"), "{said}");
+
+        let reserved = NvrmDriverConfig {
+            vgpu_host_reserve_mib: Some(1024),
+            ..node
+        };
+        reserved.validate().expect("a fixed reserve");
+    }
+
+    /// A tenant's vGPU type on a node without a reserve is refused at admission
+    /// rather than resolved against whatever the card holds at that moment.
+    #[test]
+    fn a_requested_vgpu_type_without_a_host_reserve_is_refused() {
+        let node = node(serde_json::json!({}));
+        let spec = mediated(serde_json::json!({ "vgpu_type": "2Q" }));
+        let said = node
+            .effective_params(&spec)
+            .expect_err("no reserve to resolve with")
+            .to_string();
+        assert!(said.contains("vgpu_host_reserve_mib"), "{said}");
+    }
+
+    /// The helper sees the configured reserve and none of the agent's own
+    /// LEA_ settings, so resolution does not depend on how the agent was started.
+    #[test]
+    fn vgpuprofile_runs_with_the_configured_reserve_only() {
+        let cmd = vgpuprofile_select(Path::new("/nonexistent/vgpuprofile"), 1024, "4Q");
+        let set: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                let value = v.map(|v| v.to_string_lossy().into_owned());
+                (k.to_string_lossy().into_owned(), value)
+            })
+            .collect();
+        assert!(
+            set.contains(&(HOST_RESERVE_ENV.to_string(), Some("1024".to_string()))),
+            "{set:?}"
+        );
+        let others: Vec<&String> = set
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| {
+                k.as_str() != HOST_RESERVE_ENV && k.as_str() != "PATH" && k.as_str() != "HOME"
+            })
+            .collect();
+        assert!(
+            others.is_empty(),
+            "only PATH and HOME are inherited: {others:?}"
+        );
+    }
+
+    /// A failed resolution carries the helper's own reason from stderr.
+    #[test]
+    fn a_failed_resolution_says_what_vgpuprofile_said() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"vgpuprofile: no type or size \"9Q\" on this card. It offers:\n".to_vec(),
+        };
+        let said = vgpu_from_output("9Q", &out)
+            .expect_err("exit 1")
+            .to_string();
+        assert!(said.contains("no type or size \"9Q\""), "{said}");
     }
 
     /// Extra environment variables cannot override typed admission settings;

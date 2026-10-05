@@ -447,6 +447,9 @@ pub struct NvrmConfig {
     #[serde(default = "default_nvrm_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
     pub vram_budget_mib: Option<u64>,
+    /// The host's share of the card in MiB that `vgpuprofile` subtracts before
+    /// deriving vGPU types. Required once a vGPU type is configured or requested.
+    pub vgpu_host_reserve_mib: Option<u64>,
     #[serde(default)]
     pub defaults: NvrmParams,
     #[serde(default)]

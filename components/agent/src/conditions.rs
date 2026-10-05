@@ -26,6 +26,11 @@ pub const CGROUP_UNUSABLE: &str = "CgroupUnusable";
 /// driver registration itself happens at startup.
 pub const UNPRIVILEGED: &str = "Unprivileged";
 
+/// A configured device driver could not be built at startup, so its
+/// capability is missing. Driver construction happens once, so only a restart
+/// with a corrected configuration clears it.
+pub const DRIVER_UNAVAILABLE: &str = "DriverUnavailable";
+
 /// A VMM has no matching persisted VM row. The reconciler reports it before
 /// cleanup after a grace period; see `sweep_unmanaged_vmms`.
 pub const VMM_UNMANAGED: &str = "VmmUnmanaged";

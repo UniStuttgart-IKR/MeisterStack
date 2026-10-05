@@ -534,7 +534,11 @@ async fn give_the_interfaces_away(
 
 pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let (conditions, store) = store_and_conditions(&cfg)?;
-    let drivers = Drivers::from_config(&cfg).await?;
+    let crate::drivers::Startup {
+        drivers,
+        unavailable,
+    } = Drivers::start(&cfg).await?;
+    crate::drivers::report_unavailable(&unavailable, &conditions);
     // Build recurring prerequisite watches separately from driver registration.
     let unprivileged = Arc::new(crate::privileges::Watch::new(
         Arc::new(crate::privileges::Host),
