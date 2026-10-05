@@ -41,6 +41,18 @@ impl Default for GpuParams {
     }
 }
 
+/// Device parameters a vm spec may set: none. Each `GpuParams` field picks the
+/// renderer, the context types a guest can reach, whether virglrenderer's
+/// render server sandbox is used, or the size of a host mapping, so all of them
+/// are node configuration; a spec chooses among the node's profiles.
+pub const TENANT_SETTABLE_PARAMS: [&str; 0] = [];
+
+/// Reject parameters reserved for node configuration, naming the rejected key.
+/// The agent applies it when a vm spec arrives and the driver again at use.
+pub fn refuse_operator_only_params(params: &serde_json::Value) -> Result<(), String> {
+    device::refuse_params_outside("crosvm-gpu", &TENANT_SETTABLE_PARAMS, params)
+}
+
 fn crosvm_params_json(params: &GpuParams) -> device::Result<String> {
     let value = serde_json::to_value(params).map_err(|e| DeviceError::Backend(e.into()))?;
     let obj = value
@@ -143,6 +155,10 @@ impl CrosvmGpuDriver {
             })?),
             None => None,
         };
+        // Enforce tenant parameter restrictions even for callers outside the agent.
+        if let Some(params) = &spec.params {
+            refuse_operator_only_params(params).map_err(DeviceError::InvalidSpec)?;
+        }
 
         Self::merge_params(&self.config.defaults, profile, spec.params.as_ref())
             .map_err(|e| DeviceError::InvalidSpec(e.to_string()))
@@ -281,5 +297,63 @@ impl DeviceDriver for CrosvmGpuDriver {
         let mut names: Vec<String> = self.config.profiles.keys().cloned().collect();
         names.sort_unstable();
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IKR-B21: no field of the backend's parameters is a vm spec's to set;
+    /// a tenant cannot pick gfxstream, more context types, or turn off the
+    /// render server sandbox.
+    #[test]
+    fn a_spec_may_not_configure_the_gpu_backend() {
+        for (key, value) in [
+            ("backend", serde_json::json!("gfxstream")),
+            ("vulkan", serde_json::json!(true)),
+            ("context_types", serde_json::json!("venus:cross-domain")),
+            ("external_blob", serde_json::json!(true)),
+            ("pci_bar_size", serde_json::json!(1u64 << 40)),
+            ("implicit_render_server", serde_json::json!(false)),
+        ] {
+            let said = refuse_operator_only_params(&serde_json::json!({ key: value }))
+                .expect_err("node configuration");
+            assert!(said.contains(key), "{said}");
+            assert!(said.contains("device.crosvm-gpu"), "{said}");
+        }
+        refuse_operator_only_params(&serde_json::json!({})).expect("nothing set");
+    }
+
+    fn driver(run_dir: &std::path::Path) -> CrosvmGpuDriver {
+        CrosvmGpuDriver::new(CrosvmGpuDriverConfig {
+            crosvm_bin: PathBuf::from("/nonexistent/crosvm"),
+            run_dir: run_dir.to_path_buf(),
+            defaults: GpuParams::default(),
+            profiles: HashMap::new(),
+            socket_timeout: Duration::from_millis(100),
+            vmm_user: None,
+        })
+        .expect("a driver over a temp dir")
+    }
+
+    /// The driver repeats the check for callers that bypass the agent's intake.
+    #[test]
+    fn the_driver_refuses_tenant_params_at_use() {
+        let run_dir = tempfile::Builder::new()
+            .prefix("meister-crosvm-gpu-")
+            .tempdir()
+            .expect("a temp dir");
+        let spec = DeviceSpec {
+            driver: "crosvm-gpu".into(),
+            partition: PartitionSpec::Mediated,
+            profile: None,
+            params: Some(serde_json::json!({ "implicit_render_server": false })),
+        };
+        let said = driver(run_dir.path())
+            .effective_params(&spec)
+            .expect_err("not a spec's to set")
+            .to_string();
+        assert!(said.contains("implicit_render_server"), "{said}");
     }
 }

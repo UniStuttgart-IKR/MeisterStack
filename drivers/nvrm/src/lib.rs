@@ -68,21 +68,7 @@ pub const TENANT_SETTABLE_PARAMS: [&str; 1] = ["vgpu_type"];
 
 /// Reject parameters reserved for node configuration, naming the rejected key.
 pub fn refuse_operator_only_params(params: &serde_json::Value) -> Result<(), String> {
-    let serde_json::Value::Object(fields) = params else {
-        return Err(format!("nvrm params must be an object, not {params}"));
-    };
-    for key in fields.keys() {
-        if TENANT_SETTABLE_PARAMS.contains(&key.as_str()) {
-            continue;
-        }
-        return Err(format!(
-            "nvrm params.{key} is the node's to set and not a spec's; a vm spec may name \
-             [{}] and a profile (spec.profile), and everything else comes from \
-             [device.nvrm] on the node",
-            TENANT_SETTABLE_PARAMS.join(", ")
-        ));
-    }
-    Ok(())
+    device::refuse_params_outside("nvrm", &TENANT_SETTABLE_PARAMS, params)
 }
 
 /// Backend options merged in order: defaults, named profile, tenant parameters.
