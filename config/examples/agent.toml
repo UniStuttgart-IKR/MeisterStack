@@ -254,8 +254,9 @@ default_bridge = "meister_br0"
 # only warned about.
 #vram_budget_mib = 8192
 
-# Merge defaults < profile < VM parameters. Avoid combining vgpu_type with
-# vram_limit_mib. Backend-specific env overrides typed fields.
+# Merge defaults < profile < VM parameters. The merged result may name one of
+# vgpu_type, vram_profile_mib and vram_limit_mib. env may not set a variable a
+# typed field writes.
 #[device.nvrm.defaults]
 #vgpu_type        = "RTX2070-4Q"
 #vram_reserve_mib = 256

@@ -120,15 +120,27 @@ impl NvrmParams {
     }
 
     fn validate(&self) -> device::Result<()> {
-        // The backend refuses to start when both a cap and a profile are set;
-        // a vgpu_type resolves to a profile, so it counts as one.
-        let profile_like = self.vram_profile_mib.is_some() || self.vgpu_type.is_some();
-        if self.vram_limit_mib.is_some() && profile_like {
-            return Err(DeviceError::InvalidSpec(
-                "vram_limit_mib and vram_profile_mib/vgpu_type are mutually exclusive \
-                 (the backend refuses both, cap OR profile)"
-                    .into(),
-            ));
+        self.refuse_two_vram_policies()
+    }
+
+    /// The backend takes one VRAM policy, a cap, a profile size or a vGPU
+    /// type, and refuses to start with two (Leandro vram.rs `decide`). Refusing
+    /// here fails the request at admission instead of the VM at boot.
+    fn refuse_two_vram_policies(&self) -> device::Result<()> {
+        let set: Vec<&str> = [
+            ("vram_limit_mib", self.vram_limit_mib.is_some()),
+            ("vram_profile_mib", self.vram_profile_mib.is_some()),
+            ("vgpu_type", self.vgpu_type.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, is_set)| is_set.then_some(name))
+        .collect();
+        if set.len() > 1 {
+            return Err(DeviceError::InvalidSpec(format!(
+                "{} are mutually exclusive: the backend takes one VRAM policy (cap, profile \
+                 size or vGPU type) and refuses to start with more",
+                set.join(" and ")
+            )));
         }
         Ok(())
     }
@@ -262,13 +274,15 @@ impl NvrmDriver {
             active: Mutex::new(HashMap::new()),
         })
     }
+}
 
+impl NvrmDriverConfig {
+    /// Layer defaults, the named profile and tenant parameters, and validate the result.
     fn effective_params(&self, spec: &DeviceSpec) -> device::Result<NvrmParams> {
-        let mut merged = self.config.defaults.clone();
+        let mut merged = self.defaults.clone();
         if let Some(name) = &spec.profile {
-            let profile = self.config.profiles.get(name).ok_or_else(|| {
-                let mut known: Vec<&str> =
-                    self.config.profiles.keys().map(String::as_str).collect();
+            let profile = self.profiles.get(name).ok_or_else(|| {
+                let mut known: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
                 known.sort_unstable();
                 DeviceError::InvalidSpec(format!(
                     "unknown nvrm profile {name:?}; configured profiles: [{}]",
@@ -287,7 +301,9 @@ impl NvrmDriver {
         merged.validate()?;
         Ok(merged)
     }
+}
 
+impl NvrmDriver {
     /// The backend derives the vGPU identity from the socket path, so it must
     /// be unique and stable per device for its whole lifetime.
     fn socket_path(&self, id: &DeviceId) -> PathBuf {
@@ -586,7 +602,7 @@ impl DeviceDriver for NvrmDriver {
             }
         }
 
-        let params = self.effective_params(spec)?;
+        let params = self.config.effective_params(spec)?;
 
         let vgpu = match &params.vgpu_type {
             Some(vtype) => {
@@ -701,6 +717,29 @@ impl DeviceDriver for NvrmDriver {
         names.sort_unstable();
         names
     }
+
+    /// Refuse a request the backend would reject before the agent records or
+    /// starts anything for it. VRAM is admitted in `create`, against live backends.
+    fn admit(
+        &self,
+        requested: &[(DeviceId, DeviceSpec)],
+        _claimed: &[(agent_api::VmId, DeviceSpec)],
+    ) -> device::Result<()> {
+        for (id, spec) in requested {
+            self.config
+                .effective_params(spec)
+                .map_err(|e| naming_the_device(id, e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Prefix a spec refusal with the device it is about.
+fn naming_the_device(id: &DeviceId, e: DeviceError) -> DeviceError {
+    match e {
+        DeviceError::InvalidSpec(said) => DeviceError::InvalidSpec(format!("device {id}: {said}")),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +790,50 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    /// IKR-B12: a vGPU type is a profile, so it cannot come with a profile size.
+    #[test]
+    fn a_vgpu_type_and_a_profile_size_are_mutually_exclusive() {
+        let both = p(serde_json::json!({ "vgpu_type": "4Q", "vram_profile_mib": 2048 }));
+        let said = both.validate().expect_err("two policies").to_string();
+        assert!(said.contains("vram_profile_mib and vgpu_type"), "{said}");
+    }
+
+    /// A node configuration whose defaults and profiles the tests choose.
+    fn node(defaults: serde_json::Value) -> NvrmDriverConfig {
+        NvrmDriverConfig {
+            binary: PathBuf::from("/nonexistent/vhost-user-nvrm"),
+            vgpuprofile_bin: PathBuf::from("/nonexistent/vgpuprofile"),
+            run_dir: PathBuf::from("/nonexistent/run"),
+            socket_timeout: Duration::from_millis(DEFAULT_SOCKET_TIMEOUT_MS),
+            vram_budget_mib: None,
+            defaults: p(defaults),
+            profiles: HashMap::new(),
+            vmm_user: None,
+        }
+    }
+
+    fn mediated(params: serde_json::Value) -> DeviceSpec {
+        DeviceSpec {
+            driver: "nvrm".into(),
+            partition: PartitionSpec::Mediated,
+            profile: None,
+            params: Some(params),
+        }
+    }
+
+    /// The layers are checked together: a tenant's vGPU type over a node's
+    /// default profile size is refused before a backend could refuse it.
+    #[test]
+    fn a_tenant_vgpu_type_over_a_default_profile_size_is_refused() {
+        let node = node(serde_json::json!({ "vram_profile_mib": 2048 }));
+        let spec = mediated(serde_json::json!({ "vgpu_type": "4Q" }));
+        let said = node
+            .effective_params(&spec)
+            .expect_err("the backend would not start")
+            .to_string();
+        assert!(said.contains("mutually exclusive"), "{said}");
     }
 
     /// Extra environment variables cannot override typed admission settings;
