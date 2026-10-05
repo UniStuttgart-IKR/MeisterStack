@@ -11,6 +11,10 @@
 //! successor could find. This is Floppy's cut (floppy-disk `dev.rs:126-139`)
 //! moved from block writes to file and command effects. Unlike Floppy, labels
 //! are not taken from a thread-local: the method or program is the label.
+//!
+//! An effect that lands and whose caller dies before it hears so needs no
+//! mode of its own: under freeze-after semantics it leaves the world the cut
+//! at `k + 1` leaves, which the spike checked for every cut of `confirm`.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,17 +23,6 @@ use anyhow::Result;
 
 use crate::effects::{Entry, Files};
 use crate::run::{Cmd, Effect, Output, Policy, Runner};
-
-/// What happens to the effect the cut falls on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Floppy's `arm_after(k)`: effect `k` does not land.
-    Refuse,
-    /// Effect `k` lands and its caller still gets an error: the process died
-    /// after the work was done and before it heard so. Under freeze-after
-    /// semantics this leaves the world `Refuse` leaves at `k + 1`.
-    LandThenFail,
-}
 
 /// One mutating effect, as the trace records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +52,6 @@ struct State {
     at: Option<usize>,
     frozen: Option<Op>,
     trace: Vec<Op>,
-    mode: Mode,
 }
 
 /// Shared by every decorator of one simulated process. `Arc` and `Mutex`
@@ -70,21 +62,15 @@ pub struct CutPoint {
     state: Mutex<State>,
 }
 
-enum Verdict {
-    Land,
-    Refuse(usize),
-    LandThenFail(usize),
-}
-
 impl CutPoint {
-    pub fn new(mode: Mode) -> Arc<CutPoint> {
+    /// A cut that is not armed: every effect lands and is traced.
+    pub fn new() -> Arc<CutPoint> {
         Arc::new(CutPoint {
             state: Mutex::new(State {
                 ops: 0,
                 at: None,
                 frozen: None,
                 trace: Vec::new(),
-                mode,
             }),
         })
     }
@@ -121,17 +107,12 @@ impl CutPoint {
         self.lock().trace.clone()
     }
 
-    /// Let effects land again, for the successor that recovers.
-    pub fn disarm(&self) {
-        let mut st = self.lock();
-        st.at = None;
-        st.frozen = None;
-    }
-
-    fn admit(&self, what: &str, on: String) -> Verdict {
+    /// `Err` with the ordinal the process died at, for this effect and
+    /// every one after it.
+    fn admit(&self, what: &str, on: String) -> Result<(), usize> {
         let mut st = self.lock();
         if let Some(frozen) = &st.frozen {
-            return Verdict::Refuse(frozen.ordinal);
+            return Err(frozen.ordinal);
         }
         let op = Op {
             ordinal: st.ops,
@@ -139,26 +120,19 @@ impl CutPoint {
             on,
         };
         st.ops += 1;
-        if st.at != Some(op.ordinal) {
-            st.trace.push(op);
-            return Verdict::Land;
+        if st.at == Some(op.ordinal) {
+            st.frozen = Some(op.clone());
+            return Err(op.ordinal);
         }
-        st.frozen = Some(op.clone());
-        match st.mode {
-            Mode::Refuse => Verdict::Refuse(op.ordinal),
-            Mode::LandThenFail => {
-                st.trace.push(op.clone());
-                Verdict::LandThenFail(op.ordinal)
-            }
-        }
+        st.trace.push(op);
+        Ok(())
     }
 
     /// Run one mutating effect through the cut.
     fn effect<T>(&self, what: &str, on: String, land: impl FnOnce() -> Result<T>) -> Result<T> {
         match self.admit(what, on) {
-            Verdict::Land => land(),
-            Verdict::Refuse(at) => Err(Crashed(at).into()),
-            Verdict::LandThenFail(at) => land().and_then(|_| Err(Crashed(at).into())),
+            Ok(()) => land(),
+            Err(at) => Err(Crashed(at).into()),
         }
     }
 }
