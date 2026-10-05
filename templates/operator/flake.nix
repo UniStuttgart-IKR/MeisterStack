@@ -15,8 +15,12 @@
     # Use the stack's disko input for installation layouts.
     disko.follows = "meisterstack/disko";
 
-    # Optional GPU input; CPU-only fleets do not need it.
-    # leandro.url = "github:…/Leandro";
+    # Optional GPU input; CPU-only fleets do not need it. Pin a revision: 73eb298 is the one
+    # whose cloud-hypervisor patch series this stack carries, and both ends of the vhost-user
+    # channel must be on the same series. Leandro tracks nixos-26.05 and this template
+    # nixos-25.11, so do not add `follows` (the line below) before moving nixpkgs to 26.05:
+    # it would build Leandro against a nixpkgs it was not written for.
+    # leandro.url = "github:UniStuttgart-IKR/Leandro/73eb2985f32098500d851520710439d30f7c3ffe";
     # leandro.inputs.nixpkgs.follows = "nixpkgs";
   };
 
