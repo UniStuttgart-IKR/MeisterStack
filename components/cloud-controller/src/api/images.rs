@@ -48,19 +48,33 @@ pub(super) fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
             if sha256.bytes().any(|b| b.is_ascii_uppercase()) {
                 return Err(invalid("spec.sha256 must be lowercase"));
             }
-            // The node runs `curl`, which speaks more than http. A scheme
-            // this control plane has not thought about is refused here rather
-            // than discovered on a node — `file://` in particular would make
-            // an image mean something different on every machine.
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err(invalid(
-                    "spec.url must be http:// or https://; a node fetches this, and a scheme \
-                     that means something different on every machine is not an image",
-                ));
-            }
-            Ok(())
+            check_url_shape(url)
         }
     }
+}
+
+/// Refuse an image URL no node would ever fetch while its author can still be told
+/// (R3-F10). The node makes the real egress decision against `[images] allowed_sources`
+/// with the same parser; private-range literals pass here because only the node's
+/// list can say whether it may reach them.
+pub(super) fn check_url_shape(url: &str) -> Result<(), ApiError> {
+    use common::fetch_url::{AddrClass, FetchUrl, Host, classify};
+    let parsed = FetchUrl::parse(url).map_err(|why| invalid(format!("spec.url: {why}")))?;
+    if !parsed.port_allowed() {
+        return Err(invalid(format!(
+            "spec.url names port {}; a node fetches images from ports 80 and 443 only",
+            parsed.port
+        )));
+    }
+    if let Host::Ip(addr) = parsed.host
+        && classify(addr) == AddrClass::Never
+    {
+        return Err(invalid(format!(
+            "spec.url points at {addr}, a loopback, link-local, multicast or metadata \
+             address; no node fetches an image from there"
+        )));
+    }
+    Ok(())
 }
 
 /// Restrict path-based registrations to identities not confined to a tenant.
@@ -297,6 +311,40 @@ mod tests {
         // confined, and register what is already on the estate's disks.
         check_source_kind(&path_based, None).expect("the estate is theirs");
         check_source_kind(&fetchable, None).expect("and so is the other kind");
+    }
+
+    /// Astra finding R3-F10, 2026-09-25: the url is held to one strict shape
+    /// before any node is asked to fetch it.
+    #[test]
+    fn an_image_url_no_node_would_fetch_is_refused_at_create() {
+        let spec = |url: &str| ImageSpec {
+            source: "x.raw".into(),
+            url: Some(url.into()),
+            sha256: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        for ok in [
+            "https://cloud-images.ubuntu.com/noble/x.img",
+            "http://mirror.example:80/x.raw",
+            "http://10.0.8.21/x.raw",
+        ] {
+            check_fetchable(&spec(ok)).unwrap_or_else(|e| panic!("{ok}: {e:?}"));
+        }
+        for bad in [
+            "file:///etc/passwd",
+            "http://user:pw@mirror.example/x.raw",
+            "http://mirror.example:8080/x.raw",
+            "http://127.0.0.1/x.raw",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x.raw",
+            "http://2130706433/x.raw",
+            "gopher://mirror.example/x",
+        ] {
+            assert!(
+                check_fetchable(&spec(bad)).is_err(),
+                "{bad} should be refused"
+            );
+        }
     }
 
     /// The catalogue is only worth a 422 if its names are the names the node

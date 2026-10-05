@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Candidate, CandidateKind, Capacity, CapacityReservation, EtcdStore, Lifecycle, Locality, Node,
+    Candidate, CandidateKind, CapacityReservation, EtcdStore, Lifecycle, Locality, Node,
     Overcommit, PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy,
     Scheduler, StoragePool, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
-    VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
+    VolumeSnapshot, VolumeSnapshotPhaseKind, free_on, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
 use proto::command;
@@ -276,6 +276,8 @@ async fn pass(
         nodes: std::sync::Mutex::new(nodes),
         pending: PendingTally::new(),
         kek,
+        held: &held,
+        overcommit,
     };
     for vm in vms {
         let name = vm.metadata.name.clone();
@@ -315,6 +317,7 @@ async fn pass(
         &pass.nodes,
         migration,
         &held,
+        &vms_for_drain,
         overcommit,
     )
     .await
@@ -402,6 +405,14 @@ struct Pass<'a> {
     /// `None` = no `secrets_key` in the config, and a VM naming a secret
     /// stays Pending with a sentence saying so. See `seed_for`.
     kek: Option<&'a controller_api::secrets::Kek>,
+    /// What the fleet had promised when this pass began — the reading
+    /// `nodes` was built with. `place` reads it to recognise a claim THIS
+    /// guest already holds from an attempt that did not reach the binding;
+    /// see `CapacityReservationSpec` and Astra finding R3-F05, 2026-09-24.
+    held: &'a [CapacityReservation],
+    /// The allowance rule, for the confirmation a placement makes against
+    /// the store rather than against `nodes`.
+    overcommit: Overcommit,
 }
 
 #[cfg(test)]

@@ -296,8 +296,13 @@ async fn a_router_is_built_and_taken_down_again() {
     );
 
     // Shutdown suppresses ARP without destroying the router namespace.
-    let silenced = d.fall_silent().await.expect("a node on its way out");
-    assert_eq!(silenced, [id], "the one router that spoke here fell silent");
+    let outcome = d.fall_silent().await.expect("a node on its way out");
+    assert_eq!(
+        outcome.silenced,
+        [id],
+        "the one router that spoke here fell silent"
+    );
+    assert!(outcome.complete(), "nothing failed to fall silent");
     assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "8");
     assert_eq!(sysctl(&netns, "net.ipv4.conf.int.arp_ignore"), "8");
     assert!(
@@ -324,8 +329,9 @@ async fn a_router_is_built_and_taken_down_again() {
         "the standby keeps its own address and the floating one it holds, and \
          answers for neither: {on_ext}"
     );
+    let second = d.fall_silent().await.expect("twice is once");
     assert!(
-        d.fall_silent().await.expect("twice is once").is_empty(),
+        second.silenced.is_empty() && second.complete(),
         "a second farewell has nothing left to silence"
     );
     // And the promotion back is the one pass it always was.

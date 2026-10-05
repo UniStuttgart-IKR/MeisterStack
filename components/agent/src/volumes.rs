@@ -851,6 +851,7 @@ mod tests {
                 qemu_img: std::path::PathBuf::from("qemu-img"),
                 // Nothing here converts anything: these pools are raw files.
                 convert: agent_api::base_image::Sandbox::default(),
+                host_id: "test-node".into(),
             },
         )
         .expect("the filesystem driver builds");

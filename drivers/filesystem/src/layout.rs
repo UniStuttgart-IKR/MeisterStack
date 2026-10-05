@@ -16,11 +16,6 @@ pub(crate) fn volume_path(dir: &Path, id: &VolumeId) -> PathBuf {
     dir.join(format!("{id}.raw"))
 }
 
-/// Where a volume is built before it is renamed into place.
-pub(crate) fn tmp_path(dir: &Path, id: &VolumeId) -> PathBuf {
-    dir.join(format!("{id}.tmp"))
-}
-
 /// Snapshot path beside the volumes, keyed by snapshot ID.
 pub(crate) fn snapshot_path(dir: &Path, id: &SnapshotId) -> PathBuf {
     dir.join(format!("{id}.snap"))
@@ -153,6 +148,24 @@ pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// Write under a temporary name, set the requested size, sync the file, then
 /// rename to the final name. The containing directory is not synced here.
 pub(crate) fn write_volume_file(
+    src: Option<(PathBuf, Option<BaseImage>)>,
+    sandbox: &Sandbox,
+    qemu_img: &Path,
+    tmp: &Path,
+    final_path: &Path,
+    size: u64,
+) -> std::io::Result<()> {
+    let written = write_then_rename(src, sandbox, qemu_img, tmp, final_path, size);
+    // The staging name is this attempt's own since R3-F09, so the next
+    // attempt never overwrites it: a failed one takes its file with it here,
+    // and one killed outright is the start-up sweep's.
+    if written.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    written
+}
+
+fn write_then_rename(
     src: Option<(PathBuf, Option<BaseImage>)>,
     sandbox: &Sandbox,
     qemu_img: &Path,

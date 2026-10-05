@@ -107,14 +107,26 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
         let active_was = router.status.active_node.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
+        // Astra round 3, finding R3-F03: under the uid the report named, and
+        // only while the router is still bound to this cluster as the object
+        // reads NOW — the binding check above ran on the listing.
+        let mut applied = false;
         let result = store
-            .mutate::<controller_api::Router, _>(&name, |r| {
+            .mutate_if::<controller_api::Router, _>(&name, &uid, |r| {
+                applied = r.status.cluster == cluster;
+                if !applied {
+                    return;
+                }
                 r.status.reported = Some(said.clone());
                 r.status.active_node = reported.node.clone();
                 r.status.nodes = reported.nodes.clone();
             })
             .await;
         match result {
+            Ok(_) if !applied => {
+                debug!(router = %name, cluster,
+                       "the router was rebound between the listing and the write; the word is dropped");
+            }
             Ok(_) => {
                 if was != phase || active_was != reported.node {
                     info!(router = %name, cluster, ?phase, node = %reported.node,
@@ -356,8 +368,18 @@ pub(super) async fn forget_unbound(
 ) -> anyhow::Result<()> {
     for vm in leaving_cluster(vms, cluster, status) {
         let name = vm.metadata.name.clone();
-        store
-            .mutate::<Vm, _>(&name, |v| {
+        let uid = vm.metadata.uid.clone();
+        // Astra round 3, finding R3-F03: `leaving_cluster` read a listing, and
+        // the vm may have been bound again or the name recreated since. The
+        // uid is pinned and both facts it read are read again here.
+        let mut applied = false;
+        let result = store
+            .mutate_if::<Vm, _>(&name, &uid, |v| {
+                applied = v.spec.cluster_name.is_none()
+                    && v.status.cluster_name.as_deref() == Some(cluster);
+                if !applied {
+                    return;
+                }
                 v.status.cluster_name = None;
                 // The node went with the cluster: this cloud only ever knew
                 // it because that cluster reported it, and there is nothing
@@ -379,7 +401,16 @@ pub(super) async fn forget_unbound(
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
             })
-            .await?;
+            .await;
+        if let Err(e) = result {
+            warn!(vm = %name, cluster, error = format!("{e:#}"), "clearing the old cluster failed");
+            continue;
+        }
+        if !applied {
+            debug!(vm = %name, cluster,
+                   "bound again between the listing and the write; the let-go is dropped");
+            continue;
+        }
         info!(vm = %name, cluster, "the old cluster let go; the vm can be placed again");
     }
     Ok(())
@@ -418,15 +449,31 @@ pub(super) async fn ingest_placements(
             continue;
         }
         let name = vm.metadata.name.clone();
+        // Astra round 3, finding R3-F03: under the uid the report named, for
+        // a vm still bound to this cluster as the object reads NOW, and with
+        // the MAC lines merged into the addresses as they are now — the
+        // floating pass writes the other half of that list, and merging into
+        // the listing's copy would undo a write it made in between.
+        let mut applied = false;
         if let Err(e) = store
-            .mutate::<Vm, _>(&name, |v| {
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                applied = ours(v);
+                if !applied {
+                    return;
+                }
                 v.status.node_name = node.clone();
                 v.status.volumes = volumes.clone();
-                v.status.addresses = addresses.clone();
+                v.status.addresses =
+                    controller_api::addresses_with(&v.status.addresses, &reported.nics);
             })
             .await
         {
             warn!(vm = %name, cluster, error = format!("{e:#}"), "recording the node failed");
+            continue;
+        }
+        if !applied {
+            debug!(vm = %name, cluster,
+                   "the vm was rebound between the listing and the write; the placement is dropped");
             continue;
         }
         debug!(vm = %name, cluster, node = ?node, "placement observed");
@@ -443,7 +490,7 @@ pub(super) async fn ingest_phases(
     ours: impl Fn(&Vm) -> bool,
     at: DateTime<Utc>,
 ) {
-    for (reported, seen) in controller_api::observe(known, &status.vms, ours) {
+    for (reported, seen) in controller_api::observe(known, &status.vms, &ours) {
         let Some((vm, phase, reason, message)) = changed(cluster, reported, seen) else {
             continue;
         };
@@ -452,8 +499,20 @@ pub(super) async fn ingest_phases(
         // the spec and travels with the event, so a member sees its own VMs'
         // history and nobody else's.
         let vm_tenant = vm.spec.tenant.clone();
+        // Astra round 3, finding R3-F03: `observe` matched the report to a vm
+        // of a listing and checked the binding there. Between that and this
+        // write the name may have been recreated under another uid, or the
+        // vm rebound to another cluster; `mutate_if` pins the uid on every
+        // read and the binding is asked again of the object being written,
+        // exactly as one tier down (Astra S20). Set fresh on every call,
+        // retries included, so it says what the write that landed did.
+        let mut applied = false;
         let result = store
-            .mutate::<Vm, _>(&name, |v| {
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                applied = ours(v);
+                if !applied {
+                    return;
+                }
                 v.status.reported = Some(controller_api::VmReported::by(
                     cluster,
                     phase,
@@ -476,10 +535,12 @@ pub(super) async fn ingest_phases(
             })
             .await;
         match result {
-            Ok(_) => {
+            Ok(_) if applied => {
                 note_phase(store, &name, &reported.id, phase, &message, &vm_tenant).await;
                 info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed")
             }
+            Ok(_) => debug!(vm = %name, cluster,
+                            "the vm was rebound between the listing and the write; the phase is dropped"),
             Err(e) => warn!(vm = %name, error = format!("{e:#}"), "writing vm status failed"),
         }
     }

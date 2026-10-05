@@ -22,6 +22,9 @@ use crate::reconcile::ImageReason;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, instrument};
 
+pub mod egress;
+use egress::{EgressPolicy, Pinned};
+
 /// Fetch source with paired URL and checksum, validated at the create edge.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Source {
@@ -98,6 +101,9 @@ pub struct Cache {
     inventory: Mutex<Option<Inventory>>,
     /// What a download may cost before it is cut off. See [`Bounds`].
     bounds: Bounds,
+    /// Where a download may go. See [`egress`]; `Cache::new` allows nothing
+    /// until [`Cache::with_egress`] says otherwise (R3-F10).
+    egress: EgressPolicy,
 }
 
 /// A reading of the image directory, and the mtime it was read at.
@@ -157,7 +163,15 @@ impl Cache {
             known: Mutex::default(),
             inventory: Mutex::default(),
             bounds: Bounds::default(),
+            egress: EgressPolicy::deny_all(),
         }
+    }
+
+    /// Set the egress policy from `[images] allowed_sources`. Without one no url
+    /// image is fetched at all (R3-F10).
+    pub fn with_egress(mut self, egress: EgressPolicy) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// Override download bounds for this cache.
@@ -413,7 +427,7 @@ impl Cache {
             source.cache_key(),
             std::process::id()
         ));
-        let fetched = fetch(&source.url, &partial, &self.bounds).await;
+        let fetched = fetch(&source.url, &partial, &self.bounds, &self.egress).await;
         // Remove the partial after a returned fetch failure. Cancellation may leave it.
         let digest = match fetched {
             Ok(digest) => digest,
@@ -556,28 +570,51 @@ impl Default for Bounds {
 /// believing the bound is being kept. See the deadline in [`fetch`].
 const BOUND_GRACE: Duration = Duration::from_secs(30);
 
-/// Build curl arguments for redirects, HTTP failure reporting and download limits.
-fn curl_argv(url: &str, bounds: &Bounds) -> Vec<String> {
-    vec![
+/// Build curl arguments for one hop: HTTP failure reporting and download limits.
+/// Curl follows no redirect and speaks only http(s); a 3xx is reported through
+/// `--write-out` and its target vetted before the next hop (R3-F10). `-q` keeps
+/// `.curlrc` out and `--noproxy '*'` keeps proxies from bypassing the pin.
+fn curl_argv(pinned: &Pinned, bounds: &Bounds, max_time: Duration) -> Vec<String> {
+    let mut argv = vec![
+        "-q".to_string(),
         "--fail".to_string(),
-        "--location".to_string(),
         "--silent".to_string(),
         "--show-error".to_string(),
+        "--proto".to_string(),
+        "=http,https".to_string(),
+        "--proto-redir".to_string(),
+        "=http,https".to_string(),
+        "--max-redirs".to_string(),
+        "0".to_string(),
+        "--noproxy".to_string(),
+        "*".to_string(),
         // The idle cut-off, in curl's own two halves.
         "--speed-limit".to_string(),
         bounds.floor_bytes_per_sec.to_string(),
         "--speed-time".to_string(),
         bounds.idle.as_secs().to_string(),
-        // Bound connection setup and transfer together.
+        // Bound connection setup and transfer by what is left of the deadline,
+        // so redirects cannot add up past it.
         "--max-time".to_string(),
-        bounds.deadline.as_secs().to_string(),
+        max_time.as_secs().max(1).to_string(),
         // Curl can only precheck a declared length; drain also enforces the limit
         // against bytes actually received.
         "--max-filesize".to_string(),
         bounds.max_bytes.to_string(),
-        url.to_string(),
-    ]
+        "--write-out".to_string(),
+        format!("%{{stderr}}\n{HOP_MARKER} %{{http_code}} %{{redirect_url}}\n"),
+    ];
+    // `--resolve` and the canonical url, last: the url is the last word, so
+    // no bound can be read as one.
+    argv.extend(pinned.curl_args());
+    argv
 }
+
+/// Marker line `--write-out` puts on curl's stderr after every transfer.
+const HOP_MARKER: &str = "meister-fetch-hop";
+
+/// Redirects one image fetch follows; image hosts redirect once or twice to a mirror.
+const MAX_REDIRECTS: usize = 5;
 
 /// Validate the checksum before using it as a cache path or downloading bytes.
 fn check_digest(sha256: &str) -> Result<()> {
@@ -638,13 +675,62 @@ async fn hash_local_file(path: &Path, deadline: Duration) -> Result<String> {
 }
 
 /// Stream curl output to a file while hashing, enforce byte/time bounds,
-/// and sync completed content before returning its digest.
-async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
+/// and sync completed content before returning its digest. Every hop, the
+/// first included, is vetted against the egress policy before curl starts
+/// and curl is pinned to the vetted address (R3-F10).
+async fn fetch(url: &str, into: &Path, bounds: &Bounds, egress: &EgressPolicy) -> Result<String> {
+    let started = std::time::Instant::now();
+    let mut next = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let pinned = egress.vet(&next).await?;
+        let left = bounds.deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            bail!(
+                "fetching {url} did not finish within {}s and was stopped; nothing usable was \
+                 written",
+                bounds.deadline.as_secs()
+            );
+        }
+        match fetch_hop(&pinned, into, bounds, left).await? {
+            Hop::Done(digest) => return Ok(digest),
+            Hop::Redirect(to) => {
+                debug!(from = %pinned.url.canonical(), %to, "the image url redirects");
+                next = to;
+            }
+        }
+    }
+    bail!("fetching {url} was redirected more than {MAX_REDIRECTS} times and was stopped")
+}
+
+/// What one request ended with.
+enum Hop {
+    Done(String),
+    Redirect(String),
+}
+
+/// One request, to one vetted address.
+async fn fetch_hop(pinned: &Pinned, into: &Path, bounds: &Bounds, left: Duration) -> Result<Hop> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
-    let mut child = Command::new("curl")
-        .args(curl_argv(url, bounds))
+    let url = pinned.url.canonical();
+    let mut command = Command::new("curl");
+    command.args(curl_argv(pinned, bounds, left));
+    // No proxy from the environment, for the reason `--noproxy` is passed.
+    for var in [
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+        "CURL_HOME",
+    ] {
+        command.env_remove(var);
+    }
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -653,13 +739,14 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
         })?;
 
     let mut stdout = child.stdout.take().expect("stdout was piped");
+    // Created fresh for every hop: the body of a redirect is not the image.
     let mut file = tokio::fs::File::create(into)
         .await
         .with_context(|| format!("creating {}", into.display()))?;
 
     // Bound the agent's read loop independently of curl's own timeout flags.
     let drained = tokio::time::timeout(
-        bounds.deadline.saturating_add(BOUND_GRACE),
+        left.saturating_add(BOUND_GRACE),
         drain(&mut stdout, &mut file, into, bounds.max_bytes),
     )
     .await;
@@ -695,12 +782,12 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
             bail!("curl did not exit after fetching {url} and was stopped");
         }
     };
+    let mut said = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut said).await;
+    }
+    let (hop, said) = read_hop(&said);
     if !status.success() {
-        let mut said = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut said).await;
-        }
-        let said = said.trim();
         bail!(
             "fetching {url} failed ({status}){}",
             if said.is_empty() {
@@ -710,7 +797,35 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
             }
         );
     }
-    Ok(digest)
+    match hop {
+        Some((code, to)) if matches!(code, 301 | 302 | 303 | 307 | 308) && !to.is_empty() => {
+            Ok(Hop::Redirect(to))
+        }
+        Some((code, _)) if (300..400).contains(&code) => {
+            bail!("fetching {url} answered {code} and no redirect this node can follow")
+        }
+        Some(_) => Ok(Hop::Done(digest)),
+        None => bail!("curl said nothing about how fetching {url} ended"),
+    }
+}
+
+/// Split curl's stderr into the `--write-out` line and everything else.
+fn read_hop(stderr: &str) -> (Option<(u16, String)>, String) {
+    let mut hop = None;
+    let mut rest = Vec::new();
+    for line in stderr.lines() {
+        match line.strip_prefix(HOP_MARKER) {
+            Some(tail) => {
+                let mut words = tail.split_whitespace();
+                let code = words.next().and_then(|c| c.parse::<u16>().ok());
+                let to = words.next().unwrap_or("").to_string();
+                hop = code.map(|c| (c, to));
+            }
+            None if !line.trim().is_empty() => rest.push(line.trim()),
+            None => {}
+        }
+    }
+    (hop, rest.join(" "))
 }
 
 /// Enforce the byte ceiling on actual output, independently of curl's limits.
@@ -769,6 +884,83 @@ mod tests {
         (temp, dir)
     }
 
+    /// A cache whose egress policy lets it reach the loopback listeners
+    /// these tests serve their origins from, and nothing else. Since R3-F10
+    /// `Cache::new` fetches from nowhere, and `file://` is refused outright.
+    fn test_cache(images: PathBuf) -> Cache {
+        Cache::new(images).with_egress(EgressPolicy::any_loopback_for_tests())
+    }
+
+    /// Serve `path` over http on a loopback port of its own for the rest of
+    /// the test process, and return its url. The file is read per request,
+    /// so a test that rewrites or removes it changes what the next fetch
+    /// gets (404 when it is gone).
+    fn served(path: &Path) -> String {
+        let path = path.to_path_buf();
+        origin(move |_| match std::fs::read(&path) {
+            Ok(body) => ok_response(&body),
+            Err(_) => {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        })
+        .url("/image.raw")
+    }
+
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A throwaway http origin on 127.0.0.1: every request is answered by
+    /// `respond(path)`, and every accepted connection is counted.
+    struct Origin {
+        port: u16,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Origin {
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn origin(respond: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Origin {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let _ = stream.write_all(&respond(&path));
+                let _ = stream.flush();
+            }
+        });
+        Origin { port, hits }
+    }
+
     fn digest_of(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
@@ -808,7 +1000,8 @@ mod tests {
         false
     }
 
-    /// Curl receives the idle, total-duration and byte limits used by the fetcher.
+    /// Curl receives the idle, total-duration and byte limits used by the fetcher, follows
+    /// no redirect itself and is pinned to the vetted address (S15, R3-F10).
     #[test]
     fn the_download_argv_carries_every_bound() {
         let bounds = Bounds {
@@ -817,7 +1010,11 @@ mod tests {
             deadline: Duration::from_secs(7200),
             max_bytes: 1 << 30,
         };
-        let argv = curl_argv("https://images.example/noble.img", &bounds);
+        let pinned = Pinned {
+            url: common::fetch_url::FetchUrl::parse("https://images.example/noble.img").unwrap(),
+            addr: "93.184.215.14".parse().unwrap(),
+        };
+        let argv = curl_argv(&pinned, &bounds, Duration::from_secs(7000));
 
         let after = |flag: &str| {
             argv.iter()
@@ -825,20 +1022,119 @@ mod tests {
                 .and_then(|i| argv.get(i + 1))
                 .map(String::as_str)
         };
+        assert_eq!(argv.first().map(String::as_str), Some("-q"), "no .curlrc");
         assert_eq!(after("--speed-limit"), Some("1024"), "the idle floor");
         assert_eq!(after("--speed-time"), Some("60"), "how long under it");
-        assert_eq!(after("--max-time"), Some("7200"), "the whole transfer");
+        assert_eq!(
+            after("--max-time"),
+            Some("7000"),
+            "what is left of the deadline"
+        );
         assert_eq!(after("--max-filesize"), Some("1073741824"), "the budget");
-
-        // Retain the standard HTTP failure, redirect and logging flags.
-        for flag in ["--fail", "--location", "--silent", "--show-error"] {
+        assert_eq!(after("--max-redirs"), Some("0"), "curl follows nothing");
+        assert_eq!(after("--proto"), Some("=http,https"));
+        assert_eq!(after("--proto-redir"), Some("=http,https"));
+        assert_eq!(after("--noproxy"), Some("*"));
+        assert_eq!(
+            after("--resolve"),
+            Some("images.example:443:93.184.215.14"),
+            "pinned to the vetted address"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--location" || a == "-L"),
+            "redirects are followed here, after a check, and never by curl"
+        );
+        for flag in ["--fail", "--silent", "--show-error"] {
             assert!(argv.iter().any(|a| a == flag), "{flag} is still passed");
         }
         assert_eq!(
             argv.last().map(String::as_str),
-            Some("https://images.example/noble.img"),
-            "the url is the last word, so no bound can be read as one"
+            Some("https://images.example:443/noble.img"),
+            "the canonical url is the last word, so no bound can be read as one"
         );
+    }
+
+    /// A redirect to a denied target is refused before the second request is made (R3-F10).
+    /// The denied loopback port stands for every address the node may not reach.
+    #[tokio::test]
+    async fn a_redirect_to_a_denied_address_is_refused_before_it_is_requested() {
+        let (_temp, dir) = scratch("redirect");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+
+        let target = origin(|_| ok_response(b"what the metadata service would say"));
+        let to = target.url("/latest/meta-data/");
+        let first = origin(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .into_bytes()
+        });
+        let cache =
+            Cache::new(images.clone()).with_egress(EgressPolicy::loopback_for_tests(&[first.port]));
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: first.url("/ubuntu.raw"),
+            sha256: digest_of(b"anything"),
+            uid: String::new(),
+        };
+
+        let err = format!("{:#}", cache.ensure(&source).await.expect_err("refused"));
+        assert!(err.contains("refused"), "{err}");
+        assert_eq!(first.hits(), 1, "the first hop was made");
+        assert_eq!(target.hits(), 0, "and the denied one never was: {err}");
+        assert!(!images.join("ubuntu.raw").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(images.join(CACHE_DIR))
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A redirect to an admitted target is followed and its bytes become the image.
+    #[tokio::test]
+    async fn a_redirect_to_an_admitted_address_is_followed() {
+        let (_temp, dir) = scratch("redirect-ok");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let payload = b"the image, one hop on".to_vec();
+        let body = payload.clone();
+        let o = origin(move |path| match path {
+            "/moved.raw" => ok_response(&body),
+            _ => b"HTTP/1.1 301 Moved\r\nLocation: /moved.raw\r\nContent-Length: 0\r\n\
+                   Connection: close\r\n\r\n"
+                .to_vec(),
+        });
+        let cache =
+            Cache::new(images.clone()).with_egress(EgressPolicy::loopback_for_tests(&[o.port]));
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: o.url("/ubuntu.raw"),
+            sha256: digest_of(&payload),
+            uid: String::new(),
+        };
+        cache.ensure(&source).await.expect("followed and fetched");
+        assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), payload);
+        assert_eq!(o.hits(), 2);
+    }
+
+    /// Without a policy nothing is fetched, and the reason names the key.
+    #[tokio::test]
+    async fn a_cache_with_no_policy_fetches_nothing() {
+        let (_temp, dir) = scratch("no-policy");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let o = origin(|_| ok_response(b"x"));
+        let cache = Cache::new(images.clone());
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: o.url("/ubuntu.raw"),
+            sha256: digest_of(b"x"),
+            uid: String::new(),
+        };
+        let err = format!("{:#}", cache.ensure(&source).await.expect_err("refused"));
+        assert!(err.contains("allowed_sources"), "{err}");
+        assert_eq!(o.hits(), 0, "nothing was connected to");
     }
 
     /// Keep the response open after its headers to exercise the idle timeout, not EOF.
@@ -872,7 +1168,7 @@ mod tests {
             }
         });
 
-        let cache = Cache::new(images.clone()).with_bounds(Bounds {
+        let cache = test_cache(images.clone()).with_bounds(Bounds {
             floor_bytes_per_sec: 1,
             idle: Duration::from_secs(1),
             deadline: Duration::from_secs(5),
@@ -926,13 +1222,13 @@ mod tests {
 
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone()).with_bounds(Bounds {
+        let cache = test_cache(images.clone()).with_bounds(Bounds {
             max_bytes: 512,
             ..Bounds::default()
         });
         let source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&payload),
             uid: String::new(),
         };
@@ -950,7 +1246,8 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// Exercise fetch, hashing, staging, publication and cache reuse through a `file://` URL.
+    /// Exercise fetch, egress check, hashing, staging, publication and cache reuse
+    /// through a loopback http origin.
     #[tokio::test]
     async fn an_image_is_fetched_once_and_then_found() {
         let (_temp, dir) = scratch("fetch-once");
@@ -960,10 +1257,10 @@ mod tests {
 
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         let source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&payload),
             uid: String::new(),
         };
@@ -997,7 +1294,7 @@ mod tests {
         let (_temp, dir) = scratch("uid");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
 
         let theirs = b"the image one tenant registered".to_vec();
         let mine = b"what somebody else put under the same name".to_vec();
@@ -1006,7 +1303,7 @@ mod tests {
         std::fs::write(&origin, &theirs).unwrap();
         let first = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&theirs),
             uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
         };
@@ -1015,7 +1312,7 @@ mod tests {
         std::fs::write(&origin, &mine).unwrap();
         let second = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&mine),
             uid: "9b210000-0000-0000-0000-00000000000b".into(),
         };
@@ -1069,11 +1366,11 @@ mod tests {
 
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         let claimed = digest_of(b"what the operator thought they were getting");
         let source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: claimed.clone(),
             uid: String::new(),
         };
@@ -1113,10 +1410,10 @@ mod tests {
         let (_temp, dir) = scratch("no-answer");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         let source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", dir.join("nothing-here.raw").display()),
+            url: served(&dir.join("nothing-here.raw")),
             sha256: digest_of(b"anything"),
             uid: String::new(),
         };
@@ -1148,7 +1445,7 @@ mod tests {
         let (_temp, dir) = scratch("rebuild");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
 
         let first = b"version one".to_vec();
         let origin = dir.join("origin.raw");
@@ -1156,7 +1453,7 @@ mod tests {
         cache
             .ensure(&Source {
                 name: "ubuntu.raw".into(),
-                url: format!("file://{}", origin.display()),
+                url: served(&origin),
                 sha256: digest_of(&first),
                 uid: String::new(),
             })
@@ -1168,7 +1465,7 @@ mod tests {
         cache
             .ensure(&Source {
                 name: "ubuntu.raw".into(),
-                url: format!("file://{}", origin.display()),
+                url: served(&origin),
                 sha256: digest_of(&second),
                 uid: String::new(),
             })
@@ -1184,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn the_inventory_says_what_is_on_the_disk_and_a_look_still_wins() {
         let (_temp, images) = scratch("inventory");
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
 
         std::fs::write(images.join("nixos.raw"), b"an image").expect("the bytes");
         std::fs::write(images.join("ubuntu.raw"), b"another").expect("the bytes");
@@ -1249,7 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_image_says_whether_its_bytes_are_here() {
         let (_temp, images) = scratch("path");
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
 
         // Unobserved images produce no status entries.
         assert!(cache.report().is_empty());
@@ -1308,7 +1605,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_images_digest_is_bound_once_and_trusted_after_that() {
         let (_temp, images) = scratch("digest-once");
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
 
         std::fs::write(images.join("nixos.raw"), b"the original bytes").expect("the bytes");
         cache.verify_path("nixos.raw").await;
@@ -1327,7 +1624,7 @@ mod tests {
 
         // A fresh `Cache` — this process's stand-in for a restart — has no
         // memory of the first look and binds to what is actually there now.
-        let restarted = Cache::new(images.clone());
+        let restarted = test_cache(images.clone());
         restarted.verify_path("nixos.raw").await;
         let (_, _, after_restart) = restarted.report().pop().expect("one opinion");
         assert_eq!(after_restart, Some(digest_of(b"different bytes now")));
@@ -1339,7 +1636,7 @@ mod tests {
         let (_temp, dir) = scratch("drop-uid");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         let origin = dir.join("origin.raw");
 
         let old = b"the image that gets deleted".to_vec();
@@ -1347,7 +1644,7 @@ mod tests {
         let old_uid = "4f3c0000-0000-0000-0000-00000000000a";
         let old_source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&old),
             uid: old_uid.into(),
         };
@@ -1361,7 +1658,7 @@ mod tests {
         let new_uid = "9b210000-0000-0000-0000-00000000000b";
         let new_source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&new),
             uid: new_uid.into(),
         };
@@ -1405,13 +1702,13 @@ mod tests {
         let (_temp, dir) = scratch("drop-uid-empty");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         let origin = dir.join("origin.raw");
         let payload = b"bytes".to_vec();
         std::fs::write(&origin, &payload).unwrap();
         let source = Source {
             name: "ubuntu.raw".into(),
-            url: format!("file://{}", origin.display()),
+            url: served(&origin),
             sha256: digest_of(&payload),
             uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
         };
@@ -1429,7 +1726,7 @@ mod tests {
     async fn dropping_a_path_images_uid_touches_nothing() {
         let (_temp, images) = scratch("drop-uid-path");
         std::fs::create_dir_all(&images).unwrap();
-        let cache = Cache::new(images.clone());
+        let cache = test_cache(images.clone());
         std::fs::write(images.join("nixos.raw"), b"somebody else's file").expect("the bytes");
         cache.verify_path("nixos.raw").await;
         assert_eq!(cache.report().len(), 1);

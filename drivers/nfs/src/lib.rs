@@ -76,6 +76,11 @@ pub struct NfsDriverConfig {
     /// mount managed by the deployment.
     pub manage_mount: bool,
     pub mount: Option<MountSpec>,
+    /// This node's id. The share is one directory for every node of the
+    /// pool, and the file half names its staging files after the node that
+    /// writes them so that one node's start-up sweep never removes another
+    /// node's running copy (Astra finding R3-F09, 2026-09-25).
+    pub host_id: String,
 }
 
 /// Source and options for a driver-managed mount.
@@ -160,6 +165,7 @@ impl NfsDriver {
             qemu_img: PathBuf::from("qemu-img"),
             // Use the same base-image conversion sandbox as the local filesystem driver.
             convert: agent_api::base_image::Sandbox::default(),
+            host_id: config.host_id.clone(),
         })?;
 
         Ok(Self {
@@ -597,6 +603,7 @@ mod tests {
             virtiofsd_args: Vec::new(),
             manage_mount: false,
             mount: None,
+            host_id: "test-node".into(),
         })
         .expect("the driver builds over a plain directory");
         (temp, d, share)
@@ -851,9 +858,17 @@ tmpfs /run tmpfs rw 0 0
         std::fs::create_dir_all(share.join("volumes")).expect("a temp share root");
         std::fs::create_dir_all(&images).expect("a temp image dir");
 
-        let orphan = share.join("volumes").join("aaaa.snap.tmp");
+        // This node's own orphan, and another node's copy that is still
+        // being written (R3-F09): the share is every node's pool.
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let orphan = share
+            .join("volumes")
+            .join(format!("aaaa.snap.tmp.test-node.{nonce}"));
+        let running = share
+            .join("volumes")
+            .join(format!("cccc.snap.tmp.other-node.{nonce}"));
         let volume = share.join("volumes").join("bbbb.raw");
-        for p in [&orphan, &volume] {
+        for p in [&orphan, &running, &volume] {
             std::fs::write(p, b"x").expect("a file");
         }
 
@@ -866,11 +881,13 @@ tmpfs /run tmpfs rw 0 0
             virtiofsd_args: Vec::new(),
             manage_mount: false,
             mount: None,
+            host_id: "test-node".into(),
         })
         .expect("the driver builds over a plain directory");
 
-        assert!(!orphan.exists(), "the unfinished copy is gone");
-        assert!(volume.exists(), "the volumes on the share are not");
+        assert!(!orphan.exists(), "this node's unfinished copy is gone");
+        assert!(running.exists(), "another node's running copy is not");
+        assert!(volume.exists(), "and the volumes on the share are not");
     }
 
     /// File-mode snapshot capability follows the filesystem probe; directory shares cannot snapshot.

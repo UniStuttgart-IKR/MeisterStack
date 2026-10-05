@@ -328,8 +328,6 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
         v.metadata.generation = 2;
         v
     };
-    let settled =
-        |observed: &[controller_api::VolumeAttachmentStatus]| observed.iter().all(|v| v.attached);
 
     // Told, not yet done: the second disk is in the spec and the node
     // does not report it. The generation must NOT close here.
@@ -344,24 +342,91 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
         mid.iter().map(|v| v.attached).collect::<Vec<_>>(),
         vec![true, false]
     );
-    assert!(!settled(&mid));
+    assert!(!attachments_settled(&asked, &mid));
 
     // The report that closes it.
     let done = observed_attachments(&asked, &["data-1", "data-2"]);
-    assert!(settled(&done));
+    assert!(attachments_settled(&asked, &done));
 
-    // A disk the node has that the spec no longer names is not in the
-    // answer: the spec is the question, and letting it in would leave a
-    // detach permanently unsettled.
+    // Astra round 3, finding R3-F01: this used to assert the opposite — that
+    // a disk the node has and the spec no longer names is left out of the
+    // answer and the detach counts as settled. That was the bug: with the
+    // disk gone from `status.volumes`, `volume_drift` had nothing to release
+    // and the generation closed while the node still held it. The disk is
+    // in the answer now, after the spec's own entries, and the detach is
+    // settled only once the node stops reporting it.
     let detaching = vm(&["data-1"]);
     let after = observed_attachments(&detaching, &["data-1", "data-2"]);
-    assert_eq!(after.len(), 1);
-    assert!(settled(&after), "the detach is done as far as data-1 goes");
+    assert_eq!(
+        after
+            .iter()
+            .map(|v| (v.name.as_str(), v.attached))
+            .collect::<Vec<_>>(),
+        vec![("data-1", true), ("data-2", true)]
+    );
+    assert!(!attachments_settled(&detaching, &after));
+    let released = observed_attachments(&detaching, &["data-1"]);
+    assert!(attachments_settled(&detaching, &released));
 
     // And a VM with no referenced disks has nothing to observe, which is
     // every VM before this milestone: an empty list is trivially settled
     // and the generation goes on closing at the dispatch.
     assert!(observed_attachments(&vm(&[]), &[]).is_empty());
+    assert!(attachments_settled(&vm(&[]), &[]));
+}
+
+/// Astra round 3, finding R3-F01: the hot-detach the ingest used to hide.
+///
+/// The spec drops `data` while the node, in the report that arrives before
+/// the reconciler has told it anything, still holds it. The observed set has
+/// to keep `data` so that `volume_drift` sees a release to make; before the
+/// fix it answered only for the spec's disks, `status.volumes` went empty,
+/// the drift was `None`, and the generation closed on a disk still attached.
+#[test]
+fn a_disk_dropped_from_the_spec_but_still_held_is_released() {
+    let mut web = vm("u-web");
+    web.spec.node_name = Some("n1".into());
+    web.metadata.generation = 3;
+    web.status.observed_generation = 2;
+    web.status.reported = Some(controller_api::VmReported::by(
+        "n1",
+        VmPhaseKind::Running,
+        controller_api::VmReason::Unrecorded,
+        None,
+        chrono::Utc::now(),
+    ));
+    web.settle(chrono::Utc::now());
+    // Generation 2 had `data` attached, and the status says so.
+    web.status.volumes = vec![controller_api::VolumeAttachmentStatus {
+        name: "data".into(),
+        attached: true,
+    }];
+
+    // The stale report: the node still holds `data`.
+    let observed = observed_attachments(&web, &["data"]);
+    assert_eq!(
+        observed,
+        vec![controller_api::VolumeAttachmentStatus {
+            name: "data".into(),
+            attached: true,
+        }],
+        "a disk the node holds stays in the observed set"
+    );
+    assert!(
+        !attachments_settled(&web, &observed),
+        "generation 3 dropped `data`, and the node has not let go yet"
+    );
+    web.status.volumes = observed;
+    let drift = crate::reconcile::volume_drift(&web).expect("a release to dispatch");
+    assert!(drift.attach.is_empty());
+    assert_eq!(drift.release, vec!["data".to_string()]);
+
+    // The report after the release: nothing held, and now it settles.
+    let released = observed_attachments(&web, &[]);
+    assert!(released.is_empty());
+    assert!(attachments_settled(&web, &released));
+    web.status.volumes = released;
+    assert!(crate::reconcile::volume_drift(&web).is_none());
 }
 
 /// Removing the final referenced disk clears attachment status and converges
@@ -422,6 +487,86 @@ async fn the_last_volume_removed_from_the_spec_clears_the_status() {
         crate::reconcile::volume_drift(&after).is_none(),
         "an empty spec and an empty status agree; nothing left to release"
     );
+}
+
+/// A stale report of a disk the spec dropped keeps it on the status, keeps the
+/// generation open and leaves the release visible to the reconciler (R3-F01).
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_stale_report_after_a_detach_keeps_the_release_visible() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/attach-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    let data = store
+        .create(&controller_api::resources::new_volume(
+            "data",
+            controller_api::VolumeSpec::default(),
+        ))
+        .await
+        .expect("the volume");
+
+    // The new spec swapped `data` for `logs`, so the write has something to
+    // change (`logs` arrives as not attached) and the stale report is what
+    // it is written from.
+    let mut web = vm("u-web");
+    web.spec.node_name = Some("n1".into());
+    web.spec.vm = serde_json::json!({ "volumes": [{ "volume": "logs" }] });
+    web.status.volumes = vec![controller_api::VolumeAttachmentStatus {
+        name: "data".into(),
+        attached: true,
+    }];
+    web.status.reported = Some(controller_api::VmReported::by(
+        "n1",
+        VmPhaseKind::Running,
+        controller_api::VmReason::Unrecorded,
+        None,
+        chrono::Utc::now(),
+    ));
+    web.settle(chrono::Utc::now());
+    let created = store.create(&web).await.expect("the vm");
+    let before = created.status.observed_generation;
+    let vms = vec![created];
+
+    let report = StatusReport {
+        vms: vec![proto::VmStatusReport {
+            attached_volumes: vec![data.metadata.uid.clone()],
+            ..line("u-web")
+        }],
+        ..Default::default()
+    };
+    let ours = |v: &Vm| {
+        v.spec
+            .node_name
+            .as_deref()
+            .is_none_or(|bound| bound == "n1")
+    };
+    ingest_attachments(&store, &vms, &report, ours, chrono::Utc::now())
+        .await
+        .expect("attachment ingest");
+
+    let after: Vm = store.get("u-web").await.expect("the vm");
+    assert_eq!(
+        after.status.volumes,
+        vec![
+            controller_api::VolumeAttachmentStatus {
+                name: "logs".into(),
+                attached: false,
+            },
+            controller_api::VolumeAttachmentStatus {
+                name: "data".into(),
+                attached: true,
+            },
+        ],
+        "the held disk stays on the status, after the spec's own"
+    );
+    assert_eq!(after.status.observed_generation, before);
+    let drift = crate::reconcile::volume_drift(&after).expect("a release to dispatch");
+    assert_eq!(drift.attach, vec!["logs".to_string()]);
+    assert_eq!(drift.release, vec!["data".to_string()]);
 }
 
 /// Explicit VolumeStateReport.open=false removes a node from `openOn`.
@@ -861,4 +1006,104 @@ async fn a_session_whose_certificate_was_revoked_is_ended() {
         registry.connected().contains("n1"),
         "the entry belongs to the stream; only its unwinding takes it away"
     );
+}
+
+/// Astra round 3, finding R3-F03: a `Gone` is judged against the volume as
+/// the write reads it. The ingest used to decide `home` off the listing, so
+/// a `Gone` from a node that was the home when the listing was taken cleared
+/// `status.node` on a volume that had meanwhile been handed to another node.
+#[test]
+fn a_gone_from_a_node_that_is_no_longer_home_leaves_the_volume_where_it_is() {
+    let t0 = chrono::Utc::now();
+    let at = t0 + chrono::Duration::seconds(5);
+    let volume = |node: &str, open_on: &[&str]| {
+        let mut v =
+            controller_api::resources::new_volume("data", controller_api::VolumeSpec::default());
+        v.status.node = Some(node.into());
+        v.status.open_on = open_on.iter().map(|n| n.to_string()).collect();
+        v.status.backend = "lv-data".into();
+        v.status.observed_at = Some(t0);
+        v
+    };
+
+    // Rehomed to n2 since the listing: n1's `Gone` says nothing any more.
+    let mut moved = volume("n2", &[]);
+    let before = serde_json::to_value(&moved).expect("serialises");
+    assert_eq!(apply_gone(&mut moved, "n1", false, at), GoneOutcome::NoWord);
+    assert_eq!(
+        serde_json::to_value(&moved).expect("serialises"),
+        before,
+        "nothing is written"
+    );
+
+    // n1 only still holds it open: it lets go, and the home stands.
+    let mut held = volume("n2", &["n1", "n2"]);
+    assert_eq!(
+        apply_gone(&mut held, "n1", false, at),
+        GoneOutcome::HolderLetGo
+    );
+    assert_eq!(held.status.node.as_deref(), Some("n2"));
+    assert_eq!(held.status.backend, "lv-data");
+    assert_eq!(held.status.open_on, vec!["n2".to_string()]);
+
+    // n1 is still the home: the tombstone.
+    let mut home = volume("n1", &["n1"]);
+    assert_eq!(
+        apply_gone(&mut home, "n1", false, at),
+        GoneOutcome::Tombstoned
+    );
+    assert_eq!(home.status.node, None);
+    assert!(home.status.backend.is_empty());
+    assert!(home.status.open_on.is_empty());
+
+    // A report older than the last write is no word, home or not.
+    let mut fresher = volume("n1", &["n1"]);
+    fresher.status.observed_at = Some(at + chrono::Duration::seconds(1));
+    assert_eq!(
+        apply_gone(&mut fresher, "n1", false, at),
+        GoneOutcome::NoWord
+    );
+    assert_eq!(fresher.status.node.as_deref(), Some("n1"));
+
+    // And the cheap pre-check the listing is asked says the same thing.
+    assert!(!speaks_for_volume(&volume("n2", &[]), "n1"));
+    assert!(speaks_for_volume(&volume("n2", &["n1"]), "n1"));
+}
+
+/// Astra round 3, finding R3-F03: `forget_unbound` decides the let-go off a
+/// listing. A vm bound again between the listing and the write keeps its
+/// holder and its reschedule count.
+///
+/// `#[ignore]`: needs an etcd; see
+/// `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_vm_bound_again_after_the_listing_is_not_let_go() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/letgo-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    // Unbound, still held by n1: the shape `letting_go` picks.
+    let mut web = vm("u-web");
+    web.status.node_name = Some("n1".into());
+    let listed = vec![store.create(&web).await.expect("the vm")];
+    // Bound again to n1 before the report lands.
+    store
+        .mutate::<Vm, _>("u-web", |v| v.spec.node_name = Some("n1".into()))
+        .await
+        .expect("bound again");
+
+    let report = StatusReport {
+        vms_complete: true,
+        ..Default::default()
+    };
+    forget_unbound(&store, &listed, "n1", &report, chrono::Utc::now())
+        .await
+        .expect("the let-go pass");
+    let after: Vm = store.get("u-web").await.expect("the vm");
+    assert_eq!(after.status.node_name.as_deref(), Some("n1"));
+    assert_eq!(after.status.reschedules, 0);
 }

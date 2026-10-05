@@ -2680,6 +2680,8 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
         nodes: std::sync::Mutex::new(Vec::new()),
         pending: PendingTally::new(),
         kek: None,
+        held: &[],
+        overcommit: controller_api::Overcommit::default(),
     };
 
     // First pass: the backend grows, the guest is not told.

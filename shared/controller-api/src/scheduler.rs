@@ -1096,9 +1096,34 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     }
 }
 
-/// Sum destination reservations independently of bound VM usage.
-/// Migrating VMs remain bound to their source until settlement, while their
-/// destination capacity must already be accounted for.
+/// CPU and memory allowance after subtracting every bound VM, including Pending VMs.
+/// Reservations for guests not bound here yet are subtracted separately by
+/// [`hold`] and ordered by [`reservation_holds`]. Shared so the candidate list and
+/// claim confirmation compute the same number. Device claims remain in the
+/// capability catalogue; this does not account for GPU use.
+pub fn free_on(
+    node: &str,
+    capacity: &crate::resources::NodeCapacity,
+    vms: &[Vm],
+    overcommit: Overcommit,
+) -> Capacity {
+    let bound = vms
+        .iter()
+        .filter(|v| v.spec.node_name.as_deref() == Some(node))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        });
+    overcommit
+        .allowance(Capacity {
+            vcpus: capacity.vcpus,
+            mem_mib: capacity.mem_mib,
+        })
+        .minus(bound)
+}
+
+/// Sum reservations independently of bound VM usage: migrating guests stay bound
+/// to their source until settlement, and placements are claimed before binding,
+/// yet their destination capacity must already be accounted for.
 pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
     held.iter()
         .filter(|r| r.spec.node == node)
@@ -2423,6 +2448,7 @@ mod tests {
                 node: node.to_string(),
                 vm: format!("{name}-vm"),
                 vm_uid: format!("vm-uid-{name}"),
+                claimant: crate::resources::Claimant::Migration,
                 migration: name.to_string(),
                 migration_uid: format!("migration-uid-{name}"),
                 vcpus,

@@ -161,12 +161,28 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Silence all local routers without destroying their namespaces, returning
-    /// the affected IDs. Used on shutdown to stop stale ARP and routing activity
+    /// Silence all local routers without destroying their namespaces. Used on
+    /// shutdown and by the dead man to stop stale ARP and routing activity
     /// before another gateway takes over. A later `EnsureRouter` can reactivate
-    /// the retained router. Best effort during shutdown.
-    async fn fall_silent(&self) -> Result<Vec<RouterId>> {
-        Ok(Vec::new())
+    /// the retained router. Best effort, but the outcome names the routers that
+    /// failed so a partial pass is not mistaken for a complete one (R3-F06).
+    async fn fall_silent(&self) -> Result<Silencing> {
+        Ok(Silencing::default())
+    }
+}
+
+/// Per-router outcome of one silencing pass. Lists rather than a count so a log
+/// line names the router that is still answering.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Silencing {
+    pub silenced: Vec<RouterId>,
+    pub failed: Vec<RouterId>,
+}
+
+impl Silencing {
+    /// Every router this pass looked at is now silent; vacuously true when there was none.
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
     }
 }
 
@@ -301,7 +317,8 @@ pub enum RouterReason {
     NetnsGone,
     /// Namespace exists but a required link is absent; message identifies it.
     LegGone,
-    /// Host probing failed, leaving router state unknown rather than proving resource absence.
+    /// Host probing failed or a record exists but will not parse (R3-F07), leaving
+    /// router state unknown rather than proving resource absence.
     DriverUnreachable,
 }
 
