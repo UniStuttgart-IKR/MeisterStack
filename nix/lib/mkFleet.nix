@@ -64,9 +64,10 @@ let
   # shared-memory window only when both are built from the same patch series. Which Leandro
   # revision that is, patches/README.md says; a fleet pinned to another one is refused here
   # instead of booting GPU guests that never get a window.
+  patchSeries = import ./leandro-series.nix { inherit lib; };
   leandroSeriesDrift =
     if leandro == null then [ ]
-    else (import ./leandro-series.nix { inherit lib; }).driftedPatches {
+    else patchSeries.driftedPatches {
       leandroPatchDir = "${leandro}/patches";
       patchDir = ../../patches;
     };
@@ -74,7 +75,7 @@ let
     assertions = [{
       assertion = leandroSeriesDrift == [ ];
       message = "[leandro-series] the cloud-hypervisor patches of the leandro input differ "
-        + "from MeisterStack's patches/ (${lib.concatStringsSep ", " leandroSeriesDrift}). "
+        + "from MeisterStack's patches/ (${patchSeries.describeDrift leandroSeriesDrift}). "
         + "Pin leandro to the revision MeisterStack's patches/README.md names: the GPU "
         + "backend and the hypervisor negotiate a shared-memory window only on the same series.";
     }];

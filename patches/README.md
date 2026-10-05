@@ -15,10 +15,15 @@ upstreaming notes; its `patches/REVIEW-vhost-user.md` lists what the previous
 series got wrong. Keep these three identical to Leandro's: the vhost-user channel
 between Cloud Hypervisor and `vhost-user-nvrm` only negotiates a shared-memory
 window when both ends are on the same series. A fleet that declares the
-`leandro` input is held to that: `mkFleet` asserts on every host that each patch
-in the input's `patches/` is here with the same bytes
-([`nix/lib/leandro-series.nix`](../nix/lib/leandro-series.nix)); patches only
-this repository has, such as 0004, are not compared.
+`leandro` input is held to that: `mkFleet` asserts on every host that the
+input's `patches/`, searched recursively as Leandro's package does, holds
+exactly the patches here except MeisterStack's own, under the same relative
+paths and with the same bytes
+([`nix/lib/leandro-series.nix`](../nix/lib/leandro-series.nix)). An input
+whose series lacks one of them, is empty or carries a patch as a link is
+refused too. That file's `ownPatches` names the patches that are this
+repository's alone, today 0004; a new patch of our own goes there as well, or
+every fleet with the `leandro` input is refused.
 
 Patch 0004 is MeisterStack's own and applies on top of them; see
 [Hardening](#hardening-patch-0004). All files are `git format-patch` output, so
