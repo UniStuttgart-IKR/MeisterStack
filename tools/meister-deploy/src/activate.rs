@@ -240,6 +240,26 @@ fn is_running(pid: u32) -> bool {
     )
 }
 
+/// Process identity and liveness behind the decision lock, injectable so a test
+/// can model a crashed holder and its successor.
+pub trait Processes {
+    fn own_pid(&self) -> u32;
+    fn alive(&self, pid: u32) -> bool;
+}
+
+/// This process and the kernel's process table.
+pub struct RealProcesses;
+
+impl Processes for RealProcesses {
+    fn own_pid(&self) -> u32 {
+        std::process::id()
+    }
+
+    fn alive(&self, pid: u32) -> bool {
+        is_running(pid)
+    }
+}
+
 /// A live process holds this transaction’s decision lock.
 /// The timer retries this typed error; operator requests fail immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +313,8 @@ pub struct Helper<'a> {
     pub timer_path: String,
     /// Directory containing this host’s private keys and certificates.
     pub pki_dir: PathBuf,
+    /// Who holds a decision lock, and whether that holder still lives.
+    pub processes: &'a dyn Processes,
 }
 
 impl<'a> Helper<'a> {
@@ -312,7 +334,14 @@ impl<'a> Helper<'a> {
             own_exe: own_exe.into(),
             timer_path: SYSTEM_PATH.to_string(),
             pki_dir: PathBuf::from(DEFAULT_PKI_DIR),
+            processes: &RealProcesses,
         }
+    }
+
+    /// The process identity a test models instead of this process's.
+    pub fn with_processes(mut self, processes: &'a dyn Processes) -> Helper<'a> {
+        self.processes = processes;
+        self
     }
 
     /// Where the keys are, for a host whose `meisterstack.pki.dir` is not
@@ -816,7 +845,11 @@ impl<'a> Helper<'a> {
     fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let path = self.txn_dir().join(format!("{id}.deciding"));
         self.files.create_dir_all(&self.txn_dir())?;
-        let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
+        let mine = format!(
+            "{what} pid {} at {}",
+            self.processes.own_pid(),
+            self.clock.now()
+        );
         self.hold_decision(id, &path, &mine)?;
         let out = f();
         // Release only a lock whose contents still match this process’s claim.
@@ -850,7 +883,7 @@ impl<'a> Helper<'a> {
                 continue;
             };
             match deciding_pid(&held) {
-                Some(pid) if is_running(pid) => {
+                Some(pid) if self.processes.alive(pid) => {
                     return Err(BeingDecided {
                         id: id.to_string(),
                         holder: held.trim().to_string(),
@@ -867,15 +900,17 @@ impl<'a> Helper<'a> {
                 ),
             }
             // Claim the stale record before attempting a fresh exclusive create.
-            let claim =
-                path.with_file_name(format!("{id}.deciding.taken-by-{}", std::process::id()));
+            let claim = path.with_file_name(format!(
+                "{id}.deciding.taken-by-{}",
+                self.processes.own_pid()
+            ));
             if self.files.rename(path, &claim).is_err() {
                 // Retry from the start if another contender reclaimed the stale record.
                 continue;
             }
             let carried = self.files.read_to_string(&claim).unwrap_or_default();
             if let Some(pid) = deciding_pid(&carried)
-                && is_running(pid)
+                && self.processes.alive(pid)
             {
                 match self.files.create_new(path, carried.as_bytes(), 0o600) {
                     Ok(()) => {
@@ -1973,6 +2008,9 @@ impl TxnState {
 pub fn ok_reply(what: &str, value: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "ok": true, "what": what, "result": value })
 }
+
+#[cfg(test)]
+mod crash_tests;
 
 #[cfg(test)]
 mod tests {

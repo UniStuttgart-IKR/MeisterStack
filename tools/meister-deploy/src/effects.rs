@@ -21,6 +21,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::run::{Effect, Policy};
 
+#[cfg(test)]
+pub mod cut;
+
 /// Working-tree entry type, inspected without following symlinks.
 /// Snapshot copying preserves links instead of copying their targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
