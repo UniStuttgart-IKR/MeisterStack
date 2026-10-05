@@ -129,7 +129,6 @@ pub struct ForcedRetirement {
     pub was: TxnState,
 }
 
-
 /// One transaction, on disk, on the target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +154,6 @@ pub struct TxnRecord {
     /// Present only after forced retirement; omitted for compatibility with older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_by_force: Option<ForcedRetirement>,
-
 }
 
 impl TxnRecord {
@@ -215,8 +213,6 @@ fn check_id(id: &str) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 /// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
 /// <time>`. `None` for anything this program did not write.
@@ -293,8 +289,6 @@ pub enum RevertAsker {
     /// Explicit override of an unfinished confirmation; requires a reason.
     Force,
 }
-
-
 
 /// The state of the machine, and the tools to change it.
 pub struct Helper<'a> {
@@ -1538,8 +1532,6 @@ impl<'a> Helper<'a> {
         self.pki_dir.join(format!("{}.key", kind.as_str()))
     }
 
-
-
     /// `<pki.dir>/<kind>.key`, `.key.next` or `.key.prev`.
     pub fn key_path_with(&self, kind: KeyKind, suffix: Option<&str>) -> PathBuf {
         self.pki_dir.join(match suffix {
@@ -1771,10 +1763,7 @@ impl<'a> Helper<'a> {
             .ok()
             .map(|bytes| format!("sha256:{}", crate::ids::sha256_hex(&bytes)))
     }
-
 }
-
-
 
 pub const KEYS_SCHEMA: &str = "meister-deploy/activate-keys/1";
 
@@ -1883,8 +1872,6 @@ pub struct KeysView {
     pub reason: Option<String>,
     pub record: Option<KeysRecord>,
 }
-
-
 
 /// Host key purpose: identity for outbound authentication, serving for TLS endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2517,7 +2504,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
     #[test]
     fn a_confirm_and_a_timer_revert_do_not_both_win() {
         let files = host();
@@ -2546,7 +2532,6 @@ mod tests {
         // is still armed.
         runner.verify().unwrap();
     }
-
 
     #[test]
     fn a_decision_whose_process_is_gone_does_not_block_the_next_one() {
@@ -2581,8 +2566,6 @@ mod tests {
         );
         runner.verify().unwrap();
     }
-
-
 
     /// A record in the state a crash between the two steps leaves behind.
     fn confirming(id: &str) -> TxnRecord {
@@ -2790,8 +2773,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn a_second_revert_is_the_same_answer_and_runs_nothing() {
         let files = host();
@@ -2981,8 +2962,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn an_inconsistent_record_can_be_put_aside_by_a_person_with_a_sentence() {
         // An inconsistent record requires explicit, audited retirement.
@@ -3077,8 +3056,6 @@ mod tests {
         assert!(!text.contains("retired_by_force"), "{text}");
     }
 
-
-
     #[test]
     fn a_transaction_id_is_a_file_name_and_nothing_more() {
         let files = host();
@@ -3159,7 +3136,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
     #[test]
     fn two_operators_carrying_one_run_do_not_both_hold_the_host() {
         let files = host();
@@ -3182,7 +3158,6 @@ mod tests {
         assert_eq!(helper.read_lock().unwrap().unwrap(), first);
         runner.verify().unwrap();
     }
-
 
     #[test]
     fn two_takeovers_of_one_run_leave_exactly_one_holder_of_the_host() {
@@ -3214,8 +3189,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn a_takeover_of_a_host_the_taking_run_already_holds_is_the_answer_yes() {
         // The fleet anchor and host lock step may attempt the same takeover twice.
@@ -3240,8 +3213,6 @@ mod tests {
         assert!(err.contains("held by the run run-b, not by run-a"), "{err}");
         runner.verify().unwrap();
     }
-
-
 
     #[test]
     fn gc_keeps_the_current_the_booted_and_n_others() {
@@ -3345,8 +3316,6 @@ mod tests {
             .to_string();
         assert!(err.contains("activate-txn/2"), "{err}");
     }
-
-
 
     const PKI: &str = "/var/lib/meisterstack/pki";
 
@@ -3550,8 +3519,6 @@ mod tests {
         }
     }
 
-
-
     /// A prepared key lies BESIDE the one in use, and nothing that is
     /// running notices it is there.
     #[test]
@@ -3675,7 +3642,6 @@ mod tests {
         assert_eq!(view.state, KeysState::Inconsistent);
         assert!(view.reason.unwrap().contains("without the key"));
     }
-
 
     #[test]
     fn keys_status_names_every_half_switch() {
@@ -3918,8 +3884,6 @@ mod tests {
         );
     }
 
-
-
     fn deciding_path(helper: &Helper<'_>) -> PathBuf {
         helper.txn_dir().join("run-1.deciding")
     }
@@ -4021,8 +3985,6 @@ mod tests {
             "revert pid 1 at 2026-09-22 11:30:00 UTC"
         );
     }
-
-
 
     /// A runner under which one command takes a while.
     struct Slow<'a> {
