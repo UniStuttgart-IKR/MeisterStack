@@ -6,9 +6,10 @@
 # Generic vhost-user shared-memory regions are required by the GPU backends.
 # The series is Leandro's, rewritten against the vhost-user specification on
 # 2026-09-23 (vhost 0.17 for the frontend, SHMEM = protocol feature bit 22,
-# BACKEND_SEND_FD offered); it is the same series Leandro HEAD 73eb298 builds,
-# so both ends of the vhost-user channel negotiate SHMEM. Replace 0001-0003
-# together: a backend on the old series (SHMEM = bit 21) never gets a window.
+# BACKEND_SEND_FD offered); it is the same series the Leandro revision named in
+# patches/README.md builds, so both ends of the vhost-user channel negotiate
+# SHMEM. Replace 0001-0003 together: a backend on the old series (SHMEM = bit
+# 21) never gets a window.
 # 0004 is MeisterStack's own hardening on top (overflow-checked window layout,
 # see patches/README.md); it must still apply after a new Leandro series.
 { lib

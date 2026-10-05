@@ -294,6 +294,16 @@
           gpu-profile = import ./nix/tests/gpu-profile.nix {
             inherit nixpkgs lib pkgs system self;
           };
+          # Refuse a leandro input whose cloud-hypervisor patch series is not ours.
+          leandro-series = import ./nix/tests/leandro-series.nix {
+            inherit lib pkgs;
+            fleetWith = leandro: mkFleet
+              {
+                inherit nixpkgs disko nixos-generators leandro;
+                meisterstack = self;
+              }
+              { inventory = ./examples/fleet/one-box.toml; profiles = exampleProfiles; inherit system; };
+          };
           # Validate malformed inventory fixtures.
           inventory-conflicts = import ./nix/tests/inventory-conflicts.nix {
             inherit lib pkgs inventoryLib;

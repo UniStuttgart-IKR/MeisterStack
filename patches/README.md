@@ -6,13 +6,19 @@ version is v53.0, the same tag Leandro builds (`CH_VERSION`); changing the versi
 also requires checking source/vendor hashes and patch compatibility.
 
 Patches 0001-0003 are Leandro's series, copied unchanged from `patches/` at
-Leandro HEAD `73eb298` (the rewrite of 2026-09-23 against the vhost-user
-specification). Leandro's `patches/README.md` is the reference for the message
+Leandro revision `73eb2985f32098500d851520710439d30f7c3ffe` (the rewrite of
+2026-09-23 against the vhost-user specification). This is the one place that
+records the revision; the Nix package and the operator template refer here.
+Leandro's `patches/README.md` is the reference for the message
 formats, the negotiated protocol features, the verification record and the
 upstreaming notes; its `patches/REVIEW-vhost-user.md` lists what the previous
 series got wrong. Keep these three identical to Leandro's: the vhost-user channel
 between Cloud Hypervisor and `vhost-user-nvrm` only negotiates a shared-memory
-window when both ends are on the same series.
+window when both ends are on the same series. A fleet that declares the
+`leandro` input is held to that: `mkFleet` asserts on every host that each patch
+in the input's `patches/` is here with the same bytes
+([`nix/lib/leandro-series.nix`](../nix/lib/leandro-series.nix)); patches only
+this repository has, such as 0004, are not compared.
 
 Patch 0004 is MeisterStack's own and applies on top of them; see
 [Hardening](#hardening-patch-0004). All files are `git format-patch` output, so
