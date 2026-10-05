@@ -7,8 +7,10 @@
 # The series is Leandro's, rewritten against the vhost-user specification on
 # 2026-09-23 (vhost 0.17 for the frontend, SHMEM = protocol feature bit 22,
 # BACKEND_SEND_FD offered); it is the same series Leandro HEAD 73eb298 builds,
-# so both ends of the vhost-user channel negotiate SHMEM. Replace all three
-# files together: a backend on the old series (SHMEM = bit 21) never gets a window.
+# so both ends of the vhost-user channel negotiate SHMEM. Replace 0001-0003
+# together: a backend on the old series (SHMEM = bit 21) never gets a window.
+# 0004 is MeisterStack's own hardening on top (overflow-checked window layout,
+# see patches/README.md); it must still apply after a new Leandro series.
 { lib
 , rustPlatform
 , fetchFromGitHub
@@ -34,10 +36,13 @@ rustPlatform.buildRustPackage {
   cargoPatches = lib.sort lib.lessThan (lib.filter (p: lib.hasSuffix ".patch" (toString p))
     (lib.filesystem.listFilesRecursive patchDir));
   cargoHash = "sha256-E6aBvXcFhmkhKE0xK70KZsgdgkpgfY2+FMx6cNSlwq8=";
-  # Check that the shared-memory patch marker remains in the source.
+  # Check that the shared-memory patch marker remains in the source, and that
+  # 0004's checked window layout does: without it the build would still pass.
   postPatch = ''
     grep -q get_shmem_config virtio-devices/src/vhost_user/generic_vhost_user.rs \
       || { echo "patch marker (SHMEM) missing from the source"; exit 1; }
+    grep -q checked_next_power_of_two virtio-devices/src/vhost_user/generic_vhost_user.rs \
+      || { echo "patch marker (0004 window hardening) missing from the source"; exit 1; }
   '';
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ openssl zstd ];

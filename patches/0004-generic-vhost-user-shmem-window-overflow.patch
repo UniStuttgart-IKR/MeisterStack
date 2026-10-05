@@ -1,0 +1,359 @@
+From 9b47c7f8cdf2f42af7c18f9d86e44c684a478750 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Silas=20M=C3=BCller?= <dev@silasmueller.de>
+Date: Tue, 6 Oct 2026 00:42:18 +0200
+Subject: [PATCH] vhost_user: check the shared memory window layout for
+ overflow
+
+The backend chooses the region sizes it reports with
+VHOST_USER_GET_SHMEM_CONFIG. The VMM summed them and rounded the total up
+to a power of two unchecked, and the release profile does not check
+integer overflow: sizes of 2^63, 2^63 and one page wrapped to a one-page
+window while the region list still described regions of 2^63 bytes, and
+a total above 2^63 rounded to zero. SHMEM_MAP only checked a request
+against the length of its region, not against the window, so a backend
+could make the VMM map its file descriptor with MAP_FIXED over any
+address of the VMM process.
+
+- ShmemLayout lays the regions out back to back with checked_add over
+  the sizes and checked_next_power_of_two for the window. The device
+  refuses a configuration whose window does not fit in a u64, and the
+  VMM takes the window length and the region list from that layout
+  instead of computing them again.
+- The VMM refuses a window larger than the 64-bit PCI aperture of the
+  device's segment before it allocates anything for it.
+- host_range also checks region offset + request offset + length against
+  the window length, so a region list that reaches past the window never
+  yields an address outside it.
+---
+ .../src/vhost_user/generic_vhost_user.rs      | 136 ++++++++++++++++--
+ vmm/src/device_manager.rs                     |  62 ++++----
+ 2 files changed, 159 insertions(+), 39 deletions(-)
+
+diff --git a/virtio-devices/src/vhost_user/generic_vhost_user.rs b/virtio-devices/src/vhost_user/generic_vhost_user.rs
+index 34e6a49..1ca3d87 100644
+--- a/virtio-devices/src/vhost_user/generic_vhost_user.rs
++++ b/virtio-devices/src/vhost_user/generic_vhost_user.rs
+@@ -89,6 +89,43 @@ fn shmem_sizes_from_config(cfg: &VhostUserShMemConfig, page_size: u64) -> Result
+     Ok(sizes[..end].to_vec())
+ }
+ 
++/// Where the VIRTIO Shared Memory Regions sit in the window that backs them.
++#[derive(Clone)]
++pub struct ShmemLayout {
++    /// Window length in bytes, a power of two: the window is a PCI BAR.
++    pub window_len: u64,
++    /// Regions indexed by shmid, back to back from offset 0; a zero length
++    /// marks an unused shmid.
++    pub regions: Vec<VirtioSharedMemory>,
++}
++
++impl ShmemLayout {
++    /// Lay out regions of `sizes`, indexed by shmid. The backend picks the
++    /// sizes, so the running offset and the power of two above the total are
++    /// checked: a wrapped value would give a window smaller than its regions.
++    fn new(sizes: &[u64]) -> Result<Self> {
++        let mut regions = Vec::with_capacity(sizes.len());
++        let mut end: u64 = 0;
++        for &len in sizes {
++            regions.push(VirtioSharedMemory { offset: end, len });
++            end = end.checked_add(len).ok_or_else(|| {
++                Error::VhostUserInvalidShmemConfig(
++                    "the region sizes add up to more than 2^64 bytes".to_string(),
++                )
++            })?;
++        }
++        let window_len = end.checked_next_power_of_two().ok_or_else(|| {
++            Error::VhostUserInvalidShmemConfig(format!(
++                "a power-of-two window for {end:#x} bytes of regions exceeds 2^64 bytes"
++            ))
++        })?;
++        Ok(ShmemLayout {
++            window_len,
++            regions,
++        })
++    }
++}
++
+ /// Lay an inaccessible anonymous mapping over `len` bytes at `addr`.
+ fn shmem_placeholder(addr: u64, len: u64) -> io::Result<()> {
+     // SAFETY: callers pass a range inside the shared memory window that this
+@@ -160,7 +197,23 @@ impl ShmemState {
+             );
+             return Err(io::Error::from_raw_os_error(libc::EINVAL));
+         }
+-        Ok(self.host_addr + region.offset + offset)
++        // The region list comes from the VMM, not from this request; a region
++        // reaching past the window must still never yield an address outside it.
++        let Some(window_offset) = self.window_offset(region, offset, len) else {
++            let window_len = self.window_len;
++            error!(
++                "shared memory request {offset:#x}+{len:#x} in shmid {shmid} lies outside the window of {window_len:#x} bytes"
++            );
++            return Err(io::Error::from_raw_os_error(libc::EINVAL));
++        };
++        Ok(self.host_addr + window_offset)
++    }
++
++    /// Window offset of `offset..offset + len` in `region`, if the range lies
++    /// inside the window.
++    fn window_offset(&self, region: &VirtioSharedMemory, offset: u64, len: u64) -> Option<u64> {
++        let start = region.offset.checked_add(offset)?;
++        (start.checked_add(len)? <= self.window_len).then_some(start)
+     }
+ 
+     /// VHOST_USER_BACKEND_SHMEM_MAP: map `fd` into a free range of a region.
+@@ -292,7 +345,7 @@ pub struct GenericVhostUser {
+     // which will be automatically dropped when the device is dropped
+     cache: Option<VirtioSharedMemoryList>,
+     shmem: Option<Arc<Mutex<ShmemState>>>,
+-    shmem_sizes: Vec<u64>,
++    shmem_layout: Option<ShmemLayout>,
+     seccomp_action: SeccompAction,
+     exit_evt: EventFd,
+     access_platform_enabled: bool,
+@@ -327,7 +380,7 @@ impl GenericVhostUser {
+             vu_num_queues,
+             paused,
+             vring_bases,
+-            shmem_sizes,
++            shmem_layout,
+         ) = if let Some(state) = state {
+             info!("Restoring generic vhost-user {id}");
+             vu.set_protocol_features_vhost_user(
+@@ -344,7 +397,7 @@ impl GenericVhostUser {
+                 state.vu_num_queues,
+                 true,
+                 state.vring_bases,
+-                Vec::new(),
++                None,
+             )
+         } else {
+             let avail_protocol_features = VhostUserProtocolFeatures::CONFIG
+@@ -380,16 +433,21 @@ since the backend only supports {backend_num_queues}\n",
+                 return Err(Error::BadQueueNum);
+             }
+ 
+-            // The region sizes must be known before the PCI BAR is laid out.
+-            let shmem_sizes =
++            // The region layout must be known before the PCI BAR is laid out.
++            let shmem_layout =
+                 if acked_protocol_features & VhostUserProtocolFeatures::SHMEM.bits() != 0 {
+                     let cfg = vu
+                         .socket_handle()
+                         .get_shmem_config()
+                         .map_err(Error::VhostUserGetShmemConfig)?;
+-                    shmem_sizes_from_config(&cfg, page_size())?
++                    let sizes = shmem_sizes_from_config(&cfg, page_size())?;
++                    if sizes.is_empty() {
++                        None
++                    } else {
++                        Some(ShmemLayout::new(&sizes)?)
++                    }
+                 } else {
+-                    Vec::new()
++                    None
+                 };
+ 
+             (
+@@ -403,7 +461,7 @@ since the backend only supports {backend_num_queues}\n",
+                 num_queues,
+                 false,
+                 None,
+-                shmem_sizes,
++                shmem_layout,
+             )
+         };
+ 
+@@ -431,7 +489,7 @@ since the backend only supports {backend_num_queues}\n",
+             id,
+             cache,
+             shmem,
+-            shmem_sizes,
++            shmem_layout,
+             seccomp_action,
+             exit_evt,
+             access_platform_enabled,
+@@ -439,11 +497,11 @@ since the backend only supports {backend_num_queues}\n",
+         })
+     }
+ 
+-    /// Region sizes from VHOST_USER_GET_SHMEM_CONFIG, indexed by shmid; 0
+-    /// marks an unused shmid. Empty when the backend has no regions. The VMM
+-    /// allocates them and calls [`Self::set_cache`] before activation.
+-    pub fn shmem_sizes(&self) -> &[u64] {
+-        &self.shmem_sizes
++    /// Layout of the regions from VHOST_USER_GET_SHMEM_CONFIG; None when the
++    /// backend has no regions. The VMM allocates a window of `window_len`
++    /// bytes and calls [`Self::set_cache`] with `regions` before activation.
++    pub fn shmem_layout(&self) -> Option<&ShmemLayout> {
++        self.shmem_layout.as_ref()
+     }
+ 
+     /// Hand the device the window the VMM allocated for its regions.
+@@ -792,6 +850,30 @@ mod tests {
+         shmem_sizes_from_config(&cfg(257, &[]), p).unwrap_err();
+     }
+ 
++    #[test]
++    fn shmem_layout_places_the_regions_back_to_back() {
++        let p = page_size();
++        let layout = ShmemLayout::new(&[0, 4 * p, p]).unwrap();
++        let regions: Vec<_> = layout.regions.iter().map(|r| (r.offset, r.len)).collect();
++        assert_eq!(regions, [(0, 0), (0, 4 * p), (4 * p, p)]);
++        assert_eq!(layout.window_len, 8 * p);
++    }
++
++    #[test]
++    fn shmem_layout_refuses_sizes_whose_window_overflows() {
++        let p = page_size();
++        let half = 1u64 << 63;
++        assert!(
++            ShmemLayout::new(&[half, half, p]).is_err(),
++            "unchecked, the total wrapped to one page and so did the window"
++        );
++        assert!(
++            ShmemLayout::new(&[half, p]).is_err(),
++            "the total fits, but no power of two at or above it does"
++        );
++        assert_eq!(ShmemLayout::new(&[half]).unwrap().window_len, half);
++    }
++
+     /// Eight pages; shmid 0 unused, shmid 1 is four pages at window offset
+     /// one page, so region and window offsets differ.
+     struct Window {
+@@ -892,6 +974,30 @@ mod tests {
+         assert_eq!(state.mappings.len(), 2);
+     }
+ 
++    #[test]
++    fn map_refuses_a_range_outside_the_window() {
++        let p = page_size();
++        // The window is the first half of the test mapping, so a range the
++        // check let through would still land in memory the test owns.
++        let (w, _) = Window::new();
++        let fd = memfd(4 * p);
++        let fd = fd.as_raw_fd();
++        let past_the_window = VirtioSharedMemory {
++            offset: 2 * p,
++            len: 4 * p,
++        };
++        let mut state = ShmemState::new(w.addr, 4 * p, vec![past_the_window]);
++        state.map(&req(0, 0, 2 * p), fd).unwrap();
++        assert!(einval(state.map(&req(0, 2 * p, p), fd)), "past the window");
++
++        let wrapping = VirtioSharedMemory {
++            offset: 0u64.wrapping_sub(p),
++            len: 4 * p,
++        };
++        let mut state = ShmemState::new(w.addr, 4 * p, vec![wrapping]);
++        assert!(einval(state.map(&req(0, 0, p), fd)), "wrapping offset");
++    }
++
+     #[test]
+     fn unmap_needs_exactly_one_mapping() {
+         let p = page_size();
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 1bb24d3..c70f49d 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -99,8 +99,7 @@ use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, Virti
+ use virtio_devices::vhost_user::VhostUserConfig;
+ use virtio_devices::{
+     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
+-    VirtioSharedMemory, VirtioSharedMemoryList, balloon, mem, net, transport, vdpa, vhost_user,
+-    vsock,
++    VirtioSharedMemoryList, balloon, mem, net, transport, vdpa, vhost_user, vsock,
+ };
+ use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
+ use vm_device::dma_mapping::ExternalDmaMapping;
+@@ -459,6 +458,13 @@ pub enum DeviceManagerError {
+     #[error("Failed to allocate generic vhost-user shared memory window")]
+     GenericVhostUserShmemAllocation,
+ 
++    /// The shared memory window of a generic vhost-user device is larger than
++    /// the 64-bit PCI aperture of its segment.
++    #[error(
++        "Generic vhost-user shared memory window of {window:#x} bytes exceeds the 64-bit PCI aperture of {aperture:#x} bytes"
++    )]
++    GenericVhostUserShmemWindowTooLarge { window: u64, aperture: u64 },
++
+     /// Failed to clone a File.
+     #[error("Failed to clone a File")]
+     CloneFile(#[source] io::Error),
+@@ -1227,6 +1233,28 @@ fn use_64bit_bar_for_virtio_device(
+     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
+ }
+ 
++/// Allocate a generic vhost-user shared memory window of `size` bytes, aligned
++/// to its size, from a 64-bit PCI aperture. The backend chose the size, so a
++/// window the whole aperture cannot hold is reported as such.
++fn allocate_shmem_window(
++    mem64_allocator: &Mutex<AddressAllocator>,
++    size: u64,
++) -> DeviceManagerResult<u64> {
++    let mut allocator = mem64_allocator.lock().unwrap();
++    // end() is inclusive; an aperture spanning all of u64 saturates.
++    let aperture = (allocator.end().0 - allocator.base().0).saturating_add(1);
++    if size > aperture {
++        return Err(DeviceManagerError::GenericVhostUserShmemWindowTooLarge {
++            window: size,
++            aperture,
++        });
++    }
++    allocator
++        .allocate(None, size as GuestUsize, Some(size as GuestUsize))
++        .map(|base| base.raw_value())
++        .ok_or(DeviceManagerError::GenericVhostUserShmemAllocation)
++}
++
+ impl DeviceManager {
+     #[expect(clippy::too_many_arguments)]
+     pub fn new(
+@@ -3222,18 +3250,13 @@ impl DeviceManager {
+             // Back the shared memory regions with one window, exposed to the
+             // guest as the shared memory BAR. The backend fills it with
+             // VHOST_USER_BACKEND_SHMEM_MAP.
+-            let shmem_sizes = generic_vhost_user_device.shmem_sizes().to_vec();
+-            if !shmem_sizes.is_empty() {
+-                // The regions sit back to back; a BAR size is a power of two.
+-                let window = shmem_sizes.iter().sum::<u64>().next_power_of_two();
+-                let base = self.pci_segments
+-                    [generic_vhost_user_cfg.pci_common.pci_segment as usize]
+-                    .mem64_allocator
+-                    .lock()
+-                    .unwrap()
+-                    .allocate(None, window as GuestUsize, Some(window))
+-                    .ok_or(DeviceManagerError::GenericVhostUserShmemAllocation)?
+-                    .raw_value();
++            if let Some(layout) = generic_vhost_user_device.shmem_layout().cloned() {
++                let window = layout.window_len;
++                let base = allocate_shmem_window(
++                    &self.pci_segments[generic_vhost_user_cfg.pci_common.pci_segment as usize]
++                        .mem64_allocator,
++                    window,
++                )?;
+                 node.resources
+                     .push(Resource::MmioAddressRange { base, size: window });
+ 
+@@ -3263,20 +3286,11 @@ impl DeviceManager {
+                         .map_err(DeviceManagerError::MemoryManager)?
+                 };
+ 
+-                let mut offset = 0;
+-                let region_list = shmem_sizes
+-                    .iter()
+-                    .map(|&len| {
+-                        let region = VirtioSharedMemory { offset, len };
+-                        offset += len;
+-                        region
+-                    })
+-                    .collect();
+                 generic_vhost_user_device.set_cache(VirtioSharedMemoryList {
+                     mem_slot,
+                     addr: GuestAddress(base),
+                     mapping: Arc::new(mmap_region),
+-                    region_list,
++                    region_list: layout.regions,
+                 });
+                 info!("generic vhost-user {id}: shared memory window {window:#x} at {base:#x}");
+             }

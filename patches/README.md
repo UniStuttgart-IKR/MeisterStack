@@ -5,21 +5,54 @@ recursively, sorted by path, to the pinned Cloud Hypervisor source. The default
 version is v53.0, the same tag Leandro builds (`CH_VERSION`); changing the version
 also requires checking source/vendor hashes and patch compatibility.
 
-The three files are Leandro's series, copied unchanged from `patches/` at Leandro
-HEAD `73eb298` (the rewrite of 2026-09-23 against the vhost-user specification).
-They are `git format-patch` output, so `git apply` and `git am` both accept them.
-Leandro's `patches/README.md` is the reference for the message formats, the
-negotiated protocol features, the verification record and the upstreaming notes;
-its `patches/REVIEW-vhost-user.md` lists what the previous series got wrong.
-Keep the two copies identical: the vhost-user channel between Cloud Hypervisor and
-`vhost-user-nvrm` only negotiates a shared-memory window when both ends are on the
-same series.
+Patches 0001-0003 are Leandro's series, copied unchanged from `patches/` at
+Leandro HEAD `73eb298` (the rewrite of 2026-09-23 against the vhost-user
+specification). Leandro's `patches/README.md` is the reference for the message
+formats, the negotiated protocol features, the verification record and the
+upstreaming notes; its `patches/REVIEW-vhost-user.md` lists what the previous
+series got wrong. Keep these three identical to Leandro's: the vhost-user channel
+between Cloud Hypervisor and `vhost-user-nvrm` only negotiates a shared-memory
+window when both ends are on the same series.
+
+Patch 0004 is MeisterStack's own and applies on top of them; see
+[Hardening](#hardening-patch-0004). All files are `git format-patch` output, so
+`git apply` and `git am` both accept them.
 
 | Patch | Purpose |
 | --- | --- |
 | `0001-generic-vhost-user-shmem.patch` | VIRTIO Shared Memory Regions in the generic vhost-user device: negotiate `SHMEM` (protocol feature bit 22) and `BACKEND_SEND_FD` (bit 10), `GET_SHMEM_CONFIG`, `SHMEM_MAP`/`SHMEM_UNMAP` into a PCI-visible host window. Moves the vhost-user frontend to the `vhost` 0.17 crate. |
 | `0002-generic-vhost-user-device-features.patch` | Offer the device-specific feature-bit ranges (0-23, 50-63); negotiation intersects them with the backend's advertised features. |
 | `0003-generic-vhost-user-refused-request.patch` | Keep the backend request worker alive after a refused (acknowledged) backend request; other request errors remain fatal. |
+| `0004-generic-vhost-user-shmem-window-overflow.patch` | MeisterStack hardening: lay out the shared-memory window with checked arithmetic, bound it by the 64-bit PCI aperture, and keep every backend mapping inside the window. |
+
+## Hardening (patch 0004)
+
+Leandro's series at that revision has one limitation this repository does not accept.
+The backend chooses the region sizes it reports with `GET_SHMEM_CONFIG`, and the
+VMM sums them and rounds the total up to a power of two without overflow checks
+(`shmem_sizes.iter().sum().next_power_of_two()` in `vmm/src/device_manager.rs`).
+Cloud Hypervisor's release profile has no overflow checks, so sizes such as 2^63,
+2^63 and one page wrap to a one-page window while the region list still describes
+regions of 2^63 bytes. A `SHMEM_MAP` request is only checked against the length
+of its region (`host_range`), not against the window, so such a backend could
+make the VMM map its file descriptor with `MAP_FIXED` over any address of the
+VMM process.
+
+Patch 0004 closes this in three places:
+
+- The device lays the regions out with `checked_add` over the sizes and
+  `checked_next_power_of_two` for the window, and refuses a configuration whose
+  window does not fit in a `u64`. The VMM takes the window length and the region
+  list from that layout instead of computing them again.
+- The VMM refuses a window larger than the 64-bit PCI aperture of its segment
+  before it allocates anything for it.
+- `host_range` also checks region offset + request offset + length against the
+  window length, so a region list that reaches past the window never yields an
+  address outside it.
+
+It changes no `Cargo.lock`, so the vendor hash stays that of 0001. The patch is a
+candidate for upstreaming to Leandro; once Leandro's series carries the same
+checks, take the new series and drop 0004.
 
 ## Why `cargoPatches`
 
@@ -37,10 +70,17 @@ reports.
 - A backend on the old series (`SHMEM` = bit 21, `vhost` 0.16) and this
   hypervisor never negotiate `SHMEM`: the device comes up without a window and
   the guest cannot map GPU memory (`cuInit` returns 100). Rebuild both ends.
-- The package checks for a shared-memory patch marker after applying the patches
-  and sets `doCheck = false`: the marker shows presence, not correctness. The
-  patched tree's own tests (`cargo test -p virtio-devices`, 112 tests) run in
-  the Leandro repository, which records them in its README; the Rust workspace
-  tests here do not compile or exercise this series.
+- The package checks for a marker of 0001 (shared memory) and one of 0004 (the
+  checked window layout) after applying the patches and sets `doCheck = false`:
+  the markers show presence, not correctness. The
+  patched tree's own tests (`cargo test -p virtio-devices`) run in the Leandro
+  repository for 0001-0003, which records them in its README; the Rust
+  workspace tests here do not compile or exercise this series.
+- 0004 adds tests of its own to `virtio-devices`. To run them, apply 0001-0004
+  with `git apply` to a copy of `.#cloud-hypervisor-meister.src`, point Cargo at
+  the vendor tree of `.#cloud-hypervisor-meister.cargoDeps` (its
+  `.cargo/config.toml`, with `@vendor@` replaced by the store path) and run
+  `cargo test --offline -p virtio-devices` (115 tests on 2026-10-06, three of
+  them 0004's).
 - The agent starts the GPU backends and attaches their sockets to Cloud
   Hypervisor; see [drivers](../docs/DRIVERS.md).
