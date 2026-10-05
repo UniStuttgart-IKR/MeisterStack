@@ -21,6 +21,9 @@ use backend::{Backend, BackendIo, BackendKind};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+mod ledger;
+use ledger::Ledger;
+
 /// VIRTIO_ID_NVRM, the device type Leandro's guest module binds to.
 const VIRTIO_ID_NVRM: u32 = 60;
 /// Queue 0 request/response, queue 1 host→guest events. Both are mandatory:
@@ -187,8 +190,8 @@ pub struct NvrmDriverConfig {
     pub vgpuprofile_bin: PathBuf,
     pub run_dir: PathBuf,
     pub socket_timeout: Duration,
-    /// Optional VRAM budget over backends in this driver instance's active map.
-    /// Surviving backends are not restored to that map after an agent restart.
+    /// Optional VRAM budget over every backend on the ledger, including those
+    /// read back after an agent restart.
     pub vram_budget_mib: Option<u64>,
     /// The host's share of the card in MiB, handed to `vgpuprofile`. Required
     /// once any vGPU type is configured or requested; see
@@ -203,7 +206,7 @@ pub struct NvrmDriverConfig {
 }
 
 /// What one backend counts as for admission.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Claim {
     /// Admitted VRAM in MiB; see [`NvrmParams::admitted_mib`].
     mib: u64,
@@ -230,18 +233,15 @@ impl Claim {
     }
 }
 
-struct ActiveBackend {
-    child: Backend,
-    claim: Claim,
-}
-
 pub struct NvrmDriver {
     config: NvrmDriverConfig,
     /// One backend serves one VM, in a session of its own, and is signalled
     /// as a process GROUP. See `BackendKind::detached`.
     process: BackendKind,
     vgpu_cache: Mutex<HashMap<String, VgpuType>>,
-    active: Mutex<HashMap<DeviceId, ActiveBackend>>,
+    /// Read back from the claim files of running backends before the driver
+    /// exists, so nothing is admitted while a survivor is uncounted.
+    ledger: Mutex<Ledger>,
 }
 
 impl NvrmDriver {
@@ -265,15 +265,24 @@ impl NvrmDriver {
         // first VM boot.
         let cache = config.resolve_profile_types()?;
 
+        // The name is the backend's own and not the configured binary's:
+        // `--nvrm` is Leandro's binary whatever a node has called the file
+        // it lives in, and `comm` is what the process calls itself.
+        let process = BackendKind::detached("vhost-user-nvrm", "vhost-user-nvrm", NOFILE_LIMIT)
+            .as_user(config.vmm_user.clone());
+        let ledger = Ledger::recovered(&config.run_dir, |pid, socket| process.is_ours(pid, socket))
+            .map_err(|e| {
+                DeviceError::Backend(
+                    anyhow::Error::new(e)
+                        .context("reading back what running backends were admitted as"),
+                )
+            })?;
+
         Ok(Self {
-            // The name is the backend's own and not the configured binary's:
-            // `--nvrm` is Leandro's binary whatever a node has called the file
-            // it lives in, and `comm` is what the process calls itself.
-            process: BackendKind::detached("vhost-user-nvrm", "vhost-user-nvrm", NOFILE_LIMIT)
-                .as_user(config.vmm_user.clone()),
+            process,
             config,
             vgpu_cache: Mutex::new(cache),
-            active: Mutex::new(HashMap::new()),
+            ledger: Mutex::new(ledger),
         })
     }
 }
@@ -374,11 +383,11 @@ impl NvrmDriver {
     /// The backend derives the vGPU identity from the socket path, so it must
     /// be unique and stable per device for its whole lifetime.
     fn socket_path(&self, id: &DeviceId) -> PathBuf {
-        self.config.run_dir.join(format!("{id}.sock"))
+        ledger::socket_file(&self.config.run_dir, id)
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        self.config.run_dir.join(format!("{id}.log"))
+        ledger::device_file(&self.config.run_dir, id, "log")
     }
 
     fn attachment(socket: PathBuf, pid: u32) -> DeviceAttachment {
@@ -390,20 +399,51 @@ impl NvrmDriver {
         }
     }
 
-    /// Check the active map against the optional VRAM budget and resolved
-    /// per-type instance limit. These checks do not count surviving backends
-    /// from a previous driver instance.
-    async fn admit(
+    /// The resolved vGPU type the parameters name, from the cache or the card.
+    async fn resolve(&self, params: &NvrmParams) -> device::Result<Option<VgpuType>> {
+        let Some(vtype) = &params.vgpu_type else {
+            return Ok(None);
+        };
+        // Release the cache lock before the external query. Concurrent misses may
+        // resolve the same type twice and then store the same result.
+        let cached = self.vgpu_cache.lock().await.get(vtype).cloned();
+        if let Some(vgpu) = cached {
+            return Ok(Some(vgpu));
+        }
+        // Per-VM params may name a type no profile pre-resolved.
+        let reserve = self.config.host_reserve()?;
+        let resolved = resolve_vgpu_type_async(&self.config.vgpuprofile_bin, reserve, vtype)
+            .await
+            .map_err(|e| DeviceError::InvalidSpec(format!("{e:#}")))?;
+        self.vgpu_cache
+            .lock()
+            .await
+            .insert(vtype.clone(), resolved.clone());
+        Ok(Some(resolved))
+    }
+
+    /// Put an admitted, spawned backend on the ledger and record its claim
+    /// beside its socket for the next driver instance.
+    async fn enter_started(
         &self,
         id: &DeviceId,
-        want: &Claim,
-        vgpu: Option<&VgpuType>,
+        pid: u32,
+        child: Backend,
+        claim: &Claim,
     ) -> device::Result<()> {
-        let active = self.active.lock().await;
-        let live: Vec<&Claim> = active.values().map(|b| &b.claim).collect();
-        refuse_instance_overflow(&live, vgpu)?;
-        refuse_card_overcommit(&live, want, id)?;
-        refuse_budget_overrun(&live, want, self.config.vram_budget_mib, id)
+        if let Err(e) = ledger::record(&self.config.run_dir, id, pid, claim) {
+            // Safe to continue: after a restart the unrecorded socket counts
+            // as unknown and blocks admission until this backend is gone.
+            warn!(error = %e, "could not record what this backend was admitted as");
+        }
+        let unclaimed = self.ledger.lock().await.started(id, child);
+        if let Some(child) = unclaimed {
+            self.process.stop(child).await;
+            return Err(DeviceError::Backend(anyhow::anyhow!(
+                "device {id} was destroyed while its backend started"
+            )));
+        }
+        Ok(())
     }
 
     /// Build typed and resolved environment settings, then add operator variables
@@ -704,52 +744,29 @@ impl DeviceDriver for NvrmDriver {
         }
 
         let socket = self.socket_path(id);
-        {
-            let mut active = self.active.lock().await;
-            if let Some(running) = active.get_mut(id) {
-                if running.child.is_reusable(&socket) {
-                    let pid = running.child.pid().unwrap_or(0);
-                    return Ok(Device {
-                        id: *id,
-                        attachment: Self::attachment(socket, pid),
-                    });
-                }
-                active.remove(id);
-            }
+        let reusable = self
+            .ledger
+            .lock()
+            .await
+            .reusable(id, &socket, |pid, s| self.process.is_ours(pid, s))?;
+        if let Some(pid) = reusable {
+            return Ok(Device {
+                id: *id,
+                attachment: Self::attachment(socket, pid),
+            });
         }
 
         let params = self.config.effective_params(spec)?;
-
-        let vgpu = match &params.vgpu_type {
-            Some(vtype) => {
-                // Release the cache lock before the external query. Concurrent misses may
-                // resolve the same type twice and then store the same result.
-                let cached = self.vgpu_cache.lock().await.get(vtype).cloned();
-                Some(match cached {
-                    Some(vgpu) => vgpu,
-                    // Per-VM params may name a type no profile pre-resolved.
-                    None => {
-                        let reserve = self.config.host_reserve()?;
-                        let resolved =
-                            resolve_vgpu_type_async(&self.config.vgpuprofile_bin, reserve, vtype)
-                                .await
-                                .map_err(|e| DeviceError::InvalidSpec(format!("{e:#}")))?;
-                        self.vgpu_cache
-                            .lock()
-                            .await
-                            .insert(vtype.clone(), resolved.clone());
-                        resolved
-                    }
-                })
-            }
-            None => None,
-        };
+        let vgpu = self.resolve(&params).await?;
+        let env = Self::backend_env(&params, vgpu.as_ref())?;
 
         // Count the same effective parameters used to build the backend environment.
         let claim = Claim::of(&params, vgpu.as_ref());
-        self.admit(id, &claim, vgpu.as_ref()).await?;
+        self.ledger
+            .lock()
+            .await
+            .admit(id, &claim, vgpu.as_ref(), self.config.vram_budget_mib)?;
 
-        let env = Self::backend_env(&params, vgpu.as_ref())?;
         debug!(
             vgpu_type = params.vgpu_type.as_deref().unwrap_or("-"),
             profile = spec.profile.as_deref().unwrap_or("-"),
@@ -765,7 +782,7 @@ impl DeviceDriver for NvrmDriver {
             .envs(env);
 
         // The backend must be listening before cloud-hypervisor connects.
-        let (pid, child) = self
+        let spawned = self
             .process
             .spawn(
                 cmd,
@@ -777,13 +794,16 @@ impl DeviceDriver for NvrmDriver {
                     span: tracing::info_span!("backend_spawn", driver = "nvrm", device_id = %id),
                 },
             )
-            .await?;
+            .await;
+        let (pid, child) = match spawned {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                self.ledger.lock().await.forget(id);
+                return Err(e.into());
+            }
+        };
         info!(pid, admitted_mib = claim.mib, "nvrm backend ready");
-
-        self.active
-            .lock()
-            .await
-            .insert(*id, ActiveBackend { child, claim });
+        self.enter_started(id, pid, child, &claim).await?;
 
         Ok(Device {
             id: *id,
@@ -793,10 +813,10 @@ impl DeviceDriver for NvrmDriver {
 
     #[instrument(skip_all, fields(device_id = %id))]
     async fn destroy(&self, id: &DeviceId, attachment: &DeviceAttachment) -> device::Result<()> {
-        let entry = self.active.lock().await.remove(id);
+        let child = self.ledger.lock().await.forget(id);
 
-        match entry {
-            Some(entry) => self.process.stop(entry.child).await,
+        match child {
+            Some(child) => self.process.stop(child).await,
             // Not our child: the agent restarted since create, and the
             // record's pid is the only handle left on the backend.
             None => {
@@ -806,7 +826,8 @@ impl DeviceDriver for NvrmDriver {
             }
         }
 
-        for p in [self.socket_path(id), self.log_path(id)] {
+        let claim = ledger::claim_file(&self.config.run_dir, id);
+        for p in [self.socket_path(id), self.log_path(id), claim] {
             backend::remove_if_present(&p)
                 .await
                 .map_err(|e| DeviceError::Backend(e.into()))?;

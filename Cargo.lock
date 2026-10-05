@@ -1388,6 +1388,7 @@ dependencies = [
  "meister-backend",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
