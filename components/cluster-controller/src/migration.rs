@@ -2296,6 +2296,74 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A confirmation that cannot be read ends the step before anything moves: the record
+    /// stays Pending, never Preparing, and no node is told anything. (R3-F04, R2-4)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see test_store"]
+    async fn a_prepare_whose_room_cannot_be_confirmed_dispatches_nothing() {
+        let store = std::sync::Arc::new(test_store().await);
+        let mut guest = vm("web-1");
+        guest.status.reported = Some(controller_api::VmReported::by(
+            "agent-1",
+            VmPhaseKind::Running,
+            controller_api::VmReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        guest.settle(Utc::now());
+        let guest = store.create(&guest).await.expect("the running guest");
+        let moving = store
+            .create(&migration("web-1", VmMigrationPhaseKind::Pending))
+            .await
+            .expect("the record");
+        // Both ends speak the attempt protocol; the destination has no Node object, so the
+        // confirmation's reading of it fails.
+        let speaking = |name: &str| {
+            let mut candidate = node(name);
+            candidate
+                .catalogue
+                .push(common::migration::ATTEMPT_PROTOCOL.to_string());
+            candidate
+        };
+        let nodes = Mutex::new(vec![speaking("agent-1"), speaking("agent-2")]);
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.attach("agent-1", &tx);
+        registry.attach("agent-2", &tx);
+        let dispatch = Dispatch::new(
+            registry,
+            store.clone(),
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        );
+
+        let outcome = prepare(
+            &store,
+            &dispatch,
+            &FirstFit,
+            &nodes,
+            &[],
+            Overcommit::default(),
+            &moving,
+            &guest,
+        )
+        .await;
+
+        let why = format!(
+            "{:#}",
+            outcome.expect_err("an unread room is not a confirmed one")
+        );
+        assert!(why.contains("could not be confirmed"), "{why}");
+        let still: VmMigration = store.get(&moving.metadata.name).await.expect("the record");
+        assert_eq!(still.status.phase().kind(), VmMigrationPhaseKind::Pending);
+        assert!(rx.try_recv().is_err(), "nothing was dispatched");
+    }
+
     /// The room goes back when the move ends — through `fail`, which is the
     /// one funnel every failure in this file reaches, `abandon` included.
     #[tokio::test]

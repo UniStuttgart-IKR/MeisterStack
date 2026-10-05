@@ -2752,18 +2752,18 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
     assert!(held.status.phase().message().is_none());
 }
 
-/// A store under a fresh prefix of the test etcd, for the release tests below.
-async fn release_test_store() -> EtcdStore {
+/// A store under a fresh prefix of the test etcd, for the release and placement tests below.
+async fn fresh_store() -> EtcdStore {
     let endpoint =
         std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/release-test/{}", uuid::Uuid::new_v4());
+    let prefix = format!("/reconcile-test/{}", uuid::Uuid::new_v4());
     EtcdStore::connect(&[endpoint], &prefix)
         .await
         .expect("an etcd to talk to")
 }
 
-/// A pass with no nodes and nothing held: what the release paths need of one.
-fn release_pass<'a>(
+/// A pass with no nodes and nothing held; a test puts in the candidates it needs.
+fn quiet_pass<'a>(
     store: &'a EtcdStore,
     registry: &'a SessionRegistry,
     connected: &'a HashSet<String>,
@@ -2787,7 +2787,7 @@ fn release_pass<'a>(
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
-    let store = release_test_store().await;
+    let store = fresh_store().await;
     let mut old = controller_api::resources::new_volume("data", Default::default());
     old.metadata.deletion_timestamp = Some(Utc::now());
     let listed = store.create(&old).await.expect("the old volume");
@@ -2805,7 +2805,7 @@ async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
-    release(&release_pass(&store, &registry, &connected), &listed)
+    release(&quiet_pass(&store, &registry, &connected), &listed)
         .await
         .expect("the old release");
 
@@ -2824,7 +2824,7 @@ async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
-    let store = release_test_store().await;
+    let store = fresh_store().await;
     let spec = controller_api::VolumeSnapshotSpec {
         volume: "data".into(),
         ..Default::default()
@@ -2845,7 +2845,7 @@ async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
-    drop_snapshot(&release_pass(&store, &registry, &connected), &listed)
+    drop_snapshot(&quiet_pass(&store, &registry, &connected), &listed)
         .await
         .expect("the old drop");
 
@@ -2857,14 +2857,14 @@ async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_volume_nothing_holds_is_released_and_deleted() {
-    let store = release_test_store().await;
+    let store = fresh_store().await;
     let mut old = controller_api::resources::new_volume("data", Default::default());
     old.metadata.deletion_timestamp = Some(Utc::now());
     let listed = store.create(&old).await.expect("a deleting volume");
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
-    release(&release_pass(&store, &registry, &connected), &listed)
+    release(&quiet_pass(&store, &registry, &connected), &listed)
         .await
         .expect("the release");
 
@@ -2872,4 +2872,96 @@ async fn a_volume_nothing_holds_is_released_and_deleted() {
         store.get::<Volume>("data").await,
         Err(StoreError::NotFound(_))
     ));
+}
+
+/// A guest of 2 vCPUs and `mem_mib`, bound to `on` or to nobody.
+fn sized_guest(name: &str, on: Option<&str>, mem_mib: u64) -> Vm {
+    let mut vm = bound_to(on);
+    vm.metadata.name = name.to_string();
+    vm.spec.vm = serde_json::json!({"vcpus": 2, "memory_mib": mem_mib});
+    vm
+}
+
+/// A compute node of 8 vCPUs and 8 GiB, as a candidate and as the object behind it.
+fn compute_node(name: &str) -> (Candidate, controller_api::Node) {
+    let size = controller_api::Capacity {
+        vcpus: 8,
+        mem_mib: 8192,
+    };
+    let candidate = Candidate {
+        accepts: Vec::new(),
+        kind: controller_api::CandidateKind::Node,
+        labels: Default::default(),
+        hosted: Vec::new(),
+        name: name.into(),
+        connected: true,
+        alive: true,
+        schedulable: true,
+        unhealthy: Vec::new(),
+        free: size,
+        machine: None,
+        catalogue: vec!["hypervisor/cloud-hypervisor".to_string()],
+    };
+    let mut node = controller_api::Node::declare(name, controller_api::NodeSpec::default());
+    node.status.ready = true;
+    node.status.capacity = controller_api::NodeCapacity {
+        vcpus: size.vcpus,
+        mem_mib: size.mem_mib,
+        ..Default::default()
+    };
+    (candidate, node)
+}
+
+/// A placement decided on a snapshot in which the last slot was free yields to the migration
+/// claim the store took first: the guest stays unbound and its own claim is given back. (R2-4)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_placement_onto_a_slot_a_migration_claimed_first_leaves_the_guest_unbound() {
+    let store = fresh_store().await;
+    let (candidate, node) = compute_node("agent-2");
+    store.create(&node).await.expect("the machine");
+    let flying = store
+        .create(&sized_guest("web-1", Some("agent-1"), 6144))
+        .await
+        .expect("the guest a migration moves");
+    let moving = store
+        .create(&controller_api::VmMigration::declare(
+            "web-1-move",
+            controller_api::VmMigrationSpec {
+                tenant: "acme".into(),
+                vm: "web-1".into(),
+                target_node: None,
+            },
+        ))
+        .await
+        .expect("the migration");
+    let theirs = store
+        .create(&CapacityReservation::of(&moving, &flying, "agent-2"))
+        .await
+        .expect("the migration's claim on the last slot");
+    let landing = store
+        .create(&sized_guest("web-2", None, 6144))
+        .await
+        .expect("the guest to place");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+    // The pass's snapshot predates the migration's claim: agent-2 still looks free.
+    pass.nodes.lock().unwrap().push(candidate);
+
+    place(&pass, landing).await.expect("a pass");
+
+    let after: Vm = store.get("web-2").await.expect("the guest");
+    assert_eq!(
+        after.spec.node_name, None,
+        "not bound onto the claimed slot"
+    );
+    let said = after.status.placement.expect("and it says why").message;
+    assert!(said.contains("another claim took it first"), "{said}");
+    let left: Vec<CapacityReservation> = store.list().await.expect("the claims");
+    assert_eq!(
+        left.iter().map(|r| &r.metadata.name).collect::<Vec<_>>(),
+        [&theirs.metadata.name],
+        "the placement's own claim was given back"
+    );
 }
