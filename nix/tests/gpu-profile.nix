@@ -50,19 +50,36 @@ let
   intel = { hardware.cpu.intel.updateMicrocode = true; };
 
   # What the `leandro` input looks like from this profile's point of view:
-  # two outputs, two binaries. Two trivial scripts because the check is about
-  # the SHAPE of the configuration — which keys, pointing where — and
-  # building an NVIDIA driver stack to find that out would be an afternoon
-  # for a question a store path already answers.
+  # two outputs, two binaries, and the DRIVER_VERSION file of its source tree.
+  # Two trivial scripts because the check is about the SHAPE of the
+  # configuration — which keys, pointing where — and building an NVIDIA driver
+  # stack to find that out would be an afternoon for a question a store path
+  # already answers.
   stub = {
+    outPath = ./leandro-stub;
     packages.${system} = {
       vhost-user-nvrm = pkgs.writeShellScriptBin "vhost-user-nvrm" "exit 0";
       leandro = pkgs.writeShellScriptBin "vgpuprofile" "exit 0";
     };
   };
 
+  # The stub's driver version, pinned the way the profile's message tells an operator to.
+  # Only the version is read: nothing is fetched or built, so the hashes are placeholders.
+  stubDriverVersion = lib.fileContents ./leandro-stub/DRIVER_VERSION;
+  pinnedDriver = { config, ... }: {
+    hardware.nvidia.package = config.boot.kernelPackages.nvidiaPackages.mkDriver {
+      version = stubDriverVersion;
+      sha256_64bit = lib.fakeHash;
+      openSha256 = lib.fakeHash;
+      settingsSha256 = lib.fakeHash;
+      persistencedSha256 = lib.fakeHash;
+    };
+  };
+
   without = hostWith null [ driver amd ];
-  with' = hostWith stub [ driver amd ];
+  with' = hostWith stub [ driver amd pinnedDriver ];
+  # nixpkgs' default driver, which is not the version the stub targets.
+  unpinnedHost = hostWith stub [ driver amd ];
 
   # The cases of the profile's own assertions. Only this profile's are looked at: the host
   # carries the agent's and the module system's as well.
@@ -145,10 +162,14 @@ pkgs.runCommand "gpu-profile" { } ''
     || { echo "-> the agent refuses the configuration this profile produced"; exit 1; }
   ${pkgs.meisterstack}/bin/meister-agent --check-config --config ${tomlOf without} \
     || { echo "-> the agent refuses the configuration a CPU-only fleet produced"; exit 1; }
+  ${require (failedOf with' == [ ]) "a GPU host on the stack's driver version failed: ${lib.concatStringsSep " | " (failedOf with')}"}
+  ${require (unpinnedHost.hardware.nvidia.package.version != stubDriverVersion)
+    "nixpkgs' default driver is the stub's version, so the mismatch case shows nothing"}
+  ${require (failsOnly unpinnedHost "DRIVER_VERSION") "a host on another driver version than the GPU stack's was not refused"}
   ${lib.optionalString (lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) with'.warnings) ''
     echo "-> a fleet WITH the GPU stack was warned about not having it"
     exit 1
   ''}
-  echo "  ok   both branches of the template's GPU profile parse"
+  echo "  ok   both branches of the template's GPU profile parse, the driver version is pinned"
   touch $out
 ''

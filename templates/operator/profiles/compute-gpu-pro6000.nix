@@ -56,6 +56,12 @@ let
   # the driver assertion carries that case.
   nvidiaPresent = config.hardware.nvidia.enabled or false;
 
+  # The driver version the GPU stack is written against, Leandro's DRIVER_VERSION. The guest
+  # is handed the host's libcuda and the backend forwards ioctls whose layouts change between
+  # driver releases, so a host on any other version misreads them.
+  stackDriverVersion = lib.fileContents "${leandro}/DRIVER_VERSION";
+  hostDriverVersion = config.hardware.nvidia.package.version;
+
   # Every message of this profile starts with its name, so an operator reading a failed
   # build (and the check in nix/tests/gpu-profile.nix) can tell whose assertion it was.
   refuseUnless = assertion: message: {
@@ -96,6 +102,13 @@ in
         and hardware.nvidia.open = true in the host module, at the version the GPU stack
         targets: the guest is handed the host's libcuda, and the ioctl layouts are version
         specific.
+      '')
+      (refuseUnless (leandro == null || !nvidiaPresent || hostDriverVersion == stackDriverVersion) ''
+        the host driver is ${hostDriverVersion}, and the GPU stack targets
+        ${stackDriverVersion} (DRIVER_VERSION of the leandro input). The ioctl layouts are
+        version specific. Pin the driver in the host module:
+        hardware.nvidia.package = config.boot.kernelPackages.nvidiaPackages.mkDriver {
+        version = "${stackDriverVersion}"; ... };
       '')
       (refuseUnless (!nvidiaPresent || config.hardware.nvidia.open == true) ''
         hardware.nvidia.open must be true. Blackwell cards (RTX PRO 6000) run on the open
