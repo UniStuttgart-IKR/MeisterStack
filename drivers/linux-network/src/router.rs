@@ -1611,6 +1611,29 @@ esac
         );
     }
 
+    /// One router that cannot be silenced does not stop the others, and leaves the pass partial
+    /// so the dead man tries again (R3-F06).
+    #[tokio::test]
+    async fn one_router_that_cannot_be_silenced_leaves_the_pass_partial() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let mut ok = spec(true);
+        ok.id = RouterId::from_u128(0x6b00_0000_0000_0000_0000_0000_0000_0001);
+        let mut bad = spec(true);
+        bad.id = RouterId::from_u128(0x6b00_0000_0000_0000_0000_0000_0000_0002);
+        write_record(dir, &ok);
+        write_record(dir, &bad);
+        let listed = [router_netns(&ok.id), router_netns(&bad.id)];
+        let ip = logging_ip(&dir.join("ip.log"), &listed, Some(&listed[1]));
+        let d = fake_driver(dir, &ip);
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.silenced, [ok.id]);
+        assert_eq!(outcome.failed, [bad.id]);
+        assert!(!outcome.complete());
+    }
+
     /// A hung `ip` is killed within the deadline and does not block the next command (R3-F08).
     /// The fake busy-loops rather than `sleep`, whose forked child the kill would not reach.
     #[tokio::test]
