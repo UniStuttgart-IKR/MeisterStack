@@ -63,11 +63,12 @@ let
   stackDriverVersion = lib.fileContents "${leandro}/DRIVER_VERSION";
   hostDriverVersion = config.hardware.nvidia.package.version;
 
-  # Every message of this profile starts with its name, so an operator reading a failed
-  # build (and the check in nix/tests/gpu-profile.nix) can tell whose assertion it was.
-  refuseUnless = assertion: message: {
+  # Every message of this profile starts with a stable tag and the profile's name. The tag
+  # is what nix/tests/gpu-profile.nix matches, so the prose after it is free to change; the
+  # name tells an operator reading a failed build whose assertion it was.
+  refuseUnless = tag: assertion: message: {
     inherit assertion;
-    message = "profiles/compute-gpu-pro6000.nix: ${message}";
+    message = "[${tag}] profiles/compute-gpu-pro6000.nix: ${message}";
   };
 in
 {
@@ -93,34 +94,35 @@ in
     meisterstack.agent.settings = gpu;
 
     assertions = [
-      (refuseUnless (vendor != null) ''
+      (refuseUnless "iommu-vendor" (vendor != null) ''
         cannot tell an Intel host from an AMD one (hardware.cpu.*.updateMicrocode and
         boot.kernelModules name both vendors or neither). Set
         meisterstack.gpuProfile.iommuVendor = "intel" or "amd" in the host module.
       '')
-      (refuseUnless nvidiaPresent ''
+      (refuseUnless "driver" nvidiaPresent ''
         the host has no NVIDIA driver. Set services.xserver.videoDrivers = [ "nvidia" ]
         and hardware.nvidia.open = true in the host module, at the version the GPU stack
         targets: the guest is handed the host's libcuda, and the ioctl layouts are version
         specific.
       '')
-      (refuseUnless (leandro == null || !nvidiaPresent || hostDriverVersion == stackDriverVersion) ''
+      (refuseUnless "driver-version"
+        (leandro == null || !nvidiaPresent || hostDriverVersion == stackDriverVersion) ''
         the host driver is ${hostDriverVersion}, and the GPU stack targets
         ${stackDriverVersion} (DRIVER_VERSION of the leandro input). The ioctl layouts are
         version specific. Pin the driver in the host module:
         hardware.nvidia.package = config.boot.kernelPackages.nvidiaPackages.mkDriver {
         version = "${stackDriverVersion}"; ... };
       '')
-      (refuseUnless (!nvidiaPresent || config.hardware.nvidia.open == true) ''
+      (refuseUnless "open-modules" (!nvidiaPresent || config.hardware.nvidia.open == true) ''
         hardware.nvidia.open must be true. Blackwell cards (RTX PRO 6000) run on the open
         kernel modules only, and the GPU stack is written against them.
       '')
-      (refuseUnless (!nvidiaPresent || config.hardware.nvidia.nvidiaPersistenced) ''
+      (refuseUnless "persistenced" (!nvidiaPresent || config.hardware.nvidia.nvidiaPersistenced) ''
         hardware.nvidia.nvidiaPersistenced must be true. Without the persistence daemon the
         driver tears the GPU state down when the last client exits, and every guest start
         pays the initialisation again.
       '')
-      (refuseUnless (migUnits == [ ]) ''
+      (refuseUnless "mig" (migUnits == [ ]) ''
         MIG and the GPU stack exclude each other on one card, and this host declares MIG
         units (${lib.concatStringsSep ", " migUnits}). Give the card to one of them: remove
         the MIG setup from this host, or use a profile without a GPU backend.
@@ -129,9 +131,9 @@ in
 
     # Explain the missing optional backend during evaluation.
     warnings = lib.optional (leandro == null) (
-      "profiles/compute-gpu-pro6000.nix configures the IOMMU and vfio-pci, and no NVIDIA "
-      + "backend: the `leandro` input is not declared in flake.nix. Uncomment it there, or "
-      + "this fleet's GPU hosts carry cards that nothing hands to a guest."
+      "[no-gpu-backend] profiles/compute-gpu-pro6000.nix configures the IOMMU and vfio-pci, "
+      + "and no NVIDIA backend: the `leandro` input is not declared in flake.nix. Uncomment "
+      + "it there, or this fleet's GPU hosts carry cards that nothing hands to a guest."
     );
   };
 }

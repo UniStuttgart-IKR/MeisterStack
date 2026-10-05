@@ -81,10 +81,15 @@ let
   # nixpkgs' default driver, which is not the version the stub targets.
   unpinnedHost = hostWith stub [ driver amd ];
 
-  # The cases of the profile's own assertions. Only this profile's are looked at: the host
-  # carries the agent's and the module system's as well.
-  failedOf = c: map (a: a.message)
-    (lib.filter (a: !a.assertion && lib.hasInfix "compute-gpu-pro6000" a.message) c.assertions);
+  # The cases of the profile's own assertions, told apart by the tag each message starts with
+  # ("[driver] ...") and never by the prose after it. Messages without a tag are the agent's
+  # and the module system's, which the host carries as well.
+  tagOf = message:
+    if lib.hasPrefix "[" message
+    then lib.removePrefix "[" (lib.head (lib.splitString "]" message))
+    else null;
+  failedOf = c: lib.filter (tag: tag != null)
+    (map (a: tagOf a.message) (lib.filter (a: !a.assertion) c.assertions));
   paramsOf = c: " ${lib.concatStringsSep " " c.boot.kernelParams} ";
   intelHost = hostWith null [ driver intel ];
   unknownHost = hostWith null [ driver ];
@@ -98,10 +103,8 @@ let
     { systemd.services.nvidia-mig-setup = { script = "true"; wantedBy = [ "multi-user.target" ]; }; }
   ];
 
-  # Each case must fail exactly its own assertion, whose message names `word`.
-  failsOnly = c: word:
-    let f = failedOf c; in
-    lib.length f == 1 && lib.hasInfix word (lib.head f);
+  # Each case must fail exactly its own assertion, the one tagged `tag`.
+  failsOnly = c: tag: failedOf c == [ tag ];
   tomlOf = c: c.environment.etc."meisterstack/agent.toml".source;
 
   # One shell step of the check: nothing when `ok`, else the reason and a failing exit.
@@ -132,7 +135,7 @@ pkgs.runCommand "gpu-profile" { } ''
   # And it says so, once, where an operator sees it. The host carries other
   # warnings of its own (the agent's `network-online.target` ordering, 1A
   # §8 point 5), so what is asked for is THIS one and not an empty list.
-  ${lib.optionalString (!(lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) without.warnings)) ''
+  ${lib.optionalString (!(lib.any (w: tagOf w == "no-gpu-backend") without.warnings)) ''
     echo "-> a fleet with no GPU stack got no warning about it"; exit 1
   ''}
 
@@ -143,11 +146,11 @@ pkgs.runCommand "gpu-profile" { } ''
     "an Intel GPU host did not get intel_iommu=on, or failed an assertion"}
   ${require (lib.hasInfix " intel_iommu=on " (paramsOf forcedIntel) && failedOf forcedIntel == [ ])
     "iommuVendor = intel did not select the Intel parameter"}
-  ${require (failsOnly unknownHost "tell an Intel host from an AMD") "a host of unknown CPU vendor was not refused"}
-  ${require (failsOnly noDriverHost "no NVIDIA driver") "a host without the NVIDIA driver was not refused with just that"}
-  ${require (failsOnly closedHost "hardware.nvidia.open") "the closed kernel module was not refused"}
-  ${require (failsOnly noPersistenceHost "nvidiaPersistenced") "a host without nvidia-persistenced was not refused"}
-  ${require (failsOnly migHost "MIG") "a host with MIG units was not refused"}
+  ${require (failsOnly unknownHost "iommu-vendor") "a host of unknown CPU vendor was not refused"}
+  ${require (failsOnly noDriverHost "driver") "a host without the NVIDIA driver was not refused with just that"}
+  ${require (failsOnly closedHost "open-modules") "the closed kernel module was not refused"}
+  ${require (failsOnly noPersistenceHost "persistenced") "a host without nvidia-persistenced was not refused"}
+  ${require (failsOnly migHost "mig") "a host with MIG units was not refused"}
   echo "  ok   vendor-neutral IOMMU switch and the five assertions"
 
   echo "== with it"
@@ -165,8 +168,8 @@ pkgs.runCommand "gpu-profile" { } ''
   ${require (failedOf with' == [ ]) "a GPU host on the stack's driver version failed: ${lib.concatStringsSep " | " (failedOf with')}"}
   ${require (unpinnedHost.hardware.nvidia.package.version != stubDriverVersion)
     "nixpkgs' default driver is the stub's version, so the mismatch case shows nothing"}
-  ${require (failsOnly unpinnedHost "DRIVER_VERSION") "a host on another driver version than the GPU stack's was not refused"}
-  ${lib.optionalString (lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) with'.warnings) ''
+  ${require (failsOnly unpinnedHost "driver-version") "a host on another driver version than the GPU stack's was not refused"}
+  ${lib.optionalString (lib.any (w: tagOf w == "no-gpu-backend") with'.warnings) ''
     echo "-> a fleet WITH the GPU stack was warned about not having it"
     exit 1
   ''}
