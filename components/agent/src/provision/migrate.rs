@@ -19,6 +19,26 @@ enum Departure {
     StillHere(String),
 }
 
+/// Refuse to send or receive a guest with devices. A device's state lives in
+/// its backend on the source host (a GPU's memory and objects behind nvrm or
+/// crosvm-gpu, a passed-through card) and the stream carries none of it.
+/// Cloud-hypervisor would refuse only once sending, after the destination had
+/// started backends of its own.
+fn refuse_devices(id: &VmId, devices: &[crate::types::DeviceWithId]) -> Result<()> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let mut drivers: Vec<&str> = devices.iter().map(|d| d.spec.driver.as_str()).collect();
+    drivers.sort_unstable();
+    drivers.dedup();
+    bail!(
+        "vm {id} has {} device(s) ({}): their state lives in backends on the source host and \
+         no live migration carries it; move the vm by reboot instead",
+        devices.len(),
+        drivers.join(", ")
+    )
+}
+
 impl Provisioner {
     /// Prepare a receiving VMM with a durable attempt identity. Any existing VM
     /// row, including an unreadable row, refuses reception. Inline disks are
@@ -62,6 +82,7 @@ impl Provisioner {
             );
         }
 
+        refuse_devices(&id, &spec.devices)?;
         self.check_device_admission(&id, &spec)?;
         anyhow::ensure!(
             self.store.claim_migration(&id, migration_id, false)?,
@@ -159,6 +180,7 @@ impl Provisioner {
                 record.phase
             );
         }
+        refuse_devices(id, &record.spec.devices)?;
         // An existing operation owns this VM. Do not replace its identity or peer
         // with a second send request.
         if let Some(op) = &record.operation {

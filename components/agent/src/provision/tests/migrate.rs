@@ -677,6 +677,65 @@ async fn a_vm_with_an_inline_disk_is_not_received_and_the_refusal_names_the_disk
     assert!(store.get(&id).expect("a lookup").is_none(), "no record");
 }
 
+/// IKR-B17: a destination refuses a guest with a GPU before it prepares
+/// anything, rather than starting a backend the stream will never fill.
+#[tokio::test]
+async fn a_vm_with_a_device_is_not_received() {
+    let (_temp, root) = migration_root("mig-device-in");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+
+    let id = VmId::new_v4();
+    let gpu = spec(1, 256, vec![device("nvrm", PartitionSpec::Mediated)]);
+    let refused = p
+        .prepare_migration(id, gpu, "tcp:127.0.0.1:49000", true, "attempt-1")
+        .await
+        .expect_err("a device does not migrate");
+    let said = format!("{refused:#}");
+    assert!(said.contains("nvrm"), "{said}");
+    assert!(said.contains("by reboot"), "{said}");
+    assert!(hv.said().is_empty(), "nothing was built: {:?}", hv.said());
+    assert!(store.get(&id).expect("a lookup").is_none(), "no record");
+}
+
+/// IKR-B17: a source refuses to send a guest with a device before it claims
+/// the attempt or opens a stream.
+#[tokio::test]
+async fn a_vm_with_a_device_is_not_sent() {
+    let (_temp, root) = migration_root("mig-device-out");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+    let id = VmId::new_v4();
+    p.provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    // The same guest as if it had been given a GPU when it was made.
+    let mut record = store.get(&id).expect("a lookup").expect("a record");
+    record.spec.devices = vec![device("crosvm-gpu", PartitionSpec::Mediated)];
+    store.put(&id, &record).expect("stored");
+
+    let refused = p
+        .begin_migrate_out(
+            &id,
+            "tcp:10.0.0.9:49000",
+            "attempt-1",
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .expect_err("a device does not migrate");
+    assert!(format!("{refused:#}").contains("crosvm-gpu"), "{refused:#}");
+    let record = store.get(&id).expect("a lookup").expect("still a record");
+    assert!(record.operation.is_none(), "no send was begun");
+    assert!(record.migration.is_none(), "no attempt was claimed");
+    assert!(
+        !hv.said().iter().any(|line| line.starts_with("migrate_out")),
+        "{:?}",
+        hv.said()
+    );
+}
+
 /// Successful departure retains a Migrated record. An untyped send error
 /// retains the operation barrier because it does not prove an abort.
 #[tokio::test]

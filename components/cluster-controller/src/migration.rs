@@ -220,6 +220,28 @@ pub async fn start_for_drain(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::
     }
 }
 
+/// Refuse a live migration of a guest with any device. A device's state lives
+/// in its backend on the source host (a GPU's memory and objects behind nvrm or
+/// crosvm-gpu, a passed-through card) and the migration stream carries none of
+/// it; cloud-hypervisor would only refuse once sending, after the destination
+/// had prepared backends of its own.
+pub(crate) fn device_refusal(vm: &Vm) -> Option<String> {
+    let has_device = vm
+        .spec
+        .vm
+        .get("devices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|d| !d.is_empty());
+    has_device.then(|| {
+        format!(
+            "a vm with a passthrough or paravirtual device does not migrate live: the device's \
+             state lives in its backend on this host and no live migration carries it; set \
+             spec.evacuation = restart on {} to move it by reboot",
+            vm.metadata.name
+        )
+    })
+}
+
 /// Create the cloud-named migration request, preserving an optional target node.
 /// Destination preparation checks for competing attempts before acting.
 pub async fn start_from_the_cloud(
@@ -232,10 +254,14 @@ pub async fn start_from_the_cloud(
     // The vm has to be one of ours, and saying so here is what makes the
     // cloud's answer a sentence instead of a migration that fails a pass
     // later with "vm ... does not exist here any more".
-    let _: Vm = store
+    let guest: Vm = store
         .get(vm)
         .await
         .map_err(|e| anyhow::anyhow!("vm {vm} is not on this cluster: {e}"))?;
+    // A cloud's command does not pass the REST edge, so its refusal is said here.
+    if let Some(why) = device_refusal(&guest) {
+        anyhow::bail!("{why}");
+    }
     let migration = VmMigration::declare(
         name,
         controller_api::VmMigrationSpec {
@@ -560,6 +586,11 @@ async fn prepare(
             ),
         )
         .await;
+    }
+    // Every request reaches this step, whichever door it came in by, and
+    // nothing has been prepared on a destination yet.
+    if let Some(why) = device_refusal(vm) {
+        return fail(store, migration, why).await;
     }
 
     // Where to. A named node is a HARD requirement and is checked against the
@@ -1522,6 +1553,18 @@ mod tests {
                 vm: serde_json::json!({}),
             },
         )
+    }
+
+    /// IKR-B17: a guest with a GPU, or any other device, is refused by the
+    /// rule every migration path asks before a destination is prepared.
+    #[test]
+    fn a_guest_with_a_device_does_not_migrate_live() {
+        let mut gpu = vm("gpu-1");
+        gpu.spec.vm = serde_json::json!({ "devices": [{ "driver": "nvrm", "profile": "4q" }] });
+        let why = device_refusal(&gpu).expect("a device");
+        assert!(why.contains("does not migrate live"), "{why}");
+        assert!(why.contains("gpu-1"), "{why}");
+        assert_eq!(device_refusal(&vm("web-1")), None, "no device, no refusal");
     }
 
     fn migration(vm: &str, phase: VmMigrationPhaseKind) -> VmMigration {
