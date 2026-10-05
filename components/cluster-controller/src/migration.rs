@@ -480,18 +480,19 @@ async fn step(
         )
         .await;
     }
-    if migration.status.cancelling && !migration.status.phase().kind().is_final() {
-        if let Some(target) = &migration.status.target_node {
-            return abandon(
-                store,
-                dispatch,
-                &migration,
-                &vm,
-                target,
-                "migration cancelled".into(),
-            )
-            .await;
-        }
+    if migration.status.cancelling
+        && !migration.status.phase().kind().is_final()
+        && let Some(target) = &migration.status.target_node
+    {
+        return abandon(
+            store,
+            dispatch,
+            &migration,
+            &vm,
+            target,
+            "migration cancelled".into(),
+        )
+        .await;
     }
     match migration.status.phase().kind() {
         VmMigrationPhaseKind::Pending => {

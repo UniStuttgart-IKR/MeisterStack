@@ -380,16 +380,15 @@ impl Reconciler {
             if matches!(
                 record.operation,
                 Some(crate::types::Operation::MigratingOut { .. })
-            ) {
-                if let Some(attempt) = &record.migration {
-                    self.provisioner
-                        .observe_send(&id, &attempt.id, &self.ops)
-                        .await?;
-                    record = match self.store.get(&id)? {
-                        Some(r) => r,
-                        None => break,
-                    };
-                }
+            ) && let Some(attempt) = &record.migration
+            {
+                self.provisioner
+                    .observe_send(&id, &attempt.id, &self.ops)
+                    .await?;
+                record = match self.store.get(&id)? {
+                    Some(r) => r,
+                    None => break,
+                };
             }
             let observed = self.observe(&id, &record).await;
             if let Some(fresh) = self.quarantine_if_backend_died(&id, &record, &observed)? {

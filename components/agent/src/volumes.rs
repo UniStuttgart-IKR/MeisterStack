@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     fn empty_vm_record() -> crate::types::VmRecord {
-        let record = crate::types::VmRecord {
+        crate::types::VmRecord {
             spec: crate::types::AgentVmSpec {
                 vcpus: 1,
                 memory_mib: 64,
@@ -1150,8 +1150,7 @@ mod tests {
             devices: vec![],
             vmm_pid: None,
             overlay_bridges: Default::default(),
-        };
-        record
+        }
     }
 
     #[tokio::test]
