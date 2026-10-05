@@ -4,6 +4,11 @@
 
 # Build Cloud Hypervisor v53.0 with the repository's sorted patch series.
 # Generic vhost-user shared-memory regions are required by the GPU backends.
+# The series is Leandro's, rewritten against the vhost-user specification on
+# 2026-09-23 (vhost 0.17 for the frontend, SHMEM = protocol feature bit 22,
+# BACKEND_SEND_FD offered); it is the same series Leandro HEAD 73eb298 builds,
+# so both ends of the vhost-user channel negotiate SHMEM. Replace all three
+# files together: a backend on the old series (SHMEM = bit 21) never gets a window.
 { lib
 , rustPlatform
 , fetchFromGitHub
@@ -22,10 +27,13 @@ rustPlatform.buildRustPackage {
     rev = chVersion;
     hash = "sha256-fPTGf8bAITDA8QwllWbbGXA7tJ6p/SxRDfcBQVRvCTI=";
   };
-  # The patches touch no Cargo.lock, so the vendor hash is upstream's.
-  cargoHash = "sha256-+RbW/9ap/69MyODUk/bHBlH6ZuqYYIyKaarYSMQ2G7w=";
-  patches = lib.sort lib.lessThan (lib.filter (p: lib.hasSuffix ".patch" (toString p))
+  # Patch 0001 changes Cargo.lock (vhost 0.17 for the vhost-user frontend), so
+  # the series goes in as cargoPatches: they reach the vendoring derivation as
+  # well as the build, and the vendor hash below is the patched lock's, not
+  # upstream's. `patches` would leave the vendored crates on the old lock.
+  cargoPatches = lib.sort lib.lessThan (lib.filter (p: lib.hasSuffix ".patch" (toString p))
     (lib.filesystem.listFilesRecursive patchDir));
+  cargoHash = "sha256-E6aBvXcFhmkhKE0xK70KZsgdgkpgfY2+FMx6cNSlwq8=";
   # Check that the shared-memory patch marker remains in the source.
   postPatch = ''
     grep -q get_shmem_config virtio-devices/src/vhost_user/generic_vhost_user.rs \
