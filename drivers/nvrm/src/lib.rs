@@ -163,11 +163,29 @@ pub struct NvrmDriverConfig {
     pub vmm_user: Option<agent_api::VmmUser>,
 }
 
+/// What one backend counts as for admission.
+#[derive(Clone, Debug, PartialEq)]
+struct Claim {
+    /// Admitted VRAM in MiB; see [`NvrmParams::admitted_mib`].
+    mib: u64,
+    /// The type as `vgpuprofile` names it (`RTX2070-4Q`). A node may configure
+    /// `4Q` or `rtx2070-4q` for the same type, and the instance limit must
+    /// count all of them as one.
+    vgpu_type: Option<String>,
+}
+
+impl Claim {
+    fn of(params: &NvrmParams, vgpu: Option<&VgpuType>) -> Self {
+        Self {
+            mib: params.admitted_mib(vgpu),
+            vgpu_type: vgpu.map(|v| v.vgpu_type.clone()),
+        }
+    }
+}
+
 struct ActiveBackend {
     child: Backend,
-    /// What this backend counts as for admission (vGPU profile MiB).
-    admitted_mib: u64,
-    vgpu_type: Option<String>,
+    claim: Claim,
 }
 
 pub struct NvrmDriver {
@@ -283,43 +301,13 @@ impl NvrmDriver {
     async fn admit(
         &self,
         id: &DeviceId,
-        params: &NvrmParams,
+        want: &Claim,
         vgpu: Option<&VgpuType>,
-    ) -> device::Result<u64> {
+    ) -> device::Result<()> {
         let active = self.active.lock().await;
-
-        // Count the same effective parameters used to build the backend environment.
-        let wants = params.admitted_mib(vgpu);
-
-        if let Some(vgpu) = vgpu {
-            let same_type = active
-                .values()
-                .filter(|b| b.vgpu_type.as_deref() == Some(vgpu.vgpu_type.as_str()))
-                .count() as u64;
-            if same_type >= vgpu.max_instance {
-                return Err(DeviceError::InvalidSpec(format!(
-                    "vGPU type {} allows {} instance(s) on this card, {} already active",
-                    vgpu.vgpu_type, vgpu.max_instance, same_type
-                )));
-            }
-        }
-
-        let used: u64 = active.values().map(|b| b.admitted_mib).sum();
-        if let Some(budget) = self.config.vram_budget_mib {
-            if used + wants > budget {
-                return Err(DeviceError::InvalidSpec(format!(
-                    "vram budget exceeded: {used} MiB active + {wants} MiB requested > \
-                     {budget} MiB (device {id})"
-                )));
-            }
-        } else if used + wants > 0 {
-            debug!(
-                used_mib = used,
-                requested_mib = wants,
-                "no vram budget configured, admitting without a hard check"
-            );
-        }
-        Ok(wants)
+        let live: Vec<&Claim> = active.values().map(|b| &b.claim).collect();
+        refuse_instance_overflow(&live, vgpu)?;
+        refuse_budget_overrun(&live, want, self.config.vram_budget_mib, id)
     }
 
     /// Build typed and resolved environment settings, then add operator variables
@@ -373,6 +361,54 @@ impl NvrmDriver {
             env.push((k.clone(), v.clone()));
         }
         Ok(env)
+    }
+}
+
+/// Refuse one more backend of a vGPU type the card already holds `max_instance` of.
+fn refuse_instance_overflow(live: &[&Claim], vgpu: Option<&VgpuType>) -> device::Result<()> {
+    let Some(vgpu) = vgpu else {
+        return Ok(());
+    };
+    let same_type = live
+        .iter()
+        .filter(|c| c.vgpu_type.as_deref() == Some(vgpu.vgpu_type.as_str()))
+        .count() as u64;
+    if same_type >= vgpu.max_instance {
+        return Err(DeviceError::InvalidSpec(format!(
+            "vGPU type {} allows {} instance(s) on this card, {} already active",
+            vgpu.vgpu_type, vgpu.max_instance, same_type
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a backend that would take the live claims past the node's VRAM budget.
+fn refuse_budget_overrun(
+    live: &[&Claim],
+    want: &Claim,
+    budget: Option<u64>,
+    id: &DeviceId,
+) -> device::Result<()> {
+    let used: u64 = live.iter().map(|c| c.mib).sum();
+    let wants = want.mib;
+    match budget {
+        Some(budget) if used.saturating_add(wants) > budget => {
+            Err(DeviceError::InvalidSpec(format!(
+                "vram budget exceeded: {used} MiB active + {wants} MiB requested > \
+                 {budget} MiB (device {id})"
+            )))
+        }
+        Some(_) => Ok(()),
+        None => {
+            if used + wants > 0 {
+                debug!(
+                    used_mib = used,
+                    requested_mib = wants,
+                    "no vram budget configured, admitting without a hard check"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -518,7 +554,9 @@ impl DeviceDriver for NvrmDriver {
             None => None,
         };
 
-        let admitted_mib = self.admit(id, &params, vgpu.as_ref()).await?;
+        // Count the same effective parameters used to build the backend environment.
+        let claim = Claim::of(&params, vgpu.as_ref());
+        self.admit(id, &claim, vgpu.as_ref()).await?;
 
         let env = Self::backend_env(&params, vgpu.as_ref())?;
         debug!(
@@ -549,16 +587,12 @@ impl DeviceDriver for NvrmDriver {
                 },
             )
             .await?;
-        info!(pid, admitted_mib, "nvrm backend ready");
+        info!(pid, admitted_mib = claim.mib, "nvrm backend ready");
 
-        self.active.lock().await.insert(
-            *id,
-            ActiveBackend {
-                child,
-                admitted_mib,
-                vgpu_type: params.vgpu_type.clone(),
-            },
-        );
+        self.active
+            .lock()
+            .await
+            .insert(*id, ActiveBackend { child, claim });
 
         Ok(Device {
             id: *id,
@@ -759,6 +793,39 @@ mod tests {
 
         // And a device that asks for nothing costs nothing.
         assert_eq!(NvrmParams::default().admitted_mib(None), 0);
+    }
+
+    /// A resolved type as the card describes it, for admission tests.
+    fn resolved(vgpu_type: &str, profile_mib: u64, max_instance: u64) -> VgpuType {
+        VgpuType {
+            vgpu_type: vgpu_type.into(),
+            profile_mib,
+            fb_mib: profile_mib - 512,
+            max_instance,
+            encoder_cap: 50,
+        }
+    }
+
+    fn configured(vgpu_type: &str) -> NvrmParams {
+        NvrmParams {
+            vgpu_type: Some(vgpu_type.into()),
+            ..Default::default()
+        }
+    }
+
+    /// IKR-B13: the claim records the card's name for the type, so `4Q`,
+    /// `rtx2070-4q` and `RTX2070-4Q` all count against one instance limit.
+    #[test]
+    fn the_instance_limit_holds_however_the_type_was_spelled() {
+        let card_4q = resolved("RTX2070-4Q", 4096, 1);
+        for spelling in ["4Q", "rtx2070-4q", "RTX2070-4Q"] {
+            let running = Claim::of(&configured(spelling), Some(&card_4q));
+            assert_eq!(running.vgpu_type.as_deref(), Some("RTX2070-4Q"));
+            let said = refuse_instance_overflow(&[&running], Some(&card_4q))
+                .expect_err("the card holds one 4Q, whatever the first was called")
+                .to_string();
+            assert!(said.contains("allows 1 instance"), "{spelling}: {said}");
+        }
     }
 
     #[test]
