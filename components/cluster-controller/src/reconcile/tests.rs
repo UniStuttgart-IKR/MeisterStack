@@ -2751,3 +2751,125 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
     assert_eq!(next_for(&held), Next::Settled);
     assert!(held.status.phase().message().is_none());
 }
+
+/// A store under a fresh prefix of the test etcd, for the release tests below.
+async fn release_test_store() -> EtcdStore {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/release-test/{}", uuid::Uuid::new_v4());
+    EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to")
+}
+
+/// A pass with no nodes and nothing held: what the release paths need of one.
+fn release_pass<'a>(
+    store: &'a EtcdStore,
+    registry: &'a SessionRegistry,
+    connected: &'a HashSet<String>,
+) -> Pass<'a> {
+    Pass {
+        store,
+        registry,
+        scheduler: &controller_api::FirstFit,
+        requeue: &controller_api::requeue::NoRequeue,
+        sessions: connected,
+        nodes: std::sync::Mutex::new(Vec::new()),
+        pending: PendingTally::new(),
+        kek: None,
+        held: &[],
+        overcommit: controller_api::Overcommit::default(),
+    }
+}
+
+/// A volume recreated under the same name after the listing survives the old one's release:
+/// its finalizer stays and it is not deleted. (R2-2)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
+    let store = release_test_store().await;
+    let mut old = controller_api::resources::new_volume("data", Default::default());
+    old.metadata.deletion_timestamp = Some(Utc::now());
+    let listed = store.create(&old).await.expect("the old volume");
+    store
+        .delete::<Volume>("data")
+        .await
+        .expect("the old volume goes");
+    let fresh = store
+        .create(&controller_api::resources::new_volume(
+            "data",
+            Default::default(),
+        ))
+        .await
+        .expect("a new volume under the same name");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    release(&release_pass(&store, &registry, &connected), &listed)
+        .await
+        .expect("the old release");
+
+    let still: Volume = store.get("data").await.expect("the new volume");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
+    assert!(
+        still
+            .metadata
+            .finalizers
+            .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string())
+    );
+}
+
+/// A snapshot recreated under the same name after the listing survives the old one's drop.
+/// (R2-2)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
+    let store = release_test_store().await;
+    let spec = controller_api::VolumeSnapshotSpec {
+        volume: "data".into(),
+        ..Default::default()
+    };
+    let mut old = controller_api::resources::new_volume_snapshot("snap", spec.clone());
+    old.metadata.deletion_timestamp = Some(Utc::now());
+    let listed = store.create(&old).await.expect("the old snapshot");
+    store
+        .delete::<VolumeSnapshot>("snap")
+        .await
+        .expect("the old snapshot goes");
+    let fresh = store
+        .create(&controller_api::resources::new_volume_snapshot(
+            "snap", spec,
+        ))
+        .await
+        .expect("a new snapshot under the same name");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    drop_snapshot(&release_pass(&store, &registry, &connected), &listed)
+        .await
+        .expect("the old drop");
+
+    let still: VolumeSnapshot = store.get("snap").await.expect("the new snapshot");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
+}
+
+/// The listed volume itself still goes: the guard is a guard, not a wall. (R2-2)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_volume_nothing_holds_is_released_and_deleted() {
+    let store = release_test_store().await;
+    let mut old = controller_api::resources::new_volume("data", Default::default());
+    old.metadata.deletion_timestamp = Some(Utc::now());
+    let listed = store.create(&old).await.expect("a deleting volume");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    release(&release_pass(&store, &registry, &connected), &listed)
+        .await
+        .expect("the release");
+
+    assert!(matches!(
+        store.get::<Volume>("data").await,
+        Err(StoreError::NotFound(_))
+    ));
+}

@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod capacity;
 pub mod command;
+pub mod deletion;
 pub mod drain;
 pub mod events;
 pub mod floating;

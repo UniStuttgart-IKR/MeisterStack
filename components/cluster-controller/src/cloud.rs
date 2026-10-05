@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use controller_api::{
-    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume,
+    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion,
     resources::{new_vm, new_volume},
 };
 use proto::cluster_plane_client::ClusterPlaneClient;
@@ -1359,16 +1359,40 @@ async fn handle_release_volume(store: &EtcdStore, r: proto::ReleaseVolume) -> an
     if let Some(holder) = &current.status.attached_to {
         bail!("volume {} is still attached to vm {holder} here", r.name);
     }
-    store
-        .mutate::<Volume, _>(&r.name, |v| {
-            v.metadata
-                .finalizers
-                .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
-        })
-        .await?;
-    store.delete::<Volume>(&r.name).await?;
-    info!(volume = %r.name, "record released for the cloud; the bytes are untouched");
-    Ok(())
+    release_record(store, &current, &r).await
+}
+
+/// Release the record that was checked, on the revision it was judged at (R2-2, R3-F02).
+///
+/// The finalizer comes off `checked`'s uid only while the fresh revision is still the cloud's
+/// and unattached, and the delete names the revision that write produced. A record that went
+/// or became another volume's in between is a release done; one still here is a refusal the
+/// cloud retries, never an ack for bytes another cluster would then reopen.
+async fn release_record(
+    store: &EtcdStore,
+    checked: &Volume,
+    r: &proto::ReleaseVolume,
+) -> anyhow::Result<()> {
+    let releasable = |v: &Volume| {
+        v.metadata.cloud_uid() == Some(r.uid.as_str()) && v.status.attached_to.is_none()
+    };
+    let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+    if deletion::release_and_delete(store, checked, finalizer, releasable).await? {
+        info!(volume = %r.name, "record released for the cloud; the bytes are untouched");
+        return Ok(());
+    }
+    match store.get::<Volume>(&r.name).await {
+        Err(StoreError::NotFound(_)) => Ok(()),
+        Ok(v) if v.metadata.cloud_uid() != Some(r.uid.as_str()) => Ok(()),
+        Ok(v) => match v.status.attached_to {
+            Some(holder) => bail!("volume {} is still attached to vm {holder} here", r.name),
+            None => bail!(
+                "volume {} changed while it was released; not released yet",
+                r.name
+            ),
+        },
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Result<()> {
@@ -2851,5 +2875,87 @@ mod tests {
         let held: Volume = store.get("data").await.expect("the volume");
         assert_eq!(held.spec.size_gib, 20);
         assert_eq!(held.metadata.generation, 2);
+    }
+
+    async fn release_test_store() -> EtcdStore {
+        let endpoint = std::env::var("MEISTER_TEST_ETCD")
+            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+        let prefix = format!("/cloud-release-test/{}", uuid::Uuid::new_v4());
+        EtcdStore::connect(&[endpoint], &prefix)
+            .await
+            .expect("an etcd to talk to — see the note above")
+    }
+
+    fn create_volume(uid: &str) -> proto::CreateVolume {
+        proto::CreateVolume {
+            name: "data".into(),
+            spec_json: serde_json::to_string(&controller_api::VolumeSpec {
+                pool: "fast".into(),
+                size_gib: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+            uid: uid.into(),
+            tenant: "acme".into(),
+        }
+    }
+
+    /// A release judged on a record that was replaced under the same name before the write
+    /// takes nothing from the new record: its finalizer stays and it is not deleted. (R2-2)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see the note above"]
+    async fn a_release_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = release_test_store().await;
+        handle_create_volume(&store, create_volume("u-1"))
+            .await
+            .expect("the cloud's volume");
+        let checked: Volume = store
+            .get("data")
+            .await
+            .expect("the record the release read");
+        store.delete::<Volume>("data").await.expect("it goes");
+        handle_create_volume(&store, create_volume("u-2"))
+            .await
+            .expect("another cloud volume under the same name");
+        let release = proto::ReleaseVolume {
+            name: "data".into(),
+            uid: "u-1".into(),
+        };
+
+        release_record(&store, &checked, &release)
+            .await
+            .expect("nothing of u-1 is left here, which is a release done");
+
+        let still: Volume = store.get("data").await.expect("the new record");
+        assert_eq!(still.metadata.uid, "u-2");
+        assert!(
+            still
+                .metadata
+                .finalizers
+                .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string())
+        );
+    }
+
+    /// The record the release names goes, finalizer and all: the guard is not a wall. (R2-2)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see the note above"]
+    async fn a_release_of_the_current_record_removes_it() {
+        let store = release_test_store().await;
+        handle_create_volume(&store, create_volume("u-1"))
+            .await
+            .expect("the cloud's volume");
+        let release = proto::ReleaseVolume {
+            name: "data".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_release_volume(&store, release)
+            .await
+            .expect("released");
+
+        assert!(matches!(
+            store.get::<Volume>("data").await,
+            Err(StoreError::NotFound(_))
+        ));
     }
 }

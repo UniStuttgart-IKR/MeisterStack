@@ -551,7 +551,7 @@ pub(super) async fn finish_volume_delete(
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let concluded = |v: &Volume| volume_gone(v, cluster, status, at);
-    if finish_delete(store, volume, concluded).await? {
+    if controller_api::deletion::finish_delete(store, volume, concluded).await? {
         info!(volume = %volume.metadata.name, cluster, "volume deleted");
     }
     Ok(())
@@ -605,7 +605,7 @@ pub(super) async fn finish_snapshot_delete(
     let concluded = |s: &controller_api::VolumeSnapshot| {
         s.spec.volume == volume && snapshot_gone(s, status, at)
     };
-    if finish_delete(store, snapshot, concluded).await? {
+    if controller_api::deletion::finish_delete(store, snapshot, concluded).await? {
         info!(snapshot = %snapshot.metadata.name, cluster, "snapshot deleted");
     }
     Ok(())
@@ -624,50 +624,6 @@ pub(super) fn snapshot_gone(
             snapshot.status.observed_at,
             at,
         )
-}
-
-/// Retry bound for a guarded delete after concurrent writes; the same bound `mutate` uses.
-const FINISH_DELETE_ATTEMPTS: usize = 8;
-
-/// Delete `checked` by the revision it was judged at, never by name alone.
-///
-/// `concluded` is asked of the exact revision the delete names. On a conflict the object is
-/// re-read and the delete retried only if it is still the same uid and the verdict still
-/// holds; anything else ends it. `true` means this call removed the object. (R3-F02)
-async fn finish_delete<T: Resource>(
-    store: &EtcdStore,
-    checked: &T,
-    concluded: impl Fn(&T) -> bool,
-) -> anyhow::Result<bool> {
-    let name = checked.metadata().name.clone();
-    let uid = checked.metadata().uid.clone();
-    let mut current = checked.clone();
-    for _ in 0..FINISH_DELETE_ATTEMPTS {
-        if !concluded(&current) {
-            return Ok(false);
-        }
-        match store
-            .delete_if::<T>(&name, &current.metadata().resource_version)
-            .await
-        {
-            Ok(()) => return Ok(true),
-            Err(StoreError::Conflict(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        match store.get::<T>(&name).await {
-            Ok(fresh) if fresh.metadata().uid == uid => current = fresh,
-            Ok(_) => {
-                debug!(resource = T::RESOURCE, name = %name,
-                       "recreated under the same name while its delete was finishing; left alone");
-                return Ok(false);
-            }
-            Err(StoreError::NotFound(_)) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    warn!(resource = T::RESOURCE, name = %name,
-          "finishing a delete kept losing to concurrent writes; the next report tries again");
-    Ok(false)
 }
 
 /// What a reported name amounts to. Empty is silence — a cluster that has not

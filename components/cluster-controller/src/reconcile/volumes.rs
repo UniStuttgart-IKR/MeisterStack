@@ -726,24 +726,33 @@ pub(super) async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()>
             note_volume_releasing(p, volume, holder.sentence()).await
         }
         Release::WaitingForNode(node) => deprovision_volume(p, volume, node).await,
-        Release::Drop => {
-            // Before the object goes, because the table is keyed by its uid:
-            // once it is deleted there is nothing left to look the claim up
-            // by. The DATA on the namespace is untouched — an import provider
-            // made none of it and destroys none of it.
-            namespaces::give_back(p.store, volume).await;
-            p.store
-                .mutate::<Volume, _>(name, |v| {
-                    v.metadata
-                        .finalizers
-                        .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
-                })
-                .await?;
-            p.store.delete::<Volume>(name).await?;
-            info!(volume = %name, "volume released; nothing holds its bytes any more");
-            Ok(())
-        }
+        Release::Drop => drop_volume(p, volume, &snapshots).await,
     }
+}
+
+/// Carry out `Release::Drop` on the revision it was decided for (R2-2, R3-F02).
+///
+/// The finalizer comes off the listed uid only while the fresh revision still drops, and the
+/// delete names the revision that write produced: a volume recreated under the same name, or
+/// one a holder took in between, is left for the next pass. The namespace claim goes back
+/// between the two, once the object is committed to going and before it is deleted, because
+/// the table is keyed by its uid. The DATA on the namespace is untouched — an import provider
+/// made none of it and destroys none of it.
+async fn drop_volume(p: &Pass<'_>, volume: &Volume, snapshots: &[String]) -> anyhow::Result<()> {
+    let name = &volume.metadata.name;
+    let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+    let drops = |v: &Volume| {
+        v.metadata.deletion_timestamp.is_some() && release_action(v, snapshots) == Release::Drop
+    };
+    let Some(written) = deletion::take_finalizer(p.store, volume, finalizer, &drops).await? else {
+        debug!(volume = %name, "the volume moved on since it was listed; the next pass decides");
+        return Ok(());
+    };
+    namespaces::give_back(p.store, volume).await;
+    if deletion::finish_release(p.store, &written, finalizer, drops).await? {
+        info!(volume = %name, "volume released; nothing holds its bytes any more");
+    }
+    Ok(())
 }
 
 /// Deletion decision derived from recorded holders and node placement.

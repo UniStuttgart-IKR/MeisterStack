@@ -25,6 +25,7 @@ use proto::command;
 use tracing::{debug, error, info, warn};
 
 use controller_api::EventType;
+use controller_api::deletion;
 use controller_api::events::{self, Happening};
 
 use crate::session::SessionRegistry;

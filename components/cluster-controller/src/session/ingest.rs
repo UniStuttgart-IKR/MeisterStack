@@ -829,42 +829,22 @@ pub(super) async fn ingest_snapshots(
                 // The finalizer comes off the object the report named (uid), only while it is still
                 // being deleted and on this node; the delete then names the revision that write
                 // produced, so a snapshot recreated in between survives. (R3-F02, R3-F03)
-                let mut applied = false;
-                let written = store
-                    .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
-                        applied = s.metadata.deletion_timestamp.is_some()
-                            && s.status.node.as_deref() == Some(node_id);
-                        if applied {
-                            s.metadata
-                                .finalizers
-                                .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
-                        }
-                    })
-                    .await;
-                let written = match written {
-                    Ok(written) if applied => written,
-                    Ok(_) => {
-                        debug!(snapshot = %name, node = node_id,
-                               "the snapshot moved on between the listing and the write; left alone");
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(snapshot = %name, node = node_id, error = format!("{e:#}"),
-                              "taking the finalizer off failed");
-                        continue;
-                    }
+                let gone_here = |s: &VolumeSnapshot| {
+                    s.metadata.deletion_timestamp.is_some()
+                        && s.status.node.as_deref() == Some(node_id)
                 };
-                match store
-                    .delete_if::<VolumeSnapshot>(&name, &written.metadata.resource_version)
-                    .await
+                let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+                match controller_api::deletion::release_and_delete(
+                    store, snapshot, finalizer, gone_here,
+                )
+                .await
                 {
-                    Ok(()) => {
+                    Ok(true) => {
                         info!(snapshot = %name, node = node_id, "snapshot deleted; the copy is gone")
                     }
-                    // Written since the finalizer came off; the next report judges that revision.
-                    Err(StoreError::Conflict(_)) => {
+                    Ok(false) => {
                         debug!(snapshot = %name, node = node_id,
-                               "the snapshot changed after its finalizer came off; the next report deletes it")
+                               "the snapshot moved on since it was listed; the next report decides")
                     }
                     Err(e) => return Err(e.into()),
                 }
