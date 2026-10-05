@@ -254,7 +254,6 @@ pub fn enroll(
     })
 }
 
-
 /// Add a retirement comment while retaining the enrolled host key.
 /// This preserves replacement history; it does not revoke SSH trust.
 /// Return false if the host has no matching entry.
@@ -297,7 +296,6 @@ pub fn mark_retired(
     files.write_atomic(known_hosts, text.as_bytes(), 0o644)?;
     Ok(true)
 }
-
 
 /// The host a `known_hosts` line is about, past a `@cert-authority` or
 /// `@revoked` marker. `None` for a comment or an empty line.
@@ -388,7 +386,6 @@ pub fn csr_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
 pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
     repo.join(ISSUED_DIR).join(host_id).join(file)
 }
-
 
 /// Repository copy of the fleet CRL, public and suitable for version control.
 pub const CRL_FILE: &str = "pki/crl.pem";
@@ -727,7 +724,6 @@ pub struct Subject {
     pub sans: Vec<String>,
 }
 
-
 /// Infer client identity kind from reserved CN prefixes; otherwise use Serving.
 pub fn kind_from_cn(cn: &str) -> CaKind {
     match cn {
@@ -747,7 +743,6 @@ pub fn cn_of(subject: &str) -> Option<String> {
         .map(str::trim)
         .find_map(|field| field.strip_prefix("CN=").map(|cn| cn.trim().to_string()))
 }
-
 
 /// Return candidate identity kinds from host roles. All tiers use the same
 /// identity key/certificate paths, so mixed-role hosts require an explicit choice;

@@ -839,7 +839,6 @@ impl<'a> Installer<'a> {
                  enroll {} --fingerprint {}`.",
                 target.host, installed.host_key_fingerprint
             ),
-
         };
         outcome.installed = Some(installed);
         Ok(outcome)
@@ -1038,7 +1037,6 @@ pub fn sheet(record: &MediaRecord, target: &SheetFacts) -> String {
              machine that brings its own, and this flake installs none for it.\n",
             record.host
         ),
-
     });
     if !target.preserve.is_empty() {
         out.push_str(&format!(

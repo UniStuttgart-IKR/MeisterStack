@@ -207,7 +207,6 @@ pub enum BootMode {
     /// An existing GRUB loader boots the host. Activation can roll back by switching;
     /// automated boot fallback is unavailable.
     Grub,
-
 }
 
 impl BootMode {

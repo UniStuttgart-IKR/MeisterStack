@@ -114,7 +114,6 @@ pub enum ActionKind {
     KeysVerify,
     /// What the switch replaced goes away.
     KeysRemove,
-
 }
 
 impl ActionKind {
@@ -142,7 +141,6 @@ impl ActionKind {
             ActionKind::KeysSwitch => "keys-switch",
             ActionKind::KeysVerify => "keys-verify",
             ActionKind::KeysRemove => "keys-remove",
-
         }
     }
 
@@ -395,7 +393,6 @@ pub struct Action {
     /// actions preserves existing plan hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
-
 }
 
 impl Action {
@@ -581,7 +578,6 @@ pub struct DeploymentPlan {
     /// hashes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rotations: BTreeMap<String, KeyRotation>,
-
 }
 
 /// One key rotation: which key, which certificate, and what the host has to
@@ -910,7 +906,6 @@ pub struct PlanPolicy {
     /// Prepared host keys and locally issued certificates. Preparation occurs before this
     /// pure planning step.
     pub rotations: BTreeMap<String, KeyRotation>,
-
 }
 
 impl PlanPolicy {
@@ -925,7 +920,6 @@ impl PlanPolicy {
             expected_credentials: BTreeMap::new(),
 
             rotations: BTreeMap::new(),
-
         }
     }
 
@@ -953,7 +947,6 @@ impl PlanPolicy {
         self.reinstall = reinstall;
         self
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,10 +1161,10 @@ pub fn plan(
                 granted_at: None,
             })
             .collect(),
-                // Only an install can reinstall; saying `false` anywhere else keeps
+        // Only an install can reinstall; saying `false` anywhere else keeps
         // the field from being a switch somebody could flip on an upgrade.
         reinstall: policy.kind == PlanKind::Install && policy.reinstall,
-                // Only a rotation rotates, and only for the hosts it is about.
+        // Only a rotation rotates, and only for the hosts it is about.
         rotations: if policy.kind == PlanKind::KeysRotate {
             policy
                 .rotations
@@ -1182,7 +1175,6 @@ pub fn plan(
         } else {
             BTreeMap::new()
         },
-
     };
     plan.plan_id = plan.content_id()?;
     for approval in &mut plan.approvals {
@@ -3131,9 +3123,7 @@ fn steps_for(
                 .from("held by this run")
                 .to("free"),
         );
-    } else
-
-    if policy.kind == PlanKind::Install {
+    } else if policy.kind == PlanKind::Install {
         specs = install_specs(release, id, decision);
     } else if decision.verdict == HostVerdict::Unchanged {
         // Unchanged hosts receive preflight and verify only.
@@ -3214,7 +3204,6 @@ fn steps_for(
                     want.filter(|w| w.starts_with("sha256:"))
                         .map(|w| w.to_string()),
                 )
-
                 .because(match seen.flatten() {
                     Some(None) | None => format!(
                         "{id} has no {} and the fleet says it needs one",
@@ -3414,12 +3403,9 @@ fn steps_for(
     // the edges; everything else on the host is ordered by the wave and by
     // the host being its own parallel group.
     let carries_edges = if policy.kind == PlanKind::Install {
-
         ActionKind::Install
-
     } else if policy.kind == PlanKind::KeysRotate {
         ActionKind::KeysSwitch
-
     } else if decision.reboot_only {
         ActionKind::Reboot
     } else {
@@ -3485,7 +3471,6 @@ fn steps_for(
             } else {
                 None
             },
-
         });
     }
     (actions, needed)

@@ -816,7 +816,6 @@ pub enum Step {
     AtTheProviderReboot,
 }
 
-
 /// Select remaining rotation actions from the target record and local publication.
 /// Target phases describe file state, not completion of service restarts.
 ///
@@ -1486,7 +1485,6 @@ mod tests {
         run
     }
 
-
     /// The five phases leave five different things on a host's disk, and
     /// that is what a resume reads. The journal is asked one thing only:
     /// did THIS run already switch.
@@ -1692,7 +1690,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn a_host_this_run_already_finished_stays_finished_after_its_record_is_gone() {
         // A host already unlocked before a later provider handoff remains done,
@@ -1720,7 +1717,6 @@ mod tests {
             Step::RecoveryRequired(_)
         ));
     }
-
 
     #[test]
     fn a_confirmation_that_did_not_finish_resumes_into_the_confirm() {

@@ -1705,8 +1705,6 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
-
-
     #[test]
     fn a_cache_without_a_signing_key_is_refused_before_anything_is_built() {
         let mut fleet = one_host();
@@ -1967,8 +1965,6 @@ mod tests {
             runner.calls()
         );
     }
-
-
 
     #[test]
     fn a_green_build_binds_what_the_manifest_promised() {

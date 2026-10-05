@@ -890,7 +890,6 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     );
 }
 
-
 /// Add cache provenance without changing release identity.
 fn changing_with_a_cache(cache: Option<&str>) -> Fixture {
     let mut fx = Fixture::changing(&["n1"], false);
@@ -1039,7 +1038,6 @@ fn a_target_that_names_no_substituter_is_pushed_to_even_when_there_is_a_cache() 
     );
     a_plain_copy_is_what_happens(fx, "n2", "10.0.0.12");
 }
-
 
 #[test]
 fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
@@ -1415,7 +1413,6 @@ fn a_resume_whose_target_knows_nothing_repeats_nothing_and_asks_for_a_person() {
     let stopped = applied.stopped.expect("it stopped");
     assert!(stopped.contains("no transaction record"), "{stopped}");
 }
-
 
 /// A journal of a run in which `n1` went all the way through and gave its
 /// lock and its transaction record back — which is what the `unlock` step
@@ -1983,7 +1980,6 @@ fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
         anchor.line()
     );
 }
-
 
 #[test]
 fn a_resume_of_another_plan_is_refused_by_name() {
@@ -3097,7 +3093,6 @@ fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
     run.state = HostState::Verifying;
     assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
 }
-
 
 #[test]
 fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {

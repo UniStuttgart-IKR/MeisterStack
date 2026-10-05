@@ -384,7 +384,6 @@ fn a_run_that_changes_nothing_still_takes_the_anchor_and_writes_its_receipt() {
     );
 }
 
-
 #[test]
 fn a_resume_finds_the_plan_and_the_release_in_the_run_s_own_directory() {
     // Persist the release in the run directory so resume survives replacement
@@ -451,7 +450,6 @@ fn apply_without_a_plan_and_without_a_resume_says_which_one_is_missing() {
         stderr(&out)
     );
 }
-
 
 #[test]
 fn a_second_operator_is_refused_by_the_state_directory() {
