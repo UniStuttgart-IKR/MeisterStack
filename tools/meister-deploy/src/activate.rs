@@ -1597,7 +1597,7 @@ impl<'a> Helper<'a> {
             ),
             KeyLayout::RevertStopped => format!(
                 "the {kind} key files on this host are a revert that stopped in the middle: \
-                 {files}. The pair that was in use before the switch is whole in `.prev`; \
+                 {files}. The pair that was in use before the switch is whole; \
                  `meister-activate keys revert --kind {kind}` finishes putting it back."
             ),
             KeyLayout::RemoveStopped => format!(
@@ -1759,24 +1759,20 @@ impl<'a> Helper<'a> {
     }
 
     /// Restore the `.prev` pair and discard the current pair; retain the rollback reason.
+    /// A revert that stopped part of the way is finished by running it again.
     pub fn keys_revert(&self, kind: KeyKind, because: Option<&str>) -> Result<KeysRecord> {
-        let key_prev = self.key_path_with(kind, Some("prev"));
-        let crt_prev = self.cert_path_with(kind, Some("prev"));
-        if !self.files.exists(&key_prev) || !self.files.exists(&crt_prev) {
-            bail!(
-                "there is nothing to go back to for {kind}: {} and {} are not both here. A \
-                 rotation that has not switched is taken back by deleting the `.next` pair, \
-                 and one that has been confirmed cannot be taken back at all.",
-                key_prev.display(),
-                crt_prev.display()
-            );
+        match self.key_files(kind).layout() {
+            KeyLayout::Switched | KeyLayout::RevertStopped => {}
+            _ => bail!(
+                "there is nothing to go back to for {kind}: the files on this host ({}) are \
+                 not a switch with the old pair whole beside it. A rotation that has not \
+                 switched is taken back by deleting the `.next` pair, and one that has been \
+                 confirmed cannot be taken back at all.",
+                self.key_files_listed(kind)
+            ),
         }
-        let key = self.key_path_with(kind, None);
+        self.put_the_old_pair_back(kind)?;
         let crt = self.cert_path_with(kind, None);
-        self.files.remove_file(&crt)?;
-        self.files.remove_file(&key)?;
-        self.files.rename(&key_prev, &key)?;
-        self.files.rename(&crt_prev, &crt)?;
 
         let now = self.clock.now();
         let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
@@ -1790,6 +1786,27 @@ impl<'a> Helper<'a> {
         record.changed_at = now;
         self.write_keys_record(&record)?;
         Ok(record)
+    }
+
+    /// Drop each half of the new pair before its old half comes back. While
+    /// `.prev` holds the old certificate, a certificate in use is the new
+    /// one, and while it holds the old key, so is a key in use; every step is
+    /// skipped once it is done.
+    fn put_the_old_pair_back(&self, kind: KeyKind) -> Result<()> {
+        let key = self.key_path_with(kind, None);
+        let crt = self.cert_path_with(kind, None);
+        let key_prev = self.key_path_with(kind, Some("prev"));
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        if self.files.exists(&crt) {
+            self.files.remove_file(&crt)?;
+        }
+        if self.files.exists(&key_prev) {
+            if self.files.exists(&key) {
+                self.files.remove_file(&key)?;
+            }
+            self.files.rename(&key_prev, &key)?;
+        }
+        self.files.rename(&crt_prev, &crt)
     }
 
     /// The last step: the pair that was replaced is dropped and the record
@@ -2001,10 +2018,10 @@ impl KeyFiles {
             | (false, false, true, true, true, true)
             | (true, false, false, true, true, true) => KeyLayout::SwitchStopped,
             (true, true, false, false, true, true) => KeyLayout::Switched,
-            // The new certificate is gone; the new key too.
-            (true, false, false, false, true, true) | (false, false, false, false, true, true) => {
-                KeyLayout::RevertStopped
-            }
+            // The new certificate is gone; the new key too; the old key is back.
+            (true, false, false, false, true, true)
+            | (false, false, false, false, true, true)
+            | (true, false, false, false, false, true) => KeyLayout::RevertStopped,
             (true, true, false, false, false, true) => KeyLayout::RemoveStopped,
             _ => KeyLayout::Unknown,
         }
@@ -3811,6 +3828,37 @@ mod tests {
             let reason = view.reason.unwrap_or_default();
             assert!(reason.contains("keys revert"), "{there:?}: {reason}");
         }
+    }
+
+    /// Stopped between its renames, a revert leaves the old key in use and
+    /// the old certificate aside. Neither half is lost, and running the
+    /// revert again finishes it.
+    #[test]
+    fn a_revert_stopped_between_its_renames_is_finished_by_running_it_again() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = key_layout(&[("key", "old"), ("crt.prev", "old")]);
+        let helper = helper(&runner, &files, &clock);
+        let view = helper.keys_status(KeyKind::Identity).unwrap();
+        assert_eq!(view.state, KeysState::Inconsistent);
+        assert!(view.reason.unwrap_or_default().contains("keys revert"));
+
+        let record = helper
+            .keys_revert(KeyKind::Identity, Some("the session did not come back"))
+            .unwrap();
+        assert_eq!(record.state, KeysState::Reverted);
+        let whole = key_layout(&[("key", "old"), ("crt", "old")]);
+        assert_eq!(
+            files.paths().len(),
+            whole.paths().len() + 1,
+            "and the record"
+        );
+        for path in whole.paths() {
+            assert_eq!(files.content(&path), whole.content(&path), "{path:?}");
+        }
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
     }
 
     /// `keys remove` deletes `.prev` only behind a whole new pair in use;

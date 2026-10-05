@@ -200,19 +200,17 @@ fn pinned(known: &[(usize, &str)]) -> Vec<(usize, String)> {
 #[test]
 fn every_crash_in_keys_switch_is_resolvable() {
     // Open: a crash between the last two renames (activate.rs:1651-1652)
-    // cannot be finished (no `.key.next`), and the revert that can run
-    // leaves `.crt.next` for a key it deleted.
-    let known = [(3, "recovered: Old in use, status inconsistent")];
+    // cannot be finished (no `.key.next`), and a revert refuses a switch
+    // that stopped in the middle.
+    let known = [(3, "recovered: no whole pair, status inconsistent")];
     assert_eq!(key_crashes(KeyVerb::Switch), pinned(&known));
 }
 
 #[test]
 fn every_crash_in_keys_revert_is_resolvable() {
-    // Open: between the renames (:1689-1690) no verb can finish the way
-    // back; and a revert that finished its renames but not its record
-    // (:1702) reads `none`.
+    // Open: a revert that finished its renames but not its record (:1702)
+    // reads `none`.
     let known = [
-        (3, "recovered: no whole pair, status inconsistent"),
         (4, "recovered: Old in use, status none"),
         (5, "recovered: Old in use, status none"),
     ];
