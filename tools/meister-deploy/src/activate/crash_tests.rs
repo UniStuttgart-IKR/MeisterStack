@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::effects::cut::{CutFiles, CutPoint, CutRunner, Mode as Cut, Op};
-use crate::effects::{FakeClock, MemFiles};
+use crate::effects::{FakeClock, MemFiles, ProcessState};
 use crate::run::{Output, Policy, StrictFake};
 
 const TOP: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-box-25.11";
@@ -30,16 +30,30 @@ fn clock() -> FakeClock {
 }
 
 /// One incarnation of `meister-activate`. Every earlier one has crashed, so
-/// only its own pid is alive.
+/// only its own pid runs, started at a tick of its own in the one boot.
 struct FakeProcesses(u32);
+
+fn started(pid: u32) -> ProcessState {
+    ProcessState::Running {
+        start: u64::from(pid) * 100,
+    }
+}
 
 impl Processes for FakeProcesses {
     fn own_pid(&self) -> u32 {
         self.0
     }
 
-    fn alive(&self, pid: u32) -> bool {
-        pid == self.0
+    fn boot_id(&self) -> Option<String> {
+        Some("boot-1".to_string())
+    }
+
+    fn state_of(&self, pid: u32) -> ProcessState {
+        if pid == self.0 {
+            started(pid)
+        } else {
+            ProcessState::Gone
+        }
     }
 }
 
@@ -576,8 +590,8 @@ fn land_then_fail_at_k_leaves_what_refuse_leaves_at_k_plus_one() {
     }
 }
 
-/// DCT-H1: a crashed holder's pid, recycled by an unrelated process, reads
-/// as alive to `kill(pid, 0)`.
+/// DCT-H1: a crashed holder's pid 1, recycled by an unrelated process that
+/// started later. `kill(1, 0)` says "running"; the start time does not match.
 struct Recycled(u32);
 
 impl Processes for Recycled {
@@ -585,23 +599,30 @@ impl Processes for Recycled {
         self.0
     }
 
-    fn alive(&self, pid: u32) -> bool {
-        pid == self.0 || pid == 1
+    fn boot_id(&self) -> Option<String> {
+        Some("boot-1".to_string())
+    }
+
+    fn state_of(&self, pid: u32) -> ProcessState {
+        match pid {
+            1 => ProcessState::Running { start: 99_999 },
+            pid if pid == self.0 => started(pid),
+            _ => ProcessState::Gone,
+        }
     }
 }
 
 #[test]
-fn a_recycled_pid_in_a_dead_holders_lock_disarms_the_dead_man() {
-    // Pins open hypothesis DCT-H1: confirm dies holding the lock (cut at 2,
-    // before any decision), its pid is reused, and the deadline gives up
-    // after DEADLINE_PATIENCE (activate.rs:984-990): pending, no timer.
+fn a_recycled_pid_does_not_keep_a_dead_holders_lock() {
+    // Confirm dies holding the lock (cut at 2, before any decision) and its
+    // pid goes to another process: the deadline takes the lock over and
+    // takes the machine back.
     let host = Host::waiting_for_confirm();
     let cut = CutPoint::new(Cut::Refuse);
     cut.arm_after(2);
     confirm_through(&host, &cut);
     timer_fires(&host, &Recycled(2));
     resume(&host, &Recycled(3));
-    assert_eq!(host.record().map(|r| r.state), Some(TxnState::Pending));
-    assert!(!host.machine.borrow().timer_active);
-    assert!(settled(&host, false)[0].starts_with("I-A1: pending"));
+    assert_eq!(host.record().map(|r| r.state), Some(TxnState::Reverted));
+    assert_eq!(settled(&host, false), Vec::<String>::new());
 }

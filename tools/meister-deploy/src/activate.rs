@@ -19,7 +19,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::effects::{Clock, Entry, Files};
+use crate::effects::{Clock, Entry, Files, ProcessState, Processes, RealProcesses};
 use crate::ids::sha256_hex;
 use crate::observation::{BootedKernel, Lock, Txn, TxnState};
 use crate::observe::{ACTIVATE_STATUS_SCHEMA, ActivateStatus};
@@ -214,45 +214,82 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
-/// <time>`. `None` for anything this program did not write.
-fn deciding_pid(held: &str) -> Option<u32> {
-    let rest = held.split_once(" pid ")?.1;
-    let digits = rest.split_whitespace().next()?;
-    digits.parse().ok()
+/// The process a `<id>.deciding` file names. A pid alone is reused, so
+/// the lock also carries when the kernel started that pid and in which
+/// boot: `<verb> pid <n> start <ticks> boot <id> at <time>`. A lock written
+/// before start and boot were recorded, or by a process that could not read
+/// its own, names the pid alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holder {
+    pid: u32,
+    start: Option<u64>,
+    boot: Option<String>,
 }
 
-/// Check local process existence with signal 0; EPERM also means the process exists.
-fn is_running(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Ok(()) | Err(nix::errno::Errno::EPERM)
-    )
-}
-
-/// Process identity and liveness behind the decision lock, injectable so a test
-/// can model a crashed holder and its successor.
-pub trait Processes {
-    fn own_pid(&self) -> u32;
-    fn alive(&self, pid: u32) -> bool;
-}
-
-/// This process and the kernel's process table.
-pub struct RealProcesses;
-
-impl Processes for RealProcesses {
-    fn own_pid(&self) -> u32 {
-        std::process::id()
+impl Holder {
+    /// This process, as the kernel names it.
+    fn me(processes: &dyn Processes) -> Holder {
+        let pid = processes.own_pid();
+        let start = match processes.state_of(pid) {
+            ProcessState::Running { start } => Some(start),
+            ProcessState::Gone | ProcessState::Unreadable => None,
+        };
+        Holder {
+            pid,
+            start,
+            boot: processes.boot_id(),
+        }
     }
 
-    fn alive(&self, pid: u32) -> bool {
-        is_running(pid)
+    /// The contents of the lock file this holder writes for `what`.
+    fn claim(&self, what: &str, at: DateTime<Utc>) -> String {
+        let mut claim = format!("{what} pid {}", self.pid);
+        if let Some(start) = self.start {
+            claim.push_str(&format!(" start {start}"));
+        }
+        if let Some(boot) = &self.boot {
+            claim.push_str(&format!(" boot {boot}"));
+        }
+        format!("{claim} at {at}")
+    }
+
+    /// The holder out of a lock file; `None` for anything this program did
+    /// not write.
+    fn parse(held: &str) -> Option<Holder> {
+        let mut words = held.split_once(" pid ")?.1.split_whitespace();
+        let mut holder = Holder {
+            pid: words.next()?.parse().ok()?,
+            start: None,
+            boot: None,
+        };
+        while let (Some(key), Some(value)) = (words.next(), words.next()) {
+            match key {
+                "start" => holder.start = Some(value.parse().ok()?),
+                "boot" => holder.boot = Some(value.to_string()),
+                _ => break,
+            }
+        }
+        Some(holder)
+    }
+
+    /// Certainly not running any more: its boot is over, its pid is free or
+    /// a zombie, or another process has started under the pid since. What
+    /// the kernel cannot settle counts as running, a lock naming its pid
+    /// alone included. Taking the lock of a holder that still runs would let
+    /// two decisions run at once, and the record say one system while the
+    /// machine runs the other; keeping the lock of a dead one costs a
+    /// deadline that waits, gives up and says so.
+    fn is_gone(&self, processes: &dyn Processes) -> bool {
+        if let (Some(then), Some(now)) = (&self.boot, processes.boot_id())
+            && *then != now
+        {
+            return true;
+        }
+        match processes.state_of(self.pid) {
+            ProcessState::Gone => true,
+            ProcessState::Running { start } => self.start.is_some_and(|then| then != start),
+            ProcessState::Unreadable => false,
+        }
     }
 }
 
@@ -261,7 +298,7 @@ impl Processes for RealProcesses {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeingDecided {
     pub id: String,
-    /// The record as it stands: `<verb> pid <n> at <time>`.
+    /// The record as it stands: `<verb> pid <n> start <ticks> boot <id> at <time>`.
     pub holder: String,
 }
 
@@ -835,15 +872,11 @@ impl<'a> Helper<'a> {
     // -----------------------------------------------------------------
 
     /// Serialize decisions for one transaction with an exclusive-create lock file.
-    /// A dead local holder can be reclaimed; malformed lock contents require review.
+    /// A holder known to be dead can be reclaimed; malformed lock contents require review.
     fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let path = self.txn_dir().join(format!("{id}.deciding"));
         self.files.create_dir_all(&self.txn_dir())?;
-        let mine = format!(
-            "{what} pid {} at {}",
-            self.processes.own_pid(),
-            self.clock.now()
-        );
+        let mine = Holder::me(self.processes).claim(what, self.clock.now());
         self.hold_decision(id, &path, &mine)?;
         let out = f();
         // Release only a lock whose contents still match this process’s claim.
@@ -866,7 +899,7 @@ impl<'a> Helper<'a> {
 
     /// Acquire `<id>.deciding`; reclaim a dead holder by renaming its record.
     /// Recheck the claimed record and restore a live holder without overwriting a new lock.
-    /// A live PID, including this process’s PID, prevents acquisition.
+    /// A holder that may still run, this process included, prevents acquisition.
     fn hold_decision(&self, id: &str, path: &Path, mine: &str) -> Result<()> {
         // Retry boundedly if the holder disappears between create and read.
         for _ in 0..4 {
@@ -876,8 +909,8 @@ impl<'a> Helper<'a> {
             let Some(held) = self.files.read_if_present(path)? else {
                 continue;
             };
-            match deciding_pid(&held) {
-                Some(pid) if self.processes.alive(pid) => {
+            match Holder::parse(&held) {
+                Some(holder) if !holder.is_gone(self.processes) => {
                     return Err(BeingDecided {
                         id: id.to_string(),
                         holder: held.trim().to_string(),
@@ -903,8 +936,8 @@ impl<'a> Helper<'a> {
                 continue;
             }
             let carried = self.files.read_to_string(&claim).unwrap_or_default();
-            if let Some(pid) = deciding_pid(&carried)
-                && self.processes.alive(pid)
+            if let Some(holder) = Holder::parse(&carried)
+                && !holder.is_gone(self.processes)
             {
                 match self.files.create_new(path, carried.as_bytes(), 0o600) {
                     Ok(()) => {
@@ -4427,7 +4460,7 @@ mod tests {
                 0o600,
             )
             .unwrap();
-        let mine = format!("confirm pid {} at ", std::process::id());
+        let mine = format!("confirm pid {} start ", std::process::id());
         let out = helper
             .deciding("run-1", "confirm", || {
                 let held = files.read_to_string(&path).unwrap();
@@ -4439,6 +4472,133 @@ mod tests {
         assert!(!files.exists(&path), "given back");
         let claim = path.with_file_name(format!("run-1.deciding.taken-by-{}", std::process::id()));
         assert!(!files.exists(&claim), "no claim is left lying about");
+    }
+
+    /// The kernel a decision lock asks, set by hand: one boot, and the pids
+    /// that run in it. Pid 7 is this process.
+    struct ProcessTable {
+        boot: &'static str,
+        running: Vec<(u32, ProcessState)>,
+    }
+
+    impl Processes for ProcessTable {
+        fn own_pid(&self) -> u32 {
+            7
+        }
+
+        fn boot_id(&self) -> Option<String> {
+            Some(self.boot.to_string())
+        }
+
+        fn state_of(&self, pid: u32) -> ProcessState {
+            self.running
+                .iter()
+                .find(|(running, _)| *running == pid)
+                .map_or(ProcessState::Gone, |(_, state)| *state)
+        }
+    }
+
+    /// pid 41 started 1000 ticks into boot `b-1`, and took the lock.
+    const HELD_BY_41: &str = "revert pid 41 start 1000 boot b-1 at 2026-09-22 11:00:00 UTC";
+
+    /// Whether a decision takes over the lock `held` describes, on a host
+    /// whose kernel says `kernel`.
+    fn takes_over(held: &str, kernel: &ProcessTable) -> bool {
+        let files = host();
+        let (runner, clock) = (StrictFake::new(), clock());
+        let helper = helper(&runner, &files, &clock).with_processes(kernel);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        files
+            .write_atomic(&deciding_path(&helper), held.as_bytes(), 0o600)
+            .unwrap();
+        match helper.deciding("run-1", "confirm", || Ok(())) {
+            Ok(()) => true,
+            Err(e) if e.downcast_ref::<BeingDecided>().is_some() => false,
+            Err(e) => panic!("{e:#}"),
+        }
+    }
+
+    fn running(start: u64) -> ProcessState {
+        ProcessState::Running { start }
+    }
+
+    #[test]
+    fn a_lock_whose_holder_still_runs_is_not_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(1000))],
+        };
+        assert!(!takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// DCT-H1: the holder died and its pid went to another process. Signal 0
+    /// says "running"; the start time says it is somebody else.
+    #[test]
+    fn a_lock_whose_pid_another_process_has_now_is_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(3000))],
+        };
+        assert!(takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// Every process of an earlier boot is gone, whatever runs under its
+    /// pid and since when.
+    #[test]
+    fn a_lock_from_an_earlier_boot_is_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-2",
+            running: vec![(7, running(5000)), (41, running(1000))],
+        };
+        assert!(takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// What the kernel cannot settle counts as running: a lock that names
+    /// its pid alone while that pid runs, and a holder whose start time
+    /// cannot be read.
+    #[test]
+    fn a_lock_whose_holder_cannot_be_told_from_another_process_is_not_taken_over() {
+        let pid_alone = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(3000))],
+        };
+        assert!(!takes_over(
+            "revert pid 41 at 2026-09-22 11:00:00 UTC",
+            &pid_alone
+        ));
+        let unreadable = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, ProcessState::Unreadable)],
+        };
+        assert!(!takes_over(HELD_BY_41, &unreadable));
+    }
+
+    #[test]
+    fn a_lock_names_its_holder_by_pid_start_and_boot() {
+        let files = host();
+        let (runner, clock) = (StrictFake::new(), clock());
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000))],
+        };
+        let helper = helper(&runner, &files, &clock).with_processes(&kernel);
+        let held = helper
+            .deciding("run-1", "confirm", || {
+                Ok(files.read_to_string(&deciding_path(&helper)).unwrap())
+            })
+            .unwrap();
+        assert!(
+            held.starts_with("confirm pid 7 start 5000 boot b-1 at "),
+            "{held}"
+        );
+        assert_eq!(
+            Holder::parse(&held),
+            Some(Holder {
+                pid: 7,
+                start: Some(5000),
+                boot: Some("b-1".to_string()),
+            })
+        );
     }
 
     #[test]

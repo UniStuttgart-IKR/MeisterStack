@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Policy-controlled filesystem access and injectable clocks.
+//! Policy-controlled filesystem access, injectable clocks and the process table.
 //!
 //! Mutations use `Effect::LocalWrite`, which both offline and dry-run policies
 //! refuse. Real and in-memory implementations share the filesystem interface;
-//! clock injection allows polling tests without wall-clock delays.
+//! clock injection allows polling tests without wall-clock delays, and process
+//! injection lets a test reuse a pid or reboot a host.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -597,6 +598,77 @@ impl Files for MemFiles {
     }
 }
 
+/// What the kernel says of one pid right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    /// No process has this pid, or only a zombie that runs nothing.
+    Gone,
+    /// A process runs under this pid, started this many clock ticks after boot.
+    Running { start: u64 },
+    /// The kernel did not say.
+    Unreadable,
+}
+
+/// Process identity: this process's pid, the boot it runs in, and which
+/// process holds a pid now. A pid alone is reused; the start time of the
+/// pid and the boot tell one holder from the next.
+pub trait Processes {
+    fn own_pid(&self) -> u32;
+    /// `/proc/sys/kernel/random/boot_id`; `None` when it cannot be read.
+    fn boot_id(&self) -> Option<String>;
+    fn state_of(&self, pid: u32) -> ProcessState;
+}
+
+/// This process and the kernel's process table, read from procfs.
+pub struct RealProcesses;
+
+impl Processes for RealProcesses {
+    fn own_pid(&self) -> u32 {
+        std::process::id()
+    }
+
+    fn boot_id(&self) -> Option<String> {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    fn state_of(&self, pid: u32) -> ProcessState {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => proc_stat_state(&stat).unwrap_or(ProcessState::Unreadable),
+            // Without procfs every pid reads as missing; only the kernel's
+            // own answer to signal 0 says that nothing runs there.
+            Err(_) if no_process_has(pid) => ProcessState::Gone,
+            Err(_) => ProcessState::Unreadable,
+        }
+    }
+}
+
+/// Signal 0 answers ESRCH for a pid no process has. Pid 0 and pids beyond
+/// `i32` name no process a lock could have been written by.
+fn no_process_has(pid: u32) -> bool {
+    match i32::try_from(pid) {
+        Ok(pid) if pid > 0 => matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        ),
+        _ => true,
+    }
+}
+
+/// `/proc/<pid>/stat` (proc_pid_stat(5)): the command name sits in
+/// parentheses and may hold anything, so the fields are counted from the
+/// last `)`. Field 3 is the state, field 22 the start time.
+pub fn proc_stat_state(stat: &str) -> Option<ProcessState> {
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?;
+    let start = fields.nth(18)?.parse().ok()?;
+    if matches!(state, "Z" | "X" | "x") {
+        return Some(ProcessState::Gone);
+    }
+    Some(ProcessState::Running { start })
+}
+
 /// Injectable UTC timestamps and sleep, with a controllable test clock.
 pub trait Clock {
     fn now(&self) -> DateTime<Utc>;
@@ -666,7 +738,38 @@ impl Clock for FakeClock {
 
 #[cfg(test)]
 mod tests {
-    use super::parent_of;
+    use super::{ProcessState, Processes, RealProcesses, parent_of, proc_stat_state};
+
+    #[test]
+    fn a_proc_stat_line_is_read_past_a_command_name_with_parentheses() {
+        let line = "4242 (a) b (c)) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 \
+                    98765 1000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 3";
+        assert_eq!(
+            proc_stat_state(line),
+            Some(ProcessState::Running { start: 98765 })
+        );
+    }
+
+    #[test]
+    fn a_zombie_runs_nothing_under_its_pid() {
+        let line = "4242 (gone) Z 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765";
+        assert_eq!(proc_stat_state(line), Some(ProcessState::Gone));
+    }
+
+    #[test]
+    fn this_process_is_running_in_a_boot_the_kernel_names() {
+        let me = RealProcesses;
+        assert!(matches!(
+            me.state_of(me.own_pid()),
+            ProcessState::Running { .. }
+        ));
+        assert!(me.boot_id().is_some());
+    }
+
+    #[test]
+    fn a_pid_beyond_every_pid_max_is_gone() {
+        assert_eq!(RealProcesses.state_of(2_147_483_646), ProcessState::Gone);
+    }
 
     #[test]
     fn a_bare_relative_name_lives_in_the_current_directory() {
