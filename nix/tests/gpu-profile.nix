@@ -7,6 +7,8 @@
 # not test the actual GPU package build or hardware.
 { nixpkgs, lib, pkgs, system, self }:
 let
+  inherit (import ./lib.nix { inherit lib; }) require tagOf failedOf failsOnly;
+
   profileOf = leandro:
     import ../../templates/operator/profiles/compute-gpu-pro6000.nix {
       inherit lib leandro system;
@@ -81,15 +83,7 @@ let
   # nixpkgs' default driver, which is not the version the stub targets.
   unpinnedHost = hostWith stub [ driver amd ];
 
-  # The cases of the profile's own assertions, told apart by the tag each message starts with
-  # ("[driver] ...") and never by the prose after it. Messages without a tag are the agent's
-  # and the module system's, which the host carries as well.
-  tagOf = message:
-    if lib.hasPrefix "[" message
-    then lib.removePrefix "[" (lib.head (lib.splitString "]" message))
-    else null;
-  failedOf = c: lib.filter (tag: tag != null)
-    (map (a: tagOf a.message) (lib.filter (a: !a.assertion) c.assertions));
+  # The cases of the profile's own assertions, told apart by their tags (./lib.nix).
   paramsOf = c: " ${lib.concatStringsSep " " c.boot.kernelParams} ";
   intelHost = hostWith null [ driver intel ];
   unknownHost = hostWith null [ driver ];
@@ -103,13 +97,7 @@ let
     { systemd.services.nvidia-mig-setup = { script = "true"; wantedBy = [ "multi-user.target" ]; }; }
   ];
 
-  # Each case must fail exactly its own assertion, the one tagged `tag`.
-  failsOnly = c: tag: failedOf c == [ tag ];
   tomlOf = c: c.environment.etc."meisterstack/agent.toml".source;
-
-  # One shell step of the check: nothing when `ok`, else the reason and a failing exit.
-  require = ok: reason:
-    lib.optionalString (!ok) "echo ${lib.escapeShellArg "-> ${reason}"}; exit 1";
 in
 pkgs.runCommand "gpu-profile" { } ''
   echo "== without the leandro input"
