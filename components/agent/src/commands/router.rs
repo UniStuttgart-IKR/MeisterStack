@@ -63,8 +63,7 @@ impl Agent {
                 .context("this node cannot build a router"),
         )?;
         // Serialize router creation with VM provisioning because both mutate shared bridges.
-        // The driver bounds every ip/nft call it makes, so a wedged one cannot hold this lock
-        // indefinitely (R3-F08).
+        // The driver bounds every ip/nft call, so a wedged one cannot hold this lock (R3-F08).
         let _guard = self.ops.lock().await;
         let state = bridge
             .ensure_router(&spec)

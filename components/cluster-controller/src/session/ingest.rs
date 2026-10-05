@@ -231,11 +231,9 @@ pub(super) async fn ingest_routers(
         let name = router.metadata.name.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
-        // Astra round 3, finding R3-F03: whether this node is on the router's
-        // list, and whether it is the one that speaks, decided the word above
-        // off the listing. Both are asked again of the object being written,
-        // under the uid the report named; a router whose active machine
-        // changed in between gets no word from this line.
+        // Whether this node is on the router's list and is the one that speaks is re-asked of the
+        // object being written, under the report's uid; a moved active machine gets no word.
+        // (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<controller_api::Router, _>(&name, &uid, |r| {
@@ -451,13 +449,9 @@ pub(super) async fn ingest_volumes(
         // is a rule the reconciler already had; deciding here that an object
         // may be deleted would be a second lifecycle in a second place.
         if reported.phase == crate::reconcile::VOLUME_GONE {
-            // Astra round 3, finding R3-F03: whether the reporter is the HOME
-            // is decided again inside the write, off the object as it is read
-            // there, and `mutate_if` pins the uid the report named. It used to
-            // be decided off the listing above, so a `Gone` from a node that
-            // had been the home when the listing was taken could clear
-            // `status.node` on a volume that had meanwhile been handed to
-            // another machine — stranding bytes that were on it.
+            // Whether the reporter is the home is decided inside the write, on the live object
+            // under the report's uid: a stale listing could clear `status.node` on a volume handed
+            // to another machine and strand its bytes. (R3-F03)
             let mut outcome = GoneOutcome::NoWord;
             let result = store
                 .mutate_if::<Volume, _>(&name, &reported.id, |v| {
@@ -519,11 +513,8 @@ pub(super) async fn ingest_volumes(
         {
             continue;
         }
-        // Astra round 3, finding R3-F03: the same two questions the listing
-        // was asked — does this node have a word about the volume, and is the
-        // report newer than the last thing written — asked again of the
-        // object the write is about to change, under the uid the report
-        // named.
+        // The node's word and the report's currency are re-checked on the object being written,
+        // under the report's uid. (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<Volume, _>(&name, &reported.id, |v| {
@@ -668,10 +659,8 @@ pub(super) async fn ingest_attachments(
             // empty spec, and that is what clears it, but only if the vm is
             // still let through here to receive one.
             //
-            // Astra round 3, finding R3-F01: a node that still reports a disk
-            // is a reason on its own. A spec and a status that are both empty
-            // while the node holds a disk is exactly the hot-detach this pass
-            // must make visible, or nothing ever releases it.
+            // A node that still reports a disk is a reason on its own: empty spec and status with a
+            // held disk is the hot-detach this pass must make visible. (R3-F01)
             let has_something_to_settle = !vm.spec.referenced_volumes().is_empty()
                 || !vm.status.volumes.is_empty()
                 || !r.attached_volumes.is_empty();
@@ -714,15 +703,9 @@ pub(super) async fn ingest_attachments(
         // node takes whole, and for those "told" really is all this tier can
         // honestly claim.
         //
-        // Astra round 3, finding R3-F01: the answer, the settled verdict and
-        // the generation are all derived again from the object as it is read
-        // inside the write, never from the listing `vm` came out of. A spec
-        // that dropped a disk after that listing would otherwise be judged
-        // against the spec from before, and the generation that closed would
-        // be one the node was never measured against. `mutate_if` pins the
-        // uid and `ours` is asked again for the same reason as in
-        // `ingest_phases`: the name may have been recreated or the vm rebound
-        // between the listing and this write.
+        // Answer, verdict and generation are re-derived from the object as read inside the write,
+        // not from the listing: a dropped disk or recreated name would be judged against the old
+        // spec. `mutate_if` pins the uid and `ours` is asked again. (R3-F01)
         let mut settled = false;
         let mut applied = false;
         let result = store
@@ -743,9 +726,7 @@ pub(super) async fn ingest_attachments(
                 v.status.observed_at = Some(at);
             })
             .await;
-        // One vm's write failing (gone, recreated under the same name, or
-        // contended past the retries) says nothing about the others in this
-        // report, so it is logged and the pass goes on.
+        // One vm's failed write says nothing about the others in this report: log it and go on.
         if let Err(e) = result {
             warn!(vm = %name, error = format!("{e:#}"), "writing vm attachments failed");
             continue;
@@ -784,10 +765,9 @@ pub(super) async fn ingest_addresses(
             continue;
         }
         let name = vm.metadata.name.clone();
-        // Astra round 3, finding R3-F03: under the uid the report named, for
-        // a vm that is still this node's to speak for, and merged into the
-        // addresses as they are NOW — the listing's copy may be missing a
-        // write another pass made since, and merging into it would undo that.
+        // Under the report's uid, for a vm still this node's to speak for, with the MAC lines
+        // merged into the addresses as they are now: the listing's copy may miss another pass's
+        // write. (R3-F03)
         let result = store
             .mutate_if::<Vm, _>(&name, &reported.id, |v| {
                 if ours(v) {
@@ -846,12 +826,9 @@ pub(super) async fn ingest_snapshots(
         // taken off, and the next dispatch makes it again.
         if reported.phase == crate::reconcile::SNAPSHOT_GONE {
             if snapshot.metadata.deletion_timestamp.is_some() {
-                // Astra round 3, findings R3-F02 and R3-F03, one tier down:
-                // the finalizer comes off the object the report named (uid)
-                // and only while it is still being deleted and still on this
-                // node, and the delete then names the revision that write
-                // produced. The delete used to go out by name alone, after an
-                // await, and could take a snapshot recreated in between.
+                // The finalizer comes off the object the report named (uid), only while it is still
+                // being deleted and on this node; the delete then names the revision that write
+                // produced, so a snapshot recreated in between survives. (R3-F02, R3-F03)
                 let mut applied = false;
                 let written = store
                     .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
@@ -884,9 +861,7 @@ pub(super) async fn ingest_snapshots(
                     Ok(()) => {
                         info!(snapshot = %name, node = node_id, "snapshot deleted; the copy is gone")
                     }
-                    // Written again since the finalizer came off: the next
-                    // report finds it without the finalizer and still Gone,
-                    // and judges that revision.
+                    // Written since the finalizer came off; the next report judges that revision.
                     Err(StoreError::Conflict(_)) => {
                         debug!(snapshot = %name, node = node_id,
                                "the snapshot changed after its finalizer came off; the next report deletes it")
@@ -898,9 +873,8 @@ pub(super) async fn ingest_snapshots(
                       "the node no longer has this snapshot; it will be taken again");
                 if let Err(e) = store
                     .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
-                        // Astra round 3, finding R3-F03: only while the copy
-                        // is still recorded on this node and not being
-                        // deleted — the listing's answer to both may be old.
+                        // Only while the copy is still on this node and not being deleted;
+                        // the listing may be stale. (R3-F03)
                         if s.status.node.as_deref() != Some(node_id)
                             || s.metadata.deletion_timestamp.is_some()
                         {
@@ -962,8 +936,7 @@ pub(super) async fn ingest_snapshots(
         }
         let result = store
             .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
-                // Astra round 3, finding R3-F03: the node check and the
-                // freshness check, asked again of the object being written.
+                // Node and freshness checks, re-asked of the object being written. (R3-F03)
                 if s.status.node.as_deref() != Some(node_id)
                     || !controller_api::mirror::is_current(
                         s.metadata.deletion_timestamp,
@@ -1026,11 +999,9 @@ pub(super) async fn forget_unbound(
     for vm in leaving {
         let name = vm.metadata.name.clone();
         let uid = vm.metadata.uid.clone();
-        // Astra round 3, finding R3-F03: the let-go is decided off a listing,
-        // and between it and this write the vm may have been bound again (to
-        // this node or another) or the name recreated. The uid is pinned and
-        // the two facts `letting_go` read are read again off the object being
-        // written; a vm that no longer matches them is left alone.
+        // The let-go is decided off a listing: the uid is pinned and both facts `letting_go` read
+        // are re-read on the object being written, so a rebound or recreated vm is left alone.
+        // (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<Vm, _>(&name, &uid, |v| {
@@ -1075,19 +1046,12 @@ pub(super) async fn forget_unbound(
 
 /// What the node reports this VM as holding, read against the spec.
 ///
-/// First one entry per referenced disk of the spec, in spec order, saying
-/// whether the node reports having it. Spec order and not report order,
-/// because the spec is the question: a list that reordered itself as disks
-/// arrived would be a list an operator cannot read against what they wrote.
+/// First one entry per referenced disk of the spec, in spec order, saying whether the node
+/// reports having it; spec order so the list reads against what the operator wrote.
 ///
-/// Then, in report order, every disk the node reports that the spec no longer
-/// names, marked attached. Astra round 3, finding R3-F01: this list used to
-/// stop at the spec, so a disk the spec had just dropped fell out of
-/// `status.volumes` the moment the next report was ingested — while the node
-/// still held it. `reconcile::vms::volume_drift` reads this field and nothing
-/// else, so it saw no release to make, and the hot-detach never happened.
-/// The observed set is the whole of what the node says it holds; the drift is
-/// the difference in both directions, and that is the reconciler's to act on.
+/// Then, in report order, every disk the node reports that the spec no longer names,
+/// marked attached, so `reconcile::vms::volume_drift` sees the hot-detach it must make.
+/// The observed set is all the node says it holds; the drift is the reconciler's. (R3-F01)
 pub(super) fn observed_attachments(
     vm: &Vm,
     held: &[&str],
@@ -1112,14 +1076,11 @@ pub(super) fn observed_attachments(
     observed
 }
 
-/// Whether the node holds exactly the disks the spec names: none missing and
-/// none left over.
+/// Whether the node holds exactly the disks the spec names: none missing and none left over.
 ///
-/// Astra round 3, finding R3-F01: "every entry attached" is not the test any
-/// more, because the observed list now carries disks the spec dropped, and
-/// those are attached precisely because the detach has not happened. A
-/// generation that dropped a disk closes when the node stops reporting it,
-/// not when the rest of the list looks complete.
+/// "Every entry attached" is not enough: the observed list carries disks the spec dropped,
+/// so a generation that dropped a disk closes only when the node stops reporting it.
+/// (R3-F01)
 pub(super) fn attachments_settled(
     vm: &Vm,
     observed: &[controller_api::VolumeAttachmentStatus],

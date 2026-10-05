@@ -101,8 +101,7 @@ pub struct Cache {
     inventory: Mutex<Option<Inventory>>,
     /// What a download may cost before it is cut off. See [`Bounds`].
     bounds: Bounds,
-    /// Where a download may go. See [`egress`]; `Cache::new` allows nothing
-    /// until [`Cache::with_egress`] says otherwise (R3-F10).
+    /// Where a download may go; `Cache::new` allows nothing until [`Cache::with_egress`] (R3-F10).
     egress: EgressPolicy,
 }
 
@@ -570,10 +569,9 @@ impl Default for Bounds {
 /// believing the bound is being kept. See the deadline in [`fetch`].
 const BOUND_GRACE: Duration = Duration::from_secs(30);
 
-/// Build curl arguments for one hop: HTTP failure reporting and download limits.
-/// Curl follows no redirect and speaks only http(s); a 3xx is reported through
-/// `--write-out` and its target vetted before the next hop (R3-F10). `-q` keeps
-/// `.curlrc` out and `--noproxy '*'` keeps proxies from bypassing the pin.
+/// Build curl arguments for one hop: no redirects, http(s) only, HTTP failure reporting and
+/// download limits. A 3xx is reported via `--write-out` and vetted before the next hop;
+/// `-q` and `--noproxy '*'` keep `.curlrc` and proxies from bypassing the pin (R3-F10).
 fn curl_argv(pinned: &Pinned, bounds: &Bounds, max_time: Duration) -> Vec<String> {
     let mut argv = vec![
         "-q".to_string(),
@@ -593,8 +591,7 @@ fn curl_argv(pinned: &Pinned, bounds: &Bounds, max_time: Duration) -> Vec<String
         bounds.floor_bytes_per_sec.to_string(),
         "--speed-time".to_string(),
         bounds.idle.as_secs().to_string(),
-        // Bound connection setup and transfer by what is left of the deadline,
-        // so redirects cannot add up past it.
+        // Bound setup and transfer by what is left of the deadline, so redirects cannot exceed it.
         "--max-time".to_string(),
         max_time.as_secs().max(1).to_string(),
         // Curl can only precheck a declared length; drain also enforces the limit
@@ -675,9 +672,8 @@ async fn hash_local_file(path: &Path, deadline: Duration) -> Result<String> {
 }
 
 /// Stream curl output to a file while hashing, enforce byte/time bounds,
-/// and sync completed content before returning its digest. Every hop, the
-/// first included, is vetted against the egress policy before curl starts
-/// and curl is pinned to the vetted address (R3-F10).
+/// and sync completed content before returning its digest. Every hop is vetted against
+/// the egress policy before curl starts, and curl is pinned to that address (R3-F10).
 async fn fetch(url: &str, into: &Path, bounds: &Bounds, egress: &EgressPolicy) -> Result<String> {
     let started = std::time::Instant::now();
     let mut next = url.to_string();
@@ -716,7 +712,7 @@ async fn fetch_hop(pinned: &Pinned, into: &Path, bounds: &Bounds, left: Duration
     let url = pinned.url.canonical();
     let mut command = Command::new("curl");
     command.args(curl_argv(pinned, bounds, left));
-    // No proxy from the environment, for the reason `--noproxy` is passed.
+    // No proxy or curlrc from the environment, so nothing can bypass the pin.
     for var in [
         "http_proxy",
         "https_proxy",
@@ -884,17 +880,15 @@ mod tests {
         (temp, dir)
     }
 
-    /// A cache whose egress policy lets it reach the loopback listeners
-    /// these tests serve their origins from, and nothing else. Since R3-F10
-    /// `Cache::new` fetches from nowhere, and `file://` is refused outright.
+    /// A cache whose egress policy admits only the loopback listeners these tests serve from
+    /// (R3-F10).
     fn test_cache(images: PathBuf) -> Cache {
         Cache::new(images).with_egress(EgressPolicy::any_loopback_for_tests())
     }
 
-    /// Serve `path` over http on a loopback port of its own for the rest of
-    /// the test process, and return its url. The file is read per request,
-    /// so a test that rewrites or removes it changes what the next fetch
-    /// gets (404 when it is gone).
+    /// Serve `path` over http on its own loopback port for the rest of the test process and
+    /// return its url. The file is read per request, so rewriting it changes the next fetch
+    /// (404 once removed).
     fn served(path: &Path) -> String {
         let path = path.to_path_buf();
         origin(move |_| match std::fs::read(&path) {
@@ -1055,7 +1049,6 @@ mod tests {
     }
 
     /// A redirect to a denied target is refused before the second request is made (R3-F10).
-    /// The denied loopback port stands for every address the node may not reach.
     #[tokio::test]
     async fn a_redirect_to_a_denied_address_is_refused_before_it_is_requested() {
         let (_temp, dir) = scratch("redirect");
@@ -1091,7 +1084,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// A redirect to an admitted target is followed and its bytes become the image.
+    /// A redirect to an admitted target is followed and its bytes become the image (R3-F10).
     #[tokio::test]
     async fn a_redirect_to_an_admitted_address_is_followed() {
         let (_temp, dir) = scratch("redirect-ok");
@@ -1118,7 +1111,7 @@ mod tests {
         assert_eq!(o.hits(), 2);
     }
 
-    /// Without a policy nothing is fetched, and the reason names the key.
+    /// Without a policy nothing is fetched, and the reason names the key (R3-F10).
     #[tokio::test]
     async fn a_cache_with_no_policy_fetches_nothing() {
         let (_temp, dir) = scratch("no-policy");
@@ -1246,8 +1239,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// Exercise fetch, egress check, hashing, staging, publication and cache reuse
-    /// through a loopback http origin.
+    /// Exercise fetch, egress check, hashing, staging, publication and cache reuse over http.
     #[tokio::test]
     async fn an_image_is_fetched_once_and_then_found() {
         let (_temp, dir) = scratch("fetch-once");

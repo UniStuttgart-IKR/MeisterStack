@@ -1096,11 +1096,9 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     }
 }
 
-/// CPU and memory allowance after subtracting every bound VM, including Pending VMs.
-/// Reservations for guests not bound here yet are subtracted separately by
-/// [`hold`] and ordered by [`reservation_holds`]. Shared so the candidate list and
-/// claim confirmation compute the same number. Device claims remain in the
-/// capability catalogue; this does not account for GPU use.
+/// CPU and memory allowance after every bound VM (Pending included); no GPU accounting.
+/// Reservations for not-yet-bound guests are subtracted by [`hold`] / [`reservation_holds`].
+/// Shared so the candidate list and claim confirmation compute the same number.
 pub fn free_on(
     node: &str,
     capacity: &crate::resources::NodeCapacity,
@@ -1121,9 +1119,9 @@ pub fn free_on(
         .minus(bound)
 }
 
-/// Sum reservations independently of bound VM usage: migrating guests stay bound
-/// to their source until settlement, and placements are claimed before binding,
-/// yet their destination capacity must already be accounted for.
+/// Sum reservations independently of bound VM usage: migrating guests stay bound to their
+/// source until settlement and placements are claimed before binding, yet destination
+/// capacity must already count.
 pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
     held.iter()
         .filter(|r| r.spec.node == node)

@@ -112,9 +112,8 @@ struct RouterRecord {
     spec: RouterSpec,
 }
 
-/// The record files under a gateway's state directory. A missing directory is a
-/// node that was never given a router, which is an empty answer and not a failure.
-/// Temp files from an interrupted publish (`<id>.json.tmp`) are not records.
+/// Record files under the gateway state directory. A missing directory means no router was
+/// ever given: empty, not a failure. Interrupted-publish temp files (`<id>.json.tmp`) are skipped.
 async fn record_files(dir: &Path) -> networking::Result<Vec<PathBuf>> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -139,9 +138,8 @@ async fn record_files(dir: &Path) -> networking::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Overlay ownership must include unreadable router inventory as uncertainty:
-/// any record that cannot be read, even one vanishing mid-walk, fails the whole
-/// answer so no overlay is deleted on a guess.
+/// Overlay ownership must include unreadable router inventory as uncertainty: any unreadable
+/// record, even one vanishing mid-walk, fails the whole answer so no overlay is deleted on a guess.
 pub(crate) async fn overlay_vnis(dir: &Path) -> networking::Result<Vec<u32>> {
     let mut vnis = Vec::new();
     for path in record_files(dir).await? {
@@ -238,25 +236,16 @@ fn arp_ignore(active: bool) -> &'static str {
     }
 }
 
-/// How long an external command (`ip`, `nft`) may run before this driver
-/// gives up on it and kills it.
+/// How long an external command (`ip`, `nft`) may run before it is killed (R3-F08).
 ///
-/// Astra finding R3-F08, 2026-09-25. Generous for a command that is normally
-/// milliseconds — `components/agent/src/images.rs` bounds its own curl fetch
-/// probes at the same five seconds for the same reason: long enough that an
-/// ordinarily slow node is never the cause of a false timeout, short enough
-/// that a wedged `ip` is a log line and a retried command rather than every
-/// command behind it in the agent's serial pump (`lib.rs`'s `pump`) waiting
-/// for ever.
+/// Generous for commands that take milliseconds, but short enough that a wedged `ip` costs one
+/// retried command instead of stalling the agent's serial command pump.
 const COMMAND_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Drain a child's stdout and stderr and wait for it to exit.
 ///
-/// Takes `&mut Child` rather than consuming it the way `Child::wait_with_
-/// output` does, so that a caller whose deadline fires while this is still
-/// running still holds the handle needed to kill and reap it: a future
-/// dropped by `tokio::time::timeout` drops everything it owns, and a `Child`
-/// owned by the dropped future would be gone with it, unsignalled.
+/// Takes `&mut Child` so a caller whose timeout drops this future still holds the handle
+/// needed to kill and reap the child.
 async fn drain_and_wait(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::Output> {
@@ -276,14 +265,10 @@ async fn drain_and_wait(
     })
 }
 
-/// Signal a wedged child and then WAIT for it — both halves, on every path
-/// that gives up on a command.
+/// Kill a wedged child and reap it, on every path that gives up on a command.
 ///
-/// The pattern `components/agent/src/images.rs` already carries for `curl`
-/// (`kill_and_reap` there), mirrored here rather than shared: a driver may
-/// not depend on the agent crate that defines it, the dependency runs the
-/// other way. Neither error here is worth more than a debug line — "the
-/// process is already gone" is exactly the outcome a kill is asking for.
+/// Mirrors `kill_and_reap` in the agent's `images.rs`: a driver cannot depend on the agent
+/// crate. Errors only get a debug line; "already gone" is the outcome a kill wants.
 async fn kill_and_reap(child: &mut tokio::process::Child) {
     if let Err(e) = child.start_kill() {
         debug!(error = %e, "an ip/nft child was already gone when it was stopped");
@@ -309,15 +294,9 @@ impl crate::LinuxNetworkDriver {
     /// Run `ip`, with the arguments spelled exactly as an operator would type
     /// them.
     ///
-    /// Astra finding R3-F08, 2026-09-25: bounded by [`COMMAND_DEADLINE`]. `ip`
-    /// waiting on a stuck netns mount, or a kernel that has stopped answering
-    /// netlink, used to hang this call for ever — and every command after it:
-    /// the agent's own pump (`components/agent/src/lib.rs`) reads the
-    /// controller's stream serially, and `handle_ensure_router` holds the
-    /// node's one `ops` lock for the whole of its driver call, so one router
-    /// with a bad day took every other command on the node down with it. On
-    /// a timeout the child is killed and reaped, never merely abandoned — an
-    /// unreaped `ip` is a zombie for the life of this agent.
+    /// Bounded by [`COMMAND_DEADLINE`]: a hung `ip` (stuck netns mount, unresponsive netlink)
+    /// would block the agent's serial pump and the node's `ops` lock. On timeout the child is
+    /// killed and reaped (R3-F08).
     async fn ip(&self, args: &[&str]) -> networking::Result<String> {
         let binary = &self.gateway()?.ip;
         let mut child = tokio::process::Command::new(binary)
@@ -428,11 +407,8 @@ impl crate::LinuxNetworkDriver {
     /// The script goes in on stdin for the reason the tap guard's does: a rule
     /// containing a set literal never has to survive an argv split.
     ///
-    /// Astra finding R3-F08, 2026-09-25: bounded by [`COMMAND_DEADLINE`], the
-    /// same deadline and the same kill-and-reap `ip` takes and for the same
-    /// reason — see its doc. The write to stdin is inside the bound too and
-    /// not only the wait for exit: a script `nft` is not draining would hang
-    /// there first, before `wait_with_output` is ever reached.
+    /// Bounded by [`COMMAND_DEADLINE`] with kill-and-reap like `ip`; the stdin write is inside
+    /// the bound too, since a script `nft` does not drain would hang there first (R3-F08).
     async fn netns_nft(&self, netns: &str, script: &str) -> networking::Result<()> {
         use tokio::io::AsyncWriteExt;
         let g = self.gateway()?;
@@ -528,13 +504,10 @@ impl crate::LinuxNetworkDriver {
         dir.join(format!("{id}.json"))
     }
 
-    /// The router id a record's own FILE NAME names.
+    /// The router id a record's file name names (`<id>.json`).
     ///
-    /// Astra finding R3-F07, 2026-09-25: `record_path` is `<id>.json` and
-    /// nothing else in this driver ever writes one, so the id survives even
-    /// in a record this build cannot read as JSON — which is the only id
-    /// `list_routers_impl`, `fall_silent_impl` and `sweep_routers_impl` have
-    /// left to go on once the bytes inside do not parse.
+    /// It survives a record that no longer parses, and is then the only id that listing,
+    /// silencing and sweeping have to go on (R3-F07).
     fn record_id(path: &Path) -> Option<RouterId> {
         path.file_stem()?.to_str()?.parse().ok()
     }
@@ -556,9 +529,8 @@ impl crate::LinuxNetworkDriver {
         }
     }
 
-    /// Publish a router record atomically: write and fsync a sibling temp file,
-    /// then rename it over the final name, so no reader sees a torn record
-    /// (R3-F07). A stale temp file from an earlier crash is truncated, not tripped over.
+    /// Publish a router record atomically (temp file, fsync, rename) so no reader sees a torn
+    /// record; a stale temp file from a crash is truncated, not tripped over (R3-F07).
     async fn publish_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
         let tmp = path.with_extension("json.tmp");
@@ -802,9 +774,7 @@ impl crate::LinuxNetworkDriver {
         let record = serde_json::to_vec_pretty(&RouterRecord { spec: spec.clone() })
             .map_err(|e| NetworkError::Backend(e.into()))?;
         let path = Self::record_path(dir, &spec.id);
-        // Astra finding R3-F07, 2026-09-25: written via a temp file, fsynced,
-        // and renamed into place, so a crash mid-write leaves either the old
-        // record or the new one at `path` and never a torn file in between.
+        // Atomic publish: a crash mid-write leaves the old or the new record, never a torn one.
         Self::publish_record(&path, &record).await.map_err(|e| {
             NetworkError::Backend(anyhow::anyhow!("writing {}: {e}", path.display()))
         })?;
@@ -852,18 +822,10 @@ impl crate::LinuxNetworkDriver {
 
     /// A `RouterState` for a record this build could not read.
     ///
-    /// Astra finding R3-F07, 2026-09-25: the id survives in the record's own
-    /// FILE NAME even when the bytes inside do not parse, so this router is
-    /// at least NAMED even when it cannot be described. `Failed` with
-    /// `DriverUnreachable` and not a fourth `RouterPhase` of its own,
-    /// deliberately: `RouterPhase` is wire vocabulary the cluster controller
-    /// also speaks (see `the_two_words_a_node_says_about_a_router_are_the_
-    /// ones_the_wire_names`), and `DriverUnreachable` already carries
-    /// exactly the caution this needs — "this node could not find out", not
-    /// "the router is gone". A reader that took an omitted router for one
-    /// that was never built would be wrong in the one way that matters: this
-    /// router may be answering ARP for its addresses right now, built by a
-    /// spec that simply will not parse any more.
+    /// The id survives in the record's file name, so the router is named even when it cannot
+    /// be described. Reported as `Failed`/`DriverUnreachable` rather than a new `RouterPhase`
+    /// (wire vocabulary shared with the cluster controller): "this node could not find out",
+    /// not "gone". Omitting it would read as never built while it may still answer ARP (R3-F07).
     fn unknown_router_state(id: RouterId, why: &anyhow::Error) -> RouterState {
         let netns = router_netns(&id);
         RouterState {
@@ -874,10 +836,8 @@ impl crate::LinuxNetworkDriver {
             message: format!(
                 "the record for {netns} exists but this build could not read it: {why:#}"
             ),
-            // Not claimed as active by THIS read: the record that would say
-            // so is exactly what did not parse. `fall_silent_impl` silences
-            // this namespace unconditionally regardless of this flag — see
-            // its own note.
+            // Not claimed active: the record that would say so did not parse. `fall_silent_impl`
+            // silences this namespace regardless of this flag.
             active: false,
             announce: Vec::new(),
         }
@@ -890,8 +850,7 @@ impl crate::LinuxNetworkDriver {
         for path in record_files(dir).await? {
             match Self::read_record(&path).await {
                 Ok(record) => out.push(self.state_of(&record.spec, &live).await),
-                // Raced with a destroy between the listing and the read: not
-                // a router any more, and correctly left out.
+                // Raced with a destroy between listing and read: no longer a router, left out.
                 Err(RecordError::Missing) => {}
                 // Reported as unknown, never dropped (R3-F07).
                 Err(RecordError::Invalid(e)) => {
@@ -955,10 +914,9 @@ impl crate::LinuxNetworkDriver {
         Ok(swept)
     }
 
-    /// Make every active record standby through ensure_router, continuing after
-    /// individual failures. Walks the record directory itself so an unreadable
-    /// record's namespace is silenced by its file-name id, and reports which
-    /// routers failed so the dead man can retry a partial pass (R3-F06, R3-F07).
+    /// Make every active record standby through ensure_router, continuing after failures.
+    /// Walks the record directory so an unreadable record's namespace is silenced by its
+    /// file-name id; reports failures so the dead man can retry a partial pass (R3-F06, R3-F07).
     #[instrument(skip_all)]
     pub(crate) async fn fall_silent_impl(&self) -> networking::Result<networking::Silencing> {
         let dir = self.gateway()?.state_dir.clone();
@@ -985,8 +943,7 @@ impl crate::LinuxNetworkDriver {
                         }
                     }
                 }
-                // Raced with a destroy: nothing left to silence, and not a
-                // failure of this pass.
+                // Raced with a destroy: nothing left to silence, not a failure of this pass.
                 Err(RecordError::Missing) => {}
                 Err(RecordError::Invalid(e)) => {
                     warn!(router = %id, error = %format!("{e:#}"),
@@ -1006,19 +963,12 @@ impl crate::LinuxNetworkDriver {
         Ok(outcome)
     }
 
-    /// Silence a router by NAMESPACE alone, with no record to build a
-    /// standby spec from: both legs answer no ARP, whatever they were doing
-    /// before.
+    /// Silence a router by namespace alone, with no record to build a standby spec from: both
+    /// legs stop answering ARP.
     ///
-    /// Astra finding R3-F06/R3-F07, 2026-09-25. The half of a normal
-    /// farewell that needs no spec — a router whose record cannot be read
-    /// cannot be re-run through `ensure_router_impl` (there is no
-    /// `external_addr`, no ruleset, nothing to render), but the property the
-    /// dead man exists for is exactly this sysctl pair, and the namespace
-    /// name needs nothing but the id the record's FILE NAME still gives. A
-    /// namespace that is not there any more has nothing to silence, which is
-    /// success and not an error — the same rule the record-backed path
-    /// follows by way of `ensure_router_impl`'s own idempotence.
+    /// A record that cannot be read cannot go through `ensure_router_impl`, but the id in its
+    /// file name is enough for the sysctl pair the dead man exists for. A namespace that is
+    /// already gone has nothing to silence and counts as success (R3-F06, R3-F07).
     async fn silence_unknown_router(&self, id: RouterId) -> networking::Result<()> {
         let netns = router_netns(&id);
         if !self.netns_present().await?.iter().any(|n| n == &netns) {
@@ -1382,12 +1332,7 @@ esac
         assert!(!record.exists(), "and then the record goes with it");
     }
 
-    /// A stale `.tmp` file from an earlier crash — the torn write this
-    /// atomic publish exists to survive — does not block the next one: it
-    /// is simply overwritten, and what lands at the final name is the new
-    /// record, not the old garbage.
-    ///
-    /// Astra finding R3-F07, 2026-09-25.
+    /// A stale `.tmp` file from a torn write is overwritten by the next publish (R3-F07).
     #[tokio::test]
     async fn a_stale_tmp_file_from_a_torn_write_is_overwritten_not_tripped_over() {
         let temp = tempfile::Builder::new()
@@ -1410,18 +1355,7 @@ esac
         );
     }
 
-    /// A record that exists but will not parse is an UNKNOWN router, never a
-    /// silent absence: `list_routers_impl` reports it instead of leaving it
-    /// out, `fall_silent_impl` silences its namespace directly by the id the
-    /// FILE NAME still gives, and `sweep_routers_impl` does not treat it as
-    /// a foreign namespace with no claim on it.
-    ///
-    /// Astra finding R3-F07, 2026-09-25. Before this, all three read
-    /// `read_record`'s `None` and treated it as if the router had never
-    /// existed at all — except the sweep, which (correctly, by luck of a
-    /// separate existence check) still left the namespace alone; nothing
-    /// tied the three together, and the dead man's silencing pass walked
-    /// `list_routers_impl`'s output, so it never found this router either.
+    /// An unparseable record is an unknown router: listed, silenced, and not swept (R3-F07).
     #[tokio::test]
     async fn a_broken_record_is_unknown_not_silently_omitted_nor_swept_as_foreign() {
         let temp = tempfile::Builder::new()
@@ -1445,7 +1379,7 @@ esac
             ),
         );
 
-        // --- reported, not silently dropped -----------------------------
+        // Reported, not silently dropped.
         let listed = d.list_routers_impl().await.expect("a listing");
         assert_eq!(
             listed.len(),
@@ -1461,7 +1395,7 @@ esac
             listed[0].message
         );
 
-        // --- silenced, by the namespace the file name still gives --------
+        // Silenced by the namespace the file name still gives.
         let outcome = d.fall_silent_impl().await.expect("a farewell pass");
         assert_eq!(
             outcome.silenced,
@@ -1471,7 +1405,7 @@ esac
         );
         assert!(outcome.complete());
 
-        // --- not swept as a foreign namespace with no claim on it --------
+        // Not swept as a foreign namespace.
         let swept = d.sweep_routers_impl().await.expect("a sweep");
         assert!(
             swept.is_empty(),
@@ -1484,20 +1418,8 @@ esac
         );
     }
 
-    /// A fake `ip` that never answers is killed within the deadline, not
-    /// waited on for ever, and the command after it is not blocked by the
-    /// one that hung.
-    ///
-    /// Astra finding R3-F08, 2026-09-25. The busy loop and not `sleep` is
-    /// deliberate: `sleep` would fork a grandchild the test's kill can never
-    /// reach (`Child::start_kill` signals the direct child, the `sh`
-    /// wrapper, and a real `ip`/`nft` never forks one — but a naive fake
-    /// that did would leave a process running for the rest of its own
-    /// sleep). A `while` loop is the wrapper itself spinning, so killing it
-    /// leaves nothing behind. It hangs on `netns list` alone and answers
-    /// everything else at once, so the SECOND call below proves the driver
-    /// itself is free again and not just that a differently-hung call would
-    /// also eventually time out.
+    /// A hung `ip` is killed within the deadline and does not block the next command (R3-F08).
+    /// The fake busy-loops rather than `sleep`, whose forked child the kill would not reach.
     #[tokio::test]
     async fn a_hung_ip_is_killed_within_the_deadline_and_a_following_command_runs() {
         let temp = tempfile::Builder::new()
@@ -1524,8 +1446,7 @@ esac
             "{err:#}"
         );
 
-        // A following command is not blocked by the one that hung: the
-        // child was killed and reaped, not merely abandoned.
+        // The child was killed and reaped, so the next command is not blocked by the hang.
         let out = d
             .ip(&["true"])
             .await

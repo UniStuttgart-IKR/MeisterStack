@@ -120,9 +120,8 @@ pub struct AgentConfig {
     /// Storage driver sections. Filesystem is registered by default from `[paths]`.
     #[serde(default)]
     pub volume: Sections,
-    /// `[images]` -- where this node may fetch a base image from. Absent is
-    /// the same as empty, and empty fetches from nowhere: see
-    /// [`ImagesConfig::allowed_sources`].
+    /// `[images]`: where this node may fetch base images from. Absent equals empty, which
+    /// fetches from nowhere; see [`ImagesConfig::allowed_sources`].
     #[serde(default)]
     pub images: ImagesConfig,
 }
@@ -135,15 +134,10 @@ pub struct ImagesConfig {
     /// (`cloud-images.ubuntu.com`), `*.domain` for every name below a domain,
     /// `*` for any host name, and CIDRs (`10.0.8.0/24`).
     ///
-    /// Astra finding R3-F10, 2026-09-25: a member may create an image with
-    /// any url, and this node fetched it from inside the management network.
-    /// So the node now fetches only from what an operator listed. Empty, the
-    /// default, fetches from NOWHERE: this fleet has no catalogue or mirror
-    /// of its own that could be the safe default, and a url image on a node
-    /// without this key fails with a sentence naming it. Loopback,
-    /// link-local and metadata addresses are refused whatever this says;
-    /// private ranges need a CIDR here, a host name alone does not open
-    /// them. Ports 80 and 443 only. See `images::egress`.
+    /// Empty (the default) fetches from nowhere: a member may create an image with any url,
+    /// and the fleet has no mirror that could be a safe default (R3-F10). Loopback,
+    /// link-local and metadata addresses are refused whatever this says; private ranges
+    /// need a CIDR here, a host name alone does not open them. Ports 80 and 443 only.
     #[serde(default)]
     pub allowed_sources: Vec<String>,
 }

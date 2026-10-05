@@ -25,11 +25,8 @@ pub struct FilesystemDriverConfig {
     /// Sandbox for image probing and conversion; failure does not fall back to
     /// running the parser in the agent process.
     pub convert: agent_api::base_image::Sandbox,
-    /// This node's id, written into the name of every staging file this
-    /// driver makes. Astra finding R3-F09, 2026-09-25: on a pool several
-    /// nodes share (the nfs driver roots this one in a share), a staging
-    /// file has to say whose it is, or one node's start-up sweep removes
-    /// another node's running copy. See `staging`.
+    /// This node's id, written into every staging file name so one node's start-up sweep
+    /// never removes another node's running copy on a shared pool (R3-F09).
     pub host_id: String,
 }
 
@@ -110,7 +107,7 @@ fn probe_reflink(dir: &Path, host: &staging::HostTag) -> SnapshotConsistency {
     }
 }
 
-/// See `FilesystemBlockDriver::hold`.
+/// Test hook channels: report the staged path, then wait to be released.
 #[cfg(test)]
 type Hold = (
     std::sync::mpsc::Sender<PathBuf>,
@@ -264,11 +261,9 @@ impl VolumeProvider for FilesystemBlockDriver {
         }
 
         let src = self.base_image_for(spec).await?;
-        // A name of this host's and this attempt's own (R3-F09): two
-        // attempts at one volume, a retry or two hosts after a failover,
-        // never truncate each other's half-written file, and the sweep can
-        // tell this one from a leftover. Moved into the blocking task so it
-        // lives, and beats, exactly as long as the copy does.
+        // Per-host, per-attempt staging name: concurrent attempts (retry, failover) never
+        // truncate each other's file. Moved into the blocking task so its heartbeat lasts
+        // exactly as long as the copy (R3-F09).
         let tmp = staging::Staged::begin(staging::volume_build(
             &self.config.volume_dir,
             id,
@@ -297,8 +292,7 @@ impl VolumeProvider for FilesystemBlockDriver {
     async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
         let id = &handle.id;
         let dir = &self.config.volume_dir;
-        // Every staging file of this volume, whoever wrote it: the volume is
-        // their owner, and it is going.
+        // Remove every host's staging files for this volume: the owner is going away.
         let mut doomed =
             staging::staged_for(dir, id, false).map_err(|e| StorageError::Backend(e.into()))?;
         doomed.push(staging::legacy_volume_build(dir, id));
@@ -390,11 +384,9 @@ impl VolumeProvider for FilesystemBlockDriver {
         // Reserve capacity before creating staging files and retain the guard
         // through the copy so concurrent snapshots account for these bytes.
         let _room = self.room_for_a_copy(source.len())?;
-        // This host's and this attempt's own name, registered and beating
-        // for as long as the copy runs (R3-F09): another host's start-up
-        // sweep can then tell it from a leftover. Moved into the blocking
-        // task, so an abandoned caller does not stop the heartbeat of a copy
-        // that is still running.
+        // Per-host, per-attempt name with a heartbeat while the copy runs, so another host's
+        // sweep can tell it from a leftover. Moved into the blocking task so an abandoned
+        // caller does not stop the heartbeat (R3-F09).
         let staged = staging::Staged::begin(staging::snapshot_copy(
             &self.config.volume_dir,
             id,
@@ -442,8 +434,7 @@ impl VolumeProvider for FilesystemBlockDriver {
     #[instrument(skip_all, fields(snapshot_id = %handle.id))]
     async fn drop_snapshot(&self, handle: &VolumeHandle) -> storage::Result<()> {
         let dir = &self.config.volume_dir;
-        // Every staging copy of this snapshot, whoever made it: the object
-        // is their owner, and it is going (R3-F09).
+        // Remove every host's staging copies of this snapshot: the owner is going away (R3-F09).
         let mut doomed = staging::staged_for(dir, &handle.id, true)
             .map_err(|e| StorageError::Backend(e.into()))?;
         doomed.push(staging::legacy_snapshot_copy(dir, &handle.id));
@@ -507,9 +498,7 @@ impl VolumeProvider for FilesystemBlockDriver {
                     f.sync_all()?;
                     std::fs::rename(to, &target)
                 })();
-                // Under a nonce name a failed attempt's file is never reused
-                // by the next one, so it goes with the failure here rather
-                // than lingering until the next agent start.
+                // Nonce names are never reused, so remove a failed attempt's file now.
                 if done.is_err() {
                     let _ = std::fs::remove_file(to);
                 }
@@ -704,8 +693,7 @@ mod tests {
         (temp, driver, volumes, images, handed_over)
     }
 
-    /// Every staging copy of this snapshot in the pool, of any host, under
-    /// either name.
+    /// Every staging copy of this snapshot in the pool, of any host, under either name.
     fn staged_copies(volumes: &Path, snap: &SnapshotId) -> Vec<String> {
         std::fs::read_dir(volumes)
             .expect("the pool")
@@ -884,8 +872,7 @@ mod tests {
 
         let log = std::fs::read_to_string(root.join("systemd-run.log")).expect("the two runs");
         let lines: Vec<&str> = log.lines().collect();
-        // The staging name carries this host and a nonce since R3-F09, so it
-        // is read off the conversion's own command line and then checked.
+        // The staging name carries host and nonce (R3-F09): read it off the conversion's command.
         let tmp = PathBuf::from(
             lines[1]
                 .split_whitespace()
@@ -1498,11 +1485,8 @@ mod tests {
         );
     }
 
-    /// Astra finding R3-F09, 2026-09-25: two hosts share one pool (the nfs
-    /// driver roots this driver in a share). Host A is in the middle of a
-    /// snapshot copy when host B's agent starts. B's start-up sweep must
-    /// leave A's copy alone, A's snapshot must publish, and an orphan of
-    /// B's own host must still be removed.
+    /// A second host starting on a shared pool leaves the first host's running snapshot copy
+    /// alone, lets it publish, and removes only its own orphans (R3-F09).
     #[tokio::test]
     async fn another_hosts_running_snapshot_survives_this_hosts_start() {
         let temp = tempfile::tempdir().expect("a temp dir");

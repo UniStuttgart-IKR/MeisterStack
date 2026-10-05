@@ -562,9 +562,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
 
     // One cache per agent, over the configured image directory: what it puts
     // there is exactly what the volume drivers look up.
-    //
-    // And with the operator's egress policy (Astra finding R3-F10): without
-    // `[images] allowed_sources` it fetches from nowhere.
+    // The operator's egress policy applies; empty `[images] allowed_sources` fetches nowhere.
     let images = Arc::new(
         crate::images::Cache::new(cfg.paths.image_dir.clone()).with_egress(cfg.egress_policy()?),
     );
@@ -853,9 +851,8 @@ fn should_fall_silent(last_seen: Instant, now: Instant, threshold: Duration) -> 
 }
 
 /// Wake at the earlier of redial backoff expiry or router-silencing deadline.
-/// Set `silenced` only after a verifiably complete pass; a new established
-/// session resets it. A partial pass is retried once per backoff round, not
-/// in a busy loop inside one (R3-F06).
+/// Set `silenced` only after a complete pass (a new session resets it); a partial pass is
+/// retried once per backoff round, never in a busy loop (R3-F06).
 async fn wait_out_the_backoff(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
     last_up: Instant,
@@ -909,10 +906,9 @@ async fn say_goodbye(agent: &Arc<Agent>) {
 
 /// Attempt to silence routers without destroying their namespaces. Called
 /// after the stopping report wait and after controller-session loss. Takes the
-/// bridge, not the agent, so it is testable against a fake driver.
-/// Returns true only when every active router is verifiably silent; a driver
-/// error or a partial `Silencing` is false so the caller retries (R3-F06).
-/// No bridge is vacuously true.
+/// bridge, not the agent, so a fake driver can test it.
+/// True only when every active router is verifiably silent (no bridge counts as silent);
+/// a driver error or partial `Silencing` is false so the caller retries (R3-F06).
 async fn stop_speaking_for_every_router(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
 ) -> bool {
@@ -1339,7 +1335,7 @@ mod tests {
         assert_eq!(*bridge.calls.lock().unwrap(), 2);
     }
 
-    /// A driver error is as incomplete as a partial `Silencing`.
+    /// A driver error is as incomplete as a partial `Silencing` (R3-F06).
     #[tokio::test]
     async fn a_total_driver_failure_falling_silent_is_reported_as_incomplete() {
         let bridge = ScriptedBridge::new(vec![Err(agent_api::networking::NetworkError::Backend(
@@ -1348,14 +1344,13 @@ mod tests {
         assert!(!stop_speaking_for_every_router(Some(&bridge)).await);
     }
 
-    /// A node without a bridge driver has nothing to silence.
+    /// A node without a bridge driver has nothing to silence (R3-F06).
     #[tokio::test]
     async fn a_node_with_no_bridge_driver_has_nothing_to_silence() {
         assert!(stop_speaking_for_every_router(None).await);
     }
 
-    /// One silencing attempt per backoff round; a failed round leaves `silenced`
-    /// false so the next round retries.
+    /// One silencing attempt per backoff round; a failed round is retried on the next (R3-F06).
     #[tokio::test]
     async fn a_failed_round_is_retried_on_the_next_backoff_round_and_not_inside_one() {
         let a = router(1);
@@ -1391,7 +1386,6 @@ mod tests {
             "one attempt per backoff round, not a busy retry for the rest of it"
         );
 
-        // Next backoff round with the same `last_up` and flag.
         wait_out_the_backoff(
             Some(&bridge),
             last_up,

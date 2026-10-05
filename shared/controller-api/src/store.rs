@@ -226,9 +226,8 @@ impl EtcdStore {
         Ok((Self::decode_range(resp.kvs()), resp.kvs().len()))
     }
 
-    /// Two listings at one etcd revision, in one transaction. Two separate lists
-    /// can straddle a placement that binds its VM and then releases its claim,
-    /// counting that guest nowhere; a capacity check must see one store (R3-F05).
+    /// Two listings at one etcd revision, in one transaction. Separate lists can straddle a
+    /// bind-then-release and count a guest nowhere; capacity checks need one view (R3-F05).
     pub async fn list2<A: Resource, B: Resource>(&self) -> Result<(Vec<A>, Vec<B>)> {
         let txn = Txn::new().and_then(vec![
             TxnOp::get(self.dir(A::RESOURCE), Some(GetOptions::new().with_prefix())),
@@ -240,8 +239,8 @@ impl EtcdStore {
             etcd_client::TxnOpResponse::Get(r) => Some(r),
             _ => None,
         });
-        // A missing range is a store that did not answer, not an empty directory;
-        // reading it as empty would overfill a node.
+        // A missing range means the store did not answer, not an empty directory;
+        // treating it as empty would overfill a node.
         let (Some(a), Some(b)) = (ranges.next(), ranges.next()) else {
             return Err(StoreError::Invalid(format!(
                 "etcd answered a read of {} and {} with fewer than two ranges",
@@ -512,12 +511,10 @@ impl EtcdStore {
         self.written(&name, &value, &resp).await
     }
 
-    /// `update`, but only while `guard` still stands at the revision the caller
-    /// read, in one transaction that does not write the guard (R3-F05). A
-    /// placement binds under its capacity claim this way, so a claim reaped or
-    /// released after confirmation cannot become a binding. The guard is not
-    /// rewritten because the claim's own guarded release must still match. The
-    /// conflict says whether the object or the guard moved.
+    /// `update`, but only while `guard` still stands at the revision the caller read, in one
+    /// transaction (R3-F05). A placement binds under its capacity claim, so a claim reaped or
+    /// released after confirmation cannot become a binding. The guard is not rewritten, so its
+    /// own guarded release still matches. The conflict says whether object or guard moved.
     pub async fn update_if_standing<T: Resource, G: Resource>(
         &self,
         obj: &T,
@@ -544,13 +541,13 @@ impl EtcdStore {
                 Compare::mod_revision(key.clone(), CompareOp::Equal, rev),
                 Compare::mod_revision(guard_key.clone(), CompareOp::Equal, guard_rev),
             ])
-            // The same put `update` makes, lease and all.
+            // Same put as `update`, including the lease handling.
             .and_then(vec![TxnOp::put(
                 key.clone(),
                 value.clone(),
                 Some(PutOptions::new().with_ignore_lease()),
             )])
-            // Read the guard back only on failure, to say which compare failed.
+            // On failure, read the guard back to tell which compare failed.
             .or_else(vec![TxnOp::get(guard_key.clone(), None)]);
         let resp = timed("update", self.handle().txn(txn)).await?;
         if !resp.succeeded() {

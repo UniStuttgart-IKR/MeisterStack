@@ -2,38 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Files a pool holds only while something is being made, and who they
-//! belong to.
+//! Files a pool holds only while something is being made, and who owns them.
 //!
-//! Astra finding R3-F09, 2026-09-25: the nfs driver roots this driver in a
-//! directory every node of the pool shares, and the start-up sweep removed
-//! every `.snap.tmp` without a finished `.snap` beside it. On a shared pool
-//! that is the snapshot another host is copying at that very moment: host B
-//! restarting deleted host A's running copy, and A's rename then failed or,
-//! worse, published nothing while the caller waited for it.
-//!
-//! The fix is that a staging file says whose it is and what it is for, in its
-//! name: `<id>.snap.tmp.<host>.<nonce>` for a snapshot copy,
-//! `<id>.tmp.<host>.<nonce>` for a volume being built, and the reflink probe
-//! and the clock marker below carry the host the same way. The sweep then
-//! applies two different rules:
-//!
-//! * A file of THIS host is removed at start. The agent that wrote it is the
-//!   process this one replaced, so nobody is writing into it any more. The
-//!   one exception is a file this very process has open (a second driver
-//!   instance over the same directory), which the in-process registry names.
-//! * A file of ANOTHER host, or of nobody (the names from before this change
-//!   carry no host), is removed only with a proof that its writer is gone:
-//!   the writer refreshes the file's mtime every [`HEARTBEAT`] while the copy
-//!   runs, so a file whose mtime is older than [`STALE_AFTER`] by the POOL's
-//!   own clock has had no living writer for that long. The file is looked at
-//!   a second time right before the unlink, and any change keeps it.
-//!
-//! The age is measured against the file server's clock and not this host's:
-//! the mtime of a file on NFS is set by the server, and comparing it with a
-//! local clock that is a few minutes off would turn clock skew into data
-//! loss. [`pool_now`] reads the server's "now" off a marker file it creates
-//! for that purpose.
+//! The pool may be a share used by every node (nfs driver), so a staging file names its host
+//! and a nonce (`<id>.snap.tmp.<host>.<nonce>`, `<id>.tmp.<host>.<nonce>`; probe and clock
+//! marker likewise). The start-up sweep (R3-F09) removes this host's files (their writer was
+//! the replaced process, unless this process has them open), but another host's or unnamed
+//! legacy files only when their mtime is older than [`STALE_AFTER`] by the pool's own clock
+//! ([`pool_now`]; NFS sets mtime server-side) and unchanged on a second look. Running copies
+//! refresh the mtime every [`HEARTBEAT`].
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -45,14 +22,11 @@ use tracing::{debug, warn};
 /// How often a running copy refreshes its staging file's mtime.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// How long a foreign staging file must have gone without a heartbeat before
-/// another host may remove it.
+/// How long a foreign staging file may go without a heartbeat before another host removes it.
 ///
-/// An hour is 120 missed heartbeats. The number is deliberately far from the
-/// heartbeat: what it has to cover is not a slow copy (a slow copy still
-/// beats) but a writer whose heartbeat thread is stuck behind the same hung
-/// mount as the copy, or a host that was paused. Too long costs disk space
-/// held by a dead copy for an hour longer; too short costs a live snapshot.
+/// Far above the heartbeat on purpose: it must cover a writer stuck behind the same hung mount
+/// or a paused host, not a slow copy (which still beats). Too long holds dead disk space; too
+/// short costs a live snapshot.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// What every reflink probe file is called before the host.
@@ -69,11 +43,9 @@ const VOLUME_TMP: &str = ".tmp";
 
 /// This host, as it appears in a file name.
 ///
-/// Encoded so that it cannot contain the `.` the name is split at, and so
-/// that the encoding is injective: two different node ids never become the
-/// same tag, because a collision there would let one host sweep the other's
-/// running copies as its own. `[A-Za-z0-9-]` stands for itself and every
-/// other byte, `_` included, becomes `_` plus two hex digits.
+/// Encoded so it cannot contain the `.` the name is split at, and injectively: a collision
+/// between two node ids would let one host sweep the other's running copies as its own.
+/// `[A-Za-z0-9-]` stands for itself; every other byte (`_` included) becomes `_` + two hex digits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostTag(String);
 
@@ -102,8 +74,7 @@ impl HostTag {
     }
 }
 
-/// A fresh, unguessable suffix, so two attempts at the same id (a retry, or
-/// two hosts after a failover) never write into the same file.
+/// A fresh suffix so two attempts at one id (retry, failover) never share a file.
 fn nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
@@ -137,21 +108,19 @@ pub(crate) fn probe_pair(dir: &Path, host: &HostTag) -> (PathBuf, PathBuf) {
     )
 }
 
-/// The name a volume was built under before R3-F09. Still read by `probe`
-/// and removed by `deprovision`, because a pool upgraded in place may hold
-/// one, and the S13 tombstone relies on finding it.
+/// The pre-R3-F09 volume build name; still read by `probe` and removed by `deprovision`
+/// because a pool upgraded in place may hold one (the S13 tombstone relies on finding it).
 pub(crate) fn legacy_volume_build(dir: &Path, id: &impl std::fmt::Display) -> PathBuf {
     dir.join(format!("{id}{VOLUME_TMP}"))
 }
 
-/// The name a snapshot was copied under before R3-F09.
+/// The pre-R3-F09 snapshot copy name.
 pub(crate) fn legacy_snapshot_copy(dir: &Path, id: &impl std::fmt::Display) -> PathBuf {
     dir.join(format!("{id}{SNAP_TMP}"))
 }
 
-/// Every staging file of any host for this snapshot id, or for this volume
-/// id. Used by `drop_snapshot`, `deprovision` and `probe`: the object is the
-/// owner, and when it goes, its staging files go with it whoever wrote them.
+/// Every host's staging files for this snapshot or volume id (`snapshot` selects which).
+/// The object owns them: when it goes, they go with it, whoever wrote them.
 pub(crate) fn staged_for(
     dir: &Path,
     id: &impl std::fmt::Display,
@@ -203,11 +172,9 @@ impl<'a> Leftover<'a> {
     }
 }
 
-/// Read a file name as one of the four shapes of staging file, or `None`.
+/// Read a file name as one of the four staging shapes, or `None`.
 ///
-/// The legacy `<id>.tmp` of a volume is deliberately not one of them: it is
-/// owned by its volume object (see `legacy_volume_build`), and the sweep
-/// never had it.
+/// The legacy `<id>.tmp` volume name is not one: its volume owns it (`legacy_volume_build`).
 fn classify(name: &str) -> Option<Leftover<'_>> {
     if let Some(rest) = name.strip_prefix(PROBE_PREFIX) {
         let stem = rest
@@ -243,10 +210,8 @@ fn classify(name: &str) -> Option<Leftover<'_>> {
         .map(|_| Leftover::SnapshotCopy(None))
 }
 
-/// The staging files this process is writing right now, across every driver
-/// instance in it. A second driver over the same directory in the same
-/// process shares the host tag, and without this it would take the first
-/// one's running copy for a leftover of a dead agent.
+/// Staging files this process is writing, across all driver instances. A second driver over
+/// the same directory shares the host tag and would otherwise sweep the first one's copy.
 static IN_FLIGHT: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
 fn in_flight(path: &Path) -> bool {
@@ -256,15 +221,12 @@ fn in_flight(path: &Path) -> bool {
         .contains(path)
 }
 
-/// A staging file for as long as its copy runs: registered in this process,
-/// and its mtime refreshed every [`HEARTBEAT`] so another host can tell it
-/// from a leftover.
+/// A staging file for as long as its copy runs: registered in this process, mtime refreshed
+/// every [`HEARTBEAT`] so another host can tell it from a leftover.
 ///
-/// Dropped on every path out of the copy, which unregisters it and stops the
-/// heartbeat. The heartbeat thread is not joined: it may be blocked on the
-/// same hung mount the copy was, and the copy's result must not wait for it.
-/// A beat that lands after the rename finds no file under this unique name
-/// and does nothing.
+/// Drop unregisters it and stops the heartbeat. The thread is not joined: it may be blocked
+/// on the same hung mount as the copy, which must not wait for it. A late beat finds no file
+/// under the unique name and does nothing.
 pub(crate) struct Staged {
     path: PathBuf,
     _stop: std::sync::mpsc::Sender<()>,
@@ -324,8 +286,8 @@ impl Drop for Staged {
     }
 }
 
-/// Set the file's mtime to the file SERVER's now. `UTIME_NOW` is what makes
-/// the NFS client send "set to server time" rather than this host's clock.
+/// Set the file's mtime to the file server's now: `UTIME_NOW` makes an NFS client send
+/// "server time" rather than this host's clock.
 fn touch(path: &Path) -> std::io::Result<()> {
     use nix::sys::stat::{UtimensatFlags, utimensat};
     use nix::sys::time::TimeSpec;
@@ -339,9 +301,8 @@ fn touch(path: &Path) -> std::io::Result<()> {
     .map_err(std::io::Error::from)
 }
 
-/// What time it is according to the filesystem `dir` is on: the mtime of a
-/// file created there a moment ago. `None` if no file could be made, and
-/// then no foreign file is judged at all.
+/// The pool filesystem's now: the mtime of a file just created in `dir`. `None` if none could
+/// be made, in which case no foreign file is judged.
 fn pool_now(dir: &Path, host: &HostTag) -> Option<SystemTime> {
     let marker = dir.join(format!("{CLOCK_PREFIX}{}.{}", host.as_str(), nonce()));
     let made = std::fs::OpenOptions::new()
@@ -367,10 +328,8 @@ fn fingerprint(meta: &std::fs::Metadata) -> (u64, u64, Option<SystemTime>) {
     (meta.ino(), meta.len(), meta.modified().ok())
 }
 
-/// Throw away what a dead writer left in this pool: see the module
-/// documentation for the two rules. Every failure is a WARN and nothing
-/// more; refusing to start over a leftover file would turn a wasted gigabyte
-/// into an outage.
+/// Remove what a dead writer left in this pool (rules in the module docs). Failures only warn:
+/// refusing to start over a leftover would turn a wasted gigabyte into an outage.
 pub(crate) fn sweep(dir: &Path, host: &HostTag) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -415,8 +374,7 @@ pub(crate) fn sweep(dir: &Path, host: &HostTag) {
                        "another host's staging file is still being written; left alone");
                 continue;
             }
-            // The second look: a heartbeat or a write between the first
-            // stat and here means its writer is alive after all.
+            // Second look: any heartbeat or write since the first stat means the writer lives.
             match std::fs::symlink_metadata(&path) {
                 Ok(second) if fingerprint(&second) == fingerprint(&first) => {}
                 _ => continue,
@@ -450,8 +408,7 @@ mod tests {
         f.set_modified(SystemTime::now() - by).expect("backdated");
     }
 
-    /// Two node ids never share a tag, and a tag never contains the `.` a
-    /// staging name is split at.
+    /// Distinct node ids never share a tag, and a tag never contains a `.` (R3-F09).
     #[test]
     fn the_host_tag_is_injective_and_has_no_dot() {
         let a = HostTag::new("node_2e").unwrap();
@@ -488,8 +445,7 @@ mod tests {
         assert_eq!(classify(&format!("{id}.snap")), None);
     }
 
-    /// The heartbeat keeps a running copy's mtime fresh, which is the whole
-    /// of the proof another host reads.
+    /// The heartbeat keeps a running copy's mtime fresh (R3-F09).
     #[test]
     fn a_running_copy_keeps_its_file_fresh() {
         let temp = tempfile::tempdir().unwrap();
@@ -509,9 +465,7 @@ mod tests {
         assert!(!in_flight(&path), "and unregistered when the copy ends");
     }
 
-    /// The rules, one file each: this host's goes, another host's goes only
-    /// when stale, a name from before the change is judged like a foreign
-    /// one, and nothing that is not a staging file is touched.
+    /// The sweep removes this host's files and stale foreign or legacy ones, nothing else (R3-F09).
     #[test]
     fn the_sweep_takes_what_is_provably_dead_and_nothing_else() {
         let temp = tempfile::tempdir().unwrap();

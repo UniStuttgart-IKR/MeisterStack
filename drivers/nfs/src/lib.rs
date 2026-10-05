@@ -76,10 +76,8 @@ pub struct NfsDriverConfig {
     /// mount managed by the deployment.
     pub manage_mount: bool,
     pub mount: Option<MountSpec>,
-    /// This node's id. The share is one directory for every node of the
-    /// pool, and the file half names its staging files after the node that
-    /// writes them so that one node's start-up sweep never removes another
-    /// node's running copy (Astra finding R3-F09, 2026-09-25).
+    /// This node's id; staging files carry it so one node's start-up sweep never removes
+    /// another node's running copy on the shared directory (R3-F09).
     pub host_id: String,
 }
 
@@ -858,8 +856,7 @@ tmpfs /run tmpfs rw 0 0
         std::fs::create_dir_all(share.join("volumes")).expect("a temp share root");
         std::fs::create_dir_all(&images).expect("a temp image dir");
 
-        // This node's own orphan, and another node's copy that is still
-        // being written (R3-F09): the share is every node's pool.
+        // This node's orphan and another node's still-running copy (R3-F09).
         let nonce = "0123456789abcdef0123456789abcdef";
         let orphan = share
             .join("volumes")

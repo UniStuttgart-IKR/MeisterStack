@@ -53,10 +53,9 @@ pub(super) fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
     }
 }
 
-/// Refuse an image URL no node would ever fetch while its author can still be told
-/// (R3-F10). The node makes the real egress decision against `[images] allowed_sources`
-/// with the same parser; private-range literals pass here because only the node's
-/// list can say whether it may reach them.
+/// Refuse an image URL no node would ever fetch while its author can still be told (R3-F10).
+/// The node makes the real egress decision against `[images] allowed_sources`, so
+/// private-range literals pass here.
 pub(super) fn check_url_shape(url: &str) -> Result<(), ApiError> {
     use common::fetch_url::{AddrClass, FetchUrl, Host, classify};
     let parsed = FetchUrl::parse(url).map_err(|why| invalid(format!("spec.url: {why}")))?;
@@ -313,8 +312,7 @@ mod tests {
         check_source_kind(&fetchable, None).expect("and so is the other kind");
     }
 
-    /// Astra finding R3-F10, 2026-09-25: the url is held to one strict shape
-    /// before any node is asked to fetch it.
+    /// An image URL no node would fetch is refused at create (R3-F10).
     #[test]
     fn an_image_url_no_node_would_fetch_is_refused_at_create() {
         let spec = |url: &str| ImageSpec {

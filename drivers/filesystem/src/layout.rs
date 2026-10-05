@@ -156,9 +156,8 @@ pub(crate) fn write_volume_file(
     size: u64,
 ) -> std::io::Result<()> {
     let written = write_then_rename(src, sandbox, qemu_img, tmp, final_path, size);
-    // The staging name is this attempt's own since R3-F09, so the next
-    // attempt never overwrites it: a failed one takes its file with it here,
-    // and one killed outright is the start-up sweep's.
+    // The staging name is unique per attempt: remove it on failure; a killed
+    // attempt's file is left to the start-up sweep (R3-F09).
     if written.is_err() {
         let _ = std::fs::remove_file(tmp);
     }

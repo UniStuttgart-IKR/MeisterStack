@@ -2,25 +2,18 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The capacity commit against a real etcd: both roads to a node, two
-//! replicas, one slot — and at most one of them gets it.
+//! The capacity commit against a real etcd: both roads to a node, two replicas, one slot,
+//! at most one winner.
 //!
-//! `#[ignore]` for the reason `reservation_etcd` is. Start an etcd and name
-//! it:
+//! `#[ignore]` like `reservation_etcd`. Start an etcd and name it:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
 //!   cargo test -p meister-controller-api --test capacity_etcd -- --ignored
 //! ```
 //!
-//! Astra finding R3-F05, 2026-09-24: ordinary placement booked capacity in a
-//! process-local mutex from a per-pass snapshot and bound by CAS on the VM
-//! object alone, while a migration's reservation was a separate object — so
-//! two controller replicas could each succeed against the same free
-//! capacity. B reads 8 GiB free, A reserves and confirms 6 for a migration, B
-//! binds 6 from its old snapshot: 12 of 8. Both roads make the same claim
-//! now and confirm it against one reading, and these are the interleavings
-//! the finding named, run against the store rather than argued.
+//! The R3-F05 interleavings, run against the store: a decision from an old snapshot and a
+//! migration's claim must never both succeed against the same free room.
 
 use chrono::Utc;
 use meister_controller_api::{
@@ -82,8 +75,7 @@ fn migration(vm: &str) -> VmMigration {
     )
 }
 
-/// What a replica sees when it takes its snapshot: the room on `node`
-/// before any promise, and what is promised there.
+/// A replica's snapshot: the room on `node` before any promise, and what is promised there.
 async fn snapshot(store: &EtcdStore, node: &Node) -> (u64, u64) {
     let (vms, held): (Vec<Vm>, Vec<CapacityReservation>) =
         store.list2().await.expect("one reading of both");
@@ -99,9 +91,7 @@ async fn snapshot(store: &EtcdStore, node: &Node) -> (u64, u64) {
     )
 }
 
-/// The interleaving of the finding, both ways round, and the one where both
-/// write before either confirms: whoever's claim the store ordered first
-/// keeps the slot, on both replicas, whichever road each is on.
+/// One slot, both interleavings: the claim the store ordered first wins on every replica (R3-F05).
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
@@ -140,9 +130,8 @@ async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
         "the first claim on an empty machine holds"
     );
 
-    // Replica B, deciding from its old snapshot, claims agent-2 for the
-    // placement. The create-only write SUCCEEDS — a unique key is not a sum
-    // — and the confirmation is what says no.
+    // Replica B, from its old snapshot, claims agent-2 for the placement. The create
+    // succeeds (a unique key is not a sum); the confirmation says no.
     let b = store
         .create(&CapacityReservation::for_placement(&landing, "agent-2"))
         .await
@@ -153,13 +142,11 @@ async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
             .expect("a reading"),
         "and it does not hold: the migration's claim was written first"
     );
-    // So B binds nothing and gives the claim back; the node carries exactly
-    // one guest's promise.
+    // B binds nothing and releases; the node carries exactly one guest's promise.
     capacity::release(&store, &b).await;
     assert_eq!(snapshot(&store, &agent_2).await, (8192, 6144));
 
-    // The mirror image: the migration fails and gives its room back, and
-    // next time the placement's claim is the earlier one.
+    // Mirror image: the migration gives its room back, so the placement's claim is earlier.
     capacity::release(&store, &a).await;
     assert_eq!(snapshot(&store, &agent_2).await, (8192, 0));
     let b = store
@@ -170,8 +157,7 @@ async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
         .create(&CapacityReservation::of(&moving, &flying, "agent-2"))
         .await
         .expect("the migration claims second");
-    // Both written before either confirms — and it does not matter which
-    // confirms first, because the order is the store's and not the callers'.
+    // Both written before either confirms; the order is the store's, so confirm order is moot.
     assert!(
         !capacity::claim_holds(&store, &a, overcommit)
             .await
@@ -207,8 +193,7 @@ async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
     assert_eq!(bound.spec.node_name.as_deref(), Some("agent-2"));
     capacity::release(&store, &b).await;
 
-    // And a migration that comes AFTER the binding is measured against the
-    // bound guest — no claim stands for it any more, and none has to.
+    // A migration after the binding is measured against the bound guest; no claim is needed.
     let late = store
         .create(&CapacityReservation::of(&moving, &flying, "agent-2"))
         .await
@@ -222,10 +207,7 @@ async fn a_placement_and_a_migration_racing_for_one_slot_commit_at_most_once() {
     assert_eq!(snapshot(&store, &agent_2).await, (2048, 6144));
 }
 
-/// The invariant, read off the store at every step: between the claim and
-/// the release the guest is counted at least once, and for the length of
-/// the release exactly twice — which refuses a third claim it could have
-/// carried, and never admits one it could not.
+/// A guest is counted at least once at every revision between claim and release (R3-F05).
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_guest_is_counted_at_every_revision_between_claim_and_release() {
@@ -253,9 +235,8 @@ async fn a_guest_is_counted_at_every_revision_between_claim_and_release() {
     );
     assert_eq!(snapshot(&store, &agent_2).await, (8192, 6144));
 
-    // Bound and not yet released: bound AND promised. A 2 GiB guest would
-    // fit beside the 6 GiB one, and is refused for the length of one round
-    // trip — the safe direction.
+    // Bound, not yet released: counted twice. A 2 GiB guest that would fit is refused for
+    // one round trip, the safe direction.
     let mut bound = landing.clone();
     bound.spec.node_name = Some("agent-2".into());
     store
@@ -290,8 +271,8 @@ async fn a_guest_is_counted_at_every_revision_between_claim_and_release() {
     );
     capacity::release(&store, &c).await;
 
-    // Releasing what was already released takes nothing and is not an
-    // error; a stale release cannot take a LATER claim under the same key.
+    // Releasing twice takes nothing and is no error; a stale release cannot take a later
+    // claim under the same key.
     capacity::release(&store, &b).await;
     let again = store
         .create(&CapacityReservation::for_placement(&landing, "agent-2"))
@@ -308,9 +289,7 @@ async fn a_guest_is_counted_at_every_revision_between_claim_and_release() {
     );
 }
 
-/// The guard on the binding: a claim the reaper took, or a sibling
-/// released, cannot become a binding — and neither can a claim that stands
-/// carry a binding onto a VM that moved.
+/// A binding is refused once its claim is gone, or when the VM moved under the writer (R3-F05).
 #[tokio::test]
 #[ignore = "needs a local etcd; see the module note"]
 async fn a_binding_is_refused_once_its_claim_is_gone() {
@@ -344,8 +323,7 @@ async fn a_binding_is_refused_once_its_claim_is_gone() {
     let still: Vm = store.get("web-2").await.expect("the guest");
     assert_eq!(still.spec.node_name, None, "nothing was bound");
 
-    // The claim stands, but the VM moved under the writer: the ordinary
-    // conflict, and still nothing bound onto a stale object.
+    // The claim stands but the VM moved: the ordinary conflict, nothing bound onto a stale object.
     let b = store
         .create(&CapacityReservation::for_placement(&landing, "agent-2"))
         .await
@@ -366,8 +344,7 @@ async fn a_binding_is_refused_once_its_claim_is_gone() {
         "the conflict says it was the vm: {refused}"
     );
 
-    // Both stand: the binding is written, and the claim is untouched by it
-    // — its own release takes it, and nothing else does.
+    // Both stand: the binding is written and leaves the claim untouched; only its release takes it.
     let current: Vm = store.get("web-2").await.expect("the guest as it is now");
     let mut bound = current.clone();
     bound.spec.node_name = Some("agent-2".into());

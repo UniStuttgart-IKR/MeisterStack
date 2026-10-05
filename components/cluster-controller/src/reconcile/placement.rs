@@ -351,10 +351,9 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // it is not a matter of strategy, and a strategy that chose one of these
     // would produce one refused create per pass for ever.
     let refused = refusing_now(&vm, Utc::now());
-    // A claim this guest already holds from an attempt that did not bind (R3-F05).
-    // `hold` subtracted it like every claim; give it back on the decision's copy
-    // only, or the guest is refused by its own bookkeeping every pass. The shared
-    // list keeps it spent for every other VM until the claim is used or reaped.
+    // A claim this guest holds from an attempt that did not bind (R3-F05). `hold` already
+    // subtracted it; give it back on the decision's copy only, or the guest is refused by
+    // its own claim. The shared list keeps it spent for other VMs until used or reaped.
     let standing = p.held.iter().find(|r| r.is_placement_of(&vm)).cloned();
     let decision = {
         let mut nodes = p.nodes.lock().unwrap();
@@ -417,9 +416,8 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
             return note_vm_pending(p, &vm, category, reason).await;
         }
     };
-    // The decision above is this replica's snapshot opinion; sibling replicas and
-    // migrations can spend the same room (R3-F05). From here the store decides,
-    // in the steps migrations also take: claim, confirm, bind under the claim, release.
+    // The decision above is a snapshot opinion; siblings and migrations can spend the same
+    // room (R3-F05). From here the store decides: claim, confirm, bind under it, release.
     let mine = match claim(p.store, &vm, &node).await? {
         Claimed::Fresh(mine) => mine,
         Claimed::Standing(mine) if mine.spec.node == node => mine,
@@ -459,9 +457,8 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
             )));
         }
     }
-    // CAS on the object this pass read; a retry onto a newer object could move an
-    // already placed VM. The same transaction compares the claim's revision, so a
-    // reaped or released claim cannot become a binding.
+    // CAS on the object this pass read (a retry onto a newer one could move a placed VM);
+    // it also compares the claim's revision, so a reaped claim cannot become a binding.
     let mut bound = vm;
     bound.spec.node_name = Some(node.clone());
     // What the scheduler said about the last pass is answered by the binding
@@ -502,20 +499,18 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
 
 /// What `claim` found at the key this guest's placement writes to.
 enum Claimed {
-    /// This pass wrote it; unique as a key, not yet proven to fit
-    /// (`controller_api::capacity::claim_holds`).
+    /// This pass wrote it; unique as a key, not yet proven to fit (`claim_holds`).
     Fresh(CapacityReservation),
-    /// This guest's claim already stood: a crashed earlier attempt or a sibling
-    /// replica in this step. Its node is where the choice was written down.
+    /// This guest's claim already stood (crashed attempt or sibling replica); its node is
+    /// where the choice was recorded.
     Standing(CapacityReservation),
     /// The key was taken and then given back between the two round trips.
     Gone,
 }
 
-/// Write a create-only claim that this guest goes to `node`, so one placement has
-/// exactly one claim across replicas (R3-F05). The key is `place-<vm uid>`; anything
-/// else standing under it was not written by this control plane and is refused
-/// rather than adopted, leaving it to the reaper.
+/// Write a create-only claim that this guest goes to `node`: one claim per placement across
+/// replicas (R3-F05). The key is `place-<vm uid>`; anything else under it is refused, not
+/// adopted, and left to the reaper.
 async fn claim(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::Result<Claimed> {
     let want = CapacityReservation::for_placement(vm, node);
     match store.create(&want).await {

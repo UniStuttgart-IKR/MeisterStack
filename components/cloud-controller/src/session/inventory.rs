@@ -48,13 +48,9 @@ pub(super) async fn ingest_images(
         if same_node_states(&current.status.nodes, &merged) {
             continue;
         }
-        // Astra round 3, finding R3-F03: the merge is made again of the
-        // object as the write reads it, under the uid of the catalogue entry
-        // it was computed for. Merged into the listing's copy it would put
-        // back every OTHER cluster's lines as they were at the listing — a
-        // second cluster's report landing in between was lost — and a name
-        // recreated in between would inherit the old image's lines (and,
-        // through `first_bound_digest`, its digest; Astra S02).
+        // Re-merge on the object as the write reads it, under the catalogue entry's uid: the
+        // listing's copy would restore other clusters' lines, and a recreated name would inherit
+        // the old image's lines and digest (`first_bound_digest`). (R3-F03)
         let uid = current.metadata.uid.clone();
         let mut merged = merged;
         let result = store
@@ -245,9 +241,8 @@ pub(super) async fn ingest_pools(
             // SAYS so — `settle_storage_pool` turns the pointer fact plus the
             // missing entry into `Pending { ClusterHasNoPool }`.
             if spoke || pool.status.clusters.iter().any(|e| e.cluster == cluster) {
-                // Astra round 3, finding R3-F03: whether this cluster serves
-                // the pool, and whether it is its home, were read off the
-                // listing; they are read again off the object being written.
+                // Whether this cluster serves the pool, and is its home, is re-read on the object
+                // being written. (R3-F03)
                 if let Err(e) = store
                     .mutate_if::<controller_api::StoragePool, _>(
                         &pool.metadata.name,
@@ -274,8 +269,7 @@ pub(super) async fn ingest_pools(
         if !spoke && pool_unchanged(&pool, home, &entry, reported) {
             continue;
         }
-        // Astra round 3, finding R3-F03: as above, the binding is read again
-        // off the object being written, under the listing's uid.
+        // The binding is re-read on the object being written, under the listing's uid. (R3-F03)
         let result = store
             .mutate_if::<controller_api::StoragePool, _>(
                 &pool.metadata.name,
@@ -411,9 +405,8 @@ pub(super) async fn ingest_snapshots(
         if snapshot_unchanged(snapshot, cluster, reported, phase) {
             continue;
         }
-        // Astra round 3, finding R3-F03: under the uid the report named, and
-        // only while the snapshot still names the volume whose home placed it
-        // at this cluster.
+        // Under the report's uid, and only while the snapshot still names the volume whose home
+        // placed it at this cluster. (R3-F03)
         let volume = snapshot.spec.volume.clone();
         if let Err(e) = store
             .mutate_if::<controller_api::VolumeSnapshot, _>(
@@ -466,10 +459,8 @@ pub(super) async fn ingest_volumes(
         if volume_unchanged(volume, cluster, reported, phase) {
             continue;
         }
-        // Astra round 3, finding R3-F03: under the uid the report named, and
-        // only while the record is still at this cluster as the object reads
-        // NOW. A volume handed to another cluster in between would otherwise
-        // take the old cluster's word, node and holder included.
+        // Under the report's uid, and only while the record is still at this cluster; a volume
+        // handed elsewhere must not take the old cluster's word. (R3-F03)
         if let Err(e) = store
             .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
                 if still_at(v, cluster) {
@@ -550,12 +541,8 @@ async fn snapshots_of(
 /// anything from that, and only from a list that is all of them: a volume
 /// this cloud created a moment ago is simply not down there yet.
 ///
-/// Astra round 3, finding R3-F02: the check ran on the listed object and the
-/// delete then went out by NAME alone. Between the two, the object could be
-/// written (a fresher observation that makes the conclusion wrong) or deleted
-/// and recreated under the same name, and the unguarded delete removed
-/// whatever the name named by then. `finish_delete` deletes only the revision
-/// that was checked.
+/// `finish_delete` removes only the revision that was checked, never whatever the name
+/// names by the time of the delete. (R3-F02)
 pub(super) async fn finish_volume_delete(
     store: &EtcdStore,
     volume: &Volume,
@@ -570,13 +557,10 @@ pub(super) async fn finish_volume_delete(
     Ok(())
 }
 
-/// Whether a volume record the listing placed at `cluster` is still there as
-/// this revision reads.
+/// Whether a volume the listing placed at `cluster` is still there as this revision reads.
 ///
-/// A record with no `status.cluster` yet was not dispatched anywhere, and the
-/// listing already placed it here by its pool; one that names a cluster names
-/// exactly the one the cloud handed it to. Astra round 3, findings R3-F02 and
-/// R3-F03: asked of the revision a write or a delete is about to act on.
+/// No `status.cluster` yet means not dispatched, so the pool placement stands; otherwise
+/// it must name exactly this cluster. (R3-F02, R3-F03)
 pub(super) fn still_at(volume: &Volume, cluster: &str) -> bool {
     volume
         .status
@@ -587,12 +571,9 @@ pub(super) fn still_at(volume: &Volume, cluster: &str) -> bool {
 
 /// Whether a complete report that does not name `volume` finishes its delete.
 ///
-/// Pure, and asked of every revision `finish_delete` is about to remove, not
-/// only of the one the listing handed in. The record must still be at this
-/// cluster: a volume that moved while its delete was pending is absent from
-/// the old cluster's list for a reason that has nothing to do with deletion.
-/// A record with no `status.cluster` yet was not dispatched anywhere, and
-/// the listing already placed it here by its pool.
+/// Pure, and asked of every revision `finish_delete` is about to remove. A volume that
+/// moved while its delete was pending is absent from the old cluster's list for another
+/// reason, so the record must still be at this cluster.
 pub(super) fn volume_gone(
     volume: &Volume,
     cluster: &str,
@@ -609,9 +590,8 @@ pub(super) fn volume_gone(
         )
 }
 
-/// The same rule for a snapshot the cluster did not name.
-///
-/// Astra round 3, finding R3-F02, as for `finish_volume_delete`.
+/// The same rule for a snapshot the cluster did not name, deleting only the checked revision
+/// (R3-F02).
 pub(super) async fn finish_snapshot_delete(
     store: &EtcdStore,
     snapshot: &controller_api::VolumeSnapshot,
@@ -619,9 +599,8 @@ pub(super) async fn finish_snapshot_delete(
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    // The snapshot's home was derived from the volume it names, so a
-    // revision that names another volume is not the one the listing placed
-    // at this cluster.
+    // The home was derived from the named volume, so a revision naming another volume is not
+    // the one the listing placed at this cluster.
     let volume = snapshot.spec.volume.clone();
     let concluded = |s: &controller_api::VolumeSnapshot| {
         s.spec.volume == volume && snapshot_gone(s, status, at)
@@ -632,8 +611,7 @@ pub(super) async fn finish_snapshot_delete(
     Ok(())
 }
 
-/// Whether a complete report that does not name `snapshot` finishes its
-/// delete. Pure, for the reason `volume_gone` is.
+/// Whether a complete report that does not name `snapshot` finishes its delete (pure).
 pub(super) fn snapshot_gone(
     snapshot: &controller_api::VolumeSnapshot,
     status: &ClusterStatus,
@@ -648,19 +626,14 @@ pub(super) fn snapshot_gone(
         )
 }
 
-/// How often a guarded delete is retried after a concurrent write before the
-/// next report is left to try again. The same bound `mutate` uses.
+/// Retry bound for a guarded delete after concurrent writes; the same bound `mutate` uses.
 const FINISH_DELETE_ATTEMPTS: usize = 8;
 
 /// Delete `checked` by the revision it was judged at, never by name alone.
 ///
-/// Astra round 3, finding R3-F02. `concluded` is the verdict, and it is asked
-/// of the exact revision the guarded delete names. A conflict means the key
-/// moved on since that revision was read: the object is read again and, if
-/// it is still the same object (same uid) and the verdict still holds of it,
-/// the delete is retried against the fresh revision. A name that now holds a
-/// different object, or no object, ends it without a delete; so does a
-/// verdict that no longer holds. `true` means this call removed the object.
+/// `concluded` is asked of the exact revision the delete names. On a conflict the object is
+/// re-read and the delete retried only if it is still the same uid and the verdict still
+/// holds; anything else ends it. `true` means this call removed the object. (R3-F02)
 async fn finish_delete<T: Resource>(
     store: &EtcdStore,
     checked: &T,

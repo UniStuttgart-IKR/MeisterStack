@@ -4,33 +4,19 @@
 
 //! What an image URL is allowed to look like, and what an address is.
 //!
-//! Astra finding R3-F10, 2026-09-25: an `Image`'s `spec.url` was any string
-//! starting with `http://` or `https://`, a member may write images in its
-//! tenant, and the node fetched it with `curl --location`. That is a
-//! server-side request forgery from the agent's network: loopback, the
-//! cloud's metadata address, the management network, and any of them again
-//! behind a redirect. The checksum is only compared after the bytes arrived,
-//! so it never stood in the way of the request itself.
+//! The node fetches an image `spec.url` with `curl --location`, so an unchecked url is
+//! server-side request forgery from the agent's network: loopback, metadata addresses, the
+//! management network, also behind a redirect (R3-F10). The cloud (at create) and the node
+//! (at fetch, then per address in the agent's `images::egress`) share this one parser.
 //!
-//! Two tiers need the same answer, which is why this is here and not in
-//! either of them: the cloud refuses a URL whose shape is wrong when the
-//! image is created, and the node, which is the tier that actually connects,
-//! parses the same string with the same parser and then decides per address
-//! (`meister-agent`'s `images::egress`).
-//!
-//! The parser is deliberately a strict SUBSET of what curl accepts, and that
-//! is the point of having one: a check made on one reading of a URL and a
-//! connection made on another is how SSRF filters are bypassed. So anything
-//! two parsers might read differently is refused outright -- userinfo, percent
-//! signs or backslashes in the authority, non-ASCII, numeric host spellings
-//! other than a plain dotted quad (`127.1`, `0x7f.1`, `2130706433`), IPv6
-//! zone ids -- and the node hands curl the [`FetchUrl::canonical`] spelling
-//! rebuilt from the parsed parts, never the original text.
+//! The parser is a strict subset of what curl accepts: anything two parsers might read
+//! differently is refused (userinfo, `%` or backslash in the authority, non-ASCII, numeric
+//! hosts other than a dotted quad such as `127.1`, IPv6 zone ids). The node hands curl
+//! [`FetchUrl::canonical`], rebuilt from the parsed parts, never the original text.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// The two ports an image URL may name. Anything else is refused at both
-/// tiers; a mirror on another port is an open item (R3-F10), not a default.
+/// The ports an image URL may name; both tiers refuse any other (R3-F10).
 pub const ALLOWED_PORTS: [u16; 2] = [80, 443];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,14 +54,12 @@ pub struct FetchUrl {
     pub scheme: Scheme,
     pub host: Host,
     pub port: u16,
-    /// Path and query, starting with `/`. The fragment is dropped: it is
-    /// never sent, so it means nothing to a fetch.
+    /// Path and query, starting with `/`; the fragment is dropped because it is never sent.
     pub path: String,
 }
 
 impl FetchUrl {
-    /// Parse `text` strictly. The error is a sentence for the person who
-    /// wrote the URL.
+    /// Parse `text` strictly; the error is a sentence for the person who wrote the URL.
     pub fn parse(text: &str) -> Result<Self, String> {
         if text
             .bytes()
@@ -126,8 +110,8 @@ impl FetchUrl {
         })
     }
 
-    /// The URL rebuilt from its parts, port always explicit. This is what a
-    /// node hands curl, so that what was checked is what is fetched.
+    /// The URL rebuilt from its parts, port explicit; what a node hands curl, so that what
+    /// was checked is what is fetched.
     pub fn canonical(&self) -> String {
         format!(
             "{}://{}:{}{}",
@@ -197,9 +181,8 @@ fn parse_host(h: &str) -> Result<Host, String> {
         .iter()
         .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
     {
-        // All-numeric: a plain dotted quad or nothing. `127.1`, `0177.0.0.1`
-        // and `2130706433` are all 127.0.0.1 to some resolver and a name to
-        // none, so they are refused rather than guessed.
+        // All-numeric: a plain dotted quad or nothing. `127.1` and `2130706433` are 127.0.0.1
+        // to some resolvers, so they are refused rather than guessed.
         let plain = labels.len() == 4 && labels.iter().all(|l| l.len() == 1 || !l.starts_with('0'));
         return match (plain, h.parse::<Ipv4Addr>()) {
             (true, Ok(a)) => Ok(Host::Ip(IpAddr::V4(a))),
@@ -214,9 +197,8 @@ fn parse_host(h: &str) -> Result<Host, String> {
     Ok(Host::Name(lower))
 }
 
-/// A DNS name as the allowlist and the URL both spell one: labels of
-/// `[a-z0-9-]`, no label starting or ending with `-`, and a last label that
-/// starts with a letter, which is what rules out `0x7f.1` and friends.
+/// A DNS name as the allowlist and the URL both spell one: `[a-z0-9-]` labels, none starting
+/// or ending with `-`, and a last label starting with a letter (which rules out `0x7f.1`).
 pub fn check_dns_name(name: &str) -> Result<(), String> {
     let bad = || format!("{name:?} is not a host name");
     if name.is_empty() || name.len() > 253 {
@@ -249,19 +231,16 @@ pub fn check_dns_name(name: &str) -> Result<(), String> {
 pub enum AddrClass {
     /// Routable on the internet.
     Public,
-    /// A private or special-purpose range: RFC 1918, CGNAT, ULA,
-    /// documentation and benchmarking ranges. Refused unless the node's
-    /// allowlist names a CIDR that contains the address.
+    /// A private or special-purpose range (RFC 1918, CGNAT, ULA, documentation, benchmarking).
+    /// Refused unless the node's allowlist names a CIDR containing the address.
     Private,
-    /// Never fetched from, whatever the allowlist says: loopback,
-    /// unspecified, link-local (where the cloud metadata services live),
-    /// multicast, broadcast, reserved, and the known metadata addresses.
+    /// Never fetched from, whatever the allowlist says: loopback, unspecified, link-local
+    /// (cloud metadata), multicast, broadcast, reserved, and the known metadata addresses.
     Never,
 }
 
-/// Classify an address. An IPv6 address that embeds an IPv4 one
-/// (IPv4-mapped, the NAT64 well-known prefix, 6to4) is as strict as the
-/// stricter of the two readings, so `::ffff:127.0.0.1` is loopback.
+/// Classify an address. An IPv6 address embedding an IPv4 one (mapped, NAT64, 6to4) takes
+/// the stricter of the two readings, so `::ffff:127.0.0.1` is loopback.
 pub fn classify(addr: IpAddr) -> AddrClass {
     match addr {
         IpAddr::V4(a) => classify_v4(a),
@@ -284,9 +263,8 @@ fn classify_v4(a: Ipv4Addr) -> AddrClass {
         || a.is_broadcast()
         || o[0] == 0
         || o[0] >= 240
-        // Alibaba's metadata service sits inside CGNAT, Oracle's in the IETF
-        // protocol block; both are named so that allowing the range around
-        // them does not allow them.
+        // Alibaba's (inside CGNAT) and Oracle's (IETF protocol block) metadata addresses are
+        // named so that allowing the surrounding range does not allow them.
         || a == Ipv4Addr::new(100, 100, 100, 200)
         || a == Ipv4Addr::new(192, 0, 0, 192);
     if never {
@@ -414,7 +392,7 @@ mod tests {
         assert_eq!(FetchUrl::parse("http://a.example").unwrap().path, "/");
     }
 
-    /// Everything two parsers could read differently is refused.
+    /// Everything two parsers could read differently is refused (R3-F10).
     #[test]
     fn ambiguous_urls_are_refused() {
         for bad in [

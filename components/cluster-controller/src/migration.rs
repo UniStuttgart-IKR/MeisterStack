@@ -308,14 +308,12 @@ pub async fn reconcile_migrations(
     Ok(())
 }
 
-/// Remove reservations whose move is over: a migration's once it is terminal,
-/// deleted or absent; a placement's once its guest is bound, gone or deleting,
-/// or its claim has outlived any placement (R3-F05). Compare the reservation
-/// revision when deleting so a reused name cannot lose a newer claim. `held`
-/// and `vms` are the pass's snapshot and migrations are read again after it,
-/// so claims created during this pass are not reaped from stale data. Reaping
-/// early costs a placement one retry, never room: its binding is written only
-/// while its claim stands.
+/// Remove reservations whose move is over: a migration's once terminal, deleted or absent;
+/// a placement's once its guest is bound, gone or deleting, or the claim is stale (R3-F05).
+/// Delete against the reservation revision so a reused name cannot lose a newer claim.
+/// Migrations are read again after the `held`/`vms` snapshot so claims created during
+/// this pass are not reaped from stale data. Reaping a placement early costs a retry, never
+/// room: its binding is written only while its claim stands.
 async fn reap_reservations(
     store: &EtcdStore,
     held: &[CapacityReservation],
@@ -351,7 +349,7 @@ async fn reservations(store: &EtcdStore) -> anyhow::Result<Vec<CapacityReservati
 /// What `reserve` found at the key this migration writes its promise to.
 enum Reserved {
     /// This pass wrote it. Unique as a KEY, which is not yet the same as
-    /// fitting — see `controller_api::capacity::claim_holds`.
+    /// fitting — see `claim_holds`.
     Fresh(CapacityReservation),
     /// A promise for this very migration was already standing: an earlier
     /// attempt of this record wrote it and the process died before the phase
@@ -433,9 +431,8 @@ async fn release(store: &EtcdStore, migration: &VmMigration) {
     }
 }
 
-// The post-reservation confirmation lives in `controller_api::capacity::claim_holds`,
-// shared with ordinary placement so both roads answer "does this claim still fit"
-// the same way (R3-F05). A failed read there is an error, never a pass (R3-F04).
+// The post-reservation fit check is `controller_api::capacity::claim_holds`, shared with
+// placement so both roads answer alike (R3-F05).
 
 /// One migration, one step.
 #[allow(clippy::too_many_arguments)]
@@ -669,9 +666,8 @@ async fn prepare(
         }
     };
 
-    // A unique key is not a sum: concurrent creates on one node both succeed, so
-    // confirm the claim's place in etcd's revision order. The queue includes
-    // ordinary placement claims (R3-F05).
+    // A unique key is not a sum: concurrent creates on one node both succeed, so confirm
+    // the claim's place in etcd's revision order, placement claims included (R3-F05).
     match controller_api::capacity::claim_holds(store, &mine, overcommit).await {
         Ok(true) => {}
         Ok(false) => {
@@ -685,9 +681,8 @@ async fn prepare(
             )
             .await;
         }
-        // A failed read is not a passed check (R3-F04): end the step before the
-        // claim and any dispatch. The reservation stands, so the node looks fuller
-        // until the next pass adopts it and asks again.
+        // A failed read is not a passed check (R3-F04): end the step before any dispatch.
+        // The reservation stands (the node looks fuller) until the next pass adopts it.
         Err(e) => {
             return Err(e.context(format!(
                 "migration {name}: the room at {target} could not be confirmed; \
@@ -2370,10 +2365,8 @@ mod tests {
             .await
             .expect("the orphan");
 
-        // And a placement's claim beside them, for a guest that is BOUND —
-        // the binding is the count now, and the claim is the same guest
-        // twice. The crashed-between-binding-and-release leftover, Astra
-        // finding R3-F05.
+        // And a placement's claim for a bound guest: the leftover of a crash between
+        // binding and release (R3-F05).
         store
             .create(&CapacityReservation::for_placement(&guest, "agent-2"))
             .await

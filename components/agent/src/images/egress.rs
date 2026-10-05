@@ -2,41 +2,21 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Where this node may fetch a base image from.
+//! Where this node may fetch a base image from: the egress policy, enforced here because
+//! this is the tier that connects (R3-F10).
 //!
-//! Astra finding R3-F10, 2026-09-25: a member may create an image with any
-//! http(s) URL in its tenant, and this node fetched it with `curl --location`
-//! from its own network position, which is inside the management network,
-//! next to the cloud's metadata address and in front of its own loopback. The
-//! checksum is compared only after the bytes arrive, so the request itself
-//! was never in question. That is a server-side request forgery, and a
-//! redirect made it one no URL check at the cloud could see.
+//! * `[images] allowed_sources` lists host names, `*.domain` patterns, `*` (any host name)
+//!   and CIDRs. **Empty, the default, allows nothing.**
+//! * Every resolved address is classified (`common::fetch_url::classify`): loopback,
+//!   link-local, multicast and metadata addresses are always refused; private ranges need a
+//!   CIDR entry, a host name alone never opens them.
+//! * The check runs before curl starts and the approved address is pinned with `--resolve`,
+//!   so DNS rebinding cannot change where the connection goes.
+//! * curl follows no redirect itself (`--max-redirs 0`); a 3xx target goes through the
+//!   whole check again before a second request.
 //!
-//! This is the node's egress policy, and it is enforced HERE because this is
-//! the tier that connects:
-//!
-//! * The operator lists the sources in `[images] allowed_sources`: host names
-//!   (`cloud-images.ubuntu.com`), wildcard subdomains (`*.example.org`), the
-//!   bare `*` for any host name, and CIDRs (`10.0.8.0/24`). **Empty -- the
-//!   default -- allows nothing**: there is no fleet-owned catalogue or mirror
-//!   this node could fall back to, so a node that was not told where images
-//!   come from fetches none, and says so in the image's status.
-//! * Every address the name resolves to is classified
-//!   (`common::fetch_url::classify`). Loopback, link-local (where the
-//!   metadata services live), multicast and the named metadata addresses are
-//!   refused whatever the list says. Private ranges (RFC 1918, CGNAT, ULA)
-//!   are refused unless a CIDR entry contains the address; a host-name entry
-//!   alone never opens them, so a public name that resolves to an internal
-//!   address is still refused.
-//! * The check happens BEFORE curl is started, and the address it approved is
-//!   pinned with `--resolve`, so a second DNS answer between the check and
-//!   the connect (rebinding) cannot change where the connection goes.
-//! * curl follows no redirect itself (`--max-redirs 0`, no `--location`).
-//!   A 3xx comes back here, its target goes through this whole check again,
-//!   and only then is a second request made.
-//!
-//! The fetch still runs inside the agent process's network namespace. A
-//! separate, network-restricted unit for it is the later step (R3-F10, open).
+//! The fetch still runs in the agent's network namespace; a separate network-restricted
+//! fetch unit is still open (R3-F10).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -49,8 +29,7 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HostPattern {
-    /// `*`: any DNS name. Never an address literal, and never a private
-    /// address behind the name.
+    /// `*`: any DNS name; never an address literal or a private address behind the name.
     Any,
     /// `*.example.org`: every name strictly below `example.org`.
     Below(String),
@@ -75,12 +54,10 @@ impl HostPattern {
 pub struct EgressPolicy {
     hosts: Vec<HostPattern>,
     cidrs: Vec<Cidr>,
-    /// Test-only: loopback ports a test's own listener is on. Nothing in a
-    /// build for a node can set it.
+    /// Test-only: loopback ports of a test's own listener; no node build can set it.
     #[cfg(test)]
     loopback_ports: Vec<u16>,
-    /// Test-only: loopback on any port, for the cache tests whose origins
-    /// are throwaway listeners.
+    /// Test-only: loopback on any port, for cache tests with throwaway origins.
     #[cfg(test)]
     any_loopback: bool,
 }
@@ -146,8 +123,7 @@ impl EgressPolicy {
         Ok(policy)
     }
 
-    /// Test-only: this policy plus loopback on these ports, for tests whose
-    /// origin is a listener on 127.0.0.1.
+    /// Test-only: loopback on these ports, for tests whose origin is a 127.0.0.1 listener.
     #[cfg(test)]
     pub fn loopback_for_tests(ports: &[u16]) -> Self {
         Self {
@@ -185,8 +161,7 @@ impl EgressPolicy {
         self.hosts.is_empty() && self.cidrs.is_empty()
     }
 
-    /// Whether this address may be connected to for this URL: the whole of
-    /// the rule, with no I/O, so it can be tested one address at a time.
+    /// Whether this address may be connected to for this URL; the whole rule, no I/O.
     fn admits(&self, url: &FetchUrl, addr: IpAddr) -> Result<(), String> {
         if self.test_permits(url, addr) {
             return Ok(());
@@ -290,7 +265,7 @@ mod tests {
             .unwrap()
     }
 
-    /// The default is no source at all.
+    /// The default is no source at all (R3-F10).
     #[test]
     fn an_empty_list_fetches_nothing() {
         let err = EgressPolicy::deny_all()
@@ -302,7 +277,7 @@ mod tests {
         assert!(err.contains("allowed_sources"), "{err}");
     }
 
-    /// Loopback and the metadata address are refused however the list reads.
+    /// Loopback and the metadata address are refused however the list reads (R3-F10).
     #[test]
     fn loopback_and_metadata_are_never_fetched_from() {
         let p = policy(&["*", "0.0.0.0/0", "::/0"]);
@@ -321,7 +296,7 @@ mod tests {
         }
     }
 
-    /// A private address needs a CIDR; a host-name entry is not enough.
+    /// A private address needs a CIDR; a host-name entry is not enough (R3-F10).
     #[test]
     fn a_private_address_needs_a_cidr_entry() {
         let by_name = policy(&["mirror.lab.example"]);
@@ -350,7 +325,7 @@ mod tests {
         );
     }
 
-    /// The allowed mirror is fetched, pinned to the address that passed.
+    /// The allowed mirror is fetched, pinned to the address that passed (R3-F10).
     #[test]
     fn an_allowed_mirror_is_pinned_to_the_address_that_passed() {
         let p = policy(&["cloud-images.ubuntu.com", "*.example.org"]);
@@ -396,8 +371,7 @@ mod tests {
         );
     }
 
-    /// A redirect is a new URL and goes through the same decision: one to a
-    /// denied target is refused as if it had been the first request.
+    /// A redirect goes through the same decision; one to a denied target is refused (R3-F10).
     #[test]
     fn a_redirect_to_a_denied_target_is_refused() {
         let p = policy(&["cloud-images.ubuntu.com"]);

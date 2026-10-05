@@ -348,13 +348,8 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
     let done = observed_attachments(&asked, &["data-1", "data-2"]);
     assert!(attachments_settled(&asked, &done));
 
-    // Astra round 3, finding R3-F01: this used to assert the opposite — that
-    // a disk the node has and the spec no longer names is left out of the
-    // answer and the detach counts as settled. That was the bug: with the
-    // disk gone from `status.volumes`, `volume_drift` had nothing to release
-    // and the generation closed while the node still held it. The disk is
-    // in the answer now, after the spec's own entries, and the detach is
-    // settled only once the node stops reporting it.
+    // A disk the node holds but the spec no longer names stays in the answer, after the spec's
+    // own entries; the detach settles only once the node stops reporting it. (R3-F01)
     let detaching = vm(&["data-1"]);
     let after = observed_attachments(&detaching, &["data-1", "data-2"]);
     assert_eq!(
@@ -375,13 +370,8 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
     assert!(attachments_settled(&vm(&[]), &[]));
 }
 
-/// Astra round 3, finding R3-F01: the hot-detach the ingest used to hide.
-///
-/// The spec drops `data` while the node, in the report that arrives before
-/// the reconciler has told it anything, still holds it. The observed set has
-/// to keep `data` so that `volume_drift` sees a release to make; before the
-/// fix it answered only for the spec's disks, `status.volumes` went empty,
-/// the drift was `None`, and the generation closed on a disk still attached.
+/// The spec drops `data` while the node still holds it: the observed set keeps `data` so
+/// `volume_drift` sees a release to make. (R3-F01)
 #[test]
 fn a_disk_dropped_from_the_spec_but_still_held_is_released() {
     let mut web = vm("u-web");
@@ -509,9 +499,8 @@ async fn a_stale_report_after_a_detach_keeps_the_release_visible() {
         .await
         .expect("the volume");
 
-    // The new spec swapped `data` for `logs`, so the write has something to
-    // change (`logs` arrives as not attached) and the stale report is what
-    // it is written from.
+    // The new spec swapped `data` for `logs`, so the write has something to change and the
+    // stale report is what it is written from.
     let mut web = vm("u-web");
     web.spec.node_name = Some("n1".into());
     web.spec.vm = serde_json::json!({ "volumes": [{ "volume": "logs" }] });
@@ -1008,10 +997,8 @@ async fn a_session_whose_certificate_was_revoked_is_ended() {
     );
 }
 
-/// Astra round 3, finding R3-F03: a `Gone` is judged against the volume as
-/// the write reads it. The ingest used to decide `home` off the listing, so
-/// a `Gone` from a node that was the home when the listing was taken cleared
-/// `status.node` on a volume that had meanwhile been handed to another node.
+/// A `Gone` is judged against the volume as the write reads it, not as the listing had it.
+/// (R3-F03)
 #[test]
 fn a_gone_from_a_node_that_is_no_longer_home_leaves_the_volume_where_it_is() {
     let t0 = chrono::Utc::now();
@@ -1070,12 +1057,8 @@ fn a_gone_from_a_node_that_is_no_longer_home_leaves_the_volume_where_it_is() {
     assert!(speaks_for_volume(&volume("n2", &["n1"]), "n1"));
 }
 
-/// Astra round 3, finding R3-F03: `forget_unbound` decides the let-go off a
-/// listing. A vm bound again between the listing and the write keeps its
-/// holder and its reschedule count.
-///
-/// `#[ignore]`: needs an etcd; see
-/// `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+/// A vm bound again between the listing and the write keeps its holder and reschedule
+/// count. (R3-F03)
 #[tokio::test]
 #[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
 async fn a_vm_bound_again_after_the_listing_is_not_let_go() {

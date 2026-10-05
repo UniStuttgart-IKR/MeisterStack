@@ -405,13 +405,11 @@ struct Pass<'a> {
     /// `None` = no `secrets_key` in the config, and a VM naming a secret
     /// stays Pending with a sentence saying so. See `seed_for`.
     kek: Option<&'a controller_api::secrets::Kek>,
-    /// What the fleet had promised when this pass began — the reading
-    /// `nodes` was built with. `place` reads it to recognise a claim THIS
-    /// guest already holds from an attempt that did not reach the binding;
-    /// see `CapacityReservationSpec` and Astra finding R3-F05, 2026-09-24.
+    /// Reservations as read when this pass began (the same reading `nodes` was built from).
+    /// `place` uses it to recognise a claim this guest already holds from an earlier attempt
+    /// that never reached the binding (R3-F05).
     held: &'a [CapacityReservation],
-    /// The allowance rule, for the confirmation a placement makes against
-    /// the store rather than against `nodes`.
+    /// Allowance rule for the confirmation a placement makes against the store, not `nodes`.
     overcommit: Overcommit,
 }
 

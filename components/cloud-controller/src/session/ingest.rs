@@ -107,9 +107,8 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
         let active_was = router.status.active_node.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
-        // Astra round 3, finding R3-F03: under the uid the report named, and
-        // only while the router is still bound to this cluster as the object
-        // reads NOW — the binding check above ran on the listing.
+        // Pin the uid and re-check the binding on the live object; the listing's check may be
+        // stale. (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<controller_api::Router, _>(&name, &uid, |r| {
@@ -369,9 +368,8 @@ pub(super) async fn forget_unbound(
     for vm in leaving_cluster(vms, cluster, status) {
         let name = vm.metadata.name.clone();
         let uid = vm.metadata.uid.clone();
-        // Astra round 3, finding R3-F03: `leaving_cluster` read a listing, and
-        // the vm may have been bound again or the name recreated since. The
-        // uid is pinned and both facts it read are read again here.
+        // The listing may be stale: pin the uid and re-read both facts on the live object.
+        // (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<Vm, _>(&name, &uid, |v| {
@@ -449,11 +447,8 @@ pub(super) async fn ingest_placements(
             continue;
         }
         let name = vm.metadata.name.clone();
-        // Astra round 3, finding R3-F03: under the uid the report named, for
-        // a vm still bound to this cluster as the object reads NOW, and with
-        // the MAC lines merged into the addresses as they are now — the
-        // floating pass writes the other half of that list, and merging into
-        // the listing's copy would undo a write it made in between.
+        // Pin the uid, re-check the binding on the live object and merge the MAC lines into its
+        // current addresses: the floating pass writes the other half of that list. (R3-F03)
         let mut applied = false;
         if let Err(e) = store
             .mutate_if::<Vm, _>(&name, &reported.id, |v| {
@@ -499,13 +494,8 @@ pub(super) async fn ingest_phases(
         // the spec and travels with the event, so a member sees its own VMs'
         // history and nobody else's.
         let vm_tenant = vm.spec.tenant.clone();
-        // Astra round 3, finding R3-F03: `observe` matched the report to a vm
-        // of a listing and checked the binding there. Between that and this
-        // write the name may have been recreated under another uid, or the
-        // vm rebound to another cluster; `mutate_if` pins the uid on every
-        // read and the binding is asked again of the object being written,
-        // exactly as one tier down (Astra S20). Set fresh on every call,
-        // retries included, so it says what the write that landed did.
+        // The listing may be stale (name recreated, vm rebound): `mutate_if` pins the uid and
+        // re-checks the binding on the live object; `applied` is reset on every retry. (R3-F03)
         let mut applied = false;
         let result = store
             .mutate_if::<Vm, _>(&name, &reported.id, |v| {

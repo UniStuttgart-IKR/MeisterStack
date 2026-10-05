@@ -629,8 +629,7 @@ async fn a_session_without_a_certificate_is_not_revoked_by_an_empty_serial() {
     assert!(rx.try_recv().is_err());
 }
 
-/// A complete volume list that names nothing, for the delete-finishing
-/// tests below.
+/// A complete volume list that names nothing, for the delete-finishing tests.
 fn empty_complete_inventory() -> ClusterStatus {
     ClusterStatus {
         volumes_complete: true,
@@ -648,11 +647,8 @@ fn deleting_volume(name: &str, observed: chrono::DateTime<chrono::Utc>) -> contr
     v
 }
 
-/// Astra round 3, finding R3-F02, the verdict half: whether a complete list
-/// that does not name a volume finishes its delete is asked of each revision
-/// `finish_delete` is about to remove, and a revision that moved to another
-/// cluster, stopped being deleted, or was observed after the report is not
-/// concluded about.
+/// A delete finishes only for a revision still at this cluster, still deleted and not
+/// observed after the report. (R3-F02)
 #[test]
 fn a_delete_is_finished_only_by_a_report_that_is_about_this_revision() {
     let t0 = chrono::Utc::now();
@@ -692,11 +688,7 @@ async fn delete_test_store() -> EtcdStore {
         .expect("an etcd to talk to")
 }
 
-/// Astra round 3, finding R3-F02: a volume deleted and recreated under the
-/// same name between the listing and the delete is NOT removed. Before the
-/// fix the delete went out by name and took the new volume with it.
-///
-/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+/// A volume recreated under the same name between listing and delete is not removed. (R3-F02)
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_volume_recreated_under_the_same_name_survives_the_old_delete() {
@@ -733,12 +725,8 @@ async fn a_volume_recreated_under_the_same_name_survives_the_old_delete() {
     assert_eq!(still.metadata.uid, fresh.metadata.uid);
 }
 
-/// Astra round 3, finding R3-F02: a revision written after the listing is
-/// judged again. An observation newer than the report undoes the verdict, so
-/// nothing is deleted; a write that leaves the verdict standing (here a
-/// label) only costs a retry, and the delete then lands.
-///
-/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+/// A revision written after the listing is judged again; a write that keeps the verdict
+/// only costs a retry. (R3-F02)
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_delete_after_a_concurrent_write_judges_the_fresh_revision() {
@@ -784,10 +772,7 @@ async fn a_delete_after_a_concurrent_write_judges_the_fresh_revision() {
     ));
 }
 
-/// Astra round 3, finding R3-F02, for snapshots: the same guarded delete, so
-/// a snapshot recreated under the same name survives the old one's delete.
-///
-/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+/// A snapshot recreated under the same name survives the old one's delete. (R3-F02)
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_snapshot_recreated_under_the_same_name_survives_the_old_delete() {
@@ -846,13 +831,7 @@ fn bound_vm(name: &str, cluster: &str) -> Vm {
     v
 }
 
-/// Astra round 3, finding R3-F03: the cloud's `ingest_phases` matched the
-/// report to a vm of a stale listing and wrote BY NAME, so a delayed report
-/// from the old cluster landed on a vm that had meanwhile been rebound, and
-/// one about a deleted vm landed on a new vm recreated under its name. The
-/// write now pins the uid and asks the binding again of the object it read.
-///
-/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+/// A report from the old cluster does not land on a rebound or recreated vm. (R3-F03)
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_report_from_the_old_cluster_does_not_land_after_a_rebind_or_a_recreate() {
@@ -905,10 +884,7 @@ async fn a_report_from_the_old_cluster_does_not_land_after_a_rebind_or_a_recreat
     );
 }
 
-/// Astra round 3, finding R3-F03, the placement half: the node, the disks and
-/// the MAC lines from the old cluster do not land on a rebound vm either.
-///
-/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+/// Node, disks and MAC lines from the old cluster do not land on a rebound vm. (R3-F03)
 #[tokio::test]
 #[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
 async fn a_placement_from_the_old_cluster_does_not_land_after_a_rebind() {
