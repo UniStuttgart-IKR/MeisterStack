@@ -204,25 +204,12 @@ fn every_crash_in_keys_switch_is_resolvable() {
 
 #[test]
 fn every_crash_in_keys_revert_is_resolvable() {
-    // Open: a revert that finished its renames but not its record (:1702)
-    // reads `none`.
-    let known = [
-        (4, "recovered: Old in use, status none"),
-        (5, "recovered: Old in use, status none"),
-    ];
-    assert_eq!(key_crashes(KeyVerb::Revert), pinned(&known));
+    assert_eq!(key_crashes(KeyVerb::Revert), pinned(&[]));
 }
 
 #[test]
 fn every_crash_in_keys_remove_is_resolvable() {
-    // Open: with both `.prev` gone (activate.rs:1717-1718) and the record not
-    // yet `confirmed` (:1728), status is `none` (:1580), which the resume
-    // table makes RecoveryRequired (receipt.rs:845-856) for a finished rotation.
-    let known = [
-        (2, "recovered: New in use, status none"),
-        (3, "recovered: New in use, status none"),
-    ];
-    assert_eq!(key_crashes(KeyVerb::Remove), pinned(&known));
+    assert_eq!(key_crashes(KeyVerb::Remove), pinned(&[]));
 }
 
 // -----------------------------------------------------------------------

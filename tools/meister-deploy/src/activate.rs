@@ -1657,12 +1657,6 @@ impl<'a> Helper<'a> {
             },
             Err(_) => None,
         };
-        // The record wins only where the disk cannot speak: a rotation that
-        // was finished or taken back leaves nothing behind either way.
-        let finished = record
-            .as_ref()
-            .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
-            .map(|r| r.state);
         let layout = on_disk.layout();
         let (state, reason) = match layout {
             KeyLayout::Empty => match &record {
@@ -1677,7 +1671,7 @@ impl<'a> Helper<'a> {
                     )),
                 ),
             },
-            KeyLayout::InUse => (finished.unwrap_or(KeysState::None), None),
+            KeyLayout::InUse => (self.settled_state(kind, record.as_ref()), None),
             KeyLayout::Prepared => (KeysState::Prepared, None),
             KeyLayout::Overlap => (KeysState::Overlap, None),
             // The switch, whole: the prepared pair is in and the pair it
@@ -1702,6 +1696,42 @@ impl<'a> Helper<'a> {
         })
     }
 
+    /// The pair in use and nothing beside it: a rotation finished, taken
+    /// back, or never begun, and only the record can say which. A record
+    /// whose last write did not happen still names both certificates of
+    /// its switch, and the one in use tells a finished removal (the new one)
+    /// from a finished revert (the old one).
+    fn settled_state(&self, kind: KeyKind, record: Option<&KeysRecord>) -> KeysState {
+        let Some(record) = record else {
+            return KeysState::None;
+        };
+        match record.state {
+            KeysState::Confirmed | KeysState::Reverted => record.state,
+            KeysState::Overlap | KeysState::Switched => {
+                let in_use = self.digest_of(&self.cert_path_with(kind, None));
+                match (&record.previous_sha256, &record.sha256) {
+                    (Some(old), Some(new)) if old != new && in_use.as_ref() == Some(new) => {
+                        KeysState::Confirmed
+                    }
+                    (Some(old), Some(new)) if old != new && in_use.as_ref() == Some(old) => {
+                        KeysState::Reverted
+                    }
+                    _ => KeysState::None,
+                }
+            }
+            KeysState::None | KeysState::Prepared | KeysState::Inconsistent => KeysState::None,
+        }
+    }
+
+    /// The record of this key's rotation, if there is one this program can read.
+    fn stored_keys_record(&self, kind: KeyKind) -> Option<KeysRecord> {
+        let text = self
+            .files
+            .read_to_string(&self.keys_record_path(kind))
+            .ok()?;
+        KeysRecord::from_json(&text, "the key transaction").ok()
+    }
+
     fn write_keys_record(&self, record: &KeysRecord) -> Result<()> {
         self.files.create_dir_all(&self.txn_dir())?;
         let kind = KeyKind::parse(&record.kind)?;
@@ -1724,18 +1754,47 @@ impl<'a> Helper<'a> {
                 self.cert_path_with(kind, Some("next")).display()
             ),
         }
+        let mut record = self.switch_intent(kind, run_id)?;
         self.move_the_prepared_pair_in(kind)?;
         // The owner travels with the file, so nothing is chowned here; the
         // key was written 0600 `meister:meister` when it was made.
 
+        record.state = KeysState::Switched;
+        record.changed_at = self.clock.now();
+        self.write_keys_record(&record)?;
+        Ok(record)
+    }
+
+    /// Before the first rename, the record names this switch: both
+    /// certificates, and `overlap`, which is what the disk still says. A
+    /// revert or removal that is finished on the disk and not in the record
+    /// is then read off the certificate in use (`settled_state`), never off
+    /// the record of an earlier rotation. A switch that stopped keeps the
+    /// intent it wrote.
+    fn switch_intent(&self, kind: KeyKind, run_id: Option<&str>) -> Result<KeysRecord> {
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        let old = if self.files.exists(&crt_prev) {
+            crt_prev
+        } else {
+            self.cert_path_with(kind, None)
+        };
+        let previous_sha256 = self.digest_of(&old);
+        let sha256 = self.digest_of(&self.cert_path_with(kind, Some("next")));
+        if let Some(record) = self.stored_keys_record(kind)
+            && record.state == KeysState::Overlap
+            && record.previous_sha256 == previous_sha256
+            && record.sha256 == sha256
+        {
+            return Ok(record);
+        }
         let now = self.clock.now();
         let record = KeysRecord {
             schema: KEYS_SCHEMA.to_string(),
             kind: kind.as_str().to_string(),
-            state: KeysState::Switched,
+            state: KeysState::Overlap,
             run_id: run_id.map(str::to_string),
-            previous_sha256: self.digest_of(&self.cert_path_with(kind, Some("prev"))),
-            sha256: self.digest_of(&self.cert_path_with(kind, None)),
+            previous_sha256,
+            sha256,
             started_at: now,
             changed_at: now,
             reason: None,
@@ -1783,11 +1842,9 @@ impl<'a> Helper<'a> {
         let crt = self.cert_path_with(kind, None);
 
         let now = self.clock.now();
-        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
-            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
-                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
-            Err(_) => KeysRecord::new(kind, None, now),
-        };
+        let mut record = self
+            .stored_keys_record(kind)
+            .unwrap_or_else(|| KeysRecord::new(kind, None, now));
         record.state = KeysState::Reverted;
         record.reason = Some(because.unwrap_or("the rotation was taken back").to_string());
         record.sha256 = self.digest_of(&crt);
@@ -1852,11 +1909,9 @@ impl<'a> Helper<'a> {
         self.files.remove_file(&key_prev)?;
         self.files.remove_file(&crt_prev)?;
         let now = self.clock.now();
-        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
-            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
-                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
-            Err(_) => KeysRecord::new(kind, None, now),
-        };
+        let mut record = self
+            .stored_keys_record(kind)
+            .unwrap_or_else(|| KeysRecord::new(kind, None, now));
         record.state = KeysState::Confirmed;
         record.changed_at = now;
         record.sha256 = self.digest_of(&self.cert_path_with(kind, None));
@@ -3962,6 +4017,99 @@ mod tests {
             .to_string();
         assert!(err.contains("whole pair in use"), "{err}");
         assert_eq!(pki_files(&files), before);
+    }
+
+    /// A switch names itself in the record before it moves a file.
+    #[test]
+    fn a_switch_writes_its_record_before_its_first_rename() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        let attempts = files.attempts();
+        let record = attempts
+            .iter()
+            .position(|a| a.ends_with("keys-identity.json"))
+            .expect("the record was written");
+        let rename = attempts
+            .iter()
+            .position(|a| a.starts_with("rename"))
+            .expect("a file was moved");
+        assert!(record < rename, "{attempts:#?}");
+    }
+
+    /// A revert writes its record last. Without that write, the old
+    /// certificate in use still says the rotation was taken back.
+    #[test]
+    fn a_revert_finished_on_the_disk_but_not_in_its_record_reads_reverted() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        helper.put_the_old_pair_back(KeyKind::Identity).unwrap();
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
+    }
+
+    /// A removal writes its record last. Without that write, the new
+    /// certificate in use and no old pair still say the rotation is over.
+    #[test]
+    fn a_removal_finished_on_the_disk_but_not_in_its_record_reads_confirmed() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        for old in ["key.prev", "crt.prev"] {
+            files
+                .remove_file(Path::new(&format!("{PKI}/identity.{old}")))
+                .unwrap();
+        }
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Confirmed
+        );
+    }
+
+    /// The record of a finished rotation stays on the disk until the next
+    /// switch replaces it. A switch that moved its files and a revert that
+    /// put them back, neither of them recorded, read as taken back, not as
+    /// the earlier rotation's `confirmed`.
+    #[test]
+    fn the_record_of_an_earlier_rotation_does_not_decide_this_one() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper.keys_switch(KeyKind::Identity, None).unwrap();
+        helper.keys_remove(KeyKind::Identity).unwrap();
+        files
+            .write_atomic(
+                Path::new(&format!("{PKI}/identity.key.next")),
+                b"newer key\n",
+                0o600,
+            )
+            .unwrap();
+        files
+            .write_atomic(
+                Path::new(&format!("{PKI}/identity.crt.next")),
+                b"newer certificate\n",
+                0o644,
+            )
+            .unwrap();
+
+        helper.switch_intent(KeyKind::Identity, None).unwrap();
+        helper.move_the_prepared_pair_in(KeyKind::Identity).unwrap();
+        helper.put_the_old_pair_back(KeyKind::Identity).unwrap();
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
     }
 
     /// `keys remove` deletes `.prev` only behind a whole new pair in use;
