@@ -12,8 +12,9 @@ let
       inherit lib leandro system;
     };
 
-  # A host that carries a card, as small as a host of this fleet can be.
-  hostWith = leandro: (nixpkgs.lib.nixosSystem {
+  # A host that carries a card, as small as a host of this fleet can be. `extra` are the
+  # rest of the host's modules: its driver, its CPU and whatever a case needs.
+  hostWith = leandro: extra: (nixpkgs.lib.nixosSystem {
     modules = [
       {
         nixpkgs.hostPlatform = system;
@@ -31,8 +32,22 @@ let
         meisterstack.managed.trustedPublicKeys = [ "gpu-probe:not-a-real-key" ];
       }
       (profileOf leandro)
-    ];
+    ] ++ extra;
   }).config;
+
+  # What the host's own modules provide: the open driver with the persistence daemon, and
+  # the CPU (every GPU host of the IKR fleet is AMD).
+  driver = {
+    services.xserver.videoDrivers = [ "nvidia" ];
+    hardware.nvidia.open = true;
+    hardware.nvidia.nvidiaPersistenced = true;
+    # Evaluating the driver's own module reads its package's metadata, and the licence
+    # check refuses that for unfree packages. Nothing here is built or fetched.
+    nixpkgs.config.allowUnfreePredicate = pkg:
+      builtins.elem (lib.getName pkg) [ "nvidia-x11" "nvidia-settings" "nvidia-persistenced" ];
+  };
+  amd = { hardware.cpu.amd.updateMicrocode = true; };
+  intel = { hardware.cpu.intel.updateMicrocode = true; };
 
   # What the `leandro` input looks like from this profile's point of view:
   # two outputs, two binaries. Two trivial scripts because the check is about
@@ -46,9 +61,35 @@ let
     };
   };
 
-  without = hostWith null;
-  with' = hostWith stub;
+  without = hostWith null [ driver amd ];
+  with' = hostWith stub [ driver amd ];
+
+  # The cases of the profile's own assertions. Only this profile's are looked at: the host
+  # carries the agent's and the module system's as well.
+  failedOf = c: map (a: a.message)
+    (lib.filter (a: !a.assertion && lib.hasInfix "compute-gpu-pro6000" a.message) c.assertions);
+  paramsOf = c: " ${lib.concatStringsSep " " c.boot.kernelParams} ";
+  intelHost = hostWith null [ driver intel ];
+  unknownHost = hostWith null [ driver ];
+  forcedIntel = hostWith null [ driver { meisterstack.gpuProfile.iommuVendor = "intel"; } ];
+  noDriverHost = hostWith null [ amd ];
+  closedHost = hostWith null [ driver amd { hardware.nvidia.open = lib.mkForce false; } ];
+  noPersistenceHost = hostWith null [ driver amd { hardware.nvidia.nvidiaPersistenced = lib.mkForce false; } ];
+  migHost = hostWith null [
+    driver
+    amd
+    { systemd.services.nvidia-mig-setup = { script = "true"; wantedBy = [ "multi-user.target" ]; }; }
+  ];
+
+  # Each case must fail exactly its own assertion, whose message names `word`.
+  failsOnly = c: word:
+    let f = failedOf c; in
+    lib.length f == 1 && lib.hasInfix word (lib.head f);
   tomlOf = c: c.environment.etc."meisterstack/agent.toml".source;
+
+  # One shell step of the check: nothing when `ok`, else the reason and a failing exit.
+  require = ok: reason:
+    lib.optionalString (!ok) "echo ${lib.escapeShellArg "-> ${reason}"}; exit 1";
 in
 pkgs.runCommand "gpu-profile" { } ''
   echo "== without the leandro input"
@@ -59,12 +100,13 @@ pkgs.runCommand "gpu-profile" { } ''
   fi
   # The machine half is unconditional: the card is bound to vfio whether or
   # not anything hands it to a guest.
-  ${lib.concatMapStrings (p: ''
-    echo ${lib.escapeShellArg p} | grep -qx ${lib.escapeShellArg p}
-  '') without.boot.kernelParams}
-  case " ${lib.concatStringsSep " " without.boot.kernelParams} " in
+  case "${paramsOf without}" in
     *" iommu=pt "*) ;;
     *) echo "-> the profile did not turn the IOMMU on"; exit 1 ;;
+  esac
+  # AMD host: the vendor-neutral switch and nothing Intel-specific.
+  case "${paramsOf without}" in
+    *intel_iommu*) echo "-> an AMD host got an Intel IOMMU parameter"; exit 1 ;;
   esac
   case " ${lib.concatStringsSep " " without.boot.kernelModules} " in
     *" vfio-pci "*) ;;
@@ -76,6 +118,20 @@ pkgs.runCommand "gpu-profile" { } ''
   ${lib.optionalString (!(lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) without.warnings)) ''
     echo "-> a fleet with no GPU stack got no warning about it"; exit 1
   ''}
+
+  # The profile's assertions: a host that meets them has none failed, and each way of not
+  # meeting one fails exactly that one.
+  ${require (failedOf without == [ ]) "a complete GPU host failed: ${lib.concatStringsSep " | " (failedOf without)}"}
+  ${require (lib.hasInfix " intel_iommu=on " (paramsOf intelHost) && failedOf intelHost == [ ])
+    "an Intel GPU host did not get intel_iommu=on, or failed an assertion"}
+  ${require (lib.hasInfix " intel_iommu=on " (paramsOf forcedIntel) && failedOf forcedIntel == [ ])
+    "iommuVendor = intel did not select the Intel parameter"}
+  ${require (failsOnly unknownHost "tell an Intel host from an AMD") "a host of unknown CPU vendor was not refused"}
+  ${require (failsOnly noDriverHost "no NVIDIA driver") "a host without the NVIDIA driver was not refused with just that"}
+  ${require (failsOnly closedHost "hardware.nvidia.open") "the closed kernel module was not refused"}
+  ${require (failsOnly noPersistenceHost "nvidiaPersistenced") "a host without nvidia-persistenced was not refused"}
+  ${require (failsOnly migHost "MIG") "a host with MIG units was not refused"}
+  echo "  ok   vendor-neutral IOMMU switch and the five assertions"
 
   echo "== with it"
   cat ${tomlOf with'}
