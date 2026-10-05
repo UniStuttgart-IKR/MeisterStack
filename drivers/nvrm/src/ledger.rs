@@ -12,30 +12,16 @@
 //! card is unknown, and nothing is admitted beside it.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agent_api::device::{self, DeviceError, DeviceId};
 use backend::Backend;
 
-use crate::{
-    Claim, VgpuType, refuse_budget_overrun, refuse_card_overcommit, refuse_instance_overflow,
+use crate::admission::{
+    Claim, refuse_budget_overrun, refuse_card_overcommit, refuse_instance_overflow,
 };
-
-const SOCKET: &str = "sock";
-const CLAIM: &str = "claim";
-
-/// `<run_dir>/<id>.<extension>`: every file the driver keeps for a device.
-pub(crate) fn device_file(run_dir: &Path, id: &DeviceId, extension: &str) -> PathBuf {
-    run_dir.join(format!("{id}.{extension}"))
-}
-
-pub(crate) fn socket_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
-    device_file(run_dir, id, SOCKET)
-}
-
-pub(crate) fn claim_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
-    device_file(run_dir, id, CLAIM)
-}
+use crate::paths::{CLAIM, SOCKET, claim_file, device_file, device_of, socket_file};
+use crate::vgpu::VgpuType;
 
 /// What the driver holds of a backend's process.
 enum Process {
@@ -209,15 +195,7 @@ fn device_ids(run_dir: &Path) -> std::io::Result<BTreeSet<DeviceId>> {
     let mut ids = BTreeSet::new();
     for entry in std::fs::read_dir(run_dir)? {
         let path = entry?.path();
-        let kept = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some(SOCKET | CLAIM)
-        );
-        let id = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<DeviceId>().ok());
-        if let (true, Some(id)) = (kept, id) {
+        if let Some(id) = device_of(&path, SOCKET).or_else(|| device_of(&path, CLAIM)) {
             ids.insert(id);
         }
     }

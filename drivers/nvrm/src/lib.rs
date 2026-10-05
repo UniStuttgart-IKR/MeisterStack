@@ -21,8 +21,14 @@ use backend::{Backend, BackendIo, BackendKind};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+mod admission;
 mod ledger;
+mod paths;
+mod vgpu;
+
+use admission::Claim;
 use ledger::Ledger;
+pub use vgpu::VgpuType;
 
 /// VIRTIO_ID_NVRM, the device type Leandro's guest module binds to.
 const VIRTIO_ID_NVRM: u32 = 60;
@@ -118,6 +124,11 @@ impl NvrmParams {
             .unwrap_or(0)
     }
 
+    /// What a backend started from these parameters counts as on the card.
+    fn claim(&self, vgpu: Option<&VgpuType>) -> Claim {
+        Claim::new(self.admitted_mib(vgpu), vgpu)
+    }
+
     fn validate(&self) -> device::Result<()> {
         self.refuse_two_vram_policies()?;
         self.refuse_reserved_env()
@@ -154,20 +165,6 @@ impl NvrmParams {
     }
 }
 
-/// What `vgpuprofile --select <type>` reports for one type on this card.
-#[derive(Clone, Debug, PartialEq)]
-pub struct VgpuType {
-    pub vgpu_type: String,
-    pub profile_mib: u64,
-    pub fb_mib: u64,
-    pub max_instance: u64,
-    pub encoder_cap: u64,
-    /// `vgpu_available_mib`: what the card offers all guests together. Profile
-    /// sizes already carry their share of the card's carve-out, so this is the
-    /// sum they are measured against (Leandro `Catalogue::admits`).
-    pub available_mib: u64,
-}
-
 /// Default wait for a spawned backend's socket-file readiness, shared with agent config.
 pub const DEFAULT_SOCKET_TIMEOUT_MS: u64 = 5000;
 
@@ -189,34 +186,6 @@ pub struct NvrmDriverConfig {
     /// device nodes; identity switching does not grant that access. Node parameters
     /// control whether the backend requests administrative privileges.
     pub vmm_user: Option<agent_api::VmmUser>,
-}
-
-/// What one backend counts as for admission.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Claim {
-    /// Admitted VRAM in MiB; see [`NvrmParams::admitted_mib`].
-    mib: u64,
-    /// The type as `vgpuprofile` names it (`RTX2070-4Q`). A node may configure
-    /// `4Q` or `rtx2070-4q` for the same type, and the instance limit must
-    /// count all of them as one.
-    vgpu_type: Option<String>,
-    /// The card's `vgpu_available_mib`, known only for a vGPU-typed claim.
-    card_mib: Option<u64>,
-}
-
-impl Claim {
-    fn of(params: &NvrmParams, vgpu: Option<&VgpuType>) -> Self {
-        Self {
-            mib: params.admitted_mib(vgpu),
-            vgpu_type: vgpu.map(|v| v.vgpu_type.clone()),
-            card_mib: vgpu.map(|v| v.available_mib),
-        }
-    }
-
-    /// No cap, no profile size and no type: the backend may take the whole card.
-    fn is_unbounded(&self) -> bool {
-        self.mib == 0
-    }
 }
 
 pub struct NvrmDriver {
@@ -366,14 +335,12 @@ impl NvrmDriverConfig {
 }
 
 impl NvrmDriver {
-    /// The backend derives the vGPU identity from the socket path, so it must
-    /// be unique and stable per device for its whole lifetime.
     fn socket_path(&self, id: &DeviceId) -> PathBuf {
-        ledger::socket_file(&self.config.run_dir, id)
+        paths::socket_file(&self.config.run_dir, id)
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        ledger::device_file(&self.config.run_dir, id, "log")
+        paths::log_file(&self.config.run_dir, id)
     }
 
     fn attachment(socket: PathBuf, pid: u32) -> DeviceAttachment {
@@ -500,97 +467,6 @@ fn refuse_reserved_env_key(k: &str) -> device::Result<()> {
     Ok(())
 }
 
-/// Refuse one more backend of a vGPU type the card already holds `max_instance` of.
-fn refuse_instance_overflow(live: &[&Claim], vgpu: Option<&VgpuType>) -> device::Result<()> {
-    let Some(vgpu) = vgpu else {
-        return Ok(());
-    };
-    let same_type = live
-        .iter()
-        .filter(|c| c.vgpu_type.as_deref() == Some(vgpu.vgpu_type.as_str()))
-        .count() as u64;
-    if same_type >= vgpu.max_instance {
-        return Err(DeviceError::InvalidSpec(format!(
-            "vGPU type {} allows {} instance(s) on this card, {} already active",
-            vgpu.vgpu_type, vgpu.max_instance, same_type
-        )));
-    }
-    Ok(())
-}
-
-/// Once a vGPU type is on the card, every backend on it must fit beside the
-/// others: the admitted sizes together may not exceed `vgpu_available_mib`.
-/// Per-type instance counts alone let mixed types overbook the card, and a
-/// backend without any VRAM limit could take what the profiles promise.
-fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> device::Result<()> {
-    let Some(card) = card_size(live, want) else {
-        return Ok(());
-    };
-    if want.is_unbounded() {
-        return Err(DeviceError::InvalidSpec(format!(
-            "device {id} sets no VRAM limit (no vgpu_type, vram_profile_mib or \
-             vram_limit_mib), and this card carries vGPU-typed backends whose profiles it \
-             could take; give it a profile or a cap"
-        )));
-    }
-    if live.iter().any(|c| c.is_unbounded()) {
-        return Err(DeviceError::InvalidSpec(format!(
-            "a backend without a VRAM limit is running on this card, so it cannot promise \
-             device {id} a vGPU profile beside it"
-        )));
-    }
-    let used: u64 = live.iter().map(|c| c.mib).sum();
-    if used.saturating_add(want.mib) > card {
-        return Err(DeviceError::InvalidSpec(format!(
-            "the card offers {card} MiB to guests: {used} MiB admitted + {} MiB requested \
-             does not fit (device {id})",
-            want.mib
-        )));
-    }
-    Ok(())
-}
-
-/// The card's size from any vGPU-typed claim, or `None` when no vGPU type is
-/// involved. Every type resolves against the same card, so they agree; the
-/// smallest is taken should they not.
-fn card_size(live: &[&Claim], want: &Claim) -> Option<u64> {
-    live.iter()
-        .copied()
-        .chain([want])
-        .filter_map(|c| c.card_mib)
-        .min()
-}
-
-/// Refuse a backend that would take the live claims past the node's VRAM budget.
-fn refuse_budget_overrun(
-    live: &[&Claim],
-    want: &Claim,
-    budget: Option<u64>,
-    id: &DeviceId,
-) -> device::Result<()> {
-    let used: u64 = live.iter().map(|c| c.mib).sum();
-    let wants = want.mib;
-    match budget {
-        Some(budget) if used.saturating_add(wants) > budget => {
-            Err(DeviceError::InvalidSpec(format!(
-                "vram budget exceeded: {used} MiB active + {wants} MiB requested > \
-                 {budget} MiB (device {id})"
-            )))
-        }
-        Some(_) => Ok(()),
-        None => {
-            if used + wants > 0 {
-                debug!(
-                    used_mib = used,
-                    requested_mib = wants,
-                    "no vram budget configured, admitting without a hard check"
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
 /// Best-effort host preflight; hard failures belong to the backend, which
 /// asserts the exact driver version itself. These only make problems
 /// visible at agent start instead of at the first VM boot.
@@ -667,7 +543,7 @@ fn vgpu_from_output(vtype: &str, out: &std::process::Output) -> anyhow::Result<V
             stderr_excerpt(&out.stderr)
         );
     }
-    parse_vgpu_select(&String::from_utf8_lossy(&out.stdout))
+    vgpu::parse_vgpu_select(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// The start of what the helper wrote to stderr, which is where its reason
@@ -683,34 +559,6 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
         Some((cut, _)) => format!("{}...", &said[..cut]),
         None => said.to_string(),
     }
-}
-
-/// Parse the KEY=VALUE stdout of `vgpuprofile --select`.
-fn parse_vgpu_select(stdout: &str) -> anyhow::Result<VgpuType> {
-    let mut kv = HashMap::new();
-    for line in stdout.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            kv.insert(k.trim(), v.trim());
-        }
-    }
-    let get = |k: &str| -> anyhow::Result<&str> {
-        kv.get(k).copied().ok_or_else(|| {
-            anyhow::anyhow!("vgpuprofile output is missing {k}= (got: {:?})", kv.keys())
-        })
-    };
-    let num = |k: &str| -> anyhow::Result<u64> {
-        get(k)?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("vgpuprofile {k}: {e}"))
-    };
-    Ok(VgpuType {
-        vgpu_type: get("vgpu_type")?.to_string(),
-        profile_mib: num("vgpu_profile_mib")?,
-        fb_mib: num("vgpu_fb_mib")?,
-        max_instance: num("vgpu_max_instance")?,
-        encoder_cap: num("vgpu_encoder_cap")?,
-        available_mib: num("vgpu_available_mib")?,
-    })
 }
 
 #[async_trait::async_trait]
@@ -747,7 +595,7 @@ impl DeviceDriver for NvrmDriver {
         let env = Self::backend_env(&params, vgpu.as_ref())?;
 
         // Count the same effective parameters used to build the backend environment.
-        let claim = Claim::of(&params, vgpu.as_ref());
+        let claim = params.claim(vgpu.as_ref());
         self.ledger
             .lock()
             .await
@@ -812,7 +660,7 @@ impl DeviceDriver for NvrmDriver {
             }
         }
 
-        let claim = ledger::claim_file(&self.config.run_dir, id);
+        let claim = paths::claim_file(&self.config.run_dir, id);
         for p in [self.socket_path(id), self.log_path(id), claim] {
             backend::remove_if_present(&p)
                 .await
@@ -870,6 +718,7 @@ fn naming_the_device(id: &DeviceId, e: DeviceError) -> DeviceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use admission::tests::resolved;
 
     fn p(json: serde_json::Value) -> NvrmParams {
         serde_json::from_value(json).unwrap()
@@ -1169,21 +1018,6 @@ mod tests {
         assert_eq!(NvrmParams::default().admitted_mib(None), 0);
     }
 
-    /// `vgpu_available_mib` of the 8 GiB card the fixtures resolve against.
-    const RTX2070_MIB: u64 = 8192;
-
-    /// A resolved type as the card describes it, for admission tests.
-    fn resolved(vgpu_type: &str, profile_mib: u64, max_instance: u64) -> VgpuType {
-        VgpuType {
-            vgpu_type: vgpu_type.into(),
-            profile_mib,
-            fb_mib: profile_mib - 512,
-            max_instance,
-            encoder_cap: 50,
-            available_mib: RTX2070_MIB,
-        }
-    }
-
     fn configured(vgpu_type: &str) -> NvrmParams {
         NvrmParams {
             vgpu_type: Some(vgpu_type.into()),
@@ -1197,92 +1031,13 @@ mod tests {
     fn the_instance_limit_holds_however_the_type_was_spelled() {
         let card_4q = resolved("RTX2070-4Q", 4096, 1);
         for spelling in ["4Q", "rtx2070-4q", "RTX2070-4Q"] {
-            let running = Claim::of(&configured(spelling), Some(&card_4q));
+            let running = configured(spelling).claim(Some(&card_4q));
             assert_eq!(running.vgpu_type.as_deref(), Some("RTX2070-4Q"));
-            let said = refuse_instance_overflow(&[&running], Some(&card_4q))
+            let said = admission::refuse_instance_overflow(&[&running], Some(&card_4q))
                 .expect_err("the card holds one 4Q, whatever the first was called")
                 .to_string();
             assert!(said.contains("allows 1 instance"), "{spelling}: {said}");
         }
-    }
-
-    fn typed(vgpu: &VgpuType) -> Claim {
-        Claim::of(&configured(&vgpu.vgpu_type), Some(vgpu))
-    }
-
-    fn capped(mib: u64) -> Claim {
-        Claim::of(&p(serde_json::json!({ "vram_limit_mib": mib })), None)
-    }
-
-    fn device() -> DeviceId {
-        DeviceId::new_v4()
-    }
-
-    /// IKR-B14, Leandro's `one_4q_admits_two_2q_and_nothing_more`: one 4Q
-    /// and two 2Q fill the card, and a 1Q beside them is refused although
-    /// no type has reached its own instance limit.
-    #[test]
-    fn mixed_vgpu_types_may_not_overbook_the_card() {
-        let (q4, q2, q1) = (
-            typed(&resolved("RTX2070-4Q", 4096, 2)),
-            typed(&resolved("RTX2070-2Q", 2048, 4)),
-            typed(&resolved("RTX2070-1Q", 1024, 8)),
-        );
-        refuse_card_overcommit(&[&q4, &q2], &q2, &device()).expect("4096 + 2048 + 2048 fits");
-        let said = refuse_card_overcommit(&[&q4, &q2, &q2], &q1, &device())
-            .expect_err("the card is full")
-            .to_string();
-        assert!(said.contains("8192 MiB"), "{said}");
-    }
-
-    /// A cap counts against the card like a profile once vGPU types share it.
-    #[test]
-    fn a_capped_backend_counts_against_the_card_beside_vgpu_types() {
-        let q4 = typed(&resolved("RTX2070-4Q", 4096, 2));
-        refuse_card_overcommit(&[&q4], &capped(4096), &device()).expect("exactly the card");
-        refuse_card_overcommit(&[&q4], &capped(4097), &device()).expect_err("one MiB over");
-    }
-
-    /// A backend that may take the whole card cannot join vGPU-typed ones.
-    #[test]
-    fn an_unlimited_backend_is_refused_beside_vgpu_types() {
-        let q2 = typed(&resolved("RTX2070-2Q", 2048, 4));
-        let unlimited = Claim::of(&NvrmParams::default(), None);
-        let said = refuse_card_overcommit(&[&q2], &unlimited, &device())
-            .expect_err("it could take what the 2Q was promised")
-            .to_string();
-        assert!(said.contains("no VRAM limit"), "{said}");
-    }
-
-    /// And a vGPU type cannot promise its profile beside an unlimited backend.
-    #[test]
-    fn a_vgpu_type_is_refused_beside_an_unlimited_backend() {
-        let unlimited = Claim::of(&NvrmParams::default(), None);
-        let q2 = typed(&resolved("RTX2070-2Q", 2048, 4));
-        let said = refuse_card_overcommit(&[&unlimited], &q2, &device())
-            .expect_err("the running backend could take the profile")
-            .to_string();
-        assert!(said.contains("without a VRAM limit"), "{said}");
-    }
-
-    /// Without any vGPU type the card size is unknown; only the budget applies.
-    #[test]
-    fn without_a_vgpu_type_the_card_rule_does_not_apply() {
-        refuse_card_overcommit(&[&capped(6000)], &capped(6000), &device())
-            .expect("no card size to measure against");
-        refuse_budget_overrun(&[&capped(6000)], &capped(6000), Some(8192), &device())
-            .expect_err("but a budget still holds");
-    }
-
-    /// A `vgpuprofile` that does not print the card size cannot be admitted against.
-    #[test]
-    fn select_output_without_the_card_size_is_refused() {
-        let out = "vgpu_type=RTX2070-4Q\nvgpu_profile_mib=4096\nvgpu_fb_mib=2816\n\
-                   vgpu_max_instance=2\nvgpu_encoder_cap=50\n";
-        let said = parse_vgpu_select(out)
-            .expect_err("unknown card size")
-            .to_string();
-        assert!(said.contains("vgpu_available_mib"), "{said}");
     }
 
     #[test]
@@ -1302,25 +1057,5 @@ mod tests {
         assert_eq!(get("LEA_VGPU_PROFILE_MIB"), Some("4096"));
         assert_eq!(get("LEA_VGPU_FB_MIB"), Some("2816"));
         assert_eq!(get("LEA_VGPU_ENCODER_CAP"), Some("50"));
-    }
-
-    #[test]
-    fn parses_vgpuprofile_select_output() {
-        let out = "vgpu_type=RTX2070-4Q\nvgpu_profile_mib=4096\nvgpu_fb_mib=2816\n\
-                   vgpu_max_instance=2\nvgpu_segments=11\nvgpu_segment_mib=256\n\
-                   vgpu_encoder_cap=50\nvgpu_available_mib=8192\n";
-        let v = parse_vgpu_select(out).unwrap();
-        assert_eq!(
-            v,
-            VgpuType {
-                vgpu_type: "RTX2070-4Q".into(),
-                profile_mib: 4096,
-                fb_mib: 2816,
-                max_instance: 2,
-                encoder_cap: 50,
-                available_mib: 8192,
-            }
-        );
-        assert!(parse_vgpu_select("prose only, no keys\n").is_err());
     }
 }
