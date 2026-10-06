@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_api::CgroupHandle;
@@ -245,6 +246,9 @@ pub struct NvrmDriver {
     /// as a process GROUP. See `BackendKind::detached`.
     process: BackendKind,
     vgpu_cache: Mutex<HashMap<String, VgpuType>>,
+    /// Runs `vgpuprofile` one at a time, and not at all while one killed at
+    /// its deadline still lives; see [`bounded`].
+    vgpuprofile: Arc<bounded::Runner>,
     /// The backends this instance started. Admission counts the agent's
     /// records first; see [`ledger`]. Held for no await, so a reservation
     /// can give its place back from a destructor.
@@ -287,6 +291,7 @@ impl NvrmDriver {
             process,
             config,
             vgpu_cache: Mutex::new(cache),
+            vgpuprofile: Arc::default(),
             ledger: std::sync::Mutex::new(Ledger::default()),
         }
     }
@@ -330,8 +335,11 @@ impl NvrmDriverConfig {
         })
     }
 
-    /// Resolve the vGPU type of every profile against the card, once per type.
+    /// Resolve the vGPU type of every profile against the card, once per
+    /// type. A helper that hangs here fails the driver's construction, and
+    /// nothing of this run is kept for the driver.
     fn resolve_profile_types(&self) -> device::Result<HashMap<String, VgpuType>> {
+        let runner = bounded::Runner::default();
         let mut cache = HashMap::new();
         for (name, params) in &self.profiles {
             let Some(vtype) = self.defaults.overlay(params).vgpu_type else {
@@ -340,12 +348,13 @@ impl NvrmDriverConfig {
             if cache.contains_key(&vtype) {
                 continue;
             }
-            let resolved = resolve_vgpu_type(&self.vgpuprofile_bin, self.host_reserve()?, &vtype)
+            let reserve = self.host_reserve()?;
+            let resolved = resolve_vgpu_type(&runner, &self.vgpuprofile_bin, reserve, &vtype)
                 .map_err(|e| {
-                DeviceError::InvalidSpec(format!(
-                    "nvrm profile {name:?}: vgpu_type {vtype:?}: {e:#}"
-                ))
-            })?;
+                    DeviceError::InvalidSpec(format!(
+                        "nvrm profile {name:?}: vgpu_type {vtype:?}: {e:#}"
+                    ))
+                })?;
             info!(profile = %name, vgpu_type = %vtype,
                   profile_mib = resolved.profile_mib, fb_mib = resolved.fb_mib,
                   max_instance = resolved.max_instance,
@@ -418,12 +427,14 @@ impl NvrmDriver {
         // so it goes to the agent log; the caller, maybe a tenant, hears
         // which types there are.
         let reserve = self.config.host_reserve()?;
-        let resolved = resolve_vgpu_type_async(&self.config.vgpuprofile_bin, reserve, vtype)
-            .await
-            .map_err(|e| {
-                warn!(vgpu_type = %vtype, error = %e, "a requested vGPU type did not resolve");
-                DeviceError::InvalidSpec(e.for_tenant(vtype))
-            })?;
+        let runner = Arc::clone(&self.vgpuprofile);
+        let resolved =
+            resolve_vgpu_type_async(runner, &self.config.vgpuprofile_bin, reserve, vtype)
+                .await
+                .map_err(|e| {
+                    warn!(vgpu_type = %vtype, error = %e, "a requested vGPU type did not resolve");
+                    DeviceError::InvalidSpec(e.for_tenant(vtype))
+                })?;
         self.vgpu_cache
             .lock()
             .await
@@ -551,29 +562,30 @@ fn host_checks() {
 /// Resolve a type against the card, within [`VGPUPROFILE_DEADLINE`]. The
 /// helper returns KEY=VALUE records on stdout and diagnostics on stderr.
 fn resolve_vgpu_type(
+    runner: &bounded::Runner,
     bin: &Path,
     host_reserve_mib: u64,
     vtype: &str,
 ) -> Result<VgpuType, ResolveError> {
-    let out = bounded::output_within(
-        vgpuprofile_select(bin, host_reserve_mib, vtype),
-        VGPUPROFILE_DEADLINE,
-    )
-    .map_err(|source| ResolveError::Run {
-        bin: bin.to_path_buf(),
-        source,
-    })?;
+    let select = vgpuprofile_select(bin, host_reserve_mib, vtype);
+    let out = runner
+        .output_within(select, VGPUPROFILE_DEADLINE)
+        .map_err(|source| ResolveError::Run {
+            bin: bin.to_path_buf(),
+            source,
+        })?;
     vgpu::from_select(vtype, &out)
 }
 
 /// The same off the runtime's workers, so a slow card stalls no other task.
 async fn resolve_vgpu_type_async(
+    runner: Arc<bounded::Runner>,
     bin: &Path,
     host_reserve_mib: u64,
     vtype: &str,
 ) -> Result<VgpuType, ResolveError> {
     let (bin, vtype) = (bin.to_path_buf(), vtype.to_string());
-    tokio::task::spawn_blocking(move || resolve_vgpu_type(&bin, host_reserve_mib, &vtype))
+    tokio::task::spawn_blocking(move || resolve_vgpu_type(&runner, &bin, host_reserve_mib, &vtype))
         .await
         .map_err(|e| ResolveError::Task(e.to_string()))?
 }

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A helper process run to completion within a deadline.
+//! A helper process run to completion within a deadline, one at a time.
 //!
 //! `vgpuprofile` talks to the GPU driver, and a wedged driver leaves it in an
 //! ioctl that does not return. Run unbounded, it hangs the agent's start or
@@ -10,10 +10,15 @@
 //! passes, and is waited for only a little longer: a process stuck in the
 //! kernel does not die of SIGKILL until the call returns, and the agent does
 //! not wait for that.
+//!
+//! Such a helper is kept rather than dropped, and while it lives no other is
+//! started: a tenant chooses the type an admission resolves, and every
+//! request naming a new one would otherwise leave one more stuck process, and
+//! two threads blocked on its pipes, behind.
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -43,13 +48,61 @@ pub(crate) enum RunError {
     Spawn(std::io::Error),
     #[error("could not wait for it: {0}")]
     Wait(std::io::Error),
-    #[error("it did not finish within {deadline:?} and was killed")]
-    TimedOut { deadline: Duration },
+    #[error("it did not finish within {deadline:?} and was killed (pid {pid})")]
+    TimedOut { deadline: Duration, pid: u32 },
+    #[error(
+        "an earlier run (pid {pid}) was killed at its deadline and has not exited; no other is \
+         started beside it"
+    )]
+    StillRunning { pid: u32 },
 }
 
-/// Run `cmd` with no stdin and its output captured, and wait at most
-/// `deadline` for it to finish.
-pub(crate) fn output_within(mut cmd: Command, deadline: Duration) -> Result<Finished, RunError> {
+/// Runs one helper at a time, and none while one it killed still lives.
+#[derive(Default)]
+pub(crate) struct Runner {
+    /// Held for the whole of each run. Holds the last helper killed at its
+    /// deadline that had not exited by then.
+    killed: Mutex<Option<Child>>,
+}
+
+impl Runner {
+    /// Run `cmd` with no stdin and its output captured, and wait at most
+    /// `deadline` for it to finish. Refused at once, without starting
+    /// anything, while a helper killed earlier has not exited.
+    pub(crate) fn output_within(
+        &self,
+        cmd: Command,
+        deadline: Duration,
+    ) -> Result<Finished, RunError> {
+        let mut killed = self.killed.lock().unwrap_or_else(PoisonError::into_inner);
+        refuse_while_running(&mut killed)?;
+        run(cmd, deadline, &mut killed)
+    }
+}
+
+/// Refuse while `killed` lives; forget it once it has exited.
+fn refuse_while_running(killed: &mut Option<Child>) -> Result<(), RunError> {
+    let Some(child) = killed else {
+        return Ok(());
+    };
+    // An error says there is no such child left to wait for.
+    if matches!(child.try_wait(), Ok(None)) {
+        let pid = child.id();
+        warn!(
+            pid,
+            "a helper killed at its deadline still runs; refusing to start another"
+        );
+        return Err(RunError::StillRunning { pid });
+    }
+    *killed = None;
+    Ok(())
+}
+
+fn run(
+    mut cmd: Command,
+    deadline: Duration,
+    killed: &mut Option<Child>,
+) -> Result<Finished, RunError> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -58,22 +111,22 @@ pub(crate) fn output_within(mut cmd: Command, deadline: Duration) -> Result<Fini
         .map_err(RunError::Spawn)?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let status = match wait_until(&mut child, Instant::now() + deadline) {
-        Ok(Some(status)) => status,
+    match wait_until(&mut child, Instant::now() + deadline) {
+        Ok(Some(status)) => Ok(Finished {
+            status,
+            stdout: collected(stdout),
+            stderr: collected(stderr),
+        }),
         Ok(None) => {
-            kill_and_reap(&mut child);
-            return Err(RunError::TimedOut { deadline });
+            let pid = child.id();
+            *killed = kill_and_reap(child);
+            Err(RunError::TimedOut { deadline, pid })
         }
         Err(e) => {
-            kill_and_reap(&mut child);
-            return Err(RunError::Wait(e));
+            *killed = kill_and_reap(child);
+            Err(RunError::Wait(e))
         }
-    };
-    Ok(Finished {
-        status,
-        stdout: collected(stdout),
-        stderr: collected(stderr),
-    })
+    }
 }
 
 /// The exit status, or `None` once `end` has passed without one.
@@ -89,16 +142,20 @@ fn wait_until(child: &mut Child, end: Instant) -> std::io::Result<Option<ExitSta
     }
 }
 
-fn kill_and_reap(child: &mut Child) {
+/// Kill `child` and reap it within [`GRACE`]; the child back if it did not
+/// exit by then.
+fn kill_and_reap(mut child: Child) -> Option<Child> {
     let _ = child.kill();
-    if !matches!(wait_until(child, Instant::now() + GRACE), Ok(Some(_))) {
-        // Stuck in the kernel; it is reaped when the agent exits. Better a
-        // zombie than an agent that waits for a driver that never answers.
-        warn!(
-            pid = child.id(),
-            "a killed helper did not exit; leaving it behind"
-        );
+    if matches!(wait_until(&mut child, Instant::now() + GRACE), Ok(Some(_))) {
+        return None;
     }
+    // Stuck in the kernel. Better one kept process than an agent that waits
+    // for a driver that never answers.
+    warn!(
+        pid = child.id(),
+        "a killed helper did not exit; no other is started until it does"
+    );
+    Some(child)
 }
 
 /// Read a stream to its end on a thread of its own, keeping the first
@@ -135,11 +192,12 @@ mod tests {
     /// A helper that finishes in time hands over its status and both streams.
     #[test]
     fn a_helper_that_finishes_is_heard_out() {
-        let done = output_within(
-            sh("echo said; echo why >&2; exit 3"),
-            Duration::from_secs(10),
-        )
-        .expect("finished");
+        let done = Runner::default()
+            .output_within(
+                sh("echo said; echo why >&2; exit 3"),
+                Duration::from_secs(10),
+            )
+            .expect("finished");
         assert_eq!(done.status.code(), Some(3));
         assert_eq!(done.stdout, b"said\n");
         assert_eq!(done.stderr, b"why\n");
@@ -150,7 +208,8 @@ mod tests {
     #[test]
     fn a_helper_that_hangs_is_killed_at_its_deadline() {
         let started = Instant::now();
-        let said = output_within(sh("exec sleep 600"), Duration::from_millis(200))
+        let said = Runner::default()
+            .output_within(sh("exec sleep 600"), Duration::from_millis(200))
             .expect_err("it hangs")
             .to_string();
         assert!(said.contains("did not finish within"), "{said}");
@@ -159,5 +218,52 @@ mod tests {
             "the caller went on: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A helper still alive after its kill, as one stuck in the kernel is
+    /// until its call returns, bars every later run, which starts nothing.
+    /// An unkilled child stands in for it: SIGKILL ends any process a test
+    /// can make.
+    #[test]
+    fn a_killed_helper_that_still_runs_bars_the_next() {
+        let runner = Runner::default();
+        let stuck = sh("exec sleep 600").spawn().expect("running");
+        let pid = stuck.id();
+        *runner.killed.lock().expect("unpoisoned") = Some(stuck);
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let marker = dir.path().join("ran");
+
+        let ran = runner.output_within(
+            sh(&format!(": > '{}'", marker.display())),
+            Duration::from_secs(10),
+        );
+        let mut stuck = runner
+            .killed
+            .lock()
+            .expect("unpoisoned")
+            .take()
+            .expect("still kept");
+        stuck.kill().expect("killed");
+        stuck.wait().expect("reaped");
+        let said = ran.map(|_| ()).expect_err("barred");
+        assert!(
+            matches!(said, RunError::StillRunning { pid: p } if p == pid),
+            "{said}"
+        );
+        assert!(!marker.exists(), "nothing was started");
+    }
+
+    /// Once the kept helper has exited it is reaped and forgotten, and the
+    /// next run goes ahead.
+    #[test]
+    fn a_kept_helper_that_has_exited_bars_nothing() {
+        let runner = Runner::default();
+        let mut gone = sh("exit 0").spawn().expect("running");
+        let _ = gone.wait();
+        *runner.killed.lock().expect("unpoisoned") = Some(gone);
+        runner
+            .output_within(sh("exit 0"), Duration::from_secs(10))
+            .expect("ran");
+        assert!(runner.killed.lock().expect("unpoisoned").is_none());
     }
 }
