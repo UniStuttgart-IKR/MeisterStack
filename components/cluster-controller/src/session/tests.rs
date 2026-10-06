@@ -420,7 +420,7 @@ fn a_disk_dropped_from_the_spec_but_still_held_is_released() {
 }
 
 /// Removing the final referenced disk clears attachment status and converges
-/// hot-plug reconciliation. Requires external etcd; see the namespace test setup.
+/// hot-plug reconciliation. Requires external etcd; see `crate::test_etcd`.
 #[tokio::test]
 #[ignore = "needs an etcd; see crate::test_etcd"]
 async fn the_last_volume_removed_from_the_spec_clears_the_status() {
@@ -784,7 +784,7 @@ fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
 }
 
 /// Reports buffered on a superseded session cannot overwrite current node or
-/// VM evidence. Requires external etcd; see the namespace test setup.
+/// VM evidence. Requires external etcd; see `crate::test_etcd`.
 #[tokio::test]
 #[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_report_on_a_superseded_session_changes_nothing() {
@@ -874,7 +874,7 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
 
 /// Ingest mutation rechecks the live binding even when its cached VM index is
 /// stale, rejecting an old node's report after rebinding. Requires external etcd;
-/// see the namespace test setup.
+/// see `crate::test_etcd`.
 #[tokio::test]
 #[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_report_from_the_old_node_does_not_land_after_the_vm_was_rebound() {
