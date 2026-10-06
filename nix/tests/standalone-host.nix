@@ -66,6 +66,10 @@ let
       let c = cluster { meisterstack.autostart = true; }; in
       builtins.elem "multi-user.target" c.systemd.services.meister-cluster-controller.wantedBy;
 
+    "a host without a data block mounts none" =
+      let c = cluster { meisterstack.data.label = null; }; in
+      !(c.fileSystems ? "/var/lib/etcd") && !(c.fileSystems ? "/var/lib/meister-data");
+
     "an agent holds no address on the default guest bridge unless asked" =
       !((agent { }).meisterstack.agent.effective.network ? bridge_addr);
     "an agent keeps guests from opening connections to the host" =
