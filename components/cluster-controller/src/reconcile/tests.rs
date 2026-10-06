@@ -2851,6 +2851,40 @@ async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
 
     let still: VolumeSnapshot = store.get("snap").await.expect("the new snapshot");
     assert_eq!(still.metadata.uid, fresh.metadata.uid);
+    assert!(
+        still
+            .metadata
+            .finalizers
+            .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string())
+    );
+}
+
+/// The listed snapshot itself still goes when no node ever had it: the guard is a guard, not
+/// a wall. (R2-2)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_snapshot_no_node_ever_had_is_deleted() {
+    let store = fresh_store().await;
+    let mut old = controller_api::resources::new_volume_snapshot(
+        "snap",
+        controller_api::VolumeSnapshotSpec {
+            volume: "data".into(),
+            ..Default::default()
+        },
+    );
+    old.metadata.deletion_timestamp = Some(Utc::now());
+    let listed = store.create(&old).await.expect("a deleting snapshot");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    drop_snapshot(&quiet_pass(&store, &registry, &connected), &listed)
+        .await
+        .expect("the drop");
+
+    assert!(matches!(
+        store.get::<VolumeSnapshot>("snap").await,
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 /// The listed volume itself still goes: the guard is a guard, not a wall. (R2-2)
