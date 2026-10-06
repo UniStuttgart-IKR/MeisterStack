@@ -1121,27 +1121,31 @@ async fn delete_cloud_record<T: controller_api::Resource>(
     if deletion::finish_delete(store, checked, the_clouds).await? {
         return Ok(());
     }
-    let done = |obj: &T| !the_clouds(obj);
-    answer_unwritten(store, &checked.metadata().name, done, "deleted").await
+    // Gone, or another object's: done.
+    let deleted = |now: Option<&T>| now.is_none_or(|obj| !the_clouds(obj)).then_some(());
+    answer_unwritten(store, &checked.metadata().name, deleted, "deleted").await
 }
 
-/// The answer to a cloud command whose guarded write did not land: done when the name names
-/// nothing any more or an object `done` holds for, otherwise an error the cloud retries, never
-/// an ack for an object of the cloud's that still waits on the command.
-async fn answer_unwritten<T: controller_api::Resource>(
+/// The answer to a cloud command whose guarded write did not land, read off what the name holds
+/// now (`None`: nothing): `settled` says what the command came to, or `None` while the cloud's
+/// object still waits on it — an error the cloud retries, never an ack for it.
+async fn answer_unwritten<T: controller_api::Resource, A>(
     store: &EtcdStore,
     name: &str,
-    done: impl Fn(&T) -> bool,
+    settled: impl Fn(Option<&T>) -> Option<A>,
     doing: &str,
-) -> anyhow::Result<()> {
-    match store.get::<T>(name).await {
-        Err(StoreError::NotFound(_)) => Ok(()),
-        Ok(current) if done(&current) => Ok(()),
-        Ok(_) => bail!(
+) -> anyhow::Result<A> {
+    let now = match store.get::<T>(name).await {
+        Ok(current) => Some(current),
+        Err(StoreError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    match settled(now.as_ref()) {
+        Some(answer) => Ok(answer),
+        None => bail!(
             "{}/{name} changed while it was {doing}; not {doing} yet",
             T::RESOURCE
         ),
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -1606,33 +1610,21 @@ async fn mark_for_teardown<T: controller_api::Resource>(
             }
         })
         .await;
+    // A mark that did not land: gone or another cloud object's is nothing left; this cloud
+    // object, marked by somebody else, is marked; unmarked it is not done yet.
+    let settled = |now: Option<&T>| match now {
+        Some(obj) if the_clouds(obj) => obj
+            .metadata()
+            .deletion_timestamp
+            .is_some()
+            .then_some(Teardown::Marked),
+        _ => Some(Teardown::NothingLeft),
+    };
     match written {
         Ok(_) if marked => Ok(Teardown::Marked),
         Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
-            teardown_unwritten::<T>(store, &meta.name, cloud_uid).await
+            answer_unwritten(store, &meta.name, settled, "marked for teardown").await
         }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// What the name holds after a mark that did not land: gone or another cloud object's is nothing
-/// left; this cloud object, marked by somebody else, is marked; unmarked it is an error the cloud
-/// retries.
-async fn teardown_unwritten<T: controller_api::Resource>(
-    store: &EtcdStore,
-    name: &str,
-    cloud_uid: &str,
-) -> anyhow::Result<Teardown> {
-    match store.get::<T>(name).await {
-        Err(StoreError::NotFound(_)) => Ok(Teardown::NothingLeft),
-        Ok(current) if current.metadata().cloud_uid() != Some(cloud_uid) => {
-            Ok(Teardown::NothingLeft)
-        }
-        Ok(current) if current.metadata().deletion_timestamp.is_some() => Ok(Teardown::Marked),
-        Ok(_) => bail!(
-            "{}/{name} changed while it was marked for teardown; not marked for teardown yet",
-            T::RESOURCE
-        ),
         Err(e) => Err(e.into()),
     }
 }
