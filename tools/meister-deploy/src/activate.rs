@@ -1980,7 +1980,9 @@ pub enum KeysState {
     Confirmed,
     /// The old pair is back in use and the new one is gone.
     Reverted,
-    /// The disk says something this tool has no rule for.
+    /// Not a whole step of a rotation: a verb that stopped between two of
+    /// its effects, and the reason names the verb that finishes it, or a
+    /// layout no step leaves, which a person has to resolve.
     Inconsistent,
 }
 
