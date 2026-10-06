@@ -422,6 +422,18 @@ impl MemFiles {
         self.files.borrow().keys().cloned().collect()
     }
 
+    /// Every file under `dir` and what it holds: a disk a test can compare
+    /// with another.
+    pub fn contents_under(&self, dir: impl AsRef<Path>) -> BTreeMap<PathBuf, Vec<u8>> {
+        let dir = dir.as_ref();
+        self.files
+            .borrow()
+            .iter()
+            .filter(|(path, _)| path.starts_with(dir))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    }
+
     fn may_write(&self, what: &str, path: &Path) -> Result<()> {
         self.attempts
             .borrow_mut()

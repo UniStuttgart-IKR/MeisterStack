@@ -2261,9 +2261,12 @@ pub fn ok_reply(what: &str, value: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod key_fixtures;
 
 #[cfg(test)]
 mod tests {
+    use super::key_fixtures::{key_layout, rotating};
     use super::*;
     use crate::effects::{FakeClock, MemFiles};
     use crate::run::{Matcher, Output, Policy, StrictFake};
@@ -3840,15 +3843,6 @@ mod tests {
         assert_eq!(one.public_key_sha256, two.public_key_sha256);
     }
 
-    /// A rotation with a prepared pair, ready to switch.
-    fn rotating() -> MemFiles {
-        MemFiles::new()
-            .given(format!("{PKI}/identity.key"), "old key\n")
-            .given(format!("{PKI}/identity.crt"), "old certificate\n")
-            .given(format!("{PKI}/identity.key.next"), "new key\n")
-            .given(format!("{PKI}/identity.crt.next"), "new certificate\n")
-    }
-
     /// The five states, read off the DISK. The record is the story of a
     /// rotation; the files are what it actually did.
     #[test]
@@ -3909,15 +3903,6 @@ mod tests {
         assert!(view.reason.unwrap().contains("without the key"));
     }
 
-    /// The identity files named by suffix, each holding the pair it belongs
-    /// to: `("crt.prev", "old")` is `identity.crt.prev` with `old crt`.
-    fn key_layout(there: &[(&str, &str)]) -> MemFiles {
-        there.iter().fold(MemFiles::new(), |files, (name, pair)| {
-            let what = name.split('.').next().unwrap_or(name);
-            files.given(format!("{PKI}/identity.{name}"), format!("{pair} {what}\n"))
-        })
-    }
-
     /// A revert deletes the new pair before it puts the old one back.
     /// Stopped in between, `.prev` is the only whole pair: not a switch,
     /// and the reason names the verb that finishes it.
@@ -3955,21 +3940,11 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, KeysState::Reverted);
         let whole = key_layout(&[("key", "old"), ("crt", "old")]);
-        assert_eq!(pki_files(&files), pki_files(&whole));
+        assert_eq!(files.contents_under(PKI), whole.contents_under(PKI));
         assert_eq!(
             helper.keys_status(KeyKind::Identity).unwrap().state,
             KeysState::Reverted
         );
-    }
-
-    /// The key files on a disk and what each holds, the record left out.
-    fn pki_files(files: &MemFiles) -> Vec<(PathBuf, Option<Vec<u8>>)> {
-        files
-            .paths()
-            .into_iter()
-            .filter(|path| path.starts_with(PKI))
-            .map(|path| (path.clone(), files.content(path)))
-            .collect()
     }
 
     /// A switch, stopped after each of its first three renames.
@@ -3996,23 +3971,32 @@ mod tests {
         ]
     }
 
+    /// What a whole switch leaves: the new pair in use, the old one aside.
+    fn switched_layout() -> MemFiles {
+        key_layout(&[
+            ("key", "new"),
+            ("crt", "new"),
+            ("key.prev", "old"),
+            ("crt.prev", "old"),
+        ])
+    }
+
     /// Wherever a switch stopped, running it again finishes it: the new
     /// pair in use, the old one whole beside it.
     #[test]
     fn a_switch_stopped_in_the_middle_is_finished_by_running_it_again() {
         let (runner, clock) = (StrictFake::new(), clock());
-        let switched = key_layout(&[
-            ("key", "new"),
-            ("crt", "new"),
-            ("key.prev", "old"),
-            ("crt.prev", "old"),
-        ]);
+        let switched = switched_layout();
         for there in switches_stopped_in_the_middle() {
             let files = key_layout(&there);
             let record = helper(&runner, &files, &clock)
                 .keys_switch(KeyKind::Identity, Some("run-7"))
                 .unwrap();
-            assert_eq!(pki_files(&files), pki_files(&switched), "{there:?}");
+            assert_eq!(
+                files.contents_under(PKI),
+                switched.contents_under(PKI),
+                "{there:?}"
+            );
             assert_eq!(
                 record.previous_sha256,
                 Some(format!("sha256:{}", crate::ids::sha256_hex(b"old crt\n"))),
@@ -4033,7 +4017,11 @@ mod tests {
                 .keys_revert(KeyKind::Identity, Some("taken back"))
                 .unwrap();
             assert_eq!(record.state, KeysState::Reverted, "{there:?}");
-            assert_eq!(pki_files(&files), pki_files(&in_use), "{there:?}");
+            assert_eq!(
+                files.contents_under(PKI),
+                in_use.contents_under(PKI),
+                "{there:?}"
+            );
         }
     }
 
@@ -4043,13 +4031,13 @@ mod tests {
     fn a_switch_needs_a_whole_pair_in_use_to_replace() {
         let (runner, clock) = (StrictFake::new(), clock());
         let files = key_layout(&[("key.next", "new"), ("crt.next", "new")]);
-        let before = pki_files(&files);
+        let before = files.contents_under(PKI);
         let err = helper(&runner, &files, &clock)
             .keys_switch(KeyKind::Identity, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("whole pair in use"), "{err}");
-        assert_eq!(pki_files(&files), before);
+        assert_eq!(files.contents_under(PKI), before);
     }
 
     /// A switch names itself in the record before it moves a file.
@@ -4178,63 +4166,27 @@ mod tests {
         }
     }
 
+    /// None of the layouts between the four renames of a switch is a
+    /// switch, and each names what is on the disk, which is what a person
+    /// needs. The layout after the last rename is one.
     #[test]
     fn keys_status_names_every_half_switch() {
-        // Check each partial layout between the four switch renames: old certificate aside,
-        // old key aside, then new key installed. None is a completed switch.
-        let runner = StrictFake::new();
-        let clock = clock();
-        let key = format!("{PKI}/identity.key");
-        let crt = format!("{PKI}/identity.crt");
-        let key_next = format!("{PKI}/identity.key.next");
-        let crt_next = format!("{PKI}/identity.crt.next");
-        let key_prev = format!("{PKI}/identity.key.prev");
-        let crt_prev = format!("{PKI}/identity.crt.prev");
-
-        for (after, there) in [
-            (
-                "the certificate went aside",
-                vec![&key, &key_next, &crt_next, &crt_prev],
-            ),
-            (
-                "the key went aside too",
-                vec![&key_next, &crt_next, &key_prev, &crt_prev],
-            ),
-            (
-                "the new key came in",
-                vec![&key, &crt_next, &key_prev, &crt_prev],
-            ),
-        ] {
-            let files = there.iter().fold(MemFiles::new(), |files, path| {
-                files.given((*path).clone(), "x\n")
-            });
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in switches_stopped_in_the_middle() {
+            let files = key_layout(&there);
             let view = helper(&runner, &files, &clock)
                 .keys_status(KeyKind::Identity)
                 .unwrap();
-            assert_eq!(
-                view.state,
-                KeysState::Inconsistent,
-                "after {after} the switch is not finished"
-            );
+            assert_eq!(view.state, KeysState::Inconsistent, "{there:?}");
             let reason = view.reason.unwrap_or_default();
-            assert!(
-                reason.contains("stopped in the middle"),
-                "{after}: {reason}"
-            );
-            // And it says what is on the disk, which is what a person needs.
-            for path in &there {
-                assert!(reason.contains(path.as_str()), "{after}: {reason}");
+            assert!(reason.contains("stopped in the middle"), "{reason}");
+            for (name, _) in &there {
+                let path = format!("{PKI}/identity.{name}");
+                assert!(reason.contains(&path), "{path} in {reason}");
             }
         }
-
-        // The one tuple that IS a finished switch still is one.
-        let whole = [&key, &crt, &key_prev, &crt_prev]
-            .iter()
-            .fold(MemFiles::new(), |files, path| {
-                files.given((*path).clone(), "x\n")
-            });
         assert_eq!(
-            helper(&runner, &whole, &clock)
+            helper(&runner, &switched_layout(), &clock)
                 .keys_status(KeyKind::Identity)
                 .unwrap()
                 .state,
@@ -4259,7 +4211,7 @@ mod tests {
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.crt")).unwrap(),
-            b"new certificate\n".to_vec()
+            b"new crt\n".to_vec()
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.key.prev")).unwrap(),
@@ -4270,17 +4222,11 @@ mod tests {
         assert_eq!(record.run_id.as_deref(), Some("run-7"));
         assert_eq!(
             record.previous_sha256,
-            Some(format!(
-                "sha256:{}",
-                crate::ids::sha256_hex(b"old certificate\n")
-            ))
+            Some(format!("sha256:{}", crate::ids::sha256_hex(b"old crt\n")))
         );
         assert_eq!(
             record.sha256,
-            Some(format!(
-                "sha256:{}",
-                crate::ids::sha256_hex(b"new certificate\n")
-            ))
+            Some(format!("sha256:{}", crate::ids::sha256_hex(b"new crt\n")))
         );
         // And it is on the disk, where a resume reads it.
         assert_eq!(
@@ -4333,7 +4279,7 @@ mod tests {
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.crt")).unwrap(),
-            b"old certificate\n".to_vec()
+            b"old crt\n".to_vec()
         );
         assert!(files.content(format!("{PKI}/identity.key.prev")).is_none());
         assert!(files.content(format!("{PKI}/identity.key.next")).is_none());

@@ -6,6 +6,7 @@
 //! off the bytes on the disk; `keys status` is what gets judged.
 
 use super::*;
+use crate::activate::key_fixtures::rotating;
 use crate::effects::MemFiles;
 use crate::effects::cut::CutFiles;
 use crate::run::StrictFake;
@@ -33,15 +34,6 @@ impl KeyVerb {
 
 fn pki(name: &str) -> String {
     format!("{DEFAULT_PKI_DIR}/identity.{name}")
-}
-
-/// The new pair prepared beside the one in use.
-fn rotating() -> MemFiles {
-    MemFiles::new()
-        .given(pki("key"), "old key\n")
-        .given(pki("crt"), "old crt\n")
-        .given(pki("key.next"), "new key\n")
-        .given(pki("crt.next"), "new crt\n")
 }
 
 /// What a whole switch leaves: the new pair in use, the old one aside.
@@ -81,19 +73,16 @@ fn beside_the_pair(files: &MemFiles) -> bool {
     })
 }
 
-fn on_disk(files: &MemFiles) -> Vec<(PathBuf, Option<Vec<u8>>)> {
-    files
-        .paths()
-        .into_iter()
-        .map(|path| (path.clone(), files.content(path)))
-        .collect()
+/// Every file on the host, the record included, and what it holds.
+fn on_disk(files: &MemFiles) -> BTreeMap<PathBuf, Vec<u8>> {
+    files.contents_under("/")
 }
 
 fn copy_of(files: &MemFiles) -> MemFiles {
     on_disk(files)
         .into_iter()
         .fold(MemFiles::new(), |copy, (path, bytes)| {
-            copy.given(path, bytes.unwrap_or_default())
+            copy.given(path, bytes)
         })
 }
 
@@ -166,7 +155,7 @@ impl Scenario for KeyRotation {
     type World = MemFiles;
     type Seen = ();
     type Successor = KeySuccessor;
-    type Snapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+    type Snapshot = BTreeMap<PathBuf, Vec<u8>>;
 
     fn world(&self) -> MemFiles {
         (self.from)()

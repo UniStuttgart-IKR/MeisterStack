@@ -12,6 +12,7 @@
 //! nothing (I-A5). A [`Scenario`] has a default for none of these. The model
 //! of the host judges, never what the code under test says of itself.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 

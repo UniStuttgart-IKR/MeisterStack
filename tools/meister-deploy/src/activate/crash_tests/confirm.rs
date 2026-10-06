@@ -34,7 +34,7 @@ struct Host {
 
 #[derive(Debug, PartialEq)]
 struct Snapshot {
-    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    files: BTreeMap<PathBuf, Vec<u8>>,
     profile: Option<String>,
     machine: Machine,
 }
@@ -141,12 +141,7 @@ impl Host {
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
-            files: self
-                .files
-                .paths()
-                .into_iter()
-                .map(|p| (p.clone(), self.files.content(p)))
-                .collect(),
+            files: self.files.contents_under("/"),
             profile: self.profile(),
             machine: self.machine.borrow().clone(),
         }
