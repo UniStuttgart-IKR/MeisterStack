@@ -4,10 +4,12 @@
 
 //! What an image URL is allowed to look like, and what an address is.
 //!
-//! The node fetches an image `spec.url` with `curl --location`, so an unchecked url is
-//! server-side request forgery from the agent's network: loopback, metadata addresses, the
-//! management network, also behind a redirect (R3-F10). The cloud (at create) and the node
-//! (at fetch, then per address in the agent's `images::egress`) share this one parser.
+//! The node fetches an image `spec.url` with curl one checked hop at a time: each hop's URL is
+//! parsed here, its address vetted, curl pinned to that address with its own redirects off,
+//! and a 3xx answer becomes the next hop to check. An unchecked url would be server-side
+//! request forgery from the agent's network: loopback, metadata addresses, the management
+//! network, also behind a redirect (R3-F10). The cloud (at create) and the node (at fetch,
+//! then per address in the agent's `images::egress`) share this one parser.
 //!
 //! The parser is a strict subset of what curl accepts: anything two parsers might read
 //! differently is refused (userinfo, `%` or backslash in the authority, non-ASCII, numeric
