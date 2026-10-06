@@ -149,18 +149,20 @@ pub trait Resource: StoredObject {
     fn settle(&mut self, _now: DateTime<Utc>) {}
 }
 
-/// Resource-specific name syntax. DNS-label rules apply by default;
-/// FloatingIp and Image names additionally allow dots for addresses and
-/// filenames. All names remain bounded and exclude path traversal.
+/// Resource-specific name syntax. DNS-label rules apply by default; a
+/// resource whose names carry a dot opts into `Dotted` and says why where it
+/// is declared (an image's file name, a floating address, a placement claim's
+/// `place.<vm-uid>`, R2-3). All names remain bounded and exclude path
+/// traversal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameShape {
     /// Lowercase alphanumerics and `-`, starting and ending alphanumeric.
     /// Kubernetes' own answer, and the default here for the same reason: it
     /// survives an etcd key, a file name and an interface name.
     DnsLabel,
-    /// The same, plus `.` inside it — a file name with an extension, and an
-    /// IPv4 address. Still one path segment, still no uppercase, no space,
-    /// no non-ASCII, and still no `..` anywhere in it.
+    /// The same, plus `.` inside it — a file name with an extension, an IPv4
+    /// address, a placement claim. Still one path segment, still no
+    /// uppercase, no space, no non-ASCII, and still no `..` anywhere in it.
     Dotted,
 }
 

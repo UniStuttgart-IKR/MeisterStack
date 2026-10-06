@@ -341,8 +341,9 @@ impl EtcdStore {
     const MAX_NAME: usize = 63;
 
     /// Validate a bounded ASCII DNS-label name used in keys and downstream paths.
-    /// `NameShape::Dotted` additionally allows internal dots for image names and
-    /// addresses. Neither shape allows traversal, uppercase or whitespace.
+    /// `NameShape::Dotted` additionally allows internal dots, for the resources
+    /// that opt into it (see [`NameShape`]). Neither shape allows traversal,
+    /// uppercase or whitespace.
     fn check_name(name: &str, shape: NameShape) -> Result<()> {
         let invalid = |why: &str| {
             Err(StoreError::Invalid(format!(
