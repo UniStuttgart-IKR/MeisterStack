@@ -25,12 +25,12 @@ pkgs.runCommand "no-developer-home" { } ''
       hits=$(grep -l -e /home/ -e Leandro -e /opt/meisterstack/bin "$f" 2>/dev/null || true)
     fi
     if [ -n "$hits" ]; then
-      echo "$hits names a path this fleet was not built from:"
+      echo "$hits names a path this host was not built from:"
       grep -h -e /home/ -e Leandro -e /opt/meisterstack/bin $hits | head -5
       bad=1
     fi
   done
-  test $bad = 0 || { echo "-> V04: a fleet has to be buildable without anybody's home"; exit 1; }
+  test $bad = 0 || { echo "-> V04: a host has to be buildable without anybody's home"; exit 1; }
   echo "${toString (lib.length files)} built artefacts, none of them names a home directory"
   touch $out
 ''

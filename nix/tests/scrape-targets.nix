@@ -2,18 +2,12 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The addons host of a fleet scrapes every role's metrics listener at the
-# host's management address. Each expectation names one way a host could drop
-# out of that without anyone noticing.
+# A Prometheus scrapes every role's metrics listener at the host's address.
+# Each expectation names one way a host could bind its listeners where that
+# address does not answer. The fleet half (a fleet host that binds elsewhere is
+# refused) is meister-deploy's.
 { nixpkgs, lib, pkgs, system, self }:
 let
-  failedAssertions = c: map (a: a.message) (lib.filter (a: !a.assertion) c.assertions);
-  refusesWith = needle: c: lib.any (lib.hasInfix needle) (failedAssertions c);
-  dropsOut = refusesWith "silently loses this host";
-
-  fleet = self.nixosConfigurations;
-  rebound = modules: (fleet.n1.extendModules { inherit modules; }).config;
-
   net = import ../lib/net.nix { inherit lib; };
 
   # A host whose config is rendered at boot, the way the appliance image is.
@@ -35,21 +29,6 @@ let
   v6only = { boot.kernel.sysctl."net.ipv6.bindv6only" = 1; };
 
   expectations = {
-    "every host of the example fleet binds the address it is scraped at" =
-      lib.all (s: !(dropsOut s.config)) (lib.attrValues fleet);
-    "a fleet host whose metrics bind loopback is refused" =
-      dropsOut (rebound [{ meisterstack.metrics.listenAddress = "127.0.0.1"; }]);
-    "a fleet host whose role rebinds its own listener elsewhere is refused" =
-      dropsOut (rebound [{ meisterstack.agent.settings.metrics_listen = "127.0.0.1:9102"; }]);
-    "the refusal names a role's own metrics_listen as a possible cause" =
-      refusesWith "settings.metrics_listen"
-        (rebound [{ meisterstack.agent.settings.metrics_listen = "127.0.0.1:9102"; }]);
-    "a fleet host may bind every IPv4 address" =
-      !(dropsOut (rebound [{ meisterstack.metrics.listenAddress = "0.0.0.0"; }]));
-    "a fleet host may bind every address of both families" =
-      !(dropsOut (rebound [{ meisterstack.metrics.listenAddress = "::"; }]));
-    "a fleet host whose IPv6 sockets take IPv6 only is refused when it binds ::" =
-      dropsOut (rebound [{ meisterstack.metrics.listenAddress = "::"; } v6only]);
     "an IPv4 host is scraped at its address, 0.0.0.0 or ::" =
       net.listensAnsweringAt rendered "10.0.0.5" 9102 == [ "10.0.0.5:9102" "0.0.0.0:9102" "[::]:9102" ];
     "an IPv4 host is not scraped at :: where IPv6 sockets take IPv6 only" =
@@ -74,7 +53,7 @@ pkgs.runCommand "scrape-targets" { } (
     touch $out
   '' else ''
     ${lib.concatMapStrings (e: "echo ${lib.escapeShellArg "FAIL ${e}"}\n") broken}
-    echo "-> a host can bind its metrics where the fleet's Prometheus does not look"
+    echo "-> a host can bind its metrics where its Prometheus does not look"
     exit 1
   ''
 )

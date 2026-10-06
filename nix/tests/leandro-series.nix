@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A fleet whose leandro input carries another cloud-hypervisor patch series than
-# patches/ is refused at evaluation, and one on the same series is not. The
-# comparison runs both ways, so a series that lacks one of ours, has none at
-# all or keeps it elsewhere is drift too. One of our own patches that Leandro's
-# series carries as well is no drift when the bytes are the same, and drift when
-# they differ. Only the leandro input's source tree is looked at: nothing is built.
-{ lib, pkgs, fleetWith }:
+# A Leandro source tree whose cloud-hypervisor patch series differs from
+# patches/ is drift. The comparison runs both ways, so a series that lacks one
+# of ours, has none at all or keeps it elsewhere is drift too. One of our own
+# patches that Leandro's series carries as well is no drift when the bytes are
+# the same, and drift when they differ. Only source trees are looked at: nothing
+# is built. That a fleet on a drifted series is refused is meister-deploy's half.
+{ lib, pkgs }:
 let
-  inherit (import ./lib.nix { inherit lib; }) require tagOf failedOf failsOnly;
+  inherit (import ./lib.nix { inherit lib; }) require;
   series = import ../lib/leandro-series.nix { inherit lib; };
 
   p0001 = "0001-generic-vhost-user-shmem.patch";
@@ -56,12 +56,6 @@ let
   # Comparing with this tree is refused outright instead of reported as drift.
   isRefused = src: !(builtins.tryEval (builtins.deepSeq (driftOf src) true)).success;
 
-  # One host of a fleet with this leandro source; the stub has no packages because the
-  # series assertion reads the source tree only.
-  hostOf = src:
-    (lib.head (lib.attrValues (fleetWith { outPath = src; }).nixosConfigurations)).config;
-  # Whether that host is warned that Leandro's series carries one of our own patches now.
-  warnsOfUpstreamed = src: lib.any (w: tagOf w == "leandro-series") (hostOf src).warnings;
 in
 pkgs.runCommand "leandro-series" { } ''
   ${requireDrift "Leandro's own series" sameSeries [ ]}
@@ -89,15 +83,10 @@ pkgs.runCommand "leandro-series" { } ''
   ${require (isRefused linkedSeries) "a series with a linked patch was compared instead of refused"}
   echo "  ok   the series are compared both ways; a link is refused"
 
-  ${require (failedOf (hostOf sameSeries) == [ ]) "a fleet on Leandro's series was refused"}
-  ${require (failsOnly (hostOf driftedSeries) "leandro-series") "a fleet on a drifted series was not refused"}
-  ${require (failsOnly (hostOf emptySeries) "leandro-series") "a fleet on an empty series was not refused"}
-  ${require (failedOf (hostOf upstreamedSeries) == [ ]) "a fleet on a series that took up our 0004 was refused"}
-  ${require (failsOnly (hostOf changedOwnSeries) "leandro-series") "a fleet on a series with another 0004 was not refused"}
-  echo "  ok   a fleet on the same series passes, one on a drifted, empty or other-0004 series is refused"
-
-  ${require (warnsOfUpstreamed upstreamedSeries) "a series that took up our 0004 did not warn that it can be dropped"}
-  ${require (!(warnsOfUpstreamed sameSeries)) "a series without our own patches was warned about one"}
-  echo "  ok   a series that took up our own patch is told it can be dropped from ownPatches"
+  ${require (series.upstreamedOwnPatches { leandroPatchDir = "${upstreamedSeries}/patches"; patchDir = ../../patches; } == [ p0004 ])
+    "a series that took up our 0004 unchanged does not name it as upstreamed"}
+  ${require (series.upstreamedOwnPatches { leandroPatchDir = "${sameSeries}/patches"; patchDir = ../../patches; } == [ ])
+    "a series without our own patches names one as upstreamed"}
+  echo "  ok   an own patch Leandro's series carries with the same bytes is named as upstreamed"
   touch $out
 ''

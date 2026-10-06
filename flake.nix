@@ -40,6 +40,30 @@
         }
         { inherit inventory profiles; inherit system; };
 
+      # A control plane and an agent of the service modules alone, store-built, for
+      # the checks that read what such a host is built from.
+      storeHostOf = name: roles: (nixpkgs.lib.nixosSystem {
+        modules = [
+          self.nixosModules.services
+          self.nixosModules.store-host
+          {
+            nixpkgs.hostPlatform = system;
+            nixpkgs.overlays = [ self.overlays.default ];
+            networking.hostName = name;
+            system.stateVersion = "25.11";
+            fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+            boot.loader.grub.device = "nodev";
+            meisterstack.storeHost.enable = true;
+            meisterstack.roles = roles;
+            meisterstack.cloud.settings.auth.chain = lib.mkIf (builtins.elem "cloud" roles) [ "mtls" ];
+          }
+        ];
+      }).config;
+      storeHosts = {
+        cp = storeHostOf "cp" [ "cloud" "cluster" ];
+        n1 = storeHostOf "n1" [ "agent" ];
+      };
+
       exampleProfiles = import ./examples/fleet/profiles.nix { inherit lib; };
       example = fleetOf ./examples/fleet/one-box.toml exampleProfiles;
       exampleHa = fleetOf ./examples/fleet/ha.toml exampleProfiles;
@@ -361,15 +385,9 @@
           gpu-profile = import ./nix/tests/gpu-profile.nix {
             inherit nixpkgs lib pkgs system self;
           };
-          # Refuse a leandro input whose cloud-hypervisor patch series is not ours.
+          # Compare a Leandro patch series with ours, both ways.
           leandro-series = import ./nix/tests/leandro-series.nix {
             inherit lib pkgs;
-            fleetWith = leandro: mkFleet
-              {
-                inherit nixpkgs disko nixos-generators leandro;
-                meisterstack = self;
-              }
-              { inventory = ./examples/fleet/one-box.toml; profiles = exampleProfiles; inherit system; };
           };
           # Validate malformed inventory fixtures.
           inventory-conflicts = import ./nix/tests/inventory-conflicts.nix {
@@ -379,7 +397,7 @@
           # Check that built runtime artifacts contain no developer-specific paths.
           no-developer-home = import ./nix/tests/no-developer-home.nix {
             inherit lib pkgs;
-            configs = lib.mapAttrs (_: s: s.config) example.nixosConfigurations;
+            configs = storeHosts;
           };
 
           # Check the direct-boot bundle's kernel, initrd, and command line.
