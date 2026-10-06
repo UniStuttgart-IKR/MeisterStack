@@ -8,7 +8,7 @@
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
-  inherit (import ./lib/net.nix { inherit lib; }) hostPort;
+  inherit (import ./lib/net.nix { inherit lib; }) hostPort wildcard;
 
   metricsAddress = cfg.metrics.listenAddress;
   bindsOneAddress = !(builtins.elem metricsAddress [ "127.0.0.1" "::1" "0.0.0.0" "::" ]);
@@ -196,11 +196,11 @@ in
 
     metrics.listenAddress = lib.mkOption {
       type = lib.types.str;
-      # A boot-rendered image is generic and learns its address only at
-      # boot, but the fleet's Prometheus scrapes it at that address.
-      default = if cfg.context.enable then "0.0.0.0" else "127.0.0.1";
+      # A boot-rendered image is generic and learns its address, and its
+      # family, only at boot, but the fleet's Prometheus scrapes it there.
+      default = if cfg.context.enable then wildcard config else "127.0.0.1";
       defaultText = lib.literalExpression
-        ''if config.meisterstack.context.enable then "0.0.0.0" else "127.0.0.1"'';
+        ''if config.meisterstack.context.enable then "::" else "127.0.0.1"'';
       example = "10.0.0.10";
       description = ''
         The address the three metrics listeners (`metrics_listen` of the
@@ -211,13 +211,15 @@ in
         Loopback by default, so a host that does not say otherwise exposes
         them to nobody. A fleet built with `lib.mkFleet` binds the host's
         management address, which is what its Prometheus scrapes, and refuses
-        a host that binds neither that address nor every address; a unit that
+        a host that binds neither that address nor a wildcard covering it; a unit that
         binds one address waits for `network-online.target`. A host that
         renders its config at boot (`meisterstack.context.enable`) binds every
-        address, because its image does not know the address it is scraped
-        at. `0.0.0.0` is every address, and then only the host's firewall
-        decides who reads them. A role's `settings.metrics_listen` still wins
-        over this.
+        address of either family (`::`), because its image does not know the
+        address it is scraped at; where the kernel keeps IPv6 sockets to IPv6
+        (`net.ipv6.bindv6only = 1`) or has no IPv6, that is `0.0.0.0`. A
+        wildcard binds every address, and then only the host's firewall
+        decides who reads them; `0.0.0.0` takes IPv4 only. A role's
+        `settings.metrics_listen` still wins over this.
       '';
     };
 

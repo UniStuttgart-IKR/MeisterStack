@@ -401,11 +401,11 @@ let
       scrapeTargets = lib.concatMap (h: map (metricsTarget h) (metricsRoles h))
         (lib.attrValues hosts);
 
-      # A target answers only where the listener binds the host's address or
-      # every address.
-      bindsMetricsTarget = h: role: listen:
-        builtins.elem listen
-          (map (a: net.hostPort a ports.metrics.${role}) [ h.address "0.0.0.0" "::" ]);
+      # A target answers only where the listener binds the host's address or a
+      # wildcard that covers it: 0.0.0.0 takes IPv4 only, :: takes both
+      # families where the host's IPv6 sockets are dual-stack.
+      bindsMetricsTarget = config: h: role: listen:
+        builtins.elem listen (net.listensAnsweringAt config h.address ports.metrics.${role});
 
       # The fleet's Prometheus loses a host whose listener binds elsewhere,
       # without an error anywhere; refuse that host when it is evaluated.
@@ -414,13 +414,13 @@ let
           (role:
             let listen = config.meisterstack.${role}.effective.metrics_listen or null; in
             {
-              assertion = bindsMetricsTarget h role listen;
+              assertion = bindsMetricsTarget config h role listen;
               message =
                 "host ${h.id}: the Prometheus on ${addonsHost.id} scrapes the ${role} metrics "
                 + "at ${metricsTarget h role}, and this host's listener binds "
-                + "${if listen == null then "nothing" else listen}. Bind ${h.address} or every "
-                + "address (meisterstack.metrics.listenAddress), or the fleet's monitoring "
-                + "silently loses this host.";
+                + "${if listen == null then "nothing" else listen}. Bind ${h.address} or a "
+                + "wildcard that covers it (meisterstack.metrics.listenAddress; 0.0.0.0 is IPv4 "
+                + "only), or the fleet's monitoring silently loses this host.";
             })
           (metricsRoles h));
 
