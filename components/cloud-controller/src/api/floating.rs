@@ -319,10 +319,15 @@ pub(super) async fn check_pool(
     Ok(())
 }
 
-// Range claims use administrator-chosen names, so overlapping ranges can
-// be created under different keys after concurrent checks. Recheck after
-// the write and roll back the later etcd revision. Floating addresses instead
-// use the address as their key, making store creation arbitrate the race.
+// Range claims use administrator-chosen names, so overlapping ranges can be
+// created under different keys after concurrent checks. Every claim asks its
+// question again after the write and takes itself back when it lost: among
+// pools and routed subnets to the earlier etcd revision, and a pool or a
+// subnet always to a tenant's network, whose revision dates its latest edit
+// rather than its claim (`Collision::tenant_network`). A question that cannot
+// be answered is a claim not known to have won, taken back the same way.
+// Floating addresses instead use the address as their key, making store
+// creation arbitrate the race.
 
 /// One thing already in the store that a claim collides with: what to call it
 /// in the refusal, and the revision of the write that put it there.

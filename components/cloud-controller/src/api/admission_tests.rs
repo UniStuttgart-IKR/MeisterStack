@@ -360,18 +360,20 @@ async fn growing_a_volume_is_held_to_the_ceiling_creating_it_would_be() {
 
 // --- F03: one slot is one admission, however the requests interleave ------
 
-/// Pause the first `parties` admissions after quota checks and before writes.
-/// This forces competing requests to observe the same initial usage. Gates are
-/// tenant-scoped so parallel tests do not interfere; retries pass through.
+/// Requests held between their checks and their writes, by the key the handler gates on (see
+/// `admission_gate`). Holding competing requests there makes them all read the store as it was
+/// before any of them wrote. A key names one test's own tenant or object, so parallel tests do not
+/// hold each other's requests; retries pass through once a gate is spent.
 static GATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Gate>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// One tenant's gate: the barrier, and how many admissions it still holds.
+/// One key's gate: the barrier, and how many requests it still holds.
 type Gate = (Arc<tokio::sync::Barrier>, usize);
 
-fn hold_admissions(tenant: &str, parties: usize) {
+/// Hold the first `parties` requests under `key` until all of them have arrived.
+fn hold_admissions(key: &str, parties: usize) {
     GATES.lock().unwrap().insert(
-        tenant.to_string(),
+        key.to_string(),
         (Arc::new(tokio::sync::Barrier::new(parties)), parties),
     );
 }
@@ -387,14 +389,13 @@ fn hold_together(keys: &[&str]) {
     }
 }
 
-/// Called by the handlers after their checks and before the write: under the
-/// tenant for a quota admission, under the object's own name for a range claim
-/// (a floating pool, a tenant's network). A no-op for every name no test is
-/// holding.
-pub(super) async fn admission_gate(tenant: &str) {
+/// Called by the handlers after their checks and before the write, under `key`: the tenant's
+/// name for a quota admission, the object's own name for a range claim (a floating pool, a
+/// tenant's network). A no-op for every key no test is holding.
+pub(super) async fn admission_gate(key: &str) {
     let barrier = {
         let mut gates = GATES.lock().unwrap();
-        match gates.get_mut(tenant) {
+        match gates.get_mut(key) {
             Some((barrier, left)) if *left > 0 => {
                 *left -= 1;
                 Some(barrier.clone())
@@ -1181,26 +1182,37 @@ async fn declare_network(st: &ApiState, tenant: &str, prefixes: &[&str]) -> Tena
     st.store.update(&t).await.expect("its network")
 }
 
+/// `cloud_with_routers`, with a tenant `c` that declares no network yet.
+async fn cloud_with_an_undeclared_tenant(what: &str) -> ApiState {
+    let st = cloud_with_routers(what).await;
+    st.store
+        .create(&tenant_with_network("c", &[]))
+        .await
+        .expect("tenant c");
+    st
+}
+
+/// A floating pool called `name` on 10.30.0.0/25, as the store keeps it.
+fn pool_on_10_30(name: &str) -> FloatingPool {
+    FloatingPool::declare(
+        name,
+        controller_api::FloatingPoolSpec {
+            cidrs: vec!["10.30.0.0/25".into()],
+            ..Default::default()
+        },
+    )
+}
+
 /// A floating pool that finds a tenant's network on its range after its write yields to it,
 /// even where the tenant was written later: the tenant's revision dates its latest edit, not
 /// its claim.
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]
 async fn a_pool_yields_to_a_tenants_network_it_finds_after_its_write() {
-    let st = cloud_with_routers("rr5-6-pool-yields").await;
-    st.store
-        .create(&tenant_with_network("c", &[]))
-        .await
-        .expect("tenant c");
+    let st = cloud_with_an_undeclared_tenant("rr5-6-pool-yields").await;
     let pool = st
         .store
-        .create(&FloatingPool::declare(
-            "onto-c",
-            controller_api::FloatingPoolSpec {
-                cidrs: vec!["10.30.0.0/25".into()],
-                ..Default::default()
-            },
-        ))
+        .create(&pool_on_10_30("onto-c"))
         .await
         .expect("a pool its check let through");
     declare_network(&st, "c", &["10.30.0.0/24"]).await;
@@ -1213,58 +1225,60 @@ async fn a_pool_yields_to_a_tenants_network_it_finds_after_its_write() {
 }
 
 /// A tenant's network that finds a pool on it after its write yields to a pool written before
-/// it and stands against one written after, which yields itself.
+/// it.
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]
 async fn a_tenants_network_yields_to_a_pool_written_before_it() {
-    let st = cloud_with_routers("rr5-6-network-yields").await;
+    let st = cloud_with_an_undeclared_tenant("rr5-6-network-yields").await;
     st.store
-        .create(&tenant_with_network("c", &[]))
+        .create(&pool_on_10_30("before"))
         .await
-        .expect("tenant c");
-    let pool = |name: &str| {
-        FloatingPool::declare(
-            name,
-            controller_api::FloatingPoolSpec {
-                cidrs: vec!["10.30.0.0/25".into()],
-                ..Default::default()
-            },
-        )
-    };
-    st.store.create(&pool("before")).await.expect("a pool");
+        .expect("a pool");
     let written = declare_network(&st, "c", &["10.30.0.0/24"]).await;
+
     let why = network_lost_claim(&st, &written)
         .await
         .expect("the question is answered")
         .expect("the network yields to the pool before it");
     assert!(why.contains("floating pool before"), "{why}");
+}
 
+/// A tenant's network stands against a pool written after it: that pool is the one that yields.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenants_network_stands_against_a_pool_written_after_it() {
+    let st = cloud_with_an_undeclared_tenant("rr5-6-network-stands").await;
+    let written = declare_network(&st, "c", &["10.30.0.0/24"]).await;
     st.store
-        .delete::<FloatingPool>("before")
+        .create(&pool_on_10_30("after"))
         .await
-        .expect("it went");
-    st.store.create(&pool("after")).await.expect("a pool");
+        .expect("a pool");
+
     assert_eq!(
         network_lost_claim(&st, &written)
             .await
             .expect("the question is answered"),
-        None,
-        "a pool written after the network is the one that yields"
+        None
     );
 }
 
-/// A routed subnet that finds another tenant's network on its range after its write yields to
-/// it; its own tenant's network is no collision.
-#[tokio::test]
-#[ignore = "needs an etcd; see the module note"]
-async fn a_routed_subnet_yields_to_another_tenants_network_it_finds_after_its_write() {
-    let st = cloud_with_routers("rr5-6-subnet-yields").await;
+/// `cloud_with_routers`, with a tenant `c` whose network is 10.30.0.0/24, and the range a routed
+/// subnet on it would claim.
+async fn cloud_with_a_subnet_on_a_tenant_network(what: &str) -> (ApiState, common::net::Ipv4Range) {
+    let st = cloud_with_routers(what).await;
     st.store
         .create(&tenant_with_network("c", &["10.30.0.0/24"]))
         .await
         .expect("tenant c");
-    let range: common::net::Ipv4Range = "10.30.0.0/26".parse().expect("a range");
+    (st, "10.30.0.0/26".parse().expect("a range"))
+}
 
+/// A routed subnet that finds another tenant's network on its range after its write yields to
+/// it.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_routed_subnet_yields_to_another_tenants_network_it_finds_after_its_write() {
+    let (st, range) = cloud_with_a_subnet_on_a_tenant_network("rr5-6-subnet-yields").await;
     let theirs = collisions(
         &st,
         &[range],
@@ -1275,9 +1289,16 @@ async fn a_routed_subnet_yields_to_another_tenants_network_it_finds_after_its_wr
     )
     .await
     .expect("the question is answered");
+
     let won = lost_to("1", &theirs).expect("a's subnet yields to c's network");
     assert_eq!(won.what, "tenant c's network");
+}
 
+/// A routed subnet finds no collision in its own tenant's network.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_routed_subnet_finds_no_collision_in_its_own_tenants_network() {
+    let (st, range) = cloud_with_a_subnet_on_a_tenant_network("rr5-6-subnet-own").await;
     let own = collisions(
         &st,
         &[range],
@@ -1288,6 +1309,7 @@ async fn a_routed_subnet_yields_to_another_tenants_network_it_finds_after_its_wr
     )
     .await
     .expect("the question is answered");
+
     assert!(lost_to("1", &own).is_none(), "c's own network holds it");
 }
 

@@ -85,9 +85,12 @@ fn prefix_of(range: &common::net::Ipv4Range) -> Option<u32> {
     range.to_cidr()?.rsplit_once('/')?.1.parse().ok()
 }
 
-/// Create a subnet and recheck overlap after the write, since different object
-/// names do not arbitrate competing CIDR claims. The later revision rolls back.
-/// Automatic allocation retries with another block; an explicit CIDR is refused.
+/// Create a subnet and ask the overlap question again after the write, since
+/// different object names do not arbitrate competing CIDR claims. The subnet is
+/// taken back when it lost: to a pool or a subnet of an earlier revision, to
+/// another tenant's network whatever the revisions say, or because the question
+/// could not be answered. A block lost on the cut road is cut again elsewhere;
+/// a named CIDR that lost, and a question without an answer, are refused.
 pub(super) async fn create_routed_subnet(
     State(st): State<ApiState>,
     dry: controller_api::DryRun,

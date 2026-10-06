@@ -57,8 +57,10 @@ pub struct NicSpec {
 
 impl NicSpec {
     /// Whether the tap guard holds this NIC's IPv4 sources to an allowlist of
-    /// its routed subnets, its floating addresses and the unspecified address,
-    /// rather than only banning the floating pool. A provider NIC is pinned by
+    /// the prefixes in `routed_subnets`, its floating addresses and the
+    /// unspecified address. Otherwise the tap is kept off the node's guarded
+    /// ranges (the cloud's floating and routed pools) where the node has any,
+    /// and pinned by MAC only where it has none. A provider NIC is pinned by
     /// its MAC alone and never is.
     ///
     /// Read off this document and nothing else, so every node that builds the
