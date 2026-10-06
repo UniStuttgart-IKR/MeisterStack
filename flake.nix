@@ -46,7 +46,6 @@
             boot.loader.grub.device = "nodev";
             meisterstack.storeHost.enable = true;
             meisterstack.roles = roles;
-            meisterstack.cloud.settings.auth.chain = lib.mkIf (builtins.elem "cloud" roles) [ "mtls" ];
           }
         ];
       }).config;
