@@ -52,9 +52,10 @@ pub(crate) async fn would_place(
     let mut clusters = Vec::new();
     let mut names = Vec::new();
     for cluster in store.list::<Cluster>().await? {
+        let unreported = unreported_on(store, &cluster.metadata.name, &vms).await?;
         if wanted.served_by(
             &cluster.metadata.name,
-            &rooms_of(&cluster, &vms, overcommit),
+            &rooms_of(&cluster, &unreported, overcommit),
         ) {
             names.push(cluster.metadata.name.clone());
         }
@@ -169,22 +170,49 @@ impl Ledger {
 }
 
 /// The rooms of `cluster`'s nodes as this cloud measures them: what it
-/// reported, less what it holds without a node and what this cloud bound to
-/// it that it has not reported yet. Neither is in any node's bound sum yet.
-pub(super) fn rooms_of(cluster: &Cluster, vms: &[Vm], overcommit: Overcommit) -> Vec<NodeRoom> {
-    let name = cluster.metadata.name.as_str();
-    let unreported = vms
-        .iter()
-        .filter(|v| v.spec.cluster_name.as_deref() == Some(name) && !reported_by(v, name))
-        .map(Capacity::wanted_by);
-    let unplaced: Vec<Capacity> = cluster
-        .status
-        .unplaced
-        .iter()
-        .copied()
-        .chain(unreported)
-        .collect();
-    controller_api::node_rooms(&cluster.status.nodes, overcommit, &unplaced)
+/// reported, less what it holds without a node, and less each VM this cloud
+/// bound to it that it has not reported yet. Neither is in any node's bound
+/// sum yet. The VMs not reported yet are `unreported`, each booked by what it
+/// asks of a node, the same rule [`pick_cluster`] booked it by when it bound
+/// it: so every pass assumes the same node for it. (IKR-B78)
+pub(super) fn rooms_of(
+    cluster: &Cluster,
+    unreported: &[Wanted],
+    overcommit: Overcommit,
+) -> Vec<NodeRoom> {
+    let mut rooms =
+        controller_api::node_rooms(&cluster.status.nodes, overcommit, &cluster.status.unplaced);
+    for vm in unreported {
+        vm.node.debit(&mut rooms);
+    }
+    rooms
+}
+
+/// The VMs bound to `cluster` that it has not reported yet.
+pub(super) fn unreported<'a>(cluster: &'a str, vms: &'a [Vm]) -> impl Iterator<Item = &'a Vm> {
+    vms.iter().filter(move |v| {
+        v.spec.cluster_name.as_deref() == Some(cluster) && !reported_by(v, cluster)
+    })
+}
+
+/// What each VM bound to `cluster` and not reported by it yet asks of a node:
+/// the [`Wanted`] `pick_cluster` booked it by. A VM whose volumes cannot be
+/// asked about any more (gone, not Ready) is booked by its own asks alone: it
+/// still lands on a node, and leaving it out would count its room as free.
+pub(super) async fn unreported_on<'a>(
+    store: &EtcdStore,
+    cluster: &'a str,
+    vms: &'a [Vm],
+) -> anyhow::Result<Vec<Wanted<'a>>> {
+    let mut out = Vec::new();
+    for vm in unreported(cluster, vms) {
+        out.push(
+            wanted(store, vm)
+                .await?
+                .unwrap_or_else(|_| Wanted::of(vm, None, None)),
+        );
+    }
+    Ok(out)
 }
 
 /// Whether `cluster` has said anything about this VM: from then on it counts

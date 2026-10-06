@@ -418,7 +418,8 @@ async fn expire_and_collect_clusters(
     // key since D-C7.
     let beats = store.beats::<Cluster>().await?;
     for cluster in store.list::<Cluster>().await? {
-        let rooms = rooms_of(&cluster, vms, overcommit);
+        let unreported = unreported_on(store, &cluster.metadata.name, vms).await?;
+        let rooms = rooms_of(&cluster, &unreported, overcommit);
         let name = cluster.metadata.name;
         let heard = beats.get(&name).copied();
         publish_heartbeat_age(&name, heard, now);

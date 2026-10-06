@@ -942,9 +942,7 @@ fn asking(mem_mib: u64) -> Vm {
 fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
     let name = cluster.metadata.name.clone();
     let mut ledger = Ledger::default();
-    ledger
-        .nodes
-        .insert(name.clone(), rooms_of(cluster, vms, Overcommit::default()));
+    ledger.nodes.insert(name.clone(), rooms(cluster, vms));
     ledger.clusters.push(Candidate {
         name: name.clone(),
         connected: true,
@@ -962,11 +960,20 @@ fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
     std::sync::Mutex::new(ledger)
 }
 
+/// `rooms_of` with each unreported VM booked by its own asks, as
+/// `unreported_on` books a VM without volumes.
+fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
+    let booked: Vec<Wanted> = unreported(&cluster.metadata.name, vms)
+        .map(|v| Wanted::of(v, None, None))
+        .collect();
+    rooms_of(cluster, &booked, Overcommit::default())
+}
+
 /// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
 /// cluster had room, the cloud bound, and the VM sat Pending a tier down.
 #[test]
 fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
-    let rooms = rooms_of(&netlab(2048), &[], Overcommit::default());
+    let rooms = rooms(&netlab(2048), &[]);
     let too_big = asking(4096);
     assert!(!Wanted::of(&too_big, None, None).served_by("ikr-netlab", &rooms));
     let fits = asking(1024);
@@ -1008,8 +1015,10 @@ fn a_vm_bound_but_not_reported_yet_holds_a_nodes_room() {
     let cluster = netlab(4096);
     let mut sent = asking(3072);
     sent.spec.cluster_name = Some("ikr-netlab".into());
-    let rooms = rooms_of(&cluster, std::slice::from_ref(&sent), Overcommit::default());
-    let roomy: Vec<u64> = rooms.iter().map(|r| r.room.mem_mib).collect();
+    let roomy: Vec<u64> = rooms(&cluster, std::slice::from_ref(&sent))
+        .iter()
+        .map(|r| r.room.mem_mib)
+        .collect();
     assert_eq!(roomy, [1024, 4096]);
 
     sent.status.reported = Some(controller_api::VmReported::by(
@@ -1019,8 +1028,43 @@ fn a_vm_bound_but_not_reported_yet_holds_a_nodes_room() {
         None,
         at(0),
     ));
-    let rooms = rooms_of(&cluster, std::slice::from_ref(&sent), Overcommit::default());
-    assert!(rooms.iter().all(|r| r.room.mem_mib == 4096));
+    assert!(
+        rooms(&cluster, std::slice::from_ref(&sent))
+            .iter()
+            .all(|r| r.room.mem_mib == 4096)
+    );
+}
+
+/// The pass that binds a VM and every pass after it, until the cluster
+/// reports it, book it on the same node: the one its selector picks, not the
+/// roomiest of all. Booked elsewhere, the selected node looked free again a
+/// pass later.
+#[test]
+fn a_vm_bound_but_not_reported_yet_is_booked_where_its_binding_booked_it() {
+    let mut cluster = netlab(4096);
+    cluster.status.nodes[0]
+        .labels
+        .insert("disk".into(), "ssd".into());
+    cluster.status.nodes[1].mem_mib = 6144;
+    let mut ssd = asking(3072);
+    ssd.spec.node_selector.insert("disk".into(), "ssd".into());
+    let ledger = ledger_of(&cluster, &[]);
+    pick_cluster(
+        &controller_api::FirstFit,
+        &ledger,
+        &ssd,
+        &Wanted::of(&ssd, None, None),
+    )
+    .expect("bound");
+    let booked =
+        |rooms: &[NodeRoom]| -> Vec<u64> { rooms.iter().map(|r| r.room.mem_mib).collect() };
+    let at_binding = booked(&ledger.lock().unwrap().nodes["ikr-netlab"]);
+
+    ssd.spec.cluster_name = Some("ikr-netlab".into());
+    let next_pass = booked(&rooms(&cluster, std::slice::from_ref(&ssd)));
+
+    assert_eq!(at_binding, [1024, 6144]);
+    assert_eq!(next_pass, at_binding);
 }
 
 /// What the cluster holds without a node comes off a node before the next
@@ -1035,7 +1079,7 @@ fn what_a_cluster_holds_unplaced_holds_a_nodes_room() {
         };
         2
     ];
-    let rooms = rooms_of(&cluster, &[], Overcommit::default());
+    let rooms = rooms(&cluster, &[]);
     let four = asking(2048);
     assert!(!Wanted::of(&four, None, None).served_by("ikr-netlab", &rooms));
 }
