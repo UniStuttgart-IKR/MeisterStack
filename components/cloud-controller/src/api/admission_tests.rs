@@ -388,7 +388,7 @@ fn hold_admissions(key: &str, parties: usize) {
 
 /// Hold the next request under each of `keys` until all of them have arrived: each has been
 /// checked before any of them writes. The keys are what the handlers gate on, a tenant's name
-/// or the name of the object a range claim writes.
+/// or the name of the object a claim writes (see `admission_gate`).
 fn hold_together(keys: &[&str]) {
     let barrier = Arc::new(tokio::sync::Barrier::new(keys.len()));
     let mut gates = GATES.lock().unwrap();
@@ -451,8 +451,9 @@ fn undo_key(key: &str) -> String {
 }
 
 /// Called by the handlers after their checks and before the write, under `key`: the tenant's
-/// name for a quota admission, the object's own name for a range claim (a floating pool, a
-/// tenant's network). A no-op for every key no test is holding.
+/// name for a quota admission, and otherwise the claiming object's own name (a floating pool, a
+/// routed subnet, a router's inside prefix, a tenant's network, a storage pool's default mark).
+/// A no-op for every key no test is holding.
 pub(super) async fn admission_gate(key: &str) {
     pass_gate(key).await;
 }
