@@ -15,10 +15,6 @@ let
   clusterName = "cp";
   pki = "/var/lib/meisterstack/pki";
 
-  # The CA script as the repository has it, run with the PATH of the machine
-  # (openssl, coreutils, grep, sed, awk and find are on every test VM).
-  meisterCa = pkgs.writeShellScriptBin "meister-ca" (builtins.readFile ../../tools/meister-ca);
-
   # The NewVmSpec the cloud hands down: the guest's kernel and initrd out of the
   # agent's image directory, no disk and no network.
   spec = pkgs.writeText "tiny.json" (builtins.toJSON {
@@ -36,10 +32,10 @@ let
   });
 
   # A break-glass administrator talking to the cloud on its own host.
-  cliConfig = pkgs.writeText "cli.toml" ''
+  cliConfig = cloudApi: pkgs.writeText "cli.toml" ''
     default_profile = "t"
     [profiles.t]
-    endpoint = "https://127.0.0.1:3000"
+    endpoint = "https://127.0.0.1:${toString cloudApi}"
     ca_cert = "/root/ca/ca.crt"
     credential = { type = "mtls", cert = "/root/ca/root.crt", key = "/root/ca/root.key" }
   '';
@@ -68,8 +64,8 @@ pkgs.testers.runNixOSTest {
       identity_key = "${pki}/cloud-identity.key";
     };
     networking.firewall.allowedTCPPorts = with config.meisterstack.ports; [ cluster.grpc ];
-    environment.systemPackages = [ meisterCa pkgs.openssl ];
-    environment.variables.MEISTER_CONFIG = "${cliConfig}";
+    environment.systemPackages = [ pkgs.meister-ca pkgs.openssl ];
+    environment.variables.MEISTER_CONFIG = "${cliConfig config.meisterstack.ports.cloud.api}";
     virtualisation.memorySize = 2048;
   };
 
@@ -155,7 +151,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the control plane runs and the cluster reaches the cloud"):
         cp.succeed("systemctl start meister-cloud-controller meister-cluster-controller")
-        cp.wait_for_open_port(3000)
+        cp.wait_for_open_port(${toString nodes.cp.meisterstack.ports.cloud.api})
         cp.wait_until_succeeds("meister cluster ls | grep -q ${clusterName}", timeout=180)
 
     with subtest("the agent registers with the cluster"):
