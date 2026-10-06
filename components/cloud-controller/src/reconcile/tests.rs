@@ -539,27 +539,72 @@ fn book() -> AddressBook {
 fn one_address_book_answers_for_every_vm_of_the_pass() {
     let book = book();
 
-    let web = book.for_vm(&owned("web", Some("acme")));
+    let web = book.for_vm(&owned("web", Some("acme")), &[]);
     assert_eq!(web.floating_ips, ["10.255.0.7", "10.255.0.9"], "sorted");
     assert_eq!(
-        web.routed_subnets,
+        web.source_prefixes,
         ["10.42.0.0/24", "10.7.1.0/24"],
         "the tenant's routed subnet AND the prefix behind its router, sorted"
     );
 
     // The same book, a second VM, no second listing.
-    let db = book.for_vm(&owned("db", Some("acme")));
+    let db = book.for_vm(&owned("db", Some("acme")), &[]);
     assert_eq!(db.floating_ips, ["10.255.0.8"]);
-    assert_eq!(db.routed_subnets, ["10.42.0.0/24", "10.7.1.0/24"]);
+    assert_eq!(db.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
 
     // A VM of the tenant that holds nothing assigned to it still gets the
     // tenant's subnets, and none of anybody's addresses.
-    let idle = book.for_vm(&owned("idle", Some("acme")));
+    let idle = book.for_vm(&owned("idle", Some("acme")), &[]);
     assert!(idle.floating_ips.is_empty());
-    assert_eq!(idle.routed_subnets, ["10.42.0.0/24", "10.7.1.0/24"]);
+    assert_eq!(idle.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
     // And the other tenant's router is not acme's business.
-    let theirs = book.for_vm(&owned("web", Some("other")));
-    assert_eq!(theirs.routed_subnets, ["10.7.2.0/24"]);
+    let theirs = book.for_vm(&owned("web", Some("other")), &[]);
+    assert_eq!(theirs.source_prefixes, ["10.7.2.0/24"]);
+}
+
+/// The prefixes declared on a tenant are on its VMs' source lists whether a router is there or
+/// not: the router's inside prefix goes with the router, the declared one stays, and a guest
+/// addressed out of it goes on sending after the router is deleted. (NL5-1)
+#[test]
+fn a_tenants_declared_network_prefix_outlives_its_router() {
+    let declared = ["10.42.0.0/24".to_string()];
+    let mut book = book();
+    let with_router = book.for_vm(&owned("web", Some("acme")), &declared);
+    assert_eq!(
+        with_router.source_prefixes,
+        ["10.42.0.0/24", "10.7.1.0/24"],
+        "the declared prefix and the one behind the router are one entry"
+    );
+
+    book.routers.clear();
+    let without = book.for_vm(&owned("web", Some("acme")), &declared);
+    assert_eq!(without.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
+    let undeclared = book.for_vm(&owned("web", Some("acme")), &[]);
+    assert_eq!(
+        undeclared.source_prefixes,
+        ["10.7.1.0/24"],
+        "without a declaration the router's prefix leaves with the router, as it always did"
+    );
+}
+
+/// A tenant with no routed subnet and no router is known by its declared prefixes alone, and
+/// one with nothing declared either is known by nothing, as before the field existed.
+#[test]
+fn a_tenant_without_routers_or_subnets_is_known_by_its_declared_prefixes_alone() {
+    let mut book = book();
+    book.routers.clear();
+    book.subnets.clear();
+    let declared = ["10.30.0.0/24".to_string(), "10.31.0.0/24".to_string()];
+    assert_eq!(
+        book.for_vm(&owned("idle", Some("acme")), &declared)
+            .source_prefixes,
+        declared
+    );
+    assert!(
+        book.for_vm(&owned("idle", Some("acme")), &[])
+            .source_prefixes
+            .is_empty()
+    );
 }
 
 /// What a dispatch may honestly claim to have applied, and for whom.
@@ -581,7 +626,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
         net.metadata.generation = 5;
     }
 
-    let carried = book.for_vm(&owned("web", Some("acme"))).carried;
+    let carried = book.for_vm(&owned("web", Some("acme")), &[]).carried;
     let mut names: Vec<_> = carried
         .iter()
         .map(|c| (c.resource, c.name.as_str(), c.generation))
@@ -610,7 +655,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     // And a VM with nothing of its own still carries its tenant's subnet,
     // which is what a routed subnet IS — it reaches a node inside some
     // VM's create or it reaches none.
-    let idle = book.for_vm(&owned("idle", Some("acme"))).carried;
+    let idle = book.for_vm(&owned("idle", Some("acme")), &[]).carried;
     let idle: Vec<_> = idle
         .iter()
         .map(|c| (c.resource, c.name.as_str(), c.generation))
@@ -630,7 +675,7 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
     for ip in &mut book.reservations {
         ip.metadata.generation = 2;
     }
-    let carried = book.for_vm(&owned("web", Some("acme"))).carried;
+    let carried = book.for_vm(&owned("web", Some("acme")), &[]).carried;
 
     // The client changes an assignment while the command is in flight.
     for ip in &mut book.reservations {
@@ -652,8 +697,8 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
 fn a_vm_without_a_tenant_holds_nothing() {
     let book = book();
     for vm in [owned("web", None), owned("web", Some(""))] {
-        let none = book.for_vm(&vm);
-        assert!(none.floating_ips.is_empty() && none.routed_subnets.is_empty());
+        let none = book.for_vm(&vm, &[]);
+        assert!(none.floating_ips.is_empty() && none.source_prefixes.is_empty());
         assert!(none.carried.is_empty(), "and nothing to stamp");
     }
 }

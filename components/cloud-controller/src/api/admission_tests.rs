@@ -940,3 +940,108 @@ async fn a_binding_released_through_the_api_leaves_no_time_it_was_made() {
     assert_eq!(after.spec.cluster_name, None);
     assert_eq!(after.status.bound_at, None);
 }
+
+// --- NL5-1: a tenant's network prefixes -------------------------------------
+
+/// A tenant's network prefixes are stored as the CIDRs of their networks; a change that
+/// overlaps a floating pool is refused; and an edit that leaves them as they stand is not
+/// judged again, so a pool created since does not block an edit of something else.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenants_network_prefixes_are_checked_when_they_change() {
+    let st = cloud_with_routers("nl5-prefixes").await;
+    let declared = |prefixes: &[&str]| {
+        Tenant::declare(
+            "c",
+            TenantSpec {
+                network_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+    };
+    let (_, Json(created)) = create_tenant(
+        State(st.clone()),
+        DryRun::default(),
+        Json(declared(&["10.30.0.7/24"])),
+    )
+    .await
+    .expect("a tenant with a prefix");
+    assert_eq!(created.spec.network_prefixes, ["10.30.0.0/24"]);
+
+    let mut overlapping: Tenant = st.store.get("c").await.expect("the tenant");
+    overlapping.spec.network_prefixes = vec!["198.51.100.0/25".into()];
+    let refused = update_tenant(
+        State(st.clone()),
+        Path("c".to_string()),
+        DryRun::default(),
+        Json(overlapping),
+    )
+    .await
+    .err()
+    .expect("the floating pool is not the tenant's to send from");
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.message()
+    );
+
+    let pool_on_it = FloatingPool::declare(
+        "onto-c",
+        controller_api::FloatingPoolSpec {
+            cidrs: vec!["10.30.0.128/25".into()],
+            ..Default::default()
+        },
+    );
+    let refused = create_floating_pool(State(st.clone()), DryRun::default(), Json(pool_on_it))
+        .await
+        .err()
+        .expect("a pool may not land on a tenant's network either");
+    assert!(
+        refused.message().contains("tenant c's network"),
+        "{}",
+        refused.message()
+    );
+
+    let subnet_on_it = RoutedSubnet::declare(
+        "a-onto-c",
+        controller_api::RoutedSubnetSpec {
+            tenant: "a".into(),
+            cidr: "10.30.0.0/26".into(),
+            ..Default::default()
+        },
+    );
+    let refused = create_routed_subnet(State(st.clone()), DryRun::default(), Json(subnet_on_it))
+        .await
+        .err()
+        .expect("nor another tenant's routed subnet");
+    assert!(
+        refused.message().contains("tenant c's network"),
+        "{}",
+        refused.message()
+    );
+
+    // A pool that got there anyway, written before the rule or past it.
+    st.store
+        .create(&FloatingPool::declare(
+            "late",
+            controller_api::FloatingPoolSpec {
+                cidrs: vec!["10.30.0.0/28".into()],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a pool created since");
+    let mut quota_only: Tenant = st.store.get("c").await.expect("the tenant");
+    quota_only.spec.quota.max_vms = Some(3);
+    let Json(updated) = update_tenant(
+        State(st.clone()),
+        Path("c".to_string()),
+        DryRun::default(),
+        Json(quota_only),
+    )
+    .await
+    .expect("prefixes left as they stand are not judged again");
+    assert_eq!(updated.spec.network_prefixes, ["10.30.0.0/24"]);
+    assert_eq!(updated.spec.quota.max_vms, Some(3));
+}

@@ -10,7 +10,7 @@ use super::*;
 
 /// What a VM may source from, resolved where the objects are.
 ///
-/// The same split `tenant_vni` makes and for the same reason: the FloatingIp
+/// The same split `tenant_network` makes and for the same reason: the FloatingIp
 /// and RoutedSubnet objects live at the cloud, the injection into the NIC
 /// entries happens at the cluster, and no tier below this one has to know what
 /// a tenant is. A VM with no tenant holds nothing — a reservation belongs to a
@@ -18,7 +18,11 @@ use super::*;
 #[derive(Default)]
 pub(super) struct Addresses {
     pub(super) floating_ips: Vec<String>,
-    pub(super) routed_subnets: Vec<String>,
+    /// The prefixes the VM's guest may send from: those of its tenant's network and its
+    /// tenant's routed subnets, sorted and each once. They travel in `CreateVm.routed_subnets`,
+    /// the name the wire had before the network's own prefixes went into it; a field of their
+    /// own would be dropped by a cluster or refused by an agent of the release before.
+    pub(super) source_prefixes: Vec<String>,
     /// The objects the two lists above were read out of, each with the
     /// generation it carried at that moment.
     ///
@@ -93,7 +97,9 @@ impl AddressBook {
         })
     }
 
-    pub(super) fn for_vm(&self, vm: &Vm) -> Addresses {
+    /// What `vm` may send from. `declared` are the network prefixes of its tenant
+    /// (`TenantSpec::network_prefixes`), which the caller read with the tenant.
+    pub(super) fn for_vm(&self, vm: &Vm, declared: &[String]) -> Addresses {
         let Some(tenant) = vm.spec.tenant.as_deref().filter(|t| !t.is_empty()) else {
             return Addresses::default();
         };
@@ -114,24 +120,15 @@ impl AddressBook {
             .collect();
         floating_ips.sort();
 
-        let mut routed_subnets: Vec<String> = self
+        let mut source_prefixes: Vec<String> = self
             .subnets
             .iter()
             .filter(|s| s.spec.tenant == tenant)
             .map(|s| s.spec.cidr.clone())
             .collect();
-        // Include router inside prefixes in the tap's source allowlist; guests using
-        // SNAT need these private addresses even when the tenant also has routed subnets.
-        routed_subnets.extend(
-            self.routers
-                .iter()
-                .filter(|r| r.spec.tenant == tenant)
-                .map(|r| r.spec.internal_addr.as_str())
-                .filter(|addr| !addr.is_empty())
-                .filter_map(inside_prefix),
-        );
-        routed_subnets.sort();
-        routed_subnets.dedup();
+        source_prefixes.extend(self.network_prefixes(tenant, declared));
+        source_prefixes.sort();
+        source_prefixes.dedup();
 
         let carried: Vec<Carried> = self
             .reservations
@@ -146,15 +143,34 @@ impl AddressBook {
             )
             .collect();
 
-        if !floating_ips.is_empty() || !routed_subnets.is_empty() {
-            debug!(vm = %name, tenant, floating = ?floating_ips, subnets = ?routed_subnets,
+        if !floating_ips.is_empty() || !source_prefixes.is_empty() {
+            debug!(vm = %name, tenant, floating = ?floating_ips, prefixes = ?source_prefixes,
                    "resolved the addresses this vm may source from");
         }
         Addresses {
             floating_ips,
-            routed_subnets,
+            source_prefixes,
             carried,
         }
+    }
+
+    /// The prefixes of `tenant`'s overlay network: those `declared` on the tenant, which hold
+    /// whether a router is there or not, and the one behind each of its routers, which goes
+    /// with the router. A guest addresses itself out of them, and SNAT behind a router needs
+    /// them too, so they are on the allowlist whatever routed subnets the tenant has. (NL5-1)
+    fn network_prefixes<'a>(
+        &'a self,
+        tenant: &'a str,
+        declared: &'a [String],
+    ) -> impl Iterator<Item = String> + 'a {
+        let behind_routers = self
+            .routers
+            .iter()
+            .filter(move |r| r.spec.tenant == tenant)
+            .map(|r| r.spec.internal_addr.as_str())
+            .filter(|addr| !addr.is_empty())
+            .filter_map(inside_prefix);
+        declared.iter().cloned().chain(behind_routers)
     }
 }
 

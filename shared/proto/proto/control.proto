@@ -1089,8 +1089,12 @@ message CreateVm {
   // Cloud-resolved floating addresses reserved for this VM. The cluster
   // injects them into NIC facts for the node source guard. Empty means none.
   repeated string floating_ips = 5;
-  // Cloud-resolved tenant routed prefixes used by NIC source filtering.
-  // Empty means no routed-prefix claim.
+  // Cloud-resolved prefixes the VM's guest may source from, used by NIC
+  // source filtering: its tenant's routed subnets and the prefixes of its
+  // tenant's network (declared on the tenant, and behind each of its routers).
+  // The name is the one the field had before the network's prefixes went into
+  // it. Empty means the cloud knows no prefix for the VM; its taps are then
+  // guarded against the floating pool only.
   repeated string routed_subnets = 6;
   // The cloud VM's metadata.labels. The cluster stores them on its copy, so a
   // spec.antiAffinity term of another cloud VM finds this one on its node; the

@@ -753,17 +753,18 @@ pub(super) async fn dispatch_create(
     let name = vm.metadata.name.clone();
     // The first dispatch of the pass pays for the two listings; every other
     // one reads the same book. See `AddressBook`.
+    let network = tenant_network(store, vm.spec.tenant.as_deref()).await?;
     let addresses = book
         .get_or_try_init(|| AddressBook::read(store))
         .await?
-        .for_vm(vm);
+        .for_vm(vm, &network.prefixes);
     let op = cloud_command::Op::Create(proto::CreateVm {
         name: name.clone(),
         uid: vm.metadata.uid.clone(),
         spec_json: build_spec_json(vm)?,
-        vni: tenant_vni(store, vm.spec.tenant.as_deref()).await?,
+        vni: network.vni,
         floating_ips: addresses.floating_ips,
-        routed_subnets: addresses.routed_subnets,
+        routed_subnets: addresses.source_prefixes,
         labels: vm.metadata.labels.clone().into_iter().collect(),
     });
 
@@ -921,24 +922,37 @@ pub(super) async fn teardown(
     Ok(())
 }
 
-/// Resolve the tenant VNI for injection by the cluster, which has no directory.
+/// What the cloud knows of a tenant's overlay network for a dispatch: its VNI, and the
+/// prefixes declared for it (`TenantSpec::network_prefixes`).
+#[derive(Default)]
+pub(super) struct TenantNetwork {
+    pub(super) vni: Option<u32>,
+    pub(super) prefixes: Vec<String>,
+}
+
+/// Resolve the tenant's network for injection by the cluster, which has no directory.
 /// Missing VNIs preserve default-bridge behavior. A missing tenant logs a warning
-/// and also resolves to no VNI rather than blocking dispatch.
-pub(super) async fn tenant_vni(
+/// and also resolves to no network rather than blocking dispatch. A tenant that cannot be
+/// read fails the dispatch: a create without its declared prefixes would guard its taps on
+/// less than the tenant said.
+pub(super) async fn tenant_network(
     store: &EtcdStore,
     tenant: Option<&str>,
-) -> anyhow::Result<Option<u32>> {
+) -> anyhow::Result<TenantNetwork> {
     let Some(tenant) = tenant.filter(|t| !t.is_empty()) else {
-        return Ok(None);
+        return Ok(TenantNetwork::default());
     };
     match store.get::<controller_api::Tenant>(tenant).await {
-        Ok(t) => Ok(t.spec.vni),
+        Ok(t) => Ok(TenantNetwork {
+            vni: t.spec.vni,
+            prefixes: t.spec.network_prefixes,
+        }),
         Err(StoreError::NotFound(_)) => {
             warn!(
                 tenant,
                 "the tenant this vm belongs to is gone; dispatching without an overlay"
             );
-            Ok(None)
+            Ok(TenantNetwork::default())
         }
         Err(e) => Err(e.into()),
     }

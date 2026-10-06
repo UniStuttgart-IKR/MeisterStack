@@ -24,6 +24,15 @@ pub struct TenantSpec {
     /// overlay on nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vni: Option<u32>,
+    /// The IPv4 prefixes this tenant's guests take their addresses from on its overlay, as
+    /// CIDRs. The tap of every NIC of its VMs lets them through, beside its routed subnets and
+    /// floating addresses, whether a router is there or not. An administrator declares them,
+    /// because this stack hands out no overlay addresses; without them the cloud knows the
+    /// overlay's prefix only from the inside address of a router the tenant has, and only for
+    /// as long as that router exists. Empty is what every tenant written before this field
+    /// says. (NL5-1)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }

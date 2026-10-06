@@ -308,9 +308,11 @@ pub(super) async fn check_pool(
 
     // A pool that overlapped another one would make "which pool is this
     // address from" a question about ordering, and a pool that overlapped a
-    // routed subnet would put its addresses inside somebody's allowlist.
+    // routed subnet or a tenant's network would put its addresses inside
+    // somebody's allowlist.
     let subnets = floating::all_subnets(&st.store).await?;
-    let taken = floating::occupied(&others, &subnets, None);
+    let mut taken = floating::occupied(&others, &subnets, None);
+    taken.extend(network_prefixes_taken(st, None).await?);
     for range in ranges.ranges() {
         floating::check_free(range, &taken)?;
     }

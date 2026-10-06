@@ -49,8 +49,12 @@ pub(super) async fn create_tenant(
         true => vni::peek(&st.store, st.vni_base).await?,
         false => vni::allocate(&st.store, st.vni_base).await?,
     };
+    let prefixes =
+        checked_network_prefixes(&st, &body.metadata.name, &body.spec.network_prefixes, &[])
+            .await?;
     let mut tenant = Tenant::declare(&body.metadata.name, body.spec);
     tenant.spec.vni = Some(vni);
+    tenant.spec.network_prefixes = prefixes;
     tenant.metadata.labels = body.metadata.labels;
     let created = match dry.preview(&tenant) {
         Some(preview) => preview,
@@ -91,12 +95,117 @@ pub(super) async fn update_tenant(
     // The VNI is immutable: changing it would split existing and new guests across
     // different overlays. `check_owned` rejects such changes.
     check_owned(&current, &body, TENANT_OWNED)?;
+    body.spec.network_prefixes = checked_network_prefixes(
+        &st,
+        &name,
+        &body.spec.network_prefixes,
+        &current.spec.network_prefixes,
+    )
+    .await?;
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
     match dry.preview(&body) {
         Some(preview) => Ok(Json(preview)),
         None => Ok(Json(st.store.update(&body).await?)),
     }
+}
+
+/// The field a tenant's network prefixes are named by in a refusal.
+const NETWORK_PREFIXES: &str = "spec.networkPrefixes";
+
+/// The network prefixes a write of `tenant` stores: `declared` in canonical form, checked
+/// against what it may not overlap whenever it differs from the `current` list. An unchanged
+/// list is not judged again, so an edit of the quota is not refused for a pool created since.
+async fn checked_network_prefixes(
+    st: &ApiState,
+    tenant: &str,
+    declared: &[String],
+    current: &[String],
+) -> Result<Vec<String>, ApiError> {
+    if declared.is_empty() || declared == current {
+        return Ok(declared.to_vec());
+    }
+    let taken = off_limits_to_network_prefixes(st, tenant).await?;
+    canonical_network_prefixes(declared, &taken)
+}
+
+/// What a tenant's network prefixes may not overlap, each with its name for the refusal:
+/// every floating pool, every other tenant's routed subnet, and the routed pools subnets are
+/// cut from. A network prefix goes onto the source allowlist of every tap of the tenant's VMs,
+/// so an overlap would let its guests send from addresses that are somebody else's or may
+/// become so. The tenant's own routed subnets are on that allowlist already.
+async fn off_limits_to_network_prefixes(
+    st: &ApiState,
+    tenant: &str,
+) -> Result<Vec<(String, common::net::Ipv4Range)>, ApiError> {
+    let pools = floating::all_pools(&st.store).await?;
+    let others: Vec<RoutedSubnet> = floating::all_subnets(&st.store)
+        .await?
+        .into_iter()
+        .filter(|s| s.spec.tenant != tenant)
+        .collect();
+    let routed_pools = common::net::Ipv4Ranges::parse(&st.routed_pools)
+        .map_err(|e| invalid(format!("routed_pools in the cloud config: {e}")))?;
+    let mut taken = floating::occupied(&pools, &others, None);
+    taken.extend(
+        routed_pools
+            .ranges()
+            .iter()
+            .map(|range| ("the routed pools".to_string(), *range)),
+    );
+    Ok(taken)
+}
+
+/// Every tenant's network prefixes but those of `except`, each with its name for a refusal:
+/// what a floating pool or a routed subnet may not overlap, for the reason the prefixes may
+/// not overlap them. Read from a list that is all of them, since a tenant that did not decode
+/// could hide the prefix a pool would land on.
+pub(super) async fn network_prefixes_taken(
+    st: &ApiState,
+    except: Option<&str>,
+) -> Result<Vec<(String, common::net::Ipv4Range)>, ApiError> {
+    let tenants = st.store.list::<Tenant>().await?;
+    if tenants.len() != st.store.count::<Tenant>().await? {
+        return Err(conflict(
+            "cannot tell which prefixes the tenants' networks hold (some tenant objects did not \
+             decode); refusing rather than overlapping one",
+        ));
+    }
+    Ok(tenants
+        .iter()
+        .filter(|t| Some(t.metadata.name.as_str()) != except)
+        .flat_map(|t| {
+            t.spec.network_prefixes.iter().filter_map(|prefix| {
+                let range = prefix.parse::<common::net::Ipv4Range>().ok()?;
+                Some((format!("tenant {}'s network", t.metadata.name), range))
+            })
+        })
+        .collect())
+}
+
+/// `declared` as CIDRs of their network address, sorted and each once, or why not: an entry
+/// that is no IPv4 prefix, or one that overlaps something in `taken`.
+fn canonical_network_prefixes(
+    declared: &[String],
+    taken: &[(String, common::net::Ipv4Range)],
+) -> Result<Vec<String>, ApiError> {
+    let mut prefixes = Vec::with_capacity(declared.len());
+    for entry in declared {
+        let range: common::net::Ipv4Range = entry
+            .parse()
+            .map_err(|e: common::net::RangeError| invalid_field(NETWORK_PREFIXES, e.to_string()))?;
+        let cidr = range.to_cidr().ok_or_else(|| {
+            invalid_field(
+                NETWORK_PREFIXES,
+                format!("{entry} is a run of addresses, not a prefix; name it as a CIDR"),
+            )
+        })?;
+        floating::check_free(&range, taken)?;
+        prefixes.push(cidr);
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    Ok(prefixes)
 }
 
 /// Describe the first remaining user, VM, floating-address or routed-subnet owner.
@@ -292,5 +401,70 @@ mod tests {
         assert_eq!(why, "tenant acme still has users: ann");
         let why = tenant_still_holds("acme", &[], vms, &ips, &[]).unwrap();
         assert_eq!(why, "tenant acme still has vms: web");
+    }
+
+    // --- a tenant's network prefixes (NL5-1) ---------------------------------
+
+    fn taken(entries: &[(&str, &str)]) -> Vec<(String, common::net::Ipv4Range)> {
+        entries
+            .iter()
+            .map(|(what, range)| (what.to_string(), range.parse().expect("a range")))
+            .collect()
+    }
+
+    /// A prefix is stored as the CIDR of its network address, once, in order, whatever host
+    /// address or order the administrator wrote it with.
+    #[test]
+    fn network_prefixes_are_stored_as_the_cidrs_of_their_networks() {
+        let declared = ["10.30.0.1/24", "10.20.0.0/16", "10.30.0.0/24"].map(String::from);
+        let stored = canonical_network_prefixes(&declared, &[]).expect("prefixes");
+        assert_eq!(stored, ["10.20.0.0/16", "10.30.0.0/24"]);
+    }
+
+    /// A run of addresses that is no prefix, and what is no address at all, are refused by the
+    /// field's name.
+    #[test]
+    fn a_network_prefix_must_be_a_prefix() {
+        for entry in ["10.30.0.1-10.30.0.3", "10.30.0"] {
+            let refused =
+                canonical_network_prefixes(&[entry.to_string()], &[]).expect_err("not a prefix");
+            assert_eq!(
+                refused.field(),
+                Some(NETWORK_PREFIXES),
+                "{entry}: {}",
+                refused.message()
+            );
+        }
+    }
+
+    /// A prefix that overlaps a floating pool, another tenant's routed subnet or the routed
+    /// pools would let the tenant's guests send as somebody else, and is refused naming what it
+    /// overlaps.
+    #[test]
+    fn a_network_prefix_may_not_overlap_what_is_somebody_elses() {
+        let others = taken(&[
+            ("floating pool lab", "10.255.0.0/16"),
+            ("routed subnet theirs (tenant other)", "10.7.2.0/24"),
+            ("the routed pools", "10.7.0.0/16"),
+        ]);
+        for (prefix, what) in [
+            ("10.255.3.0/24", "floating pool lab"),
+            ("10.7.2.128/25", "routed subnet theirs"),
+            ("10.7.9.0/24", "the routed pools"),
+            ("0.0.0.0/0", "floating pool lab"),
+        ] {
+            let refused =
+                canonical_network_prefixes(&[prefix.to_string()], &others).expect_err("an overlap");
+            assert_eq!(refused.status(), StatusCode::CONFLICT, "{prefix}");
+            assert!(
+                refused.message().contains(what),
+                "{prefix}: {}",
+                refused.message()
+            );
+        }
+        assert_eq!(
+            canonical_network_prefixes(&["10.30.0.0/24".to_string()], &others).expect("free"),
+            ["10.30.0.0/24"]
+        );
     }
 }

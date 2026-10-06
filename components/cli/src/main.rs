@@ -530,6 +530,23 @@ pub enum TenantCmd {
         /// What it is for, for the person reading `tenant ls`
         #[arg(long)]
         description: Option<String>,
+        /// A prefix its guests take their addresses from on its overlay, as a CIDR;
+        /// repeatable. The taps of its vms let it through, router or not
+        #[arg(long = "network-prefix")]
+        network_prefixes: Vec<String>,
+    },
+    /// The prefixes its guests take their addresses from on its overlay, in place of the
+    /// ones it has. The taps of its vms let them through whether it has a router or not;
+    /// without them a tap knows its overlay's prefix only while a router names it
+    NetworkPrefixes {
+        /// Its name
+        name: String,
+        /// The prefixes, as CIDRs
+        #[arg(required_unless_present = "none")]
+        prefixes: Vec<String>,
+        /// Take every prefix off
+        #[arg(long, conflicts_with = "prefixes")]
+        none: bool,
     },
     /// What this tenant may hold. A limit that is not named is left as it
     /// stands; `--unlimited` takes all three off. Counted over every phase,

@@ -41,15 +41,16 @@ pub(super) async fn get_routed_subnet(
 }
 
 /// Choose an explicit CIDR or the first free aligned block in `routed_pools`.
-/// Reject overlap with routed subnets and floating pools. Otherwise a tenant's
-/// source allowlist could include floating addresses it does not own.
+/// Reject overlap with routed subnets, floating pools and other tenants' networks.
+/// Otherwise a tenant's source allowlist could include addresses it does not own.
 pub(super) async fn choose_subnet_cidr(
     st: &ApiState,
     spec: &controller_api::RoutedSubnetSpec,
 ) -> Result<common::net::Ipv4Range, ApiError> {
     let pools = floating::all_pools(&st.store).await?;
     let subnets = floating::all_subnets(&st.store).await?;
-    let taken = floating::occupied(&pools, &subnets, None);
+    let mut taken = floating::occupied(&pools, &subnets, None);
+    taken.extend(network_prefixes_taken(st, Some(&spec.tenant)).await?);
 
     if spec.cidr.is_empty() {
         let supers = common::net::Ipv4Ranges::parse(&st.routed_pools)

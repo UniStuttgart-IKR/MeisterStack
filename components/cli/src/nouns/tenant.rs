@@ -99,7 +99,11 @@ pub(super) fn tenant_row(t: Tenant) -> Vec<String> {
 
 pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
     match cmd {
-        TenantCmd::Create { name, description } => {
+        TenantCmd::Create {
+            name,
+            description,
+            network_prefixes,
+        } => {
             let body = ctx
                 .post(
                     "tenants",
@@ -107,8 +111,26 @@ pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
                         "apiVersion": "meister.io/v1",
                         "kind": "Tenant",
                         "metadata": { "name": name },
-                        "spec": { "description": description.clone().unwrap_or_default() },
+                        "spec": {
+                            "description": description.clone().unwrap_or_default(),
+                            "networkPrefixes": network_prefixes,
+                        },
                     }),
+                )
+                .await?;
+            output::emit_line(ctx.global, &body, name)
+        }
+        TenantCmd::NetworkPrefixes {
+            name,
+            prefixes,
+            none: _,
+        } => {
+            // A merge patch replaces a list whole; `--none` sends the empty one.
+            let body = ctx
+                .patch(
+                    "tenants",
+                    name,
+                    json!({ "spec": { "networkPrefixes": prefixes } }),
                 )
                 .await?;
             output::emit_line(ctx.global, &body, name)

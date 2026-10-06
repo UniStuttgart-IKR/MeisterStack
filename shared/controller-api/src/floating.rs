@@ -417,7 +417,9 @@ pub fn without_nic_lists(spec: &serde_json::Value) -> serde_json::Value {
 
 /// The NIC field the addresses a VM may claim travel in.
 pub const NIC_FLOATING_IPS: &str = "floating_ips";
-/// And the one its tenant's own subnets travel in.
+/// And the one the prefixes it may send from travel in: its tenant's routed
+/// subnets and the prefixes of its tenant's network, under the name the field
+/// had before the network's prefixes went into it.
 pub const NIC_ROUTED_SUBNETS: &str = "routed_subnets";
 
 #[cfg(test)]
