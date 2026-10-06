@@ -1362,6 +1362,22 @@ async fn unparsable<T: Resource>(prefix: &str, name: &str) {
     .expect("the record");
 }
 
+/// An address book is not read past a router that does not decode: the prefix behind it would
+/// be missing from its tenant's taps, so the dispatch fails instead of handing them a list
+/// without it. (RR5-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_address_book_is_not_read_past_a_router_that_does_not_decode() {
+    let (store, prefix) = test_area("address-book").await;
+    unparsable::<controller_api::Router>(&prefix, "broken").await;
+
+    let refused = AddressBook::read(&store)
+        .await
+        .err()
+        .expect("no book out of a partial list of routers");
+    assert!(format!("{refused:#}").contains("router"), "{refused:#}");
+}
+
 /// `netlab(mem_mib)`, connected and heard from now, in `store`.
 async fn connected_netlab(store: &EtcdStore, mem_mib: u64) {
     connected(store, netlab(mem_mib)).await;

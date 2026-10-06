@@ -89,14 +89,29 @@ fn inside_prefix(addr: &str) -> Option<String> {
     Some(format!("{network}/{bits}"))
 }
 
+/// Every router, refusing to answer from a partial list: a router that did not decode would
+/// take the prefix behind it off its tenant's taps, and with nothing else named a re-send would
+/// open them from the allowlist to the pool ban. One listing, so a router created or deleted
+/// between two reads cannot pass for one that did not decode. (RR5-2)
+async fn all_routers(store: &EtcdStore) -> anyhow::Result<Vec<controller_api::Router>> {
+    let (routers, keys) = store.list_counted::<controller_api::Router>().await?;
+    anyhow::ensure!(
+        routers.len() == keys,
+        "some router objects did not decode, so the prefixes behind them cannot be named; \
+         refusing rather than guarding their tenants' taps on a list without them"
+    );
+    Ok(routers)
+}
+
 impl AddressBook {
-    /// Through the two readers that refuse to answer from a partial list —
-    /// an undecodable object here is an address handed to the wrong VM.
+    /// Through the three readers that refuse to answer from a partial list —
+    /// an undecodable object here is an address handed to the wrong VM, or a
+    /// prefix taken off a tap that sends from it.
     pub(super) async fn read(store: &EtcdStore) -> anyhow::Result<Self> {
         Ok(Self {
             reservations: controller_api::floating::all_reservations(store).await?,
             subnets: controller_api::floating::all_subnets(store).await?,
-            routers: store.list::<controller_api::Router>().await?,
+            routers: all_routers(store).await?,
         })
     }
 
