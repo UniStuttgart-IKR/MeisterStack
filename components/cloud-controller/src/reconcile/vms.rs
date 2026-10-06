@@ -199,13 +199,16 @@ async fn place(
 /// retried onto a newer object — a retry would re-apply this replica's choice
 /// over the winner's and move a VM that is already placed. One write, one
 /// winner, and the loser is told.
-async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
+pub(super) async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     let mut bound = vm;
     bound.spec.cluster_name = Some(pick.clone());
     // The binding answers whatever a previous pass wrote about why there was
     // none: clearing the FACT is all there is to do, because `settle_vm`
     // reads it only while the VM is waiting.
     bound.status.placement = None;
+    // A refusal is the word of the cluster that gave it, and this binding
+    // may be to another: it must not hold the first hand-down here back.
+    bound.status.hand_down_refused = None;
     match store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
@@ -256,12 +259,15 @@ pub(super) fn handed_down_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
         .is_some_and(|h| answered_lately(h.at, now))
 }
 
-/// Whether the cluster refused this VM's current intent — its generation and
-/// its labels — within [`RETELL_AFTER`]: asking again gets the same no. New
-/// intent is not what was refused and goes down at once. (IKR-B74)
+/// Whether the cluster the VM is bound to refused its current intent — its
+/// generation and its labels — within [`RETELL_AFTER`]: asking again gets the
+/// same no. New intent is not what was refused and goes down at once, and
+/// neither does another cluster's no hold back the first hand-down to this
+/// one. (IKR-B74)
 pub(super) fn refused_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
     vm.status.hand_down_refused.as_ref().is_some_and(|r| {
         answered_lately(r.at, now)
+            && vm.spec.cluster_name.as_deref() == Some(r.cluster.as_str())
             && r.generation == vm.metadata.generation
             && r.labels == vm.metadata.labels
     })
@@ -814,6 +820,7 @@ pub(super) async fn dispatch_create(
                         generation: dispatched,
                         labels: vm.metadata.labels.clone(),
                         message: msg.clone(),
+                        cluster: cluster.to_string(),
                     });
                 })
                 .await?;

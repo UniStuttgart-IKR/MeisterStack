@@ -565,6 +565,11 @@ pub struct HandDownRefused {
     /// The cluster's own sentence, kept after its next report has replaced
     /// the refusal in the phase.
     pub message: String,
+    /// The cluster that refused: its no is no answer from any other cluster
+    /// the VM is bound to since. Empty in a record from before the field,
+    /// which is then nobody's word and holds nothing back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cluster: String,
 }
 
 /// A hand-down the cluster acked.

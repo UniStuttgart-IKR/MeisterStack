@@ -830,6 +830,7 @@ fn refused_at(refused: i64) -> Vm {
         generation: v.metadata.generation,
         labels: v.metadata.labels.clone(),
         message: "the shape of a vm is fixed once it exists".into(),
+        cluster: "cluster-1".into(),
     });
     v
 }
@@ -862,6 +863,21 @@ fn new_intent_after_a_refusal_goes_down_at_once() {
         .labels
         .insert("app".into(), "web".into());
     assert!(must_hand_down(&relabelled, false, at(21)));
+}
+
+/// A refusal is the word of the cluster that gave it: bound to another one
+/// since, the VM goes down there at once, and so does one whose refusal
+/// names no cluster.
+#[test]
+fn another_clusters_refusal_holds_nothing_back() {
+    let mut moved = refused_at(20);
+    moved.spec.cluster_name = Some("cluster-2".into());
+    assert!(must_hand_down(&moved, true, at(21)));
+    let mut unnamed = refused_at(20);
+    if let Some(r) = unnamed.status.hand_down_refused.as_mut() {
+        r.cluster.clear();
+    }
+    assert!(must_hand_down(&unnamed, false, at(21)));
 }
 
 /// A refusal after an evacuation mark answers it as an ack would: the stop
@@ -1305,6 +1321,28 @@ async fn a_cluster_that_refuses_a_resend_is_asked_once_in_three_passes() {
     let refusal = after.status.hand_down_refused.expect("the refusal is kept");
     assert_eq!(refusal.generation, held.metadata.generation);
     assert!(refusal.message.contains("shape"), "{}", refusal.message);
+}
+
+/// A binding drops the refusal the VM carries: whichever cluster it came
+/// from, it is no word of the cluster bound now. A drain reschedule or an
+/// evacuation lets the binding go without a new generation, and the refusal
+/// held the first hand-down to the next cluster back.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_new_binding_drops_the_old_clusters_refusal() {
+    let store = test_store("rebind-test").await;
+    let mut unbound = refused_at(20);
+    unbound.spec.cluster_name = None;
+    let unbound = store.create(&unbound).await.expect("an unbound vm");
+    assert!(unbound.status.hand_down_refused.is_some(), "refused before");
+
+    bind(&store, unbound, "cluster-2".into())
+        .await
+        .expect("bound");
+
+    let bound: Vm = store.get("t").await.expect("the vm");
+    assert_eq!(bound.spec.cluster_name.as_deref(), Some("cluster-2"));
+    assert!(bound.status.hand_down_refused.is_none());
 }
 
 /// The teardown of a VM that was never placed deletes that VM and not one
