@@ -43,7 +43,7 @@ async fn replica(prefix: &str) -> ApiState {
         sessions: Arc::new(crate::session::SessionRegistry::new()),
         signing: None,
         vni_base: 10_000,
-        routed_pools: Arc::new(Vec::new()),
+        routed_pools: Arc::default(),
         advertise: None,
         overcommit: controller_api::Overcommit::default(),
         scheduler: Arc::new(controller_api::FirstFit),

@@ -105,7 +105,7 @@ async fn test_router() -> Router {
                 tls: None,
             },
             vni_base: 10_000,
-            routed_pools: Vec::new(),
+            routed_pools: Default::default(),
             advertise: None,
             overcommit: controller_api::Overcommit::default(),
             scheduler: Arc::new(controller_api::FirstFit),

@@ -323,7 +323,8 @@ async fn inside_prefix_lost(
         return Ok(None);
     }
     let claimed =
-        controller_api::address_space::ClaimedSpace::read(&st.store, routed_pools(st)?).await?;
+        controller_api::address_space::ClaimedSpace::read(&st.store, (*st.routed_pools).clone())
+            .await?;
     let declared = claimed.network_of(&router.spec.tenant);
     Ok(claimed.opened_by_router(router, declared).err())
 }

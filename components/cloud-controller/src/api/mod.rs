@@ -60,7 +60,7 @@ pub struct ApiState {
     /// outright, which is the right default: the stack does not know which
     /// prefixes an operator was actually given, and inventing one would put
     /// somebody else's addresses inside a tenant's allowlist.
-    routed_pools: Arc<Vec<String>>,
+    routed_pools: Arc<common::net::Ipv4Ranges>,
     /// This replica's own REST address, where it has one. Read by exactly one
     /// route: a console forward, to be sure it is not about to connect to
     /// itself. See `CONSOLE_FORWARDED`.
@@ -284,7 +284,7 @@ pub struct Settings {
     /// See `ApiState::sibling`.
     pub sibling: controller_api::forward::Sibling,
     pub vni_base: u32,
-    pub routed_pools: Vec<String>,
+    pub routed_pools: common::net::Ipv4Ranges,
     pub advertise: Option<String>,
     pub overcommit: controller_api::Overcommit,
     pub scheduler: Arc<dyn controller_api::Scheduler>,

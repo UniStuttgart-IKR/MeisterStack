@@ -215,14 +215,8 @@ async fn off_limits_to_network_prefixes(
         tenant,
         &pools,
         &subnets,
-        &routed_pools(st)?,
+        &st.routed_pools,
     ))
-}
-
-/// The routed pools from the cloud config, which subnets are cut from.
-pub(super) fn routed_pools(st: &ApiState) -> Result<common::net::Ipv4Ranges, ApiError> {
-    common::net::Ipv4Ranges::parse(&st.routed_pools)
-        .map_err(|e| invalid(format!("routed_pools in the cloud config: {e}")))
 }
 
 /// Every tenant's network prefixes but those of `except`, each with its name for a refusal:

@@ -53,7 +53,7 @@ pub(super) async fn choose_subnet_cidr(
     taken.extend(network_prefixes_taken(st, Some(&spec.tenant)).await?);
 
     if spec.cidr.is_empty() {
-        let supers = routed_pools(st)?;
+        let supers = &st.routed_pools;
         if supers.is_empty() {
             return Err(invalid(
                 "this cloud has no routed_pools configured, so a subnet cannot be cut; \
@@ -63,10 +63,10 @@ pub(super) async fn choose_subnet_cidr(
         let prefix = spec
             .prefix_len
             .unwrap_or(controller_api::DEFAULT_ROUTED_PREFIX_LEN);
-        floating::cut_subnet(&supers, prefix, &taken).ok_or_else(|| {
+        floating::cut_subnet(supers, prefix, &taken).ok_or_else(|| {
             conflict(format!(
                 "no free /{prefix} left in routed_pools ({})",
-                st.routed_pools.join(", ")
+                routed_pools_named(st)
             ))
         })
     } else {
@@ -77,6 +77,16 @@ pub(super) async fn choose_subnet_cidr(
         floating::check_free(&wanted, &taken)?;
         Ok(wanted)
     }
+}
+
+/// The routed pools, as a refusal names them.
+fn routed_pools_named(st: &ApiState) -> String {
+    st.routed_pools
+        .ranges()
+        .iter()
+        .map(controller_api::address_space::cidr_of)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Return the prefix length only when the range is an aligned CIDR block.
@@ -151,7 +161,7 @@ pub(super) async fn create_routed_subnet(
     }
     Err(conflict(format!(
         "lost {MAX_CLAIM_ROUNDS} races for a free block in routed_pools ({}); retries exhausted",
-        st.routed_pools.join(", ")
+        routed_pools_named(&st)
     )))
 }
 
