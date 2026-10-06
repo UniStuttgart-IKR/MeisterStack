@@ -1457,4 +1457,129 @@ mod tests {
         let said = created.expect_err("one backend per device").to_string();
         assert!(said.contains("not started a second time"), "{said}");
     }
+
+    /// A driver over a fake backend that runs `body` as `/bin/sh` with
+    /// `--nvrm <socket>` as its arguments, so `$2` is the socket.
+    fn driver_over(dir: &Path, body: &str) -> NvrmDriver {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("vhost-user-nvrm");
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).expect("a fake backend");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let mut config = node_in(&dir.join("run"));
+        config.binary = binary;
+        config.socket_timeout = Duration::from_secs(30);
+        std::fs::create_dir_all(&config.run_dir).expect("a run dir");
+        NvrmDriver::assemble(config, the_card())
+    }
+
+    /// Binds its socket at once and runs until it is stopped.
+    const BINDS: &str = ": > \"$2\"\nexec sleep 600";
+
+    fn pid_of(device: &Device) -> u32 {
+        let DeviceAttachment::VhostUser { pid, .. } = device.attachment else {
+            panic!("an nvrm device is a vhost-user device")
+        };
+        pid
+    }
+
+    /// Whether a process exists under `pid`; a backend stopped by the driver
+    /// has been waited for, so it no longer does.
+    fn exists(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Creating a device whose backend still serves it hands back the same
+    /// backend instead of starting a second one.
+    #[tokio::test]
+    async fn a_running_backend_serves_its_device_again() {
+        let dir = run_dir();
+        let driver = driver_over(dir.path(), BINDS);
+        let (id, spec) = (DeviceId::new_v4(), profiled("1q"));
+        let first = driver.create(&id, &spec, None).await.expect("started");
+        let again = driver.create(&id, &spec, None).await.expect("served");
+        assert_eq!(pid_of(&first), pid_of(&again));
+        driver
+            .destroy(&id, &first.attachment)
+            .await
+            .expect("destroyed");
+    }
+
+    /// Destroy stops the backend this driver started and clears its socket.
+    #[tokio::test]
+    async fn destroy_stops_the_backend_this_driver_started() {
+        let dir = run_dir();
+        let driver = driver_over(dir.path(), BINDS);
+        let id = DeviceId::new_v4();
+        let device = driver
+            .create(&id, &profiled("1q"), None)
+            .await
+            .expect("started");
+        driver
+            .destroy(&id, &device.attachment)
+            .await
+            .expect("destroyed");
+        assert!(!exists(pid_of(&device)), "the backend is gone");
+        assert!(!driver.socket_path(&id).exists(), "and so is its socket");
+    }
+
+    /// A backend whose socket vanished cannot serve again; it is stopped
+    /// before its replacement binds the same path, not left running beside it.
+    #[tokio::test]
+    async fn a_backend_that_lost_its_socket_is_stopped_before_its_replacement_starts() {
+        let dir = run_dir();
+        let driver = driver_over(dir.path(), BINDS);
+        let (id, spec) = (DeviceId::new_v4(), profiled("1q"));
+        let first = driver.create(&id, &spec, None).await.expect("started");
+        std::fs::remove_file(driver.socket_path(&id)).expect("the socket goes");
+
+        let second = driver.create(&id, &spec, None).await.expect("replaced");
+        assert_ne!(pid_of(&first), pid_of(&second));
+        assert!(!exists(pid_of(&first)), "the first backend was stopped");
+        driver
+            .destroy(&id, &second.attachment)
+            .await
+            .expect("destroyed");
+    }
+
+    /// A device destroyed while its backend is still coming up does not keep
+    /// that backend: the start finds its place gone, stops what it spawned
+    /// and fails, rather than leaving a backend nobody counts or destroys.
+    #[tokio::test]
+    async fn a_device_destroyed_while_its_backend_starts_does_not_keep_it() {
+        let dir = run_dir();
+        let (started, go) = (dir.path().join("started"), dir.path().join("go"));
+        for fifo in [&started, &go] {
+            nix::unistd::mkfifo(fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+                .expect("a fifo");
+        }
+        let body = format!(
+            "echo $$ > '{}'\nread go < '{}'\n{BINDS}",
+            started.display(),
+            go.display()
+        );
+        let driver = driver_over(dir.path(), &body);
+        let (id, spec) = (DeviceId::new_v4(), profiled("1q"));
+
+        let (created, pid) = tokio::join!(driver.create(&id, &spec, None), async {
+            let pid: u32 = tokio::fs::read_to_string(&started)
+                .await
+                .expect("the backend runs")
+                .trim()
+                .parse()
+                .expect("its pid");
+            // The record has no attachment yet; this one names nothing.
+            let nothing = NvrmDriver::attachment(driver.socket_path(&id), u32::MAX);
+            driver.destroy(&id, &nothing).await.expect("destroyed");
+            tokio::fs::write(&go, b"go\n").await.expect("let it bind");
+            pid
+        });
+
+        let said = created.expect_err("its device is gone").to_string();
+        assert!(
+            said.contains("destroyed while its backend started"),
+            "{said}"
+        );
+        assert!(!exists(pid), "the backend it spawned was stopped");
+    }
 }
