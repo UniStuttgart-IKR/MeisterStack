@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
 # Translate provider-neutral MEISTER_* values into role configuration attrsets.
-# Empty values are omitted. Build-time managed rendering uses this module;
+# Empty values are omitted. Build-time rendering (nix/store-host.nix) uses this module;
 # individual role modules supply defaults and explicit operator overrides.
 { lib, cloudAuth }:
 

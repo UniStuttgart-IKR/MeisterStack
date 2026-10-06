@@ -201,8 +201,8 @@ in
       not a network. It is not needed for anything this stack does: there
       is no NAT, DHCP or metadata service behind it. On a host that was not
       built for this stack it can also collide with a network the site
-      already uses. `nix/managed.nix` keeps the fleet's historical
-      `10.42.0.1/24`. Whatever is set here, `meisterstack.agent.guestGuard`
+      already uses. meister-deploy's managed profile keeps its fleets'
+      historical `10.42.0.1/24`. Whatever is set here, `meisterstack.agent.guestGuard`
       keeps guests from opening connections to the host.
     '';
   };
@@ -217,10 +217,10 @@ in
 
       The default is the APPLIANCE's answer and is what it has always been:
       on that road images arrive next to the binaries, both pushed into
-      /opt/meisterstack by `meister-deploy legacy context-push`, and moving
-      them would move a directory the push writes.
+      /opt/meisterstack, and moving them would move a directory the push
+      writes.
 
-      A MANAGED host has no push (nix/managed.nix sets
+      A STORE-BUILT host has no push (nix/store-host.nix sets
       `/var/lib/meisterstack/images`): nothing writes into its filesystem by
       hand any more, and the FHS answer for state a service owns is
       /var/lib — which is where `meisterstack.pki.dir` and the volume
@@ -238,9 +238,9 @@ in
     description = ''
       The agent's config file as a VALUE: role defaults, the two
       option-driven sections, `generated`, then `settings`.
-      `environment.etc` turns it into TOML and `lib.mkFleet` puts the same
-      attrset into `meisterDeployment.hosts.<id>.effective_settings`, so the
-      manifest cannot describe a file different from the one the unit reads.
+      `environment.etc` turns it into TOML, and a deployment tool that
+      describes the host (meister-deploy's manifest) reads the same attrset,
+      so it cannot describe a file different from the one the unit reads.
     '';
   };
 
@@ -254,7 +254,7 @@ in
       the operator's `settings`.
 
       Empty on an appliance, where the context renderer writes exactly these
-      at boot; filled by nix/managed.nix from `meisterstack.context.defaults`
+      at boot; filled by nix/store-host.nix from `meisterstack.context.defaults`
       through nix/lib/render.nix, where there is no renderer to write them.
     '';
   };
@@ -290,7 +290,7 @@ in
       "meisterstack.agent.vmm.package has no default here: this nixpkgs has no "
       + "`cloud-hypervisor-meister` attribute, so the overlay that declares it is not "
       + "in it. Add `nixpkgs.overlays = [ meisterstack.overlays.default ];` "
-      + "(lib.mkFleet does that for you), or set the option to your own build."));
+      + "(a meister-deploy fleet does that for you), or set the option to your own build."));
     defaultText = lib.literalExpression "pkgs.cloud-hypervisor-meister";
     description = ''
       The hypervisor this node's agent starts guests with: cloud-hypervisor
@@ -395,14 +395,14 @@ in
       boot from the hostname and the context, and a key in both places would
       be a duplicate TOML key and a parse error.
 
-      On a managed host they are not written at boot but BAKED
+      On a store-built host they are not written at boot but BAKED
       (`meisterstack.agent.generated`, from nix/lib/render.nix), and this
       option still wins over them: there is one file, written once, and
       naming a key twice in it is not possible.
     '';
   };
 
-  # Gate role units, managed configuration, and optional hardware independently.
+  # Gate role units, store-built configuration, and optional hardware independently.
   config = lib.mkMerge [
     (lib.mkIf (builtins.elem "agent" cfg.unitsFor) {
       # Install the helpers used by enabled storage and network backends.

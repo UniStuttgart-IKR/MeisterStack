@@ -61,8 +61,8 @@ in
         The name this box is reached under. It is the Kanidm origin, the
         issuer, the name in the serving certificate and the host in every
         oauth2 redirect url at once — so it is a NAME and not an address, it
-        has to resolve on every machine that logs in, and `meister-deploy keys
-        init` has to have signed it.
+        has to resolve on every machine that logs in, and the CA that signs
+        the serving certificate has to have signed it.
       '';
     };
 
@@ -73,7 +73,7 @@ in
       description = ''
         The `meister` scrape job, one entry per node AND role: a box with two
         roles has two metrics listeners (9100 cloud, 9101 cluster, 9102
-        agent). nix/fleet.nix derives this from the plan; the lab's twelve vms
+        agent). A fleet inventory derives this from the plan; the lab's twelve vms
         are twelve targets, not thirty-six.
       '';
     };

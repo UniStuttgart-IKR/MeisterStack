@@ -131,7 +131,7 @@ in
 
         Empty on an appliance: there the same keys are written at boot by the
         context renderer, which is the only thing that knows where this image
-        was started. `nix/managed.nix` fills it from
+        was started. `nix/store-host.nix` fills it from
         `meisterstack.context.defaults` through `nix/lib/render.nix`, so that
         both roads render the same file out of the same input.
       '';
@@ -147,7 +147,7 @@ in
 
         `auth` depends on who writes this file. A boot renderer appends the
         whole [auth] table at boot, so a key here would be a duplicate table
-        and a parse error on the VM; a managed host bakes it through
+        and a parse error on the VM; a store-built host bakes it through
         `meisterstack.cloud.generated`. A host with neither has to name its
         chain here, e.g. `auth.chain = [ "mtls" ];` — the evaluation refuses a
         cloud without one rather than leave the choice to the binary.
@@ -176,8 +176,8 @@ in
       description = ''
         The file, as a VALUE: role defaults, then `generated`, then
         `settings`, which is the order the renderer has. `environment.etc`
-        turns it into TOML, and `lib.mkFleet` puts the same attrset into
-        `meisterDeployment.hosts.<id>.effective_settings` — one merge with
+        turns it into TOML, and a deployment tool that describes the host
+        (meister-deploy's manifest) reads the same attrset — one merge with
         two readers, rather than a second one in the manifest that could
         drift from the file the unit actually reads.
       '';
@@ -200,7 +200,7 @@ in
       description = ''
         The cloud-controller's per-machine keys, the counterpart of
         `meisterstack.cluster.generated` — including the whole [auth] table on
-        a managed host, where nothing appends it at boot.
+        a store-built host, where nothing appends it at boot.
       '';
     };
   };
@@ -241,9 +241,9 @@ in
         assertion = cfg.context.enable || namesAuthChain cfg.cloud.effective;
         message =
           "the cloud-controller on this host names no authenticator: no [auth] chain in "
-          + "meisterstack.cloud.settings, none baked by nix/managed.nix and no boot renderer "
+          + "meisterstack.cloud.settings, none baked by nix/store-host.nix and no boot renderer "
           + "to append one. Name it, e.g. meisterstack.cloud.settings.auth.chain = [ \"mtls\" ] "
-          + "(certificates only), or import nixosModules.managed.";
+          + "(certificates only), or import nixosModules.store-host.";
       }];
       meisterstack.cloud.effective = lib.recursiveUpdate
         (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)

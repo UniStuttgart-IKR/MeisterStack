@@ -38,16 +38,16 @@ in
         Whether this machine renders its config files at BOOT, from a
         context. A renderer sets it by being imported; this flake ships none
         any more (M5B), so on a host of this flake it is always false and
-        what reads it is the refusal in nix/managed.nix.
+        what reads it is the refusal in nix/store-host.nix.
 
         It is read rather than set: the two auth fragments of the cloud exist
-        only where something appends them, and `nix/managed.nix` refuses to
+        only where something appends them, and `nix/store-host.nix` refuses to
         be combined with a renderer — a host whose config files are complete
         at build time must not have a second author for them at boot.
       '';
     };
 
-    # Declare provider initialization here so managed hosts can use it without
+    # Declare provider initialization here so store-built hosts can use it without
     # importing a boot-time configuration renderer.
     context.providerScript = lib.mkOption {
       type = lib.types.lines;
@@ -91,13 +91,13 @@ in
         instead — and the context, being the thing that knows where this
         machine was actually booted, wins over it.
 
-        On a managed host this attrset is the WHOLE input: there is no
+        On a store-built host this attrset is the WHOLE input: there is no
         provider and no cd, `nix/lib/render.nix` turns it into the complete
         config files at build time, and nothing overrides it afterwards.
 
         Secrets do not belong here: this file is in the nix store and the
-        store is world-readable. Certificates and keys travel with
-        `meister-deploy keys push`, as they always have.
+        store is world-readable. Certificates and keys travel outside the
+        store, as they always have.
       '';
     };
   };

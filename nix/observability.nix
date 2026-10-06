@@ -34,7 +34,7 @@ in
       leader, the VMM refusing a disk, the kernel remounting read-only.
 
       Off unless a boot renderer is imported, because that renderer is the
-      only author of the collector's config: a managed host would have to
+      only author of the collector's config: a store-built host would have to
       bake it at build time, which is not built yet, and on any other host
       `services.alloy` may already be the host's own collector. Turning this
       on where the host configures `services.alloy` itself is refused at

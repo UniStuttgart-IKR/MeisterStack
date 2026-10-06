@@ -17,7 +17,7 @@ final: prev: {
   # Operator-side CA utility; runtime hosts do not need the CA signing tool.
   meister-ca = final.callPackage ./packages/meister-ca.nix { };
 
-  # Static workspace binaries for deployments outside the managed NixOS closure.
+  # Static workspace binaries for deployments outside a store-built NixOS closure.
   meisterstack-static = final.pkgsStatic.callPackage ./packages/meisterstack.nix { };
 
   # Static patched hypervisor for the same deployment path.
@@ -28,6 +28,6 @@ final: prev: {
     name = "meisterstack-runtime-${final.meisterstack.version}";
     paths = [ final.meisterstack final.cloud-hypervisor-meister ];
     meta.description =
-      "The binaries a managed host's units name, in one directory: the workspace and the hypervisor";
+      "The binaries a store-built host's units name, in one directory: the workspace and the hypervisor";
   };
 }

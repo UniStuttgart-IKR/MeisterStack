@@ -45,7 +45,7 @@ in
         message =
           "meisterstack.singleNode is an agent and nothing else: this host's roles are "
           + builtins.toJSON cfg.roles + ", and a single node has exactly [\"agent\"]. A "
-          + "machine that also carries a controller is a one-box fleet (examples/fleet/one-box.toml).";
+          + "machine that also carries a controller is a one-box fleet.";
       }
       {
         assertion =

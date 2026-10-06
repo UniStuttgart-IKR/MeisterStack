@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Evaluate hosts that import nixosModules.services without nix/managed.nix,
+# Evaluate hosts that import nixosModules.services without nix/store-host.nix,
 # the way an existing NixOS configuration does. Each expectation names one
 # default that has to fail closed on such a host.
 { nixpkgs, lib, pkgs, system, self }:
@@ -119,7 +119,7 @@ pkgs.runCommand "standalone-host" { } (
     touch $out
   '' else ''
     ${lib.concatMapStrings (e: "echo ${lib.escapeShellArg "FAIL ${e}"}\n") broken}
-    echo "-> a host without nix/managed.nix got a default that does not fail closed"
+    echo "-> a host without nix/store-host.nix got a default that does not fail closed"
     exit 1
   ''
 )

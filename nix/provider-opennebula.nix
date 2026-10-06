@@ -5,7 +5,7 @@
 # Read OpenNebula CONTEXT media through an optional provider module.
 # The default strict reader accepts six validated data keys and never sources
 # the file or imports MEISTER_* values. Legacy mode executes the context as root.
-# Managed hosts can use this provider without a boot-time configuration renderer.
+# Store-built hosts can use this provider without a boot-time configuration renderer.
 { lib, config, ... }:
 let
   cfg = config.meisterstack.provider.opennebula;

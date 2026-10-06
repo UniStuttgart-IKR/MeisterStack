@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Boot an agent host without nix/managed.nix and stand in for a guest with a
+# Boot an agent host without nix/store-host.nix and stand in for a guest with a
 # network namespace on the default bridge. The guest must not open
 # connections to the host over IPv4 or IPv6, except to a port the host lists,
 # and the host must still reach the guest.

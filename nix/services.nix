@@ -4,7 +4,7 @@
 
 # Public runtime module: role services, accounts, helpers, and optional storage.
 # Host profiles retain control of boot, firewall, DHCP, resolver, and stateVersion.
-# Managed deployment adds immutable package and configuration paths separately.
+# nix/store-host.nix adds immutable package and configuration paths separately.
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
@@ -52,15 +52,15 @@ in
       default = pkgs.meisterstack or (throw (
         "meisterstack.package has no default here: this nixpkgs has no `meisterstack` "
         + "attribute, so the overlay that declares it is not in it. Add "
-        + "`nixpkgs.overlays = [ meisterstack.overlays.default ];` (lib.mkFleet does "
-        + "that for you), or set meisterstack.package to your own build."));
+        + "`nixpkgs.overlays = [ meisterstack.overlays.default ];` (a meister-deploy fleet "
+        + "does that for you), or set meisterstack.package to your own build."));
       defaultText = lib.literalExpression "pkgs.meisterstack";
       description = ''
         The package the units of this stack take their binaries from.
 
         Read only where `meisterstack.binDir` is derived from it — which is
-        what nix/managed.nix does. A host that is not managed by this flake
-        may get its binaries pushed into /opt/meisterstack/bin instead, and
+        what nix/store-host.nix does. A host whose binaries do not come from
+        the store may get them pushed into /opt/meisterstack/bin instead, and
         then this option is never forced. That is also why the default may
         be a package that the operator's nixpkgs does not have: a foreign
         host importing `nixosModules.default` without the overlay is a
@@ -106,8 +106,8 @@ in
         Off by default: importing `nixosModules.services` into an existing
         configuration defines the units and starts none of them, so a host
         decides when it is ready — typically once its certificates are in
-        place. `nix/managed.nix` turns it on, because there the deployed
-        closure is the decision. Either way a unit still waits for its key
+        place. `nix/store-host.nix` turns it on, because there the system
+        generation is the decision. Either way a unit still waits for its key
         material (`ConditionPathExists`), and the agent for its guest guard.
       '';
     };
@@ -187,7 +187,7 @@ in
         the lab's twelve context VMs boot is in
         `~/git/meisterstack-lab/legacy/nix/context.nix`.
 
-        A managed host has no renderer and no context: Nix knows every one of
+        A store-built host has no renderer and no context: Nix knows every one of
         those values at build time, writes the complete file into /etc and
         points this option at it. Then the config a unit reads is part of the
         system generation, which is what makes a rollback a rollback.
@@ -209,7 +209,7 @@ in
         every tenant.
 
         Loopback by default, so a host that does not say otherwise exposes
-        them to nobody. A fleet built with `lib.mkFleet` binds the host's
+        them to nobody. A fleet built with meister-deploy binds the host's
         management address, which is what its Prometheus scrapes, and refuses
         a host that binds neither that address nor a wildcard covering it; a unit that
         binds one address waits for `network-online.target`. A host that
@@ -304,7 +304,7 @@ in
       };
 
     # Run provider initialization independently of the configuration renderer.
-    # Managed hosts can obtain network and hostname information from a provider
+    # Store-built hosts can obtain network and hostname information from a provider
     # while their role configurations remain part of the system generation.
     systemd.services.meister-provider-context =
       lib.mkIf (cfg.context.providerScript != "" && !cfg.context.enable) {

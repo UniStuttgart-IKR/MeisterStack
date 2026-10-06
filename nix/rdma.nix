@@ -21,7 +21,7 @@ in
         `rping` and `ibv_devinfo` out of rdma-core, `ib_send_lat` and
         `ib_write_bw` out of perftest.
 
-        It is what `meister-deploy verify --suite rdma` drives, over ssh, one
+        It is what a fleet's RDMA verification suite drives, over ssh, one
         end of a declared pair at a time. Without it that suite finds no
         binary on the host and says `skipped` with the sentence — never
         `pass`, because a fabric nobody could measure is not a fabric that
