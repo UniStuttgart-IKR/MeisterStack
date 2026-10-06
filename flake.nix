@@ -168,6 +168,11 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # A tenant router outlives the agent that built it (IKR-B69).
+          vm-router-netns-outlives-agent = import ./nix/tests/router-netns-outlives-agent.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # Every host binds its metrics where the fleet's Prometheus scrapes them.
           scrape-targets = import ./nix/tests/scrape-targets.nix {
             inherit nixpkgs lib pkgs system self;
