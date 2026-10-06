@@ -8,6 +8,7 @@
 //! records and survive VM deletion. Ownership comes from the persisted spec.
 
 use super::*;
+use crate::types::VolumeWithId;
 
 /// Resolve the creating volume driver from persisted ownership records for cleanup.
 pub(crate) fn volume_driver_name(store: &Store, record: &VmRecord, id: &VolumeId) -> String {
@@ -41,21 +42,34 @@ pub(crate) fn volume_is_referenced(record: &VmRecord, id: &VolumeId) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the entry at `position` may come and go while the VM exists: a referenced volume
+/// past the boot position. The boot disk and inline disks are fixed for the VM's life; API
+/// validation enforces that.
+fn is_pluggable(position: usize, volume: &VolumeWithId) -> bool {
+    position > 0 && volume.referenced
+}
+
+/// The entries of a volume list that never change while the VM exists, in order.
+fn fixed_volumes(volumes: &[VolumeWithId]) -> impl Iterator<Item = &VolumeWithId> {
+    volumes
+        .iter()
+        .enumerate()
+        .filter(|(position, v)| !is_pluggable(*position, v))
+        .map(|(_, v)| v)
+}
+
 /// Compare secondary referenced volumes by ID, ignoring position changes.
 /// Boot and inline disks are excluded; API validation enforces their immutability.
 pub(crate) fn volume_diff(
     held: &AgentVmSpec,
     wanted: &AgentVmSpec,
-) -> (
-    Vec<crate::types::VolumeWithId>,
-    Vec<crate::types::VolumeWithId>,
-) {
-    let pluggable = |spec: &AgentVmSpec| -> Vec<crate::types::VolumeWithId> {
+) -> (Vec<VolumeWithId>, Vec<VolumeWithId>) {
+    let pluggable = |spec: &AgentVmSpec| -> Vec<VolumeWithId> {
         spec.volumes
             .iter()
-            .skip(1)
-            .filter(|v| v.referenced)
-            .cloned()
+            .enumerate()
+            .filter(|(position, v)| is_pluggable(*position, v))
+            .map(|(_, v)| v.clone())
             .collect()
     };
     let (held, wanted) = (pluggable(held), pluggable(wanted));
@@ -70,6 +84,72 @@ pub(crate) fn volume_diff(
         .cloned()
         .collect();
     (attach, detach)
+}
+
+/// The volume list a record keeps after its referenced volumes changed: the order and the
+/// pluggable entries of `wanted`, and every fixed entry as `held` has it (IKR-B66).
+///
+/// A create document names no inline disk, and every conversion of it gives each inline disk
+/// a fresh id. The record's id is the one naming the bytes on this node, and a cold start
+/// provisions whatever id the record says: a replaced id is a guest booting a fresh copy of
+/// its base image. Fixed entries pair up in order. Lists whose fixed entries do not pair (a
+/// count, a kind or a referenced id differs) are refused, because picking one would be
+/// guessing which disk the guest boots from.
+pub(crate) fn volumes_keeping_fixed(
+    held: &[VolumeWithId],
+    wanted: &[VolumeWithId],
+) -> Result<Vec<VolumeWithId>> {
+    let mut kept = fixed_volumes(held);
+    let mut volumes = Vec::with_capacity(wanted.len());
+    for (position, w) in wanted.iter().enumerate() {
+        if is_pluggable(position, w) {
+            volumes.push(w.clone());
+            continue;
+        }
+        let h = kept.next().ok_or_else(|| {
+            anyhow!(
+                "the spec names more fixed disks (the boot disk and inline disks) than this \
+                 node holds; disk {} at position {position} has no counterpart here",
+                w.id
+            )
+        })?;
+        refuse_a_different_fixed_volume(h, w, position)?;
+        volumes.push(h.clone());
+    }
+    if let Some(h) = kept.next() {
+        bail!(
+            "this node holds the fixed disk {} that the spec no longer names; a boot disk or an \
+             inline disk cannot be detached",
+            h.id
+        );
+    }
+    Ok(volumes)
+}
+
+/// Two fixed entries are the same disk when both are inline (whose ids each conversion makes
+/// anew) or both reference the same volume.
+fn refuse_a_different_fixed_volume(
+    held: &VolumeWithId,
+    wanted: &VolumeWithId,
+    position: usize,
+) -> Result<()> {
+    match (held.referenced, wanted.referenced) {
+        (false, false) => Ok(()),
+        (true, true) if held.id == wanted.id => Ok(()),
+        _ => bail!(
+            "the fixed disk at position {position} is {} here and the spec names {}; the boot \
+             disk and inline disks cannot be replaced",
+            describe_fixed(held),
+            describe_fixed(wanted)
+        ),
+    }
+}
+
+fn describe_fixed(volume: &VolumeWithId) -> String {
+    match volume.referenced {
+        true => format!("the volume {}", volume.id),
+        false => "an inline disk".to_string(),
+    }
 }
 
 /// Increase memory allowance for storage attachments with backend processes.
@@ -273,6 +353,9 @@ impl Provisioner {
         if attach.is_empty() && detach.is_empty() {
             return Ok(());
         }
+        // Paired before anything is plugged, so that a refusal leaves the VM as it was.
+        let volumes = volumes_keeping_fixed(&record.spec.volumes, &wanted.volumes)
+            .with_context(|| format!("vm {id}: the spec's volumes do not match this node's"))?;
         // Use one liveness decision for the entire attachment diff.
         let hypervisor = self.drivers.hypervisor()?;
         let live = record.vmm_pid.is_some() && hypervisor.is_tracked(id);
@@ -345,7 +428,7 @@ impl Provisioner {
 
         // Update only the volume list, preserving the node-resolved fields and
         // other immutable parts of the existing specification.
-        record.spec.volumes = wanted.volumes.clone();
+        record.spec.volumes = volumes;
         Ok(())
     }
 

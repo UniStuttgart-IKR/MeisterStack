@@ -99,6 +99,92 @@ impl agent_api::hypervisor::Hypervisor for EmptyHypervisor {
     }
 }
 
+/// Path-backed disk fixture: both migration endpoints resolve its path, and a boot finds a
+/// block disk in it.
+#[derive(Default)]
+struct PlainDisk {
+    /// Every id a provision named, in order, so a test can tell a fresh disk from a held one.
+    provisioned: std::sync::Mutex<Vec<VolumeId>>,
+    /// Record forget calls separately from destructive deprovision calls.
+    forgotten: std::sync::Mutex<Vec<VolumeId>>,
+    /// Record destructive deprovision requests.
+    deprovisioned: std::sync::Mutex<Vec<VolumeId>>,
+}
+
+#[async_trait::async_trait]
+impl agent_api::storage::VolumeProvider for PlainDisk {
+    fn locality(&self) -> agent_api::storage::Locality {
+        agent_api::storage::Locality::Shared
+    }
+    async fn provision(
+        &self,
+        id: &VolumeId,
+        spec: &agent_api::storage::VolumeSpec,
+    ) -> agent_api::storage::Result<agent_api::storage::VolumeHandle> {
+        self.provisioned.lock().unwrap().push(*id);
+        Ok(agent_api::storage::VolumeHandle {
+            id: *id,
+            backend: format!("/fake/{id}.raw"),
+            size_bytes: spec.size_bytes,
+            params: None,
+        })
+    }
+    async fn deprovision(
+        &self,
+        h: &agent_api::storage::VolumeHandle,
+    ) -> agent_api::storage::Result<()> {
+        self.deprovisioned.lock().unwrap().push(h.id);
+        Ok(())
+    }
+    /// A fake that keeps no bytes holds none under any id.
+    async fn probe(
+        &self,
+        _: &VolumeId,
+        _: &agent_api::storage::VolumeSpec,
+    ) -> agent_api::storage::Result<Option<agent_api::storage::VolumeHandle>> {
+        Ok(None)
+    }
+    async fn forget(&self, h: &agent_api::storage::VolumeHandle) -> agent_api::storage::Result<()> {
+        self.forgotten.lock().unwrap().push(h.id);
+        Ok(())
+    }
+    async fn describe(
+        &self,
+        h: &agent_api::storage::VolumeHandle,
+    ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
+        Ok(agent_api::storage::VolumeState {
+            size_bytes: h.size_bytes,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_api::storage::VolumeAttacher for PlainDisk {
+    async fn attach(
+        &self,
+        handle: &agent_api::storage::VolumeHandle,
+        _: Option<&agent_api::CgroupHandle>,
+    ) -> agent_api::storage::Result<VolumeAttachment> {
+        Ok(VolumeAttachment::Path(handle.path()))
+    }
+    async fn detach(
+        &self,
+        _: &agent_api::storage::VolumeHandle,
+        _: &VolumeAttachment,
+    ) -> agent_api::storage::Result<()> {
+        Ok(())
+    }
+    async fn stat(
+        &self,
+        h: &agent_api::storage::VolumeHandle,
+        _: &VolumeAttachment,
+    ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
+        Ok(agent_api::storage::VolumeState {
+            size_bytes: h.size_bytes,
+        })
+    }
+}
+
 fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
     let nic_id = agent_api::networking::NicId::new_v4();
     let nic_spec = agent_api::networking::NicSpec {

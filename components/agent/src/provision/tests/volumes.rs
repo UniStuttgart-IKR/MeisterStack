@@ -1053,7 +1053,7 @@ async fn an_inline_attach_failure_remains_reclaimable_after_restart() {
     let driver = Arc::new(CountingVolume::default());
     driver.fail_attach.store(true, SeqCst);
     driver.fail_deprovision.store(true, SeqCst);
-    let build = |store| counting_provisioner(root, store, driver.clone());
+    let build = |store| disk_provisioner(root, store, driver.clone());
     let vm = VmId::new_v4();
     let disk = VolumeId::new_v4();
     {
@@ -1095,10 +1095,12 @@ async fn an_inline_attach_failure_remains_reclaimable_after_restart() {
     );
 }
 
-fn counting_provisioner(
+/// A provisioner over `driver` as the node's `filesystem` backend, with a hypervisor that
+/// tracks no VMM, so that every volume change is one for the next start.
+fn disk_provisioner(
     root: &std::path::Path,
     store: Arc<crate::store::Store>,
-    driver: Arc<CountingVolume>,
+    driver: Arc<dyn agent_api::storage::VolumeDriver>,
 ) -> Provisioner {
     let mut storage: HashMap<String, Arc<dyn agent_api::storage::VolumeDriver>> = HashMap::new();
     storage.insert("filesystem".into(), driver);
@@ -1156,7 +1158,7 @@ async fn a_crash_before_inline_handle_commit_is_recovered_by_probe() {
     for probe_fails in [true, false] {
         driver.fail_probe.store(probe_fails, SeqCst);
         let store = Arc::new(crate::store::Store::open(&db).unwrap());
-        let provisioner = counting_provisioner(temp.path(), store.clone(), driver.clone());
+        let provisioner = disk_provisioner(temp.path(), store.clone(), driver.clone());
         provisioner
             .teardown(&vm)
             .await
@@ -1168,7 +1170,7 @@ async fn a_crash_before_inline_handle_commit_is_recovered_by_probe() {
     driver.fail_deprovision.store(false, SeqCst);
     {
         let store = Arc::new(crate::store::Store::open(&db).unwrap());
-        counting_provisioner(temp.path(), store.clone(), driver.clone())
+        disk_provisioner(temp.path(), store.clone(), driver.clone())
             .teardown(&vm)
             .await
             .unwrap();
@@ -1189,7 +1191,7 @@ async fn a_restarted_attach_reuses_the_persisted_inline_handle() {
     for attach_fails in [true, false] {
         driver.fail_attach.store(attach_fails, SeqCst);
         let store = Arc::new(crate::store::Store::open(&db).unwrap());
-        let provisioner = counting_provisioner(temp.path(), store.clone(), driver.clone());
+        let provisioner = disk_provisioner(temp.path(), store.clone(), driver.clone());
         let mut record = store
             .get(&vm)
             .unwrap()
@@ -1212,5 +1214,194 @@ async fn a_restarted_attach_reuses_the_persisted_inline_handle() {
         driver.provisions.load(SeqCst),
         1,
         "retry attaches the original disk"
+    );
+}
+
+/// A volume this node owns already, as a `Volume` object's provisioning leaves one.
+fn a_volume_held_here(store: &crate::store::Store) -> VolumeId {
+    let id = VolumeId::new_v4();
+    let spec = agent_api::storage::VolumeSpec {
+        base_image: None,
+        size_bytes: 4096,
+        driver: Some("filesystem".into()),
+        params: None,
+    };
+    let handle = agent_api::storage::VolumeHandle {
+        id,
+        backend: format!("/fake/{id}.raw"),
+        size_bytes: 4096,
+        params: None,
+    };
+    let record = crate::types::VolumeRecord {
+        spec,
+        handle: Some(handle),
+        phase: crate::types::VolumeRecordPhase::Ready,
+        reason: None,
+        message: None,
+        gone_at: None,
+    };
+    store.put_volume(&id, &record).expect("a volume record");
+    id
+}
+
+/// The node's spec for a create document with one inline boot disk and the `attached`
+/// volumes, converted the way every create and every replay of it is.
+fn converted(attached: &[VolumeId]) -> AgentVmSpec {
+    use crate::types::NewVmSpecExt;
+    let mut volumes = vec![serde_json::json!({"size_bytes": 4096, "driver": "filesystem"})];
+    volumes.extend(
+        attached
+            .iter()
+            .map(|id| serde_json::json!({"volume": id.to_string()})),
+    );
+    let document: crate::types::NewVmSpec = serde_json::from_value(serde_json::json!({
+        "vcpus": 1,
+        "memory_mib": 256,
+        "boot": {"kind": "firmware", "firmware": "fw"},
+        "volumes": volumes,
+    }))
+    .expect("a create document");
+    document.into_spec("br0").expect("a valid document").1
+}
+
+/// IKR-B66: an attach and a detach replay the create document, whose conversion names the
+/// inline boot disk anew each time. The record keeps the disk it holds, and a cold restart
+/// boots from it instead of provisioning a fresh copy of the base image.
+#[tokio::test]
+async fn the_boot_disk_survives_an_attach_a_detach_and_a_cold_restart() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let disk = Arc::new(PlainDisk::default());
+    let provisioner = disk_provisioner(temp.path(), store.clone(), disk.clone());
+    let data = a_volume_held_here(&store);
+    let vm = VmId::new_v4();
+    provisioner
+        .provision(vm, converted(&[]), Desired::Running, true)
+        .await
+        .expect("the vm is made");
+    let boot = store
+        .get(&vm)
+        .expect("a read")
+        .expect("a record")
+        .spec
+        .volumes[0]
+        .id;
+
+    provisioner
+        .sync_volumes(&vm, &converted(&[data]))
+        .await
+        .expect("the volume is attached");
+    provisioner
+        .sync_volumes(&vm, &converted(&[]))
+        .await
+        .expect("and detached again");
+    let record = store.get(&vm).expect("a read").expect("a record");
+    let named: Vec<VolumeId> = record.spec.volumes.iter().map(|v| v.id).collect();
+    assert_eq!(
+        named,
+        vec![boot],
+        "the record still names the disk it holds"
+    );
+
+    provisioner.stop(&vm, record).await.expect("the vm stops");
+    let stopped = store.get(&vm).expect("a read").expect("a record");
+    provisioner
+        .resume(&vm, stopped)
+        .await
+        .expect("and starts again");
+
+    assert_eq!(
+        *disk.provisioned.lock().unwrap(),
+        vec![boot, boot],
+        "every provision named the disk the vm was made with"
+    );
+    let held: Vec<VolumeId> = store
+        .get(&vm)
+        .expect("a read")
+        .expect("a record")
+        .volumes
+        .iter()
+        .map(|v| v.id())
+        .collect();
+    assert_eq!(held, vec![boot], "and the restarted guest boots from it");
+}
+
+/// A spec whose fixed disks do not pair with the record's is refused before anything is
+/// attached: the node cannot tell which of the disks the guest boots from.
+#[tokio::test]
+async fn a_spec_with_another_inline_disk_is_refused_before_anything_is_attached() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let disk = Arc::new(PlainDisk::default());
+    let provisioner = disk_provisioner(temp.path(), store.clone(), disk.clone());
+    let data = a_volume_held_here(&store);
+    let vm = VmId::new_v4();
+    provisioner
+        .provision(vm, converted(&[]), Desired::Running, true)
+        .await
+        .expect("the vm is made");
+    let before = store.get(&vm).expect("a read").expect("a record");
+
+    let mut grown = converted(&[data]);
+    grown.volumes.push(converted(&[]).volumes.remove(0));
+    let refused = provisioner
+        .sync_volumes(&vm, &grown)
+        .await
+        .expect_err("a second inline disk is not an attach");
+
+    assert!(
+        format!("{refused:#}").contains("more fixed disks"),
+        "{refused:#}"
+    );
+    let after = store.get(&vm).expect("a read").expect("a record");
+    assert_eq!(
+        after.volumes.iter().map(|v| v.id()).collect::<Vec<_>>(),
+        before.volumes.iter().map(|v| v.id()).collect::<Vec<_>>(),
+        "nothing was attached"
+    );
+    assert_eq!(
+        after.spec.volumes.len(),
+        1,
+        "and the record names what it did"
+    );
+}
+
+/// Fixed entries pair in order and keep the record's ids; pluggable ones come from the spec.
+#[test]
+fn fixed_disks_keep_the_records_ids_and_volumes_come_from_the_spec() {
+    let inline = |id: VolumeId| crate::types::VolumeWithId {
+        id,
+        spec: agent_api::storage::VolumeSpec {
+            base_image: Some("img".into()),
+            size_bytes: 4096,
+            driver: None,
+            params: None,
+        },
+        referenced: false,
+    };
+    let referenced = |id: VolumeId| crate::types::VolumeWithId {
+        referenced: true,
+        ..inline(id)
+    };
+    let (boot, scratch, data) = (VolumeId::new_v4(), VolumeId::new_v4(), VolumeId::new_v4());
+    let held = [inline(boot), inline(scratch)];
+    let wanted = [
+        inline(VolumeId::new_v4()),
+        referenced(data),
+        inline(VolumeId::new_v4()),
+    ];
+
+    let kept = volumes_keeping_fixed(&held, &wanted).expect("the lists pair");
+
+    let ids: Vec<VolumeId> = kept.iter().map(|v| v.id).collect();
+    assert_eq!(ids, vec![boot, data, scratch]);
+    let swapped = [referenced(data)];
+    assert!(
+        volumes_keeping_fixed(&held[..1], &swapped).is_err(),
+        "an inline boot disk is not a volume's"
+    );
+    assert!(
+        volumes_keeping_fixed(&held, &wanted[..2]).is_err(),
+        "an inline disk does not detach"
     );
 }
