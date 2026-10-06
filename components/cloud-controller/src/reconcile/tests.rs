@@ -1080,8 +1080,8 @@ fn what_a_cluster_holds_unplaced_holds_a_nodes_room() {
         2
     ];
     let rooms = rooms(&cluster, &[]);
-    let four = asking(2048);
-    assert!(!Wanted::of(&four, None, None).served_by("ikr-netlab", &rooms));
+    let more_than_is_left = asking(2048);
+    assert!(!Wanted::of(&more_than_is_left, None, None).served_by("ikr-netlab", &rooms));
 }
 
 // --- IKR-B81: a write lands on the object that was judged -------------------
