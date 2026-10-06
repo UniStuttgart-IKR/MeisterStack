@@ -107,29 +107,100 @@ pub(super) async fn update_tenant(
     .await?;
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => Ok(Json(st.store.update(&body).await?)),
+    if let Some(preview) = dry.preview(&body) {
+        return Ok(Json(preview));
     }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&name).await;
+    let updated = st.store.update(&body).await?;
+
+    // And the question again from inside the store, as a pool or a routed subnet
+    // asks it after its write: one written at the same moment was not in the
+    // listing the check above read. No retry: the administrator named these
+    // prefixes outright. (RR5-6)
+    if network_prefixes_judged(
+        &updated.spec.network_prefixes,
+        &current.spec.network_prefixes,
+    ) && let Some(refusal) = refusal_after_write(network_lost_claim(&st, &updated).await)
+    {
+        put_back(&st, &current, &updated).await;
+        return Err(refusal);
+    }
+    Ok(Json(updated))
 }
 
 /// The field a tenant's network prefixes are named by in a refusal.
 const NETWORK_PREFIXES: &str = "spec.networkPrefixes";
 
+/// Whether a write of `declared` over the `current` network prefixes is judged on them: when
+/// it names some and they differ from what stands. An unchanged list is not judged again, so
+/// an edit of the quota is not refused for a pool created since.
+fn network_prefixes_judged(declared: &[String], current: &[String]) -> bool {
+    !declared.is_empty() && declared != current
+}
+
 /// The network prefixes a write of `tenant` stores: `declared` in canonical form, checked
-/// against what it may not overlap whenever it differs from the `current` list. An unchanged
-/// list is not judged again, so an edit of the quota is not refused for a pool created since.
+/// against what it may not overlap whenever it is judged (`network_prefixes_judged`).
 async fn checked_network_prefixes(
     st: &ApiState,
     tenant: &str,
     declared: &[String],
     current: &[String],
 ) -> Result<Vec<String>, ApiError> {
-    if declared.is_empty() || declared == current {
+    if !network_prefixes_judged(declared, current) {
         return Ok(declared.to_vec());
     }
     let taken = off_limits_to_network_prefixes(st, tenant).await?;
     canonical_network_prefixes(declared, &taken)
+}
+
+/// The claim a tenant's network that is already in the store turns out to have lost: what
+/// `checked_network_prefixes` asked before the write, asked once more now that a pool or a
+/// routed subnet written at the same moment is visible. The routed pools are configuration
+/// and cannot race. A pool or a subnet that finds this network after its own write yields to
+/// it whatever the revisions say (`Collision::tenant_network`); this side yields to one that
+/// was written first. (RR5-6)
+pub(super) async fn network_lost_claim(
+    st: &ApiState,
+    tenant: &Tenant,
+) -> Result<Option<String>, ApiError> {
+    let ranges = common::net::Ipv4Ranges::parse(&tenant.spec.network_prefixes)
+        .map_err(|e| invalid_field(NETWORK_PREFIXES, e.to_string()))?
+        .ranges()
+        .to_vec();
+    let hits = collisions(st, &ranges, Claimant::Network(&tenant.metadata.name)).await?;
+    Ok(
+        lost_to(&tenant.metadata.resource_version, &hits).map(|won| {
+            format!(
+                "{} was claimed at the same moment and overlaps this tenant's network ({})",
+                won.what,
+                tenant.spec.network_prefixes.join(", ")
+            )
+        }),
+    )
+}
+
+/// Undo an update of a tenant whose network lost its race: `before` written back over
+/// `written`, the revision this request wrote, and over nothing anybody wrote since. The whole
+/// request is undone, since it is refused whole.
+///
+/// A failure is an ERROR for the reason `take_back`'s is: the tenant's network now overlaps
+/// what won the claim, and no pass ever clears that; only a person does.
+async fn put_back(st: &ApiState, before: &Tenant, written: &Tenant) {
+    if let Err(e) = write_back(st, before, written).await {
+        error!(tenant = %written.metadata.name, error = %e.message(),
+               "could not put back a tenant whose network lost its claim; it now overlaps \
+                another claim and has to be fixed by hand");
+    }
+}
+
+/// `before`, written over the revision `written` holds.
+async fn write_back(st: &ApiState, before: &Tenant, written: &Tenant) -> Result<(), ApiError> {
+    let mut back = before.clone();
+    back.metadata.resource_version = written.metadata.resource_version.clone();
+    controller_api::carry_generation(written, &mut back)?;
+    st.store.update(&back).await?;
+    Ok(())
 }
 
 /// What a tenant's network prefixes may not overlap, each with its name for the refusal:

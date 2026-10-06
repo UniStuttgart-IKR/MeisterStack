@@ -125,7 +125,18 @@ pub(super) async fn create_routed_subnet(
         };
 
         let name = created.metadata.name.clone();
-        let hits = collisions(&st, &[cidr], Claimant::Subnet(&name)).await?;
+        let claimant = Claimant::Subnet {
+            name: &name,
+            tenant: &created.spec.tenant,
+        };
+        // A question that cannot be answered is a claim not known to be won.
+        let hits = match collisions(&st, &[cidr], claimant).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                take_back::<RoutedSubnet>(&st, &created, "routed subnet").await;
+                return Err(e);
+            }
+        };
         let Some(won) = lost_to(&created.metadata.resource_version, &hits) else {
             info!(subnet = %name, tenant = %created.spec.tenant,
                   cidr = %created.spec.cidr, "routed subnet created");

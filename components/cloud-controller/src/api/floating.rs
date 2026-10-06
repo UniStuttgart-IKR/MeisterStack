@@ -321,7 +321,7 @@ pub(super) async fn check_pool(
 
 // Range claims use administrator-chosen names, so overlapping ranges can
 // be created under different keys after concurrent checks. Recheck after
-// creation and roll back the later etcd revision. Floating addresses instead
+// the write and roll back the later etcd revision. Floating addresses instead
 // use the address as their key, making store creation arbitrate the race.
 
 /// One thing already in the store that a claim collides with: what to call it
@@ -333,13 +333,53 @@ pub(super) struct Collision {
     pub(super) revision: String,
 }
 
-/// Whose post-write scan this is, so that it does not find itself. A pool and
-/// a subnet may carry the same name, so which resource it is has to travel
-/// with the name.
+impl Collision {
+    /// A tenant's network, which a pool or a routed subnet that finds it after its own write
+    /// always yields to. The tenant object's revision is that of its latest edit of any kind,
+    /// later than the claim on its network whenever the quota or a label moved since, so it
+    /// cannot say which came first; it is left unread, and an unreadable revision is the one
+    /// `arrived_after` yields to. The tenant's own update knows its revision and asks the same
+    /// question from its side (`network_lost_claim`), so of two claims at the same moment at
+    /// most one stays. (RR5-6)
+    fn tenant_network(what: String) -> Self {
+        Self {
+            what,
+            revision: String::new(),
+        }
+    }
+}
+
+/// Whose post-write scan this is, so that it does not find itself or what its
+/// claim may lie on. A pool and a subnet may carry the same name, so which
+/// resource it is has to travel with the name.
 #[derive(Clone, Copy)]
 pub(super) enum Claimant<'a> {
     Pool(&'a str),
-    Subnet(&'a str),
+    /// A routed subnet, and the tenant it was cut for, whose network it may lie in.
+    Subnet {
+        name: &'a str,
+        tenant: &'a str,
+    },
+    /// A tenant's network, which may hold the tenant's own routed subnets and may
+    /// overlap other tenants' networks, which are other overlays.
+    Network(&'a str),
+}
+
+impl Claimant<'_> {
+    /// Whether `pool` is the claimant's own object.
+    fn is_pool(&self, pool: &FloatingPool) -> bool {
+        matches!(self, Self::Pool(name) if *name == pool.metadata.name)
+    }
+
+    /// Whether the claim may lie on `subnet`: its own object, or a subnet of the
+    /// tenant whose network it is.
+    fn may_hold(&self, subnet: &RoutedSubnet) -> bool {
+        match self {
+            Self::Pool(_) => false,
+            Self::Subnet { name, .. } => *name == subnet.metadata.name,
+            Self::Network(tenant) => *tenant == subnet.spec.tenant,
+        }
+    }
 }
 
 /// Compare etcd modification revisions. An unreadable revision yields the claim,
@@ -358,7 +398,8 @@ pub(super) fn lost_to<'a>(mine: &str, hits: &'a [Collision]) -> Option<&'a Colli
 }
 
 /// Everything in the store these ranges overlap, skipping the claimant's own
-/// object, each with the revision of the write that put it there.
+/// object and what it may lie on, each with the revision of the write that put
+/// it there: floating pools, routed subnets and tenants' networks.
 ///
 /// `floating::occupied` answers the same question and throws the revision
 /// away, and the revision is precisely what the arbitration needs.
@@ -370,7 +411,7 @@ pub(super) async fn collisions(
     let hits = |r: &common::net::Ipv4Range| ranges.iter().any(|c| r.overlaps(c));
     let mut out = Vec::new();
     for pool in floating::all_pools(&st.store).await? {
-        if matches!(mine, Claimant::Pool(n) if n == pool.metadata.name) {
+        if mine.is_pool(&pool) {
             continue;
         }
         if pool
@@ -387,7 +428,7 @@ pub(super) async fn collisions(
         }
     }
     for subnet in floating::all_subnets(&st.store).await? {
-        if matches!(mine, Claimant::Subnet(n) if n == subnet.metadata.name) {
+        if mine.may_hold(&subnet) {
             continue;
         }
         if subnet
@@ -405,7 +446,30 @@ pub(super) async fn collisions(
             });
         }
     }
+    let networks = match mine {
+        Claimant::Pool(_) => network_prefixes_taken(st, None).await?,
+        Claimant::Subnet { tenant, .. } => network_prefixes_taken(st, Some(tenant)).await?,
+        Claimant::Network(_) => Vec::new(),
+    };
+    out.extend(
+        networks
+            .into_iter()
+            .filter(|(_, range)| hits(range))
+            .map(|(what, _)| Collision::tenant_network(what)),
+    );
     Ok(out)
+}
+
+/// What a claim already in the store is told once its question was asked again:
+/// nothing when it won, the refusal when it lost, and the error when the question
+/// could not be answered, since a claim not known to have won is taken back like
+/// one that lost. (RR5-6)
+pub(super) fn refusal_after_write(lost: Result<Option<String>, ApiError>) -> Option<ApiError> {
+    match lost {
+        Ok(None) => None,
+        Ok(Some(why)) => Some(conflict(why)),
+        Err(e) => Some(e),
+    }
 }
 
 /// Undo a create that turned out to have lost its race. The object is the only
@@ -433,9 +497,10 @@ pub(super) const MAX_CLAIM_ROUNDS: usize = 8;
 
 /// The claims a pool that is already in the store turns out to have lost.
 ///
-/// The same three questions `check_pool` asked before the write, asked once
-/// more now that a concurrent create is visible: the default mark, and the
-/// ranges. Two pools posted at the same moment both read a store with no
+/// The questions `check_pool` asked before the write, asked once more now that
+/// a concurrent create is visible: the default mark, and the ranges against
+/// the other pools, the routed subnets and the tenants' networks. Two pools
+/// posted at the same moment both read a store with no
 /// default in it and both wrote one — which is not a hand-edited etcd, it is
 /// two administrators and one second, and `floating::pick_pool` then refuses
 /// every allocation on this cloud until somebody deletes one by hand.
@@ -489,6 +554,8 @@ pub(super) async fn create_floating_pool(
     let mut pool = FloatingPool::declare(&body.metadata.name, body.spec);
     pool.metadata.labels = body.metadata.labels;
     check_pool(&st, &pool, None).await?;
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&pool.metadata.name).await;
     let created = match dry.preview(&pool) {
         Some(preview) => preview,
         None => st.store.create(&pool).await?,
@@ -497,9 +564,9 @@ pub(super) async fn create_floating_pool(
     // And now the same questions again, from inside the store. No retry: an
     // administrator named these ranges and this default mark outright, so
     // there is nothing for the server to pick differently on a second round.
-    if let Some(why) = pool_lost_claim(&st, &created).await? {
+    if let Some(refusal) = refusal_after_write(pool_lost_claim(&st, &created).await) {
         take_back::<FloatingPool>(&st, &created, "floating pool").await;
-        return Err(conflict(why));
+        return Err(refusal);
     }
 
     info!(pool = %created.metadata.name, cidrs = %created.spec.cidrs.join(","),
