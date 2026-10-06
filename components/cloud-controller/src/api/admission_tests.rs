@@ -1577,3 +1577,54 @@ async fn a_tenant_created_onto_a_pool_written_after_its_check_is_taken_back() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+// --- NL6-6: a pool's update asks its questions after the write too ----------
+
+/// An update that widens a pool onto a tenant's network declared between the update's check and
+/// its write is put back and refused naming the network. (NL6-6)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_pool_widened_onto_a_network_declared_after_its_check_is_put_back() {
+    let st = cloud_with_an_undeclared_tenant("nl6-6").await;
+    let pool = unique("p");
+    let before = st
+        .store
+        .create(&FloatingPool::declare(
+            &pool,
+            controller_api::FloatingPoolSpec {
+                cidrs: vec!["10.40.0.0/24".into()],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the pool");
+    let mut wider = before.clone();
+    wider.spec.cidrs.push("10.30.0.0/24".into());
+    let checked = pause(&pool);
+
+    let (answer, _) = tokio::join!(
+        update_floating_pool(
+            State(st.clone()),
+            Path(pool.clone()),
+            DryRun::default(),
+            Json(wider),
+        ),
+        async {
+            checked.arrived().await;
+            let declared = declare_network(&st, "c", &["10.30.0.0/24"]).await;
+            checked.release().await;
+            declared
+        },
+    );
+
+    let refused = answer
+        .err()
+        .expect("the pool yields to the tenant's network");
+    assert!(
+        refused.message().contains("tenant c's network"),
+        "{}",
+        refused.message()
+    );
+    let stands: FloatingPool = st.store.get(&pool).await.expect("the pool");
+    assert_eq!(stands.spec.cidrs, ["10.40.0.0/24"]);
+}

@@ -472,10 +472,11 @@ pub(super) const MAX_CLAIM_ROUNDS: usize = 8;
 
 /// The claims a pool that is already in the store turns out to have lost.
 ///
-/// The questions `check_pool` asked before the write, asked once more now that
-/// a concurrent create is visible: the default mark, and the ranges against
-/// the other pools, the routed subnets and the tenants' networks. Two pools
-/// posted at the same moment both read a store with no
+/// The questions `check_pool` asked before the write (a create's or an
+/// update's), asked once more now that a concurrent write is visible: the
+/// default mark, and the ranges against the other pools, the routed subnets
+/// and the tenants' networks. Two pools posted at the same moment both read a
+/// store with no
 /// default in it and both wrote one — which is not a hand-edited etcd, it is
 /// two administrators and one second, and `floating::pick_pool` then refuses
 /// every allocation on this cloud until somebody deletes one by hand.
@@ -587,10 +588,25 @@ pub(super) async fn update_floating_pool(
         )));
     }
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => Ok(Json(st.store.update(&body).await?)),
+    if let Some(preview) = dry.preview(&body) {
+        return Ok(Json(preview));
     }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&name).await;
+    let updated = st.store.update(&body).await?;
+
+    // The questions the create asks after its write, for the same reason: a
+    // pool, a routed subnet or a tenant's network written at the same moment
+    // was not in the listings `check_pool` read. Lost, the whole update is put
+    // back. (NL6-6)
+    settle_claim(
+        &name,
+        "floating pool",
+        pool_lost_claim(&st, &updated).await,
+        put_back(&st, &current, &updated),
+    )
+    .await?;
+    Ok(Json(updated))
 }
 
 /// A pool with reservations in it stays. The same rule and the same reason as
