@@ -5,8 +5,9 @@
 //! Tenant routers implemented as network namespaces with provider and overlay veths.
 //! Active and standby routers both have addresses and NAT state; standby suppresses
 //! ARP replies and route announcements. This is not a distributed fencing mechanism.
-//! A JSON spec under run_dir identifies each router across agent restarts. Router
-//! listing skips unreadable records, while overlay ownership checks reject them.
+//! A JSON spec under run_dir identifies each router across agent restarts. An unreadable
+//! record is listed as an unknown router, the sweep spares its namespace, and overlay
+//! ownership checks reject it (R3-F07).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
