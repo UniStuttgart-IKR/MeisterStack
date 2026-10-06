@@ -145,7 +145,7 @@ impl BackendKind {
         let _ = tokio::fs::remove_file(socket).await;
 
         let log_file = create_log(log).map_err(|e| {
-            BackendError::Failed(anyhow::Error::new(e).context(format!("{}", log.display())))
+            BackendError::Failed(anyhow::anyhow!("creating {}: {e}", log.display()))
         })?;
         // The socket directory goes to the backend identity, so the backend
         // can bind there. The log stays the agent's: the backend writes it
@@ -469,14 +469,15 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// else, is refused: whoever controls it controls what the agent opens there.
 pub fn create_log_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let at = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(at)?;
     }
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(at(e)),
         _ => {}
     }
-    let meta = std::fs::symlink_metadata(dir)?;
+    let meta = std::fs::symlink_metadata(dir).map_err(at)?;
     if !meta.is_dir() {
         return Err(std::io::Error::other(format!(
             "{} is not a directory; backend logs need one of the agent's own",
@@ -493,7 +494,7 @@ pub fn create_log_dir(dir: &Path) -> std::io::Result<()> {
         )));
     }
     if meta.mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(at)?;
     }
     Ok(())
 }
