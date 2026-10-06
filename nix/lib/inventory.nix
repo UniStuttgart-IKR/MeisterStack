@@ -420,7 +420,9 @@ let
                 + "at ${metricsTarget h role}, and this host's listener binds "
                 + "${if listen == null then "nothing" else listen}. Bind ${h.address} or a "
                 + "wildcard that covers it (meisterstack.metrics.listenAddress; 0.0.0.0 is IPv4 "
-                + "only), or the fleet's monitoring silently loses this host.";
+                + "only); otherwise the fleet's monitoring silently loses this host. A "
+                + "`settings.metrics_listen` of the ${role} role (a deviation in the inventory or "
+                + "a host module) wins over that address and may be what moved the listener.";
             })
           (metricsRoles h));
 

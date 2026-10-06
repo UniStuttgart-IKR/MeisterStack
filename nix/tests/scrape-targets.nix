@@ -41,6 +41,9 @@ let
       dropsOut (rebound [{ meisterstack.metrics.listenAddress = "127.0.0.1"; }]);
     "a fleet host whose role rebinds its own listener elsewhere is refused" =
       dropsOut (rebound [{ meisterstack.agent.settings.metrics_listen = "127.0.0.1:9102"; }]);
+    "the refusal names a role's own metrics_listen as a possible cause" =
+      refusesWith "settings.metrics_listen"
+        (rebound [{ meisterstack.agent.settings.metrics_listen = "127.0.0.1:9102"; }]);
     "a fleet host may bind every IPv4 address" =
       !(dropsOut (rebound [{ meisterstack.metrics.listenAddress = "0.0.0.0"; }]));
     "a fleet host may bind every address of both families" =
