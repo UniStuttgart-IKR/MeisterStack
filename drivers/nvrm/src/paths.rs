@@ -8,12 +8,11 @@ use std::path::{Path, PathBuf};
 
 use agent_api::device::DeviceId;
 
-pub(crate) const SOCKET: &str = "sock";
-pub(crate) const LOG: &str = "log";
-pub(crate) const CLAIM: &str = "claim";
+const SOCKET: &str = "sock";
+const LOG: &str = "log";
 
 /// `<run_dir>/<id>.<extension>`: every file the driver keeps for a device.
-pub(crate) fn device_file(run_dir: &Path, id: &DeviceId, extension: &str) -> PathBuf {
+fn device_file(run_dir: &Path, id: &DeviceId, extension: &str) -> PathBuf {
     run_dir.join(format!("{id}.{extension}"))
 }
 
@@ -25,17 +24,4 @@ pub(crate) fn socket_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
 
 pub(crate) fn log_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
     device_file(run_dir, id, LOG)
-}
-
-pub(crate) fn claim_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
-    device_file(run_dir, id, CLAIM)
-}
-
-/// The device a file in the run directory belongs to, if its name is
-/// `<id>.<extension>`.
-pub(crate) fn device_of(path: &Path, extension: &str) -> Option<DeviceId> {
-    if path.extension().and_then(|e| e.to_str()) != Some(extension) {
-        return None;
-    }
-    path.file_stem()?.to_str()?.parse().ok()
 }

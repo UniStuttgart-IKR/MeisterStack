@@ -83,7 +83,7 @@ impl Provisioner {
         }
 
         refuse_devices(&id, &spec.devices)?;
-        self.check_device_admission(&id, &spec)?;
+        self.check_device_admission(&id, &spec).await?;
         anyhow::ensure!(
             self.store.claim_migration(&id, migration_id, false)?,
             "migration attempt was already handled or cancelled"

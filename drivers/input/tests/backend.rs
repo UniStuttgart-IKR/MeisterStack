@@ -173,8 +173,17 @@ async fn rejects_legacy_and_invalid_sources() {
     assert!(driver.create(&id, &s, None).await.is_err());
 }
 
-#[test]
-fn admission_excludes_aliases_and_duplicates() {
+/// Another VM's record holding `spec`, as the agent hands it to `admit`.
+fn held(spec: DeviceSpec) -> agent_api::device::ClaimedDevice {
+    agent_api::device::ClaimedDevice {
+        vm: agent_api::VmId::new_v4(),
+        id: DeviceId::new_v4(),
+        spec,
+    }
+}
+
+#[tokio::test]
+async fn admission_excludes_aliases_and_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let driver = fake(temp.path(), LISTENS);
     let alias = temp.path().join("event");
@@ -183,19 +192,18 @@ fn admission_excludes_aliases_and_duplicates() {
     let b = (DeviceId::new_v4(), spec(&alias));
     assert!(
         driver
-            .admit(
-                std::slice::from_ref(&b),
-                &[(agent_api::VmId::new_v4(), a.1.clone())]
-            )
+            .admit(std::slice::from_ref(&b), &[held(a.1.clone())])
+            .await
             .is_err()
     );
-    assert!(driver.admit(&[a, b], &[]).is_err());
+    assert!(driver.admit(&[a, b], &[]).await.is_err());
     assert!(
         driver
             .admit(
                 &[(DeviceId::new_v4(), spec(Path::new("/dev/zero")))],
-                &[(agent_api::VmId::new_v4(), spec(Path::new("/dev/null")))]
+                &[held(spec(Path::new("/dev/null")))]
             )
+            .await
             .is_ok()
     );
     assert_eq!(driver.profiles(), ["evdev"]);

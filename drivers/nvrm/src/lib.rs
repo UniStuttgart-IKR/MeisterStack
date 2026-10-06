@@ -8,13 +8,14 @@
 //! resolves configured vGPU types; node configuration supplies resource limits
 //! and privileged backend options.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_api::CgroupHandle;
 use agent_api::device::{
-    self, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
+    self, ClaimedDevice, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec,
+    PartitionSpec,
 };
 use anyhow::Context;
 use backend::{Backend, BackendIo, BackendKind};
@@ -26,7 +27,7 @@ mod ledger;
 mod paths;
 mod vgpu;
 
-use admission::Claim;
+use admission::{Claim, Wanted};
 use ledger::Ledger;
 pub use vgpu::VgpuType;
 
@@ -173,8 +174,8 @@ pub struct NvrmDriverConfig {
     pub vgpuprofile_bin: PathBuf,
     pub run_dir: PathBuf,
     pub socket_timeout: Duration,
-    /// Optional VRAM budget over every backend on the ledger, including those
-    /// read back after an agent restart.
+    /// Optional VRAM budget over the nvrm devices of every vm on record on
+    /// this node, running or stopped.
     pub vram_budget_mib: Option<u64>,
     /// The host's share of the card in MiB, handed to `vgpuprofile`. Required
     /// once any vGPU type is configured or requested; see
@@ -194,8 +195,8 @@ pub struct NvrmDriver {
     /// as a process GROUP. See `BackendKind::detached`.
     process: BackendKind,
     vgpu_cache: Mutex<HashMap<String, VgpuType>>,
-    /// Read back from the claim files of running backends before the driver
-    /// exists, so nothing is admitted while a survivor is uncounted.
+    /// The backends this instance started. Admission counts the agent's
+    /// records first; see [`ledger`].
     ledger: Mutex<Ledger>,
 }
 
@@ -219,26 +220,23 @@ impl NvrmDriver {
         // an unknown type is a config error, not something to discover at the
         // first VM boot.
         let cache = config.resolve_profile_types()?;
+        Ok(Self::assemble(config, cache))
+    }
 
+    /// The driver over a checked configuration and the types already
+    /// resolved for it. Asks the host nothing.
+    fn assemble(config: NvrmDriverConfig, cache: HashMap<String, VgpuType>) -> Self {
         // The name is the backend's own and not the configured binary's:
         // `--nvrm` is Leandro's binary whatever a node has called the file
         // it lives in, and `comm` is what the process calls itself.
         let process = BackendKind::detached("vhost-user-nvrm", "vhost-user-nvrm", NOFILE_LIMIT)
             .as_user(config.vmm_user.clone());
-        let ledger = Ledger::recovered(&config.run_dir, |pid, socket| process.is_ours(pid, socket))
-            .map_err(|e| {
-                DeviceError::Backend(
-                    anyhow::Error::new(e)
-                        .context("reading back what running backends were admitted as"),
-                )
-            })?;
-
-        Ok(Self {
+        Self {
             process,
             config,
             vgpu_cache: Mutex::new(cache),
-            ledger: Mutex::new(ledger),
-        })
+            ledger: Mutex::new(Ledger::default()),
+        }
     }
 }
 
@@ -375,20 +373,8 @@ impl NvrmDriver {
         Ok(Some(resolved))
     }
 
-    /// Put an admitted, spawned backend on the ledger and record its claim
-    /// beside its socket for the next driver instance.
-    async fn enter_started(
-        &self,
-        id: &DeviceId,
-        pid: u32,
-        child: Backend,
-        claim: &Claim,
-    ) -> device::Result<()> {
-        if let Err(e) = ledger::record(&self.config.run_dir, id, pid, claim) {
-            // Safe to continue: after a restart the unrecorded socket counts
-            // as unknown and blocks admission until this backend is gone.
-            warn!(error = %e, "could not record what this backend was admitted as");
-        }
+    /// Put a spawned backend on the ledger in place of its start.
+    async fn enter_started(&self, id: &DeviceId, child: Backend) -> device::Result<()> {
         let unclaimed = self.ledger.lock().await.started(id, child);
         if let Some(child) = unclaimed {
             self.process.stop(child).await;
@@ -578,11 +564,7 @@ impl DeviceDriver for NvrmDriver {
         }
 
         let socket = self.socket_path(id);
-        let reusable = self
-            .ledger
-            .lock()
-            .await
-            .reusable(id, &socket, |pid, s| self.process.is_ours(pid, s))?;
+        let reusable = self.ledger.lock().await.reusable(id, &socket)?;
         if let Some(pid) = reusable {
             return Ok(Device {
                 id: *id,
@@ -590,16 +572,13 @@ impl DeviceDriver for NvrmDriver {
             });
         }
 
-        let params = self.config.effective_params(spec)?;
-        let vgpu = self.resolve(&params).await?;
+        let (params, vgpu) = self.sized(spec).await?;
         let env = Self::backend_env(&params, vgpu.as_ref())?;
 
         // Count the same effective parameters used to build the backend environment.
         let claim = params.claim(vgpu.as_ref());
-        self.ledger
-            .lock()
-            .await
-            .admit(id, &claim, vgpu.as_ref(), self.config.vram_budget_mib)?;
+        let admitted_mib = claim.mib;
+        self.ledger.lock().await.start(id, claim)?;
 
         debug!(
             vgpu_type = params.vgpu_type.as_deref().unwrap_or("-"),
@@ -636,8 +615,8 @@ impl DeviceDriver for NvrmDriver {
                 return Err(e.into());
             }
         };
-        info!(pid, admitted_mib = claim.mib, "nvrm backend ready");
-        self.enter_started(id, pid, child, &claim).await?;
+        info!(pid, admitted_mib, "nvrm backend ready");
+        self.enter_started(id, child).await?;
 
         Ok(Device {
             id: *id,
@@ -660,8 +639,7 @@ impl DeviceDriver for NvrmDriver {
             }
         }
 
-        let claim = paths::claim_file(&self.config.run_dir, id);
-        for p in [self.socket_path(id), self.log_path(id), claim] {
+        for p in [self.socket_path(id), self.log_path(id)] {
             backend::remove_if_present(&p)
                 .await
                 .map_err(|e| DeviceError::Backend(e.into()))?;
@@ -691,19 +669,79 @@ impl DeviceDriver for NvrmDriver {
         names
     }
 
-    /// Refuse a request the backend would reject before the agent records or
-    /// starts anything for it. VRAM is admitted in `create`, against live backends.
-    fn admit(
+    /// Refuse a request the backend would reject, or the card cannot hold
+    /// beside the devices of every other vm record on this node, before the
+    /// agent records or starts anything for it.
+    ///
+    /// The records are the agent's store, which no backend can write and
+    /// which outlives an agent restart; a stopped vm keeps its share, so it
+    /// can always start again. Starts this driver has under way that no
+    /// record shows yet count as well.
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        _claimed: &[(agent_api::VmId, DeviceSpec)],
+        claimed: &[ClaimedDevice],
     ) -> device::Result<()> {
+        let mut wanted = Vec::with_capacity(requested.len());
         for (id, spec) in requested {
-            self.config
-                .effective_params(spec)
-                .map_err(|e| naming_the_device(id, e))?;
+            wanted.push(
+                self.wanted(id, spec)
+                    .await
+                    .map_err(|e| naming_the_device(id, e))?,
+            );
         }
-        Ok(())
+        let mut held = Vec::with_capacity(claimed.len());
+        for device in claimed {
+            held.push(self.recorded_claim(device).await?);
+        }
+        let recorded: HashSet<DeviceId> = claimed
+            .iter()
+            .map(|d| d.id)
+            .chain(requested.iter().map(|(id, _)| *id))
+            .collect();
+        held.extend(self.ledger.lock().await.unrecorded(&recorded));
+        admission::admit_all(held, &wanted, self.config.vram_budget_mib)
+    }
+}
+
+impl NvrmDriver {
+    /// A spec's effective parameters and the vGPU type they resolve to.
+    async fn sized(&self, spec: &DeviceSpec) -> device::Result<(NvrmParams, Option<VgpuType>)> {
+        let params = self.config.effective_params(spec)?;
+        let vgpu = self.resolve(&params).await?;
+        Ok((params, vgpu))
+    }
+
+    /// What a requested device would count as on the card.
+    async fn wanted(&self, id: &DeviceId, spec: &DeviceSpec) -> device::Result<Wanted> {
+        let (params, vgpu) = self.sized(spec).await?;
+        Ok(Wanted {
+            id: *id,
+            claim: params.claim(vgpu.as_ref()),
+            vgpu,
+        })
+    }
+
+    /// What another vm's recorded device counts as. One whose share cannot
+    /// be worked out from today's configuration (a profile since removed, a
+    /// type the card no longer offers) could hold anything, so nothing is
+    /// admitted beside it. Which vm and why goes to the operator's log; the
+    /// refusal a tenant reads does not name another tenant's vm.
+    async fn recorded_claim(&self, device: &ClaimedDevice) -> device::Result<Claim> {
+        match self.sized(&device.spec).await {
+            Ok((params, vgpu)) => Ok(params.claim(vgpu.as_ref())),
+            Err(why) => {
+                warn!(vm_id = %device.vm, device_id = %device.id, reason = %why,
+                      "a recorded nvrm device cannot be accounted for; admitting no nvrm \
+                       device on this node until its record or the configuration is corrected");
+                Err(DeviceError::InvalidSpec(
+                    "this node holds an nvrm device whose share of the card it cannot work out \
+                     from its configuration, so it admits no other; the agent log names the \
+                     device and the reason"
+                        .into(),
+                ))
+            }
+        }
     }
 }
 
@@ -1033,7 +1071,12 @@ mod tests {
         for spelling in ["4Q", "rtx2070-4q", "RTX2070-4Q"] {
             let running = configured(spelling).claim(Some(&card_4q));
             assert_eq!(running.vgpu_type.as_deref(), Some("RTX2070-4Q"));
-            let said = admission::refuse_instance_overflow(&[&running], Some(&card_4q))
+            let another = Wanted {
+                id: DeviceId::new_v4(),
+                claim: running.clone(),
+                vgpu: Some(card_4q.clone()),
+            };
+            let said = admission::admit_all(vec![running], &[another], None)
                 .expect_err("the card holds one 4Q, whatever the first was called")
                 .to_string();
             assert!(said.contains("allows 1 instance"), "{spelling}: {said}");
@@ -1057,5 +1100,136 @@ mod tests {
         assert_eq!(get("LEA_VGPU_PROFILE_MIB"), Some("4096"));
         assert_eq!(get("LEA_VGPU_FB_MIB"), Some("2816"));
         assert_eq!(get("LEA_VGPU_ENCODER_CAP"), Some("50"));
+    }
+
+    /// A driver over `run_dir` whose `8q` and `1q` profiles are already
+    /// resolved against the fixture card. Built without asking the host
+    /// anything, as `new` would after resolving them.
+    fn driver_in(run_dir: &Path) -> NvrmDriver {
+        let mut config = node(serde_json::json!({}));
+        config.run_dir = run_dir.to_path_buf();
+        config.vgpu_host_reserve_mib = Some(1024);
+        config.profiles.insert("8q".into(), configured("8Q"));
+        config.profiles.insert("1q".into(), configured("1Q"));
+        let cache = HashMap::from([
+            ("8Q".to_string(), resolved("RTX2070-8Q", 8192, 1)),
+            ("1Q".to_string(), resolved("RTX2070-1Q", 1024, 8)),
+        ]);
+        NvrmDriver::assemble(config, cache)
+    }
+
+    fn profiled(profile: &str) -> DeviceSpec {
+        DeviceSpec {
+            driver: "nvrm".into(),
+            partition: PartitionSpec::Mediated,
+            profile: Some(profile.into()),
+            params: None,
+        }
+    }
+
+    /// Another vm's record naming `spec`, as the agent's store hands it over.
+    fn recorded(spec: DeviceSpec) -> ClaimedDevice {
+        ClaimedDevice {
+            vm: agent_api::VmId::new_v4(),
+            id: DeviceId::new_v4(),
+            spec,
+        }
+    }
+
+    fn requested(spec: DeviceSpec) -> Vec<(DeviceId, DeviceSpec)> {
+        vec![(DeviceId::new_v4(), spec)]
+    }
+
+    fn run_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("meister-nvrm-")
+            .tempdir()
+            .expect("a temp dir")
+    }
+
+    /// IKR-B30 without claim files: a driver that has just started knows no
+    /// backend, and still refuses what the vms on record would not leave room
+    /// for, because admission counts the agent's records and not its own memory.
+    #[tokio::test]
+    async fn every_vm_on_record_counts_against_the_card_after_a_restart() {
+        let dir = run_dir();
+        let fresh = driver_in(dir.path());
+        let held = [recorded(profiled("8q"))];
+        let said = fresh
+            .admit(&requested(profiled("1q")), &held)
+            .await
+            .expect_err("the 8Q on record fills the card")
+            .to_string();
+        assert!(said.contains("8192 MiB admitted"), "{said}");
+        fresh
+            .admit(&requested(profiled("1q")), &[])
+            .await
+            .expect("with no record the card is free");
+    }
+
+    /// A record whose share cannot be worked out any more could hold
+    /// anything; nothing is admitted beside it, and the refusal does not
+    /// name the other tenant's vm.
+    #[tokio::test]
+    async fn a_record_of_unknown_size_admits_nothing_beside_it() {
+        let dir = run_dir();
+        let driver = driver_in(dir.path());
+        let gone = recorded(profiled("a-profile-since-removed"));
+        let said = driver
+            .admit(&requested(profiled("1q")), std::slice::from_ref(&gone))
+            .await
+            .expect_err("unknown is not zero")
+            .to_string();
+        assert!(said.contains("cannot work out"), "{said}");
+        assert!(!said.contains(&gone.vm.to_string()), "{said}");
+    }
+
+    /// R2-1: the run directory is the backend user's to write, and files at
+    /// the paths claim records once had are read by nobody. A FIFO there does
+    /// not hang admission or teardown, a symlink is not followed, and a forged
+    /// claim neither frees nor fills the card.
+    #[tokio::test]
+    async fn files_at_the_old_claim_paths_neither_block_nor_change_admission() {
+        let dir = run_dir();
+        let elsewhere = run_dir();
+        let (fifo_owner, forged_owner) = (DeviceId::new_v4(), DeviceId::new_v4());
+        let at = |id: &DeviceId, extension: &str| dir.path().join(format!("{id}.{extension}"));
+        nix::unistd::mkfifo(
+            &at(&fifo_owner, "claim"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .expect("a fifo");
+        let target = elsewhere.path().join("victim");
+        std::fs::write(&target, b"untouched").expect("a file to aim at");
+        std::os::unix::fs::symlink(&target, at(&fifo_owner, "claim.tmp")).expect("a symlink");
+        std::fs::write(
+            at(&forged_owner, "claim"),
+            br#"{"pid":1,"claim":{"mib":0,"vgpu_type":null,"card_mib":null}}"#,
+        )
+        .expect("a forged claim");
+
+        let driver = driver_in(dir.path());
+        let bounded = |work| tokio::time::timeout(Duration::from_secs(10), work);
+        let (one_1q, one_8q) = (requested(profiled("1q")), requested(profiled("8q")));
+        let held = [recorded(profiled("8q"))];
+        bounded(driver.admit(&one_1q, &held))
+            .await
+            .expect("admission does not wait on a fifo")
+            .expect_err("a forged empty claim does not free the card");
+        bounded(driver.admit(&one_8q, &[]))
+            .await
+            .expect("admission does not wait on a fifo")
+            .expect("nor does anything in the directory fill it");
+
+        let attachment = NvrmDriver::attachment(at(&fifo_owner, "sock"), u32::MAX);
+        bounded(driver.destroy(&fifo_owner, &attachment))
+            .await
+            .expect("teardown does not wait on a fifo")
+            .expect("destroyed");
+        assert_eq!(
+            std::fs::read(&target).expect("still there"),
+            b"untouched",
+            "no write went through the symlink"
+        );
     }
 }

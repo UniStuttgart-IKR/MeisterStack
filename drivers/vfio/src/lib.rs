@@ -260,10 +260,10 @@ impl DeviceDriver for VfioPciDriver {
     /// Reject duplicate PCI addresses within this request or readable stored
     /// claims. Unparseable stored device specifications are skipped; this check
     /// does not establish that such a device is unused.
-    fn admit(
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        claimed: &[(agent_api::VmId, DeviceSpec)],
+        claimed: &[device::ClaimedDevice],
     ) -> device::Result<()> {
         let mut wanted: Vec<(PciAddress, DeviceId)> = Vec::new();
         for (dev_id, spec) in requested {
@@ -280,13 +280,14 @@ impl DeviceDriver for VfioPciDriver {
         if wanted.is_empty() {
             return Ok(());
         }
-        for (vm, spec) in claimed {
-            let Ok(addr) = Self::requested_address(spec) else {
+        for held in claimed {
+            let Ok(addr) = Self::requested_address(&held.spec) else {
                 continue;
             };
             if wanted.iter().any(|(a, _)| *a == addr) {
                 return Err(DeviceError::InvalidSpec(format!(
-                    "pci device {addr} is already assigned to vm {vm}"
+                    "pci device {addr} is already assigned to vm {}",
+                    held.vm
                 )));
             }
         }
@@ -320,22 +321,28 @@ mod tests {
         (Uuid::from_u128(n), spec(pci))
     }
 
-    fn held(n: u128, pci: &str) -> (agent_api::VmId, DeviceSpec) {
-        (Uuid::from_u128(n), spec(Some(pci)))
+    fn held(n: u128, pci: &str) -> device::ClaimedDevice {
+        device::ClaimedDevice {
+            vm: Uuid::from_u128(n),
+            id: Uuid::from_u128(n + 1000),
+            spec: spec(Some(pci)),
+        }
     }
 
-    #[test]
-    fn a_free_device_is_admitted() {
+    #[tokio::test]
+    async fn a_free_device_is_admitted() {
         driver()
             .admit(&[dev(1, Some("0000:23:00.0"))], &[held(9, "0000:24:00.0")])
+            .await
             .expect("a different address is nobody's conflict");
     }
 
     /// Reject PCI devices already held by another VM.
-    #[test]
-    fn a_device_another_vm_holds_is_refused_by_name() {
+    #[tokio::test]
+    async fn a_device_another_vm_holds_is_refused_by_name() {
         let err = driver()
             .admit(&[dev(1, Some("0000:23:00.0"))], &[held(9, "0000:23:00.0")])
+            .await
             .unwrap_err();
         assert!(matches!(err, DeviceError::InvalidSpec(_)), "{err:?}");
         let msg = err.to_string();
@@ -346,30 +353,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_same_device_twice_in_one_spec_is_refused() {
+    #[tokio::test]
+    async fn the_same_device_twice_in_one_spec_is_refused() {
         let err = driver()
             .admit(
                 &[dev(1, Some("0000:23:00.0")), dev(2, Some("0000:23:00.0"))],
                 &[],
             )
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("twice"), "{err}");
     }
 
     /// Compare parsed PCI addresses independently of short or full spelling.
-    #[test]
-    fn the_conflict_is_on_the_address_not_on_its_spelling() {
+    #[tokio::test]
+    async fn the_conflict_is_on_the_address_not_on_its_spelling() {
         let err = driver()
             .admit(&[dev(1, Some("23:00.0"))], &[held(9, "0000:23:00.0")])
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("already assigned"), "{err}");
     }
 
     /// Reject missing PCI addresses before allocating resources.
-    #[test]
-    fn a_vfio_device_without_an_address_is_refused_before_anything_is_built() {
-        let err = driver().admit(&[dev(1, None)], &[]).unwrap_err();
+    #[tokio::test]
+    async fn a_vfio_device_without_an_address_is_refused_before_anything_is_built() {
+        let err = driver().admit(&[dev(1, None)], &[]).await.unwrap_err();
         assert!(matches!(err, DeviceError::InvalidSpec(_)));
         assert!(err.to_string().contains("pci_address"), "{err}");
         let err = driver()
@@ -385,31 +394,35 @@ mod tests {
                 )],
                 &[],
             )
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid vfio params"), "{err}");
     }
 
     /// Document current behavior: an unparseable stored claim is skipped.
-    #[test]
-    fn an_unparseable_stored_spec_does_not_block_a_new_vm() {
-        let broken = (
-            Uuid::from_u128(9),
-            DeviceSpec {
+    #[tokio::test]
+    async fn an_unparseable_stored_spec_does_not_block_a_new_vm() {
+        let broken = device::ClaimedDevice {
+            vm: Uuid::from_u128(9),
+            id: Uuid::from_u128(1009),
+            spec: DeviceSpec {
                 driver: "vfio".into(),
                 partition: PartitionSpec::Exclusive,
                 profile: None,
                 params: Some(serde_json::json!({ "pci_address": 42 })),
             },
-        );
+        };
         driver()
             .admit(&[dev(1, Some("0000:23:00.0"))], &[broken])
+            .await
             .expect("admitted");
     }
 
-    #[test]
-    fn nothing_requested_is_nothing_to_refuse() {
+    #[tokio::test]
+    async fn nothing_requested_is_nothing_to_refuse() {
         driver()
             .admit(&[], &[held(9, "0000:23:00.0")])
+            .await
             .expect("admitted");
     }
 }

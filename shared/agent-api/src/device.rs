@@ -132,19 +132,30 @@ pub trait DeviceDriver: Send + Sync {
     }
 
     /// Check declared device claims before creating resources. `claimed`
-    /// contains this driver's specs from every other VM in the persistent
-    /// store, so conflicts remain visible after agent restart.
+    /// holds this driver's devices from every other VM record in the
+    /// persistent store, running or not, so a conflict is visible after an
+    /// agent restart and a stopped VM keeps what it was admitted to.
     ///
-    /// Drivers may separately enforce live-backend limits in `create`, such
-    /// as NVRM VRAM and instance budgets.
-    fn admit(
+    /// The agent admits before every `create` of a VM's devices (provision,
+    /// restart, reception) and writes the VM's record under the same
+    /// operations lock, so a driver that shares a resource between VMs
+    /// accounts for it here, against the store, and not in `create`.
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        claimed: &[(crate::VmId, DeviceSpec)],
+        claimed: &[ClaimedDevice],
     ) -> Result<()> {
         let _ = (requested, claimed);
         Ok(())
     }
+}
+
+/// A device another VM's persisted record names, as `admit` sees it.
+#[derive(Clone, Debug)]
+pub struct ClaimedDevice {
+    pub vm: crate::VmId,
+    pub id: DeviceId,
+    pub spec: DeviceSpec,
 }
 
 #[cfg(test)]

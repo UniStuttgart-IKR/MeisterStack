@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::vgpu::VgpuType;
 
 /// What one backend counts as for admission.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Claim {
     /// Admitted VRAM in MiB; see `NvrmParams::admitted_mib`.
     pub(crate) mib: u64,
@@ -39,11 +39,33 @@ impl Claim {
     }
 }
 
-/// Refuse one more backend of a vGPU type the card already holds `max_instance` of.
-pub(crate) fn refuse_instance_overflow(
-    live: &[&Claim],
-    vgpu: Option<&VgpuType>,
+/// A device an admission asks for, with the type its claim was resolved to.
+pub(crate) struct Wanted {
+    pub(crate) id: DeviceId,
+    pub(crate) claim: Claim,
+    pub(crate) vgpu: Option<VgpuType>,
+}
+
+/// Admit the wanted devices beside the held claims, one after the other, so
+/// a VM's second device is measured against its first.
+pub(crate) fn admit_all(
+    held: Vec<Claim>,
+    wanted: &[Wanted],
+    budget: Option<u64>,
 ) -> device::Result<()> {
+    let mut live = held;
+    for want in wanted {
+        let counted: Vec<&Claim> = live.iter().collect();
+        refuse_instance_overflow(&counted, want.vgpu.as_ref())?;
+        refuse_card_overcommit(&counted, &want.claim, &want.id)?;
+        refuse_budget_overrun(&counted, &want.claim, budget, &want.id)?;
+        live.push(want.claim.clone());
+    }
+    Ok(())
+}
+
+/// Refuse one more backend of a vGPU type the card already holds `max_instance` of.
+fn refuse_instance_overflow(live: &[&Claim], vgpu: Option<&VgpuType>) -> device::Result<()> {
     let Some(vgpu) = vgpu else {
         return Ok(());
     };
@@ -64,11 +86,7 @@ pub(crate) fn refuse_instance_overflow(
 /// others: the admitted sizes together may not exceed `vgpu_available_mib`.
 /// Per-type instance counts alone let mixed types overbook the card, and a
 /// backend without any VRAM limit could take what the profiles promise.
-pub(crate) fn refuse_card_overcommit(
-    live: &[&Claim],
-    want: &Claim,
-    id: &DeviceId,
-) -> device::Result<()> {
+fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> device::Result<()> {
     let Some(card) = card_size(live, want) else {
         return Ok(());
     };
@@ -108,7 +126,7 @@ fn card_size(live: &[&Claim], want: &Claim) -> Option<u64> {
 }
 
 /// Refuse a backend that would take the live claims past the node's VRAM budget.
-pub(crate) fn refuse_budget_overrun(
+fn refuse_budget_overrun(
     live: &[&Claim],
     want: &Claim,
     budget: Option<u64>,
@@ -215,6 +233,20 @@ pub(crate) mod tests {
             .expect_err("the running backend could take the profile")
             .to_string();
         assert!(said.contains("without a VRAM limit"), "{said}");
+    }
+
+    /// The devices of one admission count against each other as well as
+    /// against what is held: two 8Q in one vm do not fit a card that has one.
+    #[test]
+    fn a_vms_second_device_is_measured_against_its_first() {
+        let q8 = resolved("RTX2070-8Q", 8192, 1);
+        let want = |vgpu: &VgpuType| Wanted {
+            id: device(),
+            claim: typed(vgpu),
+            vgpu: Some(vgpu.clone()),
+        };
+        admit_all(Vec::new(), &[want(&q8)], None).expect("one 8Q fits");
+        admit_all(Vec::new(), &[want(&q8), want(&q8)], None).expect_err("two do not");
     }
 
     /// Without any vGPU type the card size is unknown; only the budget applies.

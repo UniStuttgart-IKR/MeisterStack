@@ -237,10 +237,10 @@ impl DeviceDriver for InputDriver {
         vec![PROFILE_EVDEV.to_string()]
     }
 
-    fn admit(
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        claimed: &[(agent_api::VmId, DeviceSpec)],
+        claimed: &[device::ClaimedDevice],
     ) -> device::Result<()> {
         for (index, (id, spec)) in requested.iter().enumerate() {
             // Detect ownership by device number, including mknod aliases; report
@@ -250,9 +250,10 @@ impl DeviceDriver for InputDriver {
                 continue;
             };
 
-            if let Some((holder, _)) = claimed
+            if let Some(holder) = claimed
                 .iter()
-                .find(|(_, held)| Self::claimed_node(held) == Some(node))
+                .find(|held| Self::claimed_node(&held.spec) == Some(node))
+                .map(|held| held.vm)
             {
                 return Err(DeviceError::InvalidSpec(format!(
                     "host input device {} (device number {node}) is already claimed by vm \

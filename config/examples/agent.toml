@@ -251,7 +251,8 @@ default_bridge = "meister_br0"
 # Optional hard VRAM admission budget. Once a vGPU type is on the card, the
 # card itself is a hard limit too: per-type max_instance, and all admitted
 # sizes together within vgpu_available_mib. Without either, overcommit is
-# only warned about.
+# only warned about. Admission counts the devices of every vm this node has a
+# record of, running or stopped: a stopped vm keeps its share.
 #vram_budget_mib = 8192
 
 # The host's share of the card in MiB that vgpuprofile subtracts before it
