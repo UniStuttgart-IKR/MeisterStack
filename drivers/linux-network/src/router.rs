@@ -608,9 +608,10 @@ impl crate::LinuxNetworkDriver {
         self.clear_dead_netns(&netns).await;
         // A demotion silences the old namespace before anything that can fail: a pass stopping
         // halfway would leave it answering ARP for an address the controller has made active on
-        // another node (N2).
+        // another node (N2). Its record says standby from here on, so a pass that stops later
+        // no longer lists the router active nor announces it (NL2-1).
         if !spec.active {
-            self.silence_if_present(&netns).await?;
+            self.silence_router_impl(&spec.id).await?;
         }
         if !g.physnets.contains_key(&spec.physnet) {
             let mut have: Vec<&str> = g.physnets.keys().map(String::as_str).collect();
@@ -980,13 +981,19 @@ impl crate::LinuxNetworkDriver {
         }
     }
 
-    /// Silence a router namespace if the kernel lists it. One that is not listed has nothing to
-    /// silence; legs the pass creates later are born silent.
-    async fn silence_if_present(&self, netns: &str) -> networking::Result<()> {
-        match self.netns_present().await?.iter().any(|n| n == netns) {
-            true => self.silence_legs(netns).await,
-            false => Ok(()),
-        }
+    /// Silence one router as the dead man silences each: its namespace unless the kernel's list
+    /// proves it absent, then its record standby, so the router is neither listed active nor
+    /// announced while it may still be answering elsewhere (NL2-1).
+    ///
+    /// The record is rewritten even when the legs refuse: the controller has made the router
+    /// standby here, and an announcement this node keeps would draw the address's traffic away
+    /// from the node now active. A namespace the kernel could not list is tried all the same and
+    /// still an error: unknown is not silent.
+    pub(crate) async fn silence_router_impl(&self, id: &RouterId) -> networking::Result<()> {
+        let dir = &self.gateway()?.state_dir;
+        let live = self.netns_present().await;
+        self.silence_router(dir, *id, live.as_deref().ok()).await?;
+        live.map(|_| ())
     }
 
     /// Silence the legs a namespace has, as the kernel lists them (N3).
@@ -1849,6 +1856,49 @@ exit 0
 
         assert!(matches!(err, NetworkError::Backend(_)), "{err:#}");
         assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
+    }
+
+    /// A demotion that fails after silencing has rewritten the active record standby, so the
+    /// router is listed standby and announces nothing while the pass is retried (NL2-1).
+    #[tokio::test]
+    async fn a_demotion_that_fails_early_lists_the_router_standby() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        write_record(dir, &spec(true));
+        let netns = router_netns(&spec(true).id);
+        let listed = std::slice::from_ref(&netns);
+        let d = fake_driver(
+            dir,
+            &logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, None),
+        );
+
+        d.ensure_router_impl(&spec(false))
+            .await
+            .expect_err("this node has no [network.vxlan] section, so no overlay is built");
+
+        let routers = d.list_routers_impl().await.expect("a listing");
+        assert_eq!(routers.len(), 1);
+        assert!(!routers[0].active, "{:?}", routers[0]);
+        assert!(routers[0].announce.is_empty(), "{:?}", routers[0]);
+    }
+
+    /// A demotion whose legs refuse silencing still withdraws the active record: the controller
+    /// made another node active, and this one must stop announcing the address (NL2-1).
+    #[tokio::test]
+    async fn a_demotion_whose_legs_refuse_still_withdraws_the_active_record() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let path = write_record(dir, &spec(true));
+        let netns = router_netns(&spec(true).id);
+        let listed = std::slice::from_ref(&netns);
+        let ip = logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, Some(&netns));
+        let d = fake_driver(dir, &ip);
+
+        d.ensure_router_impl(&spec(false))
+            .await
+            .expect_err("a namespace that may still answer is not a standby");
+
+        assert!(!read_spec(&path).active);
     }
 
     /// A hung `ip` is killed within the deadline and does not block the next command (R3-F08).
