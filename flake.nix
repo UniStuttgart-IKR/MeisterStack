@@ -53,6 +53,9 @@
       nixosModules = {
         services = ./nix/services.nix;
         managed = ./nix/managed.nix;
+        # Binaries and complete config files from the system generation, without
+        # any deployment transport.
+        store-host = ./nix/store-host.nix;
         # Optional OpenNebula provider initialization, separate from the default module.
         provider-opennebula = ./nix/provider-opennebula.nix;
         default = self.nixosModules.services;
