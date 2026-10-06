@@ -1398,12 +1398,14 @@ mod tests {
         assert!(!said.contains(&gone.vm.to_string()), "{said}");
     }
 
-    /// R2-1: the run directory is the backend user's to write. A link or a
-    /// FIFO that user plants at a device's log path, the old one beside the
-    /// socket or the one in the agent's log directory, is neither written
-    /// through nor waited on when the device is created or destroyed.
+    /// The log lives in the agent's own directory, which the vmm user cannot
+    /// reach; the run directory it once shared with the socket is the vmm
+    /// user's to write. A link or a FIFO at either path, a leftover in the log
+    /// directory or something planted at the old place beside the socket, is
+    /// neither written through nor waited on when the device is created or
+    /// destroyed, and the log is a fresh file of the agent's.
     #[tokio::test]
-    async fn files_planted_at_a_devices_log_paths_are_neither_followed_nor_waited_on() {
+    async fn a_link_or_fifo_at_a_devices_log_path_is_neither_followed_nor_waited_on() {
         let dir = run_dir();
         let driver = driver_over(dir.path(), BINDS);
         let victim = dir.path().join("victim");
