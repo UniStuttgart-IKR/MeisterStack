@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use agent_api::device::{self, DeviceError, DeviceId};
 use backend::Backend;
@@ -21,8 +22,10 @@ use crate::admission::Claim;
 
 /// What the driver holds of a backend's process.
 enum Process {
-    /// Admitted and being spawned.
-    Starting,
+    /// Being spawned, under the token of the [`Reservation`] that holds it.
+    Starting {
+        token: u64,
+    },
     Child(Backend),
 }
 
@@ -31,17 +34,72 @@ struct Entry {
     claim: Claim,
 }
 
+impl Entry {
+    fn is_start(&self, token: u64) -> bool {
+        matches!(self.process, Process::Starting { token: held } if held == token)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Ledger {
     entries: HashMap<DeviceId, Entry>,
+    /// Tells one start of a device from a later one, so a start that is
+    /// given up removes its own entry and never its successor's.
+    last_token: u64,
+}
+
+/// The ledger behind its lock. No update panics halfway, so a ledger whose
+/// lock was poisoned is still consistent and stays usable.
+pub(crate) fn lock(ledger: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
+    ledger.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A start's place on the ledger while its backend is spawned. Dropped
+/// without [`Reservation::commit`], because the spawn failed or because the
+/// future that creates the device was cancelled mid-spawn, it gives the place
+/// back, so neither a phantom claim nor "already being started" outlives it.
+pub(crate) struct Reservation<'a> {
+    ledger: &'a Mutex<Ledger>,
+    id: DeviceId,
+    token: u64,
+}
+
+impl<'a> Reservation<'a> {
+    /// Hold `id`'s place. Refused while another start of it is under way.
+    pub(crate) fn hold(
+        ledger: &'a Mutex<Ledger>,
+        id: &DeviceId,
+        claim: Claim,
+    ) -> device::Result<Self> {
+        let token = lock(ledger).start(id, claim)?;
+        Ok(Self {
+            ledger,
+            id: *id,
+            token,
+        })
+    }
+
+    /// The backend is up and its entry becomes the child's. Returns the child
+    /// when the device was destroyed during the spawn, so the caller stops it
+    /// instead of leaving it running uncounted.
+    #[must_use]
+    pub(crate) fn commit(self, child: Backend) -> Option<Backend> {
+        let unclaimed = lock(self.ledger).started(&self.id, self.token, child);
+        std::mem::forget(self);
+        unclaimed
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        lock(self.ledger).abandon(&self.id, self.token);
+    }
 }
 
 impl Ledger {
-    /// Hold `id`'s place while its backend is spawned. Refused while another
-    /// start of the same device is under way.
-    pub(crate) fn start(&mut self, id: &DeviceId, claim: Claim) -> device::Result<()> {
+    fn start(&mut self, id: &DeviceId, claim: Claim) -> device::Result<u64> {
         if let Some(Entry {
-            process: Process::Starting,
+            process: Process::Starting { .. },
             ..
         }) = self.entries.get(id)
         {
@@ -49,27 +107,35 @@ impl Ledger {
                 "device {id} is already being started"
             )));
         }
+        self.last_token += 1;
+        let token = self.last_token;
         self.entries.insert(
             *id,
             Entry {
-                process: Process::Starting,
+                process: Process::Starting { token },
                 claim,
             },
         );
-        Ok(())
+        Ok(token)
     }
 
-    /// Record that an admitted backend is up. Returns the child when its
-    /// entry was forgotten during the spawn, so the caller stops it instead of
-    /// leaving it running uncounted.
-    #[must_use]
-    pub(crate) fn started(&mut self, id: &DeviceId, child: Backend) -> Option<Backend> {
+    fn started(&mut self, id: &DeviceId, token: u64, child: Backend) -> Option<Backend> {
         match self.entries.get_mut(id) {
-            Some(entry) => {
+            Some(entry) if entry.is_start(token) => {
                 entry.process = Process::Child(child);
                 None
             }
-            None => Some(child),
+            _ => Some(child),
+        }
+    }
+
+    fn abandon(&mut self, id: &DeviceId, token: u64) {
+        if self
+            .entries
+            .get(id)
+            .is_some_and(|entry| entry.is_start(token))
+        {
+            self.entries.remove(id);
         }
     }
 
@@ -77,7 +143,7 @@ impl Ledger {
     pub(crate) fn forget(&mut self, id: &DeviceId) -> Option<Backend> {
         match self.entries.remove(id)?.process {
             Process::Child(child) => Some(child),
-            Process::Starting => None,
+            Process::Starting { .. } => None,
         }
     }
 
@@ -88,7 +154,7 @@ impl Ledger {
             return Ok(None);
         };
         let pid = match &mut entry.process {
-            Process::Starting => {
+            Process::Starting { .. } => {
                 return Err(DeviceError::Backend(anyhow::anyhow!(
                     "device {id} is already being started"
                 )));
@@ -106,7 +172,7 @@ impl Ledger {
     /// holds nothing and is dropped.
     pub(crate) fn unrecorded(&mut self, recorded: &HashSet<DeviceId>) -> Vec<Claim> {
         self.entries.retain(|_, entry| match &mut entry.process {
-            Process::Starting => true,
+            Process::Starting { .. } => true,
             Process::Child(child) => child.is_running(),
         });
         self.entries
@@ -128,23 +194,51 @@ mod tests {
     /// A start under way counts for an admission that cannot see its record.
     #[test]
     fn a_start_under_way_counts_until_its_record_is_seen() {
-        let mut ledger = Ledger::default();
+        let ledger = Mutex::new(Ledger::default());
         let starting = DeviceId::new_v4();
-        ledger.start(&starting, claim(4096)).expect("held");
-        assert_eq!(ledger.unrecorded(&HashSet::new()), vec![claim(4096)]);
+        let _held = Reservation::hold(&ledger, &starting, claim(4096)).expect("held");
+        assert_eq!(lock(&ledger).unrecorded(&HashSet::new()), vec![claim(4096)]);
         assert!(
-            ledger.unrecorded(&HashSet::from([starting])).is_empty(),
+            lock(&ledger)
+                .unrecorded(&HashSet::from([starting]))
+                .is_empty(),
             "the record counts it, so the ledger does not count it twice"
         );
     }
 
-    /// A backend that failed to start gives its place back.
+    /// A start that is given up gives its place back.
     #[test]
-    fn a_forgotten_start_gives_its_place_back() {
-        let mut ledger = Ledger::default();
+    fn a_start_given_up_gives_its_place_back() {
+        let ledger = Mutex::new(Ledger::default());
         let failed = DeviceId::new_v4();
-        ledger.start(&failed, claim(8192)).expect("held");
-        assert!(ledger.forget(&failed).is_none(), "no child was spawned");
-        assert!(ledger.unrecorded(&HashSet::new()).is_empty());
+        drop(Reservation::hold(&ledger, &failed, claim(8192)).expect("held"));
+        assert!(lock(&ledger).unrecorded(&HashSet::new()).is_empty());
+        Reservation::hold(&ledger, &failed, claim(8192)).expect("and can start again");
+    }
+
+    /// A second start of a device whose first is under way is refused.
+    #[test]
+    fn a_device_is_started_once_at_a_time() {
+        let ledger = Mutex::new(Ledger::default());
+        let id = DeviceId::new_v4();
+        let _first = Reservation::hold(&ledger, &id, claim(1024)).expect("held");
+        let said = Reservation::hold(&ledger, &id, claim(1024))
+            .err()
+            .expect("the first is still starting")
+            .to_string();
+        assert!(said.contains("already being started"), "{said}");
+    }
+
+    /// A start destroyed and begun again: the first one, given up late,
+    /// does not take the second one's place with it.
+    #[test]
+    fn a_start_given_up_late_leaves_its_successor_alone() {
+        let ledger = Mutex::new(Ledger::default());
+        let id = DeviceId::new_v4();
+        let first = Reservation::hold(&ledger, &id, claim(1024)).expect("held");
+        assert!(lock(&ledger).forget(&id).is_none(), "destroyed mid-spawn");
+        let _second = Reservation::hold(&ledger, &id, claim(2048)).expect("started again");
+        drop(first);
+        assert_eq!(lock(&ledger).unrecorded(&HashSet::new()), vec![claim(2048)]);
     }
 }

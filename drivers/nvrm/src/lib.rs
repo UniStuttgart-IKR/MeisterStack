@@ -28,7 +28,7 @@ mod paths;
 mod vgpu;
 
 use admission::{Claim, Wanted};
-use ledger::Ledger;
+use ledger::{Ledger, Reservation};
 pub use vgpu::VgpuType;
 
 /// VIRTIO_ID_NVRM, the device type Leandro's guest module binds to.
@@ -196,8 +196,9 @@ pub struct NvrmDriver {
     process: BackendKind,
     vgpu_cache: Mutex<HashMap<String, VgpuType>>,
     /// The backends this instance started. Admission counts the agent's
-    /// records first; see [`ledger`].
-    ledger: Mutex<Ledger>,
+    /// records first; see [`ledger`]. Held for no await, so a reservation
+    /// can give its place back from a destructor.
+    ledger: std::sync::Mutex<Ledger>,
 }
 
 impl NvrmDriver {
@@ -235,7 +236,7 @@ impl NvrmDriver {
             process,
             config,
             vgpu_cache: Mutex::new(cache),
-            ledger: Mutex::new(Ledger::default()),
+            ledger: std::sync::Mutex::new(Ledger::default()),
         }
     }
 }
@@ -373,10 +374,18 @@ impl NvrmDriver {
         Ok(Some(resolved))
     }
 
+    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        ledger::lock(&self.ledger)
+    }
+
     /// Put a spawned backend on the ledger in place of its start.
-    async fn enter_started(&self, id: &DeviceId, child: Backend) -> device::Result<()> {
-        let unclaimed = self.ledger.lock().await.started(id, child);
-        if let Some(child) = unclaimed {
+    async fn enter_started(
+        &self,
+        id: &DeviceId,
+        start: Reservation<'_>,
+        child: Backend,
+    ) -> device::Result<()> {
+        if let Some(child) = start.commit(child) {
             self.process.stop(child).await;
             return Err(DeviceError::Backend(anyhow::anyhow!(
                 "device {id} was destroyed while its backend started"
@@ -564,7 +573,7 @@ impl DeviceDriver for NvrmDriver {
         }
 
         let socket = self.socket_path(id);
-        let reusable = self.ledger.lock().await.reusable(id, &socket)?;
+        let reusable = self.ledger().reusable(id, &socket)?;
         if let Some(pid) = reusable {
             return Ok(Device {
                 id: *id,
@@ -578,7 +587,8 @@ impl DeviceDriver for NvrmDriver {
         // Count the same effective parameters used to build the backend environment.
         let claim = params.claim(vgpu.as_ref());
         let admitted_mib = claim.mib;
-        self.ledger.lock().await.start(id, claim)?;
+        // Given back if the spawn fails or this future is dropped mid-spawn.
+        let start = Reservation::hold(&self.ledger, id, claim)?;
 
         debug!(
             vgpu_type = params.vgpu_type.as_deref().unwrap_or("-"),
@@ -608,15 +618,9 @@ impl DeviceDriver for NvrmDriver {
                 },
             )
             .await;
-        let (pid, child) = match spawned {
-            Ok(spawned) => spawned,
-            Err(e) => {
-                self.ledger.lock().await.forget(id);
-                return Err(e.into());
-            }
-        };
+        let (pid, child) = spawned?;
         info!(pid, admitted_mib, "nvrm backend ready");
-        self.enter_started(id, child).await?;
+        self.enter_started(id, start, child).await?;
 
         Ok(Device {
             id: *id,
@@ -626,7 +630,7 @@ impl DeviceDriver for NvrmDriver {
 
     #[instrument(skip_all, fields(device_id = %id))]
     async fn destroy(&self, id: &DeviceId, attachment: &DeviceAttachment) -> device::Result<()> {
-        let child = self.ledger.lock().await.forget(id);
+        let child = self.ledger().forget(id);
 
         match child {
             Some(child) => self.process.stop(child).await,
@@ -699,7 +703,7 @@ impl DeviceDriver for NvrmDriver {
             .map(|d| d.id)
             .chain(requested.iter().map(|(id, _)| *id))
             .collect();
-        held.extend(self.ledger.lock().await.unrecorded(&recorded));
+        held.extend(self.ledger().unrecorded(&recorded));
         admission::admit_all(held, &wanted, self.config.vram_budget_mib)
     }
 }
@@ -1106,16 +1110,24 @@ mod tests {
     /// resolved against the fixture card. Built without asking the host
     /// anything, as `new` would after resolving them.
     fn driver_in(run_dir: &Path) -> NvrmDriver {
+        NvrmDriver::assemble(node_in(run_dir), the_card())
+    }
+
+    fn node_in(run_dir: &Path) -> NvrmDriverConfig {
         let mut config = node(serde_json::json!({}));
         config.run_dir = run_dir.to_path_buf();
         config.vgpu_host_reserve_mib = Some(1024);
         config.profiles.insert("8q".into(), configured("8Q"));
         config.profiles.insert("1q".into(), configured("1Q"));
-        let cache = HashMap::from([
+        config
+    }
+
+    /// The `8Q` and `1Q` the fixture card resolves to.
+    fn the_card() -> HashMap<String, VgpuType> {
+        HashMap::from([
             ("8Q".to_string(), resolved("RTX2070-8Q", 8192, 1)),
             ("1Q".to_string(), resolved("RTX2070-1Q", 1024, 8)),
-        ]);
-        NvrmDriver::assemble(config, cache)
+        ])
     }
 
     fn profiled(profile: &str) -> DeviceSpec {
@@ -1230,6 +1242,87 @@ mod tests {
             std::fs::read(&target).expect("still there"),
             b"untouched",
             "no write went through the symlink"
+        );
+    }
+
+    /// A backend that says it runs, by writing its pid into `started` (a
+    /// FIFO, so the write waits for the test to read it), and then never
+    /// binds its socket.
+    fn never_ready_backend(dir: &Path, started: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("vhost-user-nvrm");
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+            started.display()
+        );
+        std::fs::write(&binary, script).expect("a fake backend");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        binary
+    }
+
+    /// R2-3: a create whose future is dropped while its backend is being
+    /// spawned (a client that hung up, a cancelled request) gives the device's
+    /// place on the ledger back and kills the backend it had started, instead
+    /// of leaving a phantom start that refuses every later one and a process
+    /// nobody counts.
+    #[tokio::test]
+    async fn a_create_dropped_mid_spawn_gives_its_place_back_and_stops_its_backend() {
+        let dir = run_dir();
+        let started = dir.path().join("started");
+        nix::unistd::mkfifo(&started, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("a fifo");
+        let mut config = node_in(&dir.path().join("run"));
+        config.binary = never_ready_backend(dir.path(), &started);
+        config.socket_timeout = Duration::from_secs(600);
+        std::fs::create_dir_all(&config.run_dir).expect("a run dir");
+        let driver = NvrmDriver::assemble(config, the_card());
+        let (id, spec) = (DeviceId::new_v4(), profiled("1q"));
+
+        let pid: i32 = tokio::select! {
+            said = tokio::fs::read_to_string(&started) => {
+                said.expect("the backend runs").trim().parse().expect("its pid")
+            }
+            created = driver.create(&id, &spec, None) => {
+                let _ = std::fs::write(&started, b"");
+                panic!("this backend never binds its socket: {created:?}")
+            }
+        };
+
+        assert!(
+            driver.ledger().unrecorded(&HashSet::new()).is_empty(),
+            "the dropped start counts for nothing"
+        );
+        let socket = driver.socket_path(&id);
+        driver
+            .ledger()
+            .reusable(&id, &socket)
+            .expect("no start of this device is under way any more");
+
+        let exited = tokio::task::spawn_blocking(move || {
+            use nix::sys::wait::{Id, WaitPidFlag, waitid};
+            // WNOWAIT: wait for the exit and leave reaping to the runtime.
+            waitid(
+                Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+            )
+        });
+        let Ok(exited) = tokio::time::timeout(Duration::from_secs(10), exited).await else {
+            // Ends the wait above, so the failure is reported now and not
+            // when the fake backend's own sleep runs out.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            panic!("the abandoned backend is still running");
+        };
+        let exited = exited.expect("the wait ran");
+        assert!(
+            matches!(
+                exited,
+                Ok(nix::sys::wait::WaitStatus::Signaled(..)) | Err(nix::errno::Errno::ECHILD)
+            ),
+            "{exited:?}"
         );
     }
 }

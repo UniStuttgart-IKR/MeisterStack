@@ -189,10 +189,16 @@ impl BackendKind {
             None => BackendError::Failed(e.into()),
         })?;
         // Every early return after spawn must kill and reap the child through
-        // `abandon`; dropping a Tokio Child alone does not stop it.
-        let Some(pid) = child.id() else {
+        // `abandon`; dropping a Tokio Child alone does not stop it. A caller
+        // that drops this future mid-spawn returns early too, and the guard
+        // kills the child then.
+        let unready = KillUnlessReady {
+            kind: self,
+            child: &mut child,
+        };
+        let Some(pid) = unready.child.id() else {
             // Run cleanup for the exited child to ensure it is reaped.
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(BackendError::Died(format!(
                 "{} exited before pid could be read",
                 self.label
@@ -207,7 +213,7 @@ impl BackendKind {
         if let Some(cg) = cgroup
             && let Err(e) = cg.attach_pid(pid)
         {
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(BackendError::Failed(anyhow::anyhow!("cgroup attach: {e}")));
         }
 
@@ -219,7 +225,7 @@ impl BackendKind {
                 if socket.exists() {
                     break;
                 }
-                if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(Some(status)) = unready.child.try_wait() {
                     return Err(BackendError::Died(format!(
                         "{label} exited with {status} before its socket appeared; log tail:\n{}",
                         tail_log(log)
@@ -240,10 +246,11 @@ impl BackendKind {
         // Kill and reap failed startups, including socket timeouts. An already
         // collected child makes cleanup a no-op.
         if let Err(e) = waited {
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(e);
         }
 
+        unready.ready();
         Ok((pid, Backend { child }))
     }
 
@@ -327,6 +334,38 @@ impl BackendKind {
             // No setsid(2) at spawn: this process is in the AGENT's group.
             nix::sys::signal::kill(pid, sig)
         };
+    }
+}
+
+/// A spawned backend nobody has been handed yet. Dropped before [`ready`],
+/// as when the future spawning it is cancelled, it kills the backend: nothing
+/// else knows of it, so nothing else would ever stop it.
+///
+/// [`ready`]: KillUnlessReady::ready
+struct KillUnlessReady<'a> {
+    kind: &'a BackendKind,
+    child: &'a mut tokio::process::Child,
+}
+
+impl KillUnlessReady<'_> {
+    /// The backend is up and goes to the caller.
+    fn ready(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for KillUnlessReady<'_> {
+    fn drop(&mut self) {
+        // `None` once `abandon` or `try_wait` reaped it: then its pid may
+        // belong to someone else already and is not signalled.
+        if let Some(pid) = self.child.id() {
+            warn!(
+                pid,
+                backend = self.kind.label,
+                "the start of this backend was abandoned; killing it"
+            );
+            self.kind.signal(pid, Signal::SIGKILL);
+        }
     }
 }
 
