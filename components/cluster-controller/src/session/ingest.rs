@@ -231,11 +231,32 @@ pub(super) async fn ingest_routers(
         let name = router.metadata.name.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
-        store
-            .mutate::<controller_api::Router, _>(&name, |r| {
-                r.status.reported = Some(said.clone());
+        // Whether this node is on the router's list and is the one that speaks is re-asked of the
+        // object being written, under the report's uid; a moved active machine gets no word.
+        // (R3-F03)
+        let mut applied = false;
+        let result = store
+            .mutate_if::<controller_api::Router, _>(&name, &uid, |r| {
+                applied = r.status.nodes.iter().any(|n| n == node_id)
+                    && (r.status.active_node == node_id) == speaks;
+                if applied {
+                    r.status.reported = Some(said.clone());
+                }
             })
-            .await?;
+            .await;
+        match result {
+            Ok(_) if applied => {}
+            Ok(_) => {
+                debug!(router = %name, node = node_id,
+                       "the router moved on between the listing and the write; the word is dropped");
+                continue;
+            }
+            Err(e) => {
+                warn!(router = %name, node = node_id, error = format!("{e:#}"),
+                      "writing router status failed");
+                continue;
+            }
+        }
         info!(router = %name, node = node_id, phase = phase.as_str(), "router phase observed");
         events::record(
             store,
@@ -402,9 +423,7 @@ pub(super) async fn ingest_volumes(
         // Accept volume reports from its home or an `openOn` node, including a live
         // migration destination. Other nodes may retain stale records after a move;
         // ignore those reports and leave record cleanup to the storage workflow.
-        let home = volume.status.node.as_deref() == Some(node_id);
-        let holds = volume.status.open_on.iter().any(|n| n == node_id);
-        if !home && !holds {
+        if !speaks_for_volume(volume, node_id) {
             debug!(volume = %volume.metadata.name, node = node_id,
                    placed_on = volume.status.node.as_deref().unwrap_or("nowhere"),
                    "a node that does not hold this volume reported it; ignoring its word");
@@ -430,44 +449,31 @@ pub(super) async fn ingest_volumes(
         // is a rule the reconciler already had; deciding here that an object
         // may be deleted would be a second lifecycle in a second place.
         if reported.phase == crate::reconcile::VOLUME_GONE {
-            // From a holder that is not the home, `Gone` says only that THIS
-            // node has let go — the bytes are still where the home says they
-            // are. Clearing `status.node` on that word would strand a volume
-            // whose destination tidied up after a migration that did not
-            // happen.
-            if !home {
-                info!(volume = %name, node = node_id, "a holder let the volume go");
-                store
-                    .mutate::<Volume, _>(&name, |v| {
-                        note_open(v, node_id, reported.open);
-                    })
-                    .await?;
-                continue;
-            }
-            info!(volume = %name, node = node_id, "the node reports the volume is gone");
-            store
-                .mutate::<Volume, _>(&name, |v| {
-                    v.status.node = None;
-                    note_open(v, node_id, reported.open);
-                    v.status.backend = String::new();
-                    // The tombstone, as the node's own word. For a volume on
-                    // its way out this IS the answer a release acts on; for
-                    // one nobody deleted it says the bytes have to be made
-                    // again, which is what `place_volumes` does next pass.
-                    //
-                    // The phase used to be KEPT here, so a volume whose node
-                    // had just said the bytes were gone went on reading
-                    // `Ready`. It reads `Pending { Deprovisioned }` now.
-                    v.status.reported = Some(controller_api::VolumeReported::by(
-                        node_id,
-                        VolumePhaseKind::Pending,
-                        controller_api::VolumeReason::Deprovisioned,
-                        Some(format!("{node_id} no longer has the bytes")),
-                        at,
-                    ));
-                    v.status.observed_at = Some(at);
+            // Whether the reporter is the home is decided inside the write, on the live object
+            // under the report's uid: a stale listing could clear `status.node` on a volume handed
+            // to another machine and strand its bytes. (R3-F03)
+            let mut outcome = GoneOutcome::NoWord;
+            let result = store
+                .mutate_if::<Volume, _>(&name, &reported.id, |v| {
+                    outcome = apply_gone(v, node_id, reported.open, at);
                 })
-                .await?;
+                .await;
+            match (result, outcome) {
+                (Err(e), _) => {
+                    warn!(volume = %name, node = node_id, error = format!("{e:#}"),
+                          "writing a volume's tombstone failed");
+                }
+                (Ok(_), GoneOutcome::Tombstoned) => {
+                    info!(volume = %name, node = node_id, "the node reports the volume is gone");
+                }
+                (Ok(_), GoneOutcome::HolderLetGo) => {
+                    info!(volume = %name, node = node_id, "a holder let the volume go");
+                }
+                (Ok(_), GoneOutcome::NoWord) => {
+                    debug!(volume = %name, node = node_id,
+                           "the volume moved on between the listing and the write; the gone is dropped");
+                }
+            }
             continue;
         }
 
@@ -507,8 +513,22 @@ pub(super) async fn ingest_volumes(
         {
             continue;
         }
-        store
-            .mutate::<Volume, _>(&name, |v| {
+        // The node's word and the report's currency are re-checked on the object being written,
+        // under the report's uid. (R3-F03)
+        let mut applied = false;
+        let result = store
+            .mutate_if::<Volume, _>(&name, &reported.id, |v| {
+                applied = false;
+                if !speaks_for_volume(v, node_id)
+                    || !controller_api::mirror::is_current(
+                        v.metadata.deletion_timestamp,
+                        v.status.observed_at,
+                        at,
+                    )
+                {
+                    return;
+                }
+                applied = true;
                 // The node's word, whole, and no special case for a volume on
                 // its way out: `settle_volume` reads the `deletionTimestamp`
                 // and keeps such a volume `Releasing` whatever the bytes are
@@ -530,10 +550,80 @@ pub(super) async fn ingest_volumes(
                 }
                 v.status.observed_at = Some(at);
             })
-            .await?;
-        debug!(volume = %name, node = node_id, phase = phase.as_str(), "volume observed");
+            .await;
+        match result {
+            Err(e) => {
+                warn!(volume = %name, node = node_id, error = format!("{e:#}"),
+                      "writing volume status failed");
+            }
+            Ok(_) if applied => {
+                debug!(volume = %name, node = node_id, phase = phase.as_str(), "volume observed");
+            }
+            Ok(_) => {
+                debug!(volume = %name, node = node_id,
+                       "the volume moved on between the listing and the write; the report is dropped");
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether `node_id` may report on `volume`: its home or a node holding it open.
+/// Checked on the listed object to skip cheaply and again inside the write,
+/// because the volume may have moved in between (R3-F03).
+pub(super) fn speaks_for_volume(volume: &Volume, node_id: &str) -> bool {
+    volume.status.node.as_deref() == Some(node_id)
+        || volume.status.open_on.iter().any(|n| n == node_id)
+}
+
+/// What a `Gone` from one node did to one volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoneOutcome {
+    /// The reporter is the home: the node came off and the tombstone is on.
+    Tombstoned,
+    /// The reporter only held it open, and has let go.
+    HolderLetGo,
+    /// The reporter has no word about the volume as it is now, or the report is stale.
+    NoWord,
+}
+
+/// Apply one node's `Gone` to `v`, the object as the write just read it, re-deriving
+/// home, holder and currency from `v` (R3-F03). Pure so the rule is testable without etcd.
+pub(super) fn apply_gone(
+    v: &mut Volume,
+    node_id: &str,
+    open: bool,
+    at: DateTime<Utc>,
+) -> GoneOutcome {
+    if !controller_api::mirror::is_current(v.metadata.deletion_timestamp, v.status.observed_at, at)
+    {
+        return GoneOutcome::NoWord;
+    }
+    let home = v.status.node.as_deref() == Some(node_id);
+    let holds = v.status.open_on.iter().any(|n| n == node_id);
+    if !home {
+        // From a non-home holder, `Gone` only means this node let go; clearing
+        // `status.node` would strand a volume whose migration destination tidied up.
+        if !holds {
+            return GoneOutcome::NoWord;
+        }
+        note_open(v, node_id, open);
+        return GoneOutcome::HolderLetGo;
+    }
+    v.status.node = None;
+    note_open(v, node_id, open);
+    v.status.backend = String::new();
+    // The home's tombstone: a release acts on it for a deleting volume, and
+    // `place_volumes` recreates the bytes for one nobody deleted.
+    v.status.reported = Some(controller_api::VolumeReported::by(
+        node_id,
+        VolumePhaseKind::Pending,
+        controller_api::VolumeReason::Deprovisioned,
+        Some(format!("{node_id} no longer has the bytes")),
+        at,
+    ));
+    v.status.observed_at = Some(at);
+    GoneOutcome::Tombstoned
 }
 
 /// Update openOn from the node's explicit open-handle report.
@@ -568,8 +658,12 @@ pub(super) async fn ingest_attachments(
             // never rewritten — `observed_attachments` returns `[]` for an
             // empty spec, and that is what clears it, but only if the vm is
             // still let through here to receive one.
-            let has_something_to_settle =
-                !vm.spec.referenced_volumes().is_empty() || !vm.status.volumes.is_empty();
+            //
+            // A node that still reports a disk is a reason on its own: empty spec and status with a
+            // held disk is the hot-detach this pass must make visible. (R3-F01)
+            let has_something_to_settle = !vm.spec.referenced_volumes().is_empty()
+                || !vm.status.volumes.is_empty()
+                || !r.attached_volumes.is_empty();
             (ours(vm) && has_something_to_settle).then_some((vm, r))
         })
         .collect();
@@ -583,10 +677,9 @@ pub(super) async fn ingest_attachments(
         .collect();
 
     for (vm, reported) in relevant {
-        // Spec order, one entry per referenced disk, so the list reads like
-        // the spec it answers. A uid the node named that this tier cannot
-        // resolve to a name is simply not among the spec's volumes and
-        // therefore not in the answer — the spec is the question.
+        // A uid the node named that this tier cannot resolve to a name is a
+        // volume object that no longer exists; there is no claim on it to
+        // release and no name to show, so it is not in the answer.
         let held: Vec<&str> = reported
             .attached_volumes
             .iter()
@@ -595,6 +688,8 @@ pub(super) async fn ingest_attachments(
         // Do not derive `openOn` from VM attachment lists: a deleting VM can leave
         // that inventory before its disk is detached. VolumeStateReport.open supplies
         // node-level handle evidence; this pass updates only per-VM attachments.
+        // Comparing against the listing only saves a write; the write re-derives
+        // the answer from the object it reads (R3-F01).
         let observed = observed_attachments(vm, &held);
         if vm.status.volumes == observed {
             continue;
@@ -607,17 +702,39 @@ pub(super) async fn ingest_attachments(
         // command long since acked. Every other spec change is a document the
         // node takes whole, and for those "told" really is all this tier can
         // honestly claim.
-        let settled = observed.iter().all(|v| v.attached);
-        let generation = vm.metadata.generation;
-        store
-            .mutate::<Vm, _>(&name, |v| {
-                v.status.volumes = observed.clone();
+        //
+        // Answer, verdict and generation are re-derived from the object as read inside the write,
+        // not from the listing: a dropped disk or recreated name would be judged against the old
+        // spec. `mutate_if` pins the uid and `ours` is asked again. (R3-F01)
+        let mut settled = false;
+        let mut applied = false;
+        let result = store
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                settled = false;
+                applied = false;
+                if !ours(v) {
+                    return;
+                }
+                applied = true;
+                let observed = observed_attachments(v, &held);
+                settled = attachments_settled(v, &observed);
+                v.status.volumes = observed;
                 if settled {
-                    v.status.observed_generation = v.status.observed_generation.max(generation);
+                    v.status.observed_generation =
+                        v.status.observed_generation.max(v.metadata.generation);
                 }
                 v.status.observed_at = Some(at);
             })
-            .await?;
+            .await;
+        // One vm's failed write says nothing about the others in this report: log it and go on.
+        if let Err(e) = result {
+            warn!(vm = %name, error = format!("{e:#}"), "writing vm attachments failed");
+            continue;
+        }
+        if !applied {
+            debug!(vm = %name, "vm rebound between the listing and the write, attachments dropped");
+            continue;
+        }
         debug!(vm = %name, attached = held.len(), settled, "vm attachments observed");
     }
     Ok(())
@@ -648,9 +765,22 @@ pub(super) async fn ingest_addresses(
             continue;
         }
         let name = vm.metadata.name.clone();
-        store
-            .mutate::<Vm, _>(&name, |v| v.status.addresses = addresses.clone())
-            .await?;
+        // Under the report's uid, for a vm still this node's to speak for, with the MAC lines
+        // merged into the addresses as they are now: the listing's copy may miss another pass's
+        // write. (R3-F03)
+        let result = store
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                if ours(v) {
+                    v.status.addresses =
+                        controller_api::addresses_with(&v.status.addresses, &reported.nics);
+                }
+            })
+            .await;
+        if let Err(e) = result {
+            warn!(vm = %name, node = node_id, error = format!("{e:#}"),
+                  "writing vm addresses failed");
+            continue;
+        }
         debug!(vm = %name, node = node_id, nics = reported.nics.len(), "vm addresses observed");
     }
     Ok(())
@@ -696,20 +826,40 @@ pub(super) async fn ingest_snapshots(
         // taken off, and the next dispatch makes it again.
         if reported.phase == crate::reconcile::SNAPSHOT_GONE {
             if snapshot.metadata.deletion_timestamp.is_some() {
-                store
-                    .mutate::<VolumeSnapshot, _>(&name, |s| {
-                        s.metadata
-                            .finalizers
-                            .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
-                    })
-                    .await?;
-                store.delete::<VolumeSnapshot>(&name).await?;
-                info!(snapshot = %name, node = node_id, "snapshot deleted; the copy is gone");
+                // The finalizer comes off the object the report named (uid), only while it is still
+                // being deleted and on this node; the delete then names the revision that write
+                // produced, so a snapshot recreated in between survives. (R3-F02, R3-F03)
+                let gone_here = |s: &VolumeSnapshot| {
+                    s.metadata.deletion_timestamp.is_some()
+                        && s.status.node.as_deref() == Some(node_id)
+                };
+                let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+                match controller_api::deletion::release_and_delete(
+                    store, snapshot, finalizer, gone_here,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        info!(snapshot = %name, node = node_id, "snapshot deleted; the copy is gone")
+                    }
+                    Ok(false) => {
+                        debug!(snapshot = %name, node = node_id,
+                               "the snapshot moved on since it was listed; the next report decides")
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 warn!(snapshot = %name, node = node_id,
                       "the node no longer has this snapshot; it will be taken again");
-                store
-                    .mutate::<VolumeSnapshot, _>(&name, |s| {
+                if let Err(e) = store
+                    .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
+                        // Only while the copy is still on this node and not being deleted;
+                        // the listing may be stale. (R3-F03)
+                        if s.status.node.as_deref() != Some(node_id)
+                            || s.metadata.deletion_timestamp.is_some()
+                        {
+                            return;
+                        }
                         // This tier's own conclusion out of a node's silence
                         // about a copy it used to report, so `here` and not
                         // `by`: what the node said is that it does not have
@@ -725,7 +875,11 @@ pub(super) async fn ingest_snapshots(
                         s.status.backend = String::new();
                         s.status.observed_at = Some(at);
                     })
-                    .await?;
+                    .await
+                {
+                    warn!(snapshot = %name, node = node_id, error = format!("{e:#}"),
+                          "writing the snapshot's tombstone failed");
+                }
             }
             continue;
         }
@@ -760,8 +914,18 @@ pub(super) async fn ingest_snapshots(
         {
             continue;
         }
-        store
-            .mutate::<VolumeSnapshot, _>(&name, |s| {
+        let result = store
+            .mutate_if::<VolumeSnapshot, _>(&name, &reported.snapshot_id, |s| {
+                // Node and freshness checks, re-asked of the object being written. (R3-F03)
+                if s.status.node.as_deref() != Some(node_id)
+                    || !controller_api::mirror::is_current(
+                        s.metadata.deletion_timestamp,
+                        s.status.observed_at,
+                        at,
+                    )
+                {
+                    return;
+                }
                 s.status.reported = Some(said.clone());
                 if !backend.is_empty() {
                     s.status.backend = backend.clone();
@@ -771,7 +935,12 @@ pub(super) async fn ingest_snapshots(
                 }
                 s.status.observed_at = Some(at);
             })
-            .await?;
+            .await;
+        if let Err(e) = result {
+            warn!(snapshot = %name, node = node_id, error = format!("{e:#}"),
+                  "writing snapshot status failed");
+            continue;
+        }
         debug!(snapshot = %name, node = node_id, phase = phase.as_str(), "snapshot observed");
     }
     Ok(())
@@ -809,8 +978,18 @@ pub(super) async fn forget_unbound(
     }
     for vm in leaving {
         let name = vm.metadata.name.clone();
-        store
-            .mutate::<Vm, _>(&name, |v| {
+        let uid = vm.metadata.uid.clone();
+        // The let-go is decided off a listing: the uid is pinned and both facts `letting_go` read
+        // are re-read on the object being written, so a rebound or recreated vm is left alone.
+        // (R3-F03)
+        let mut applied = false;
+        let result = store
+            .mutate_if::<Vm, _>(&name, &uid, |v| {
+                applied =
+                    v.spec.node_name.is_none() && v.status.node_name.as_deref() == Some(node_id);
+                if !applied {
+                    return;
+                }
                 v.status.node_name = None;
                 // Pending and not Stopped: the VM has no node, and the phase
                 // an operator reads has to say that rather than describing a
@@ -829,32 +1008,70 @@ pub(super) async fn forget_unbound(
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
             })
-            .await?;
+            .await;
+        if let Err(e) = result {
+            warn!(vm = %name, node = node_id, error = format!("{e:#}"),
+                  "clearing the old node failed");
+            continue;
+        }
+        if !applied {
+            debug!(vm = %name, node = node_id,
+                   "bound again between the listing and the write; the let-go is dropped");
+            continue;
+        }
         info!(vm = %name, node = node_id, "the old node let go; the vm can be placed again");
     }
     Ok(())
 }
 
-/// One entry per referenced disk of the spec, in spec order, saying whether
-/// the node reports having it.
+/// What the node reports this VM as holding, read against the spec.
 ///
-/// Spec order and not report order, because the spec is the question: a list
-/// that reordered itself as disks arrived would be a list an operator cannot
-/// read against what they wrote. A uid the node named that is not among the
-/// spec's volumes is simply not in the answer — it is a disk this VM is not
-/// asking for, and the drift that follows is the reconciler's.
+/// First one entry per referenced disk of the spec, in spec order, saying whether the node
+/// reports having it; spec order so the list reads against what the operator wrote.
+///
+/// Then, in report order, every disk the node reports that the spec no longer names,
+/// marked attached, so `reconcile::vms::volume_drift` sees the hot-detach it must make.
+/// The observed set is all the node says it holds; the drift is the reconciler's. (R3-F01)
 pub(super) fn observed_attachments(
     vm: &Vm,
     held: &[&str],
 ) -> Vec<controller_api::VolumeAttachmentStatus> {
-    vm.spec
-        .referenced_volumes()
-        .into_iter()
+    let wanted = vm.spec.referenced_volumes();
+    let mut observed: Vec<controller_api::VolumeAttachmentStatus> = wanted
+        .iter()
         .map(|name| controller_api::VolumeAttachmentStatus {
             attached: held.contains(&name.as_str()),
-            name,
+            name: name.clone(),
         })
-        .collect()
+        .collect();
+    for name in held {
+        if wanted.iter().any(|w| w == name) || observed.iter().any(|o| o.name == *name) {
+            continue;
+        }
+        observed.push(controller_api::VolumeAttachmentStatus {
+            name: (*name).to_string(),
+            attached: true,
+        });
+    }
+    observed
+}
+
+/// Whether the node holds exactly the disks the spec names: none missing and none left over.
+///
+/// "Every entry attached" is not enough: the observed list carries disks the spec dropped,
+/// so a generation that dropped a disk closes only when the node stops reporting it.
+/// (R3-F01)
+pub(super) fn attachments_settled(
+    vm: &Vm,
+    observed: &[controller_api::VolumeAttachmentStatus],
+) -> bool {
+    let wanted = vm.spec.referenced_volumes();
+    wanted
+        .iter()
+        .all(|w| observed.iter().any(|o| o.attached && o.name == *w))
+        && observed
+            .iter()
+            .all(|o| !o.attached || wanted.contains(&o.name))
 }
 
 /// The phase half: what the node says each of its VMs is doing, written onto

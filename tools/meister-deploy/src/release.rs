@@ -473,7 +473,6 @@ mod tests {
         );
     }
 
-
     /// One required check, as `build` writes it: a derivation that built.
     fn a_check(duration_ms: u64) -> CheckResult {
         CheckResult {
@@ -545,7 +544,6 @@ mod tests {
             release_with(Vec::new(), "2026-09-21T11:00:00Z").release_id
         );
     }
-
 
     // ---------------------------------------------------------------
     // The bundle of a direct-boot host (M3A position 3)

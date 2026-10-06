@@ -130,8 +130,6 @@ pub struct Mount {
     pub fstype: String,
 }
 
-
-
 /// One PCI device, as the machine lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -151,8 +149,6 @@ pub struct NetworkInterface {
     /// Lower case, colon separated, as `/sys/class/net/*/address` writes it.
     pub mac: String,
 }
-
-
 
 /// One host, as of `Observations::taken_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -258,8 +254,6 @@ impl HostObservation {
         self.capabilities.iter().any(|c| c == name)
     }
 
-
-
     /// Case-insensitive match for a full PCI domain address.
     pub fn has_pci(&self, address: &str) -> bool {
         self.pci
@@ -271,8 +265,6 @@ impl HostObservation {
     pub fn has_mac(&self, mac: &str) -> bool {
         self.nics.iter().any(|n| n.mac.eq_ignore_ascii_case(mac))
     }
-
-
 }
 
 /// Fleet snapshot used as plan input and saved under `observations/`.

@@ -325,7 +325,6 @@ impl ProbeSpec {
              \"$(cd /run/current-system/etc/systemd/system 2>/dev/null && printf '%s ' *)\"\n",
         );
 
-
         if let Some(etcd) = &self.etcd {
             let url = shell_quote(&etcd.client_url);
             // Skip stopped etcd members. Bound running-member queries with both etcd and shell timeouts.
@@ -1167,8 +1166,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn the_hardware_of_a_healthy_host_is_read() {
         let spec = spec_for("box");
@@ -1249,8 +1246,6 @@ mod tests {
             "nobody asks which units the running generation carries:\n{script}"
         );
     }
-
-
 
     #[test]
     fn a_path_that_is_not_a_mount_point_is_absent_and_not_a_mount() {
@@ -1449,7 +1444,6 @@ mod tests {
         assert_eq!(obs.lock.as_ref().map(|l| l.pid), Some(4711));
         assert_eq!(obs.unknown_reason, None);
     }
-
 
     #[test]
     fn a_decision_in_flight_comes_across_the_wire_as_the_word_it_is() {

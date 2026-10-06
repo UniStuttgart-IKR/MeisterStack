@@ -305,3 +305,27 @@ default_bridge = "meister_br0"
 #[[device.managed]]
 #kind        = "passthrough"      # or "nic-sriov"
 #pci_address = "0000:23:00.0"
+
+# --- where a base image may be fetched from ---------------------------------
+#
+# An image created with a url (`meister image create --from-url`) is fetched
+# by the node that first needs it, from this node's network position. Astra
+# finding R3-F10: a member may write such a url, so without a list it is a
+# request forgery into the management network. The node therefore fetches
+# ONLY from what is listed here:
+#
+#   "cloud-images.ubuntu.com"   that host name
+#   "*.example.org"             every name below example.org (not the apex)
+#   "*"                         any host name (never a bare address, and never
+#                               a private address behind the name)
+#   "10.0.8.0/24"               addresses in that range, by name or literally
+#
+# Empty -- the default -- fetches from NOWHERE: this fleet has no catalogue or
+# mirror of its own to fall back to, so a url image on a node without this
+# list goes Failed with a sentence naming the key. Loopback, link-local (the
+# metadata services) and multicast are refused whatever the list says; a
+# private range (RFC 1918, CGNAT, ULA) needs a CIDR entry, a host name alone
+# does not open it. Ports 80 and 443 only. Every redirect is checked again
+# before it is followed, and the address that passed is the one connected to.
+#[images]
+#allowed_sources = ["cloud-images.ubuntu.com", "10.0.8.0/24"]

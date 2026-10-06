@@ -44,12 +44,18 @@ pub(super) async fn ingest_images(
         let lines: Vec<&proto::ImageStateReport> =
             by_image.get(name.as_str()).cloned().unwrap_or_default();
         let mine = lines_of(cluster, &name, &lines, &complete);
-        let merged = merged_lines(&current, cluster, mine);
+        let merged = merged_lines(&current, cluster, mine.clone());
         if same_node_states(&current.status.nodes, &merged) {
             continue;
         }
+        // Re-merge on the object as the write reads it, under the catalogue entry's uid: the
+        // listing's copy would restore other clusters' lines, and a recreated name would inherit
+        // the old image's lines and digest (`first_bound_digest`). (R3-F03)
+        let uid = current.metadata.uid.clone();
+        let mut merged = merged;
         let result = store
-            .mutate::<Image, _>(&name, |i| {
+            .mutate_if::<Image, _>(&name, &uid, |i| {
+                merged = merged_lines(i, cluster, mine.clone());
                 // The FACT, and nothing else. What the fleet's words add up
                 // to is `settle_image`, which the store runs on the way out —
                 // so there is exactly one rule for "is this image usable" and
@@ -235,12 +241,26 @@ pub(super) async fn ingest_pools(
             // SAYS so — `settle_storage_pool` turns the pointer fact plus the
             // missing entry into `Pending { ClusterHasNoPool }`.
             if spoke || pool.status.clusters.iter().any(|e| e.cluster == cluster) {
-                store
-                    .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
-                        note_pointer(p, cluster, home);
-                        p.status.clusters.retain(|e| e.cluster != cluster);
-                    })
-                    .await?;
+                // Whether this cluster serves the pool, and is its home, is re-read on the object
+                // being written. (R3-F03)
+                if let Err(e) = store
+                    .mutate_if::<controller_api::StoragePool, _>(
+                        &pool.metadata.name,
+                        &pool.metadata.uid,
+                        |p| {
+                            if !p.spec.serves(cluster) {
+                                return;
+                            }
+                            let home = p.spec.home() == Some(cluster);
+                            note_pointer(p, cluster, home);
+                            p.status.clusters.retain(|e| e.cluster != cluster);
+                        },
+                    )
+                    .await
+                {
+                    warn!(pool = %pool.metadata.name, cluster, error = format!("{e:#}"),
+                          "writing storage pool status failed");
+                }
             }
             continue;
         };
@@ -249,22 +269,36 @@ pub(super) async fn ingest_pools(
         if !spoke && pool_unchanged(&pool, home, &entry, reported) {
             continue;
         }
-        store
-            .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
-                note_pointer(p, cluster, home);
-                if home {
-                    p.status.locality = locality;
-                    p.status.nodes = nodes.clone();
-                }
-                // Each cluster replaces its own entry and no other's — the
-                // same "evidence, whole" rule the node list one field over
-                // follows, applied per reporter. The FACT, and nothing else:
-                // what the pointer therefore IS is `settle_storage_pool`.
-                p.status.clusters.retain(|e| e.cluster != cluster);
-                p.status.clusters.push(entry.clone());
-                p.status.clusters.sort_by(|a, b| a.cluster.cmp(&b.cluster));
-            })
-            .await?;
+        // The binding is re-read on the object being written, under the listing's uid. (R3-F03)
+        let result = store
+            .mutate_if::<controller_api::StoragePool, _>(
+                &pool.metadata.name,
+                &pool.metadata.uid,
+                |p| {
+                    if !p.spec.serves(cluster) {
+                        return;
+                    }
+                    let home = p.spec.home() == Some(cluster);
+                    note_pointer(p, cluster, home);
+                    if home {
+                        p.status.locality = locality;
+                        p.status.nodes = nodes.clone();
+                    }
+                    // Each cluster replaces its own entry and no other's — the
+                    // same "evidence, whole" rule the node list one field over
+                    // follows, applied per reporter. The FACT, and nothing else:
+                    // what the pointer therefore IS is `settle_storage_pool`.
+                    p.status.clusters.retain(|e| e.cluster != cluster);
+                    p.status.clusters.push(entry.clone());
+                    p.status.clusters.sort_by(|a, b| a.cluster.cmp(&b.cluster));
+                },
+            )
+            .await;
+        if let Err(e) = result {
+            warn!(pool = %pool.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing storage pool status failed");
+            continue;
+        }
         debug!(pool = %pool.metadata.name, cluster, phase = entry.phase.as_str(),
                "storage pool observed");
     }
@@ -371,11 +405,25 @@ pub(super) async fn ingest_snapshots(
         if snapshot_unchanged(snapshot, cluster, reported, phase) {
             continue;
         }
-        store
-            .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-                write_snapshot_status(s, cluster, reported, phase, at)
-            })
-            .await?;
+        // Under the report's uid, and only while the snapshot still names the volume whose home
+        // placed it at this cluster. (R3-F03)
+        let volume = snapshot.spec.volume.clone();
+        if let Err(e) = store
+            .mutate_if::<controller_api::VolumeSnapshot, _>(
+                &snapshot.metadata.name,
+                &snapshot.metadata.uid,
+                |s| {
+                    if s.spec.volume == volume {
+                        write_snapshot_status(s, cluster, reported, phase, at)
+                    }
+                },
+            )
+            .await
+        {
+            warn!(snapshot = %snapshot.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing snapshot status failed");
+            continue;
+        }
         debug!(snapshot = %snapshot.metadata.name, cluster, phase = phase.as_str(),
                "snapshot observed");
     }
@@ -411,11 +459,20 @@ pub(super) async fn ingest_volumes(
         if volume_unchanged(volume, cluster, reported, phase) {
             continue;
         }
-        store
-            .mutate::<Volume, _>(&volume.metadata.name, |v| {
-                write_volume_status(v, cluster, reported, phase, at)
+        // Under the report's uid, and only while the record is still at this cluster; a volume
+        // handed elsewhere must not take the old cluster's word. (R3-F03)
+        if let Err(e) = store
+            .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
+                if still_at(v, cluster) {
+                    write_volume_status(v, cluster, reported, phase, at)
+                }
             })
-            .await?;
+            .await
+        {
+            warn!(volume = %volume.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing volume status failed");
+            continue;
+        }
         debug!(volume = %volume.metadata.name, cluster, phase = phase.as_str(),
                "volume observed");
     }
@@ -483,49 +540,90 @@ async fn snapshots_of(
 /// A volume the cluster did not name. Only a DELETED one may conclude
 /// anything from that, and only from a list that is all of them: a volume
 /// this cloud created a moment ago is simply not down there yet.
-async fn finish_volume_delete(
+///
+/// `finish_delete` removes only the revision that was checked, never whatever the name
+/// names by the time of the delete. (R3-F02)
+pub(super) async fn finish_volume_delete(
     store: &EtcdStore,
     volume: &Volume,
     cluster: &str,
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if volume.metadata.deletion_timestamp.is_some()
-        && status.volumes_complete
-        && controller_api::mirror::is_current(
-            volume.metadata.deletion_timestamp,
-            volume.status.observed_at,
-            at,
-        )
-    {
-        store.delete::<Volume>(&volume.metadata.name).await?;
+    let concluded = |v: &Volume| volume_gone(v, cluster, status, at);
+    if controller_api::deletion::finish_delete(store, volume, concluded).await? {
         info!(volume = %volume.metadata.name, cluster, "volume deleted");
     }
     Ok(())
 }
 
-/// The same rule for a snapshot the cluster did not name.
-async fn finish_snapshot_delete(
+/// Whether a volume the listing placed at `cluster` is still there as this revision reads.
+///
+/// No `status.cluster` yet means not dispatched, so the pool placement stands; otherwise
+/// it must name exactly this cluster. (R3-F02, R3-F03)
+pub(super) fn still_at(volume: &Volume, cluster: &str) -> bool {
+    volume
+        .status
+        .cluster
+        .as_deref()
+        .is_none_or(|at_cluster| at_cluster == cluster)
+}
+
+/// Whether a complete report that does not name `volume` finishes its delete.
+///
+/// Pure, and asked of every revision `finish_delete` is about to remove. A volume that
+/// moved while its delete was pending is absent from the old cluster's list for another
+/// reason, so the record must still be at this cluster.
+pub(super) fn volume_gone(
+    volume: &Volume,
+    cluster: &str,
+    status: &ClusterStatus,
+    at: DateTime<Utc>,
+) -> bool {
+    volume.metadata.deletion_timestamp.is_some()
+        && status.volumes_complete
+        && still_at(volume, cluster)
+        && controller_api::mirror::is_current(
+            volume.metadata.deletion_timestamp,
+            volume.status.observed_at,
+            at,
+        )
+}
+
+/// The same rule for a snapshot the cluster did not name, deleting only the checked revision
+/// (R3-F02).
+pub(super) async fn finish_snapshot_delete(
     store: &EtcdStore,
     snapshot: &controller_api::VolumeSnapshot,
     cluster: &str,
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if snapshot.metadata.deletion_timestamp.is_some()
+    // The home was derived from the named volume, so a revision naming another volume is not
+    // the one the listing placed at this cluster.
+    let volume = snapshot.spec.volume.clone();
+    let concluded = |s: &controller_api::VolumeSnapshot| {
+        s.spec.volume == volume && snapshot_gone(s, status, at)
+    };
+    if controller_api::deletion::finish_delete(store, snapshot, concluded).await? {
+        info!(snapshot = %snapshot.metadata.name, cluster, "snapshot deleted");
+    }
+    Ok(())
+}
+
+/// Whether a complete report that does not name `snapshot` finishes its delete (pure).
+pub(super) fn snapshot_gone(
+    snapshot: &controller_api::VolumeSnapshot,
+    status: &ClusterStatus,
+    at: DateTime<Utc>,
+) -> bool {
+    snapshot.metadata.deletion_timestamp.is_some()
         && status.snapshots_complete
         && controller_api::mirror::is_current(
             snapshot.metadata.deletion_timestamp,
             snapshot.status.observed_at,
             at,
         )
-    {
-        store
-            .delete::<controller_api::VolumeSnapshot>(&snapshot.metadata.name)
-            .await?;
-        info!(snapshot = %snapshot.metadata.name, cluster, "snapshot deleted");
-    }
-    Ok(())
 }
 
 /// What a reported name amounts to. Empty is silence — a cluster that has not

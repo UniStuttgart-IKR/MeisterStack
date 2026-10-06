@@ -123,7 +123,6 @@ pub struct Applied {
     pub waiting: Option<ProviderWait>,
 }
 
-
 /// Provider handoff carried through the action error path without classifying
 /// it as a host failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,7 +182,6 @@ enum Stop {
     /// The plan reached the step this tool does not take.
     Provider(ProviderWait),
 }
-
 
 /// Inject fresh host observations independently of execution ordering.
 pub trait Look {
@@ -1382,7 +1380,6 @@ impl<'a> Executor<'a> {
         }
         Ok(evidence)
     }
-
 
     /// Check the local active certificate against this rotation's expected digest.
     /// Missing or unreadable local evidence means publication still needs checking.

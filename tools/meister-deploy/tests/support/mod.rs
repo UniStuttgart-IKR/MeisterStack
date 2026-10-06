@@ -154,7 +154,6 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     .expect("the fixture binds")
 }
 
-
 /// Add guest-tiny artifacts required by VM verification and recompute the release ID.
 pub fn with_guest_tiny(mut release: ReleaseManifest, store_path: &str) -> ReleaseManifest {
     release.packages.insert(
@@ -169,7 +168,6 @@ pub fn with_guest_tiny(mut release: ReleaseManifest, store_path: &str) -> Releas
             .expect("a release hashes");
     release
 }
-
 
 /// A release in which the named hosts got a new system.
 pub fn with_new_systems(
@@ -196,7 +194,6 @@ pub fn with_new_systems(
             .expect("a manifest hashes");
     release_of(fleet)
 }
-
 
 /// Give one host provider-loaded boot artifacts without a bootloader.
 pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {

@@ -161,12 +161,35 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Silence all local routers without destroying their namespaces, returning
-    /// the affected IDs. Used on shutdown to stop stale ARP and routing activity
+    /// Silence one router without destroying its namespace: it stops answering ARP and stops
+    /// claiming to be active, so it announces nothing. Used ahead of a demotion, before the rest
+    /// of the command is read, so a command this node refuses cannot leave the old router
+    /// answering (NL2-2). An absent router is silent already; the default builds no router and
+    /// has none to silence.
+    async fn silence_router(&self, _id: &RouterId) -> Result<()> {
+        Ok(())
+    }
+
+    /// Silence all local routers without destroying their namespaces. Used on
+    /// shutdown and by the dead man to stop stale ARP and routing activity
     /// before another gateway takes over. A later `EnsureRouter` can reactivate
-    /// the retained router. Best effort during shutdown.
-    async fn fall_silent(&self) -> Result<Vec<RouterId>> {
-        Ok(Vec::new())
+    /// the retained router. Best effort; the outcome names failed routers (R3-F06).
+    async fn fall_silent(&self) -> Result<Silencing> {
+        Ok(Silencing::default())
+    }
+}
+
+/// Per-router outcome of one silencing pass; lists, so a log names the router still answering.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Silencing {
+    pub silenced: Vec<RouterId>,
+    pub failed: Vec<RouterId>,
+}
+
+impl Silencing {
+    /// Every router this pass looked at is now silent; vacuously true when there was none.
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
     }
 }
 
@@ -301,7 +324,7 @@ pub enum RouterReason {
     NetnsGone,
     /// Namespace exists but a required link is absent; message identifies it.
     LegGone,
-    /// Host probing failed, leaving router state unknown rather than proving resource absence.
+    /// Host probing failed or a record will not parse (R3-F07); state unknown, not proven absent.
     DriverUnreachable,
 }
 
@@ -431,6 +454,17 @@ mod tests {
         assert!(
             NoGatewaySlot
                 .destroy_router(&RouterId::from_u128(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A driver that builds no router has none answering, so silencing one is done (NL2-2).
+    #[tokio::test]
+    async fn silencing_a_router_that_was_never_built_is_done_and_not_refused() {
+        assert!(
+            NoGatewaySlot
+                .silence_router(&RouterId::from_u128(1))
                 .await
                 .is_ok()
         );

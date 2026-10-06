@@ -628,3 +628,287 @@ async fn a_session_without_a_certificate_is_not_revoked_by_an_empty_serial() {
     assert!(reg.drop_revoked(&list).await.is_empty());
     assert!(rx.try_recv().is_err());
 }
+
+/// A complete volume list that names nothing, for the delete-finishing tests.
+fn empty_complete_inventory() -> ClusterStatus {
+    ClusterStatus {
+        volumes_complete: true,
+        snapshots_complete: true,
+        ..status(true, &[])
+    }
+}
+
+/// A volume that is being deleted and was last observed at `observed`.
+fn deleting_volume(name: &str, observed: chrono::DateTime<chrono::Utc>) -> controller_api::Volume {
+    let mut v = controller_api::resources::new_volume(name, Default::default());
+    v.metadata.deletion_timestamp = Some(observed);
+    v.status.observed_at = Some(observed);
+    v.status.cluster = Some("c1".into());
+    v
+}
+
+/// A delete finishes only for a revision still at this cluster, still deleted and not
+/// observed after the report. (R3-F02)
+#[test]
+fn a_delete_is_finished_only_by_a_report_that_is_about_this_revision() {
+    let t0 = chrono::Utc::now();
+    let at = t0 + chrono::Duration::seconds(5);
+    let report = empty_complete_inventory();
+    let v = deleting_volume("data", t0);
+    assert!(volume_gone(&v, "c1", &report, at));
+
+    let mut moved = v.clone();
+    moved.status.cluster = Some("c2".into());
+    assert!(!volume_gone(&moved, "c1", &report, at), "moved, not gone");
+
+    let mut alive = v.clone();
+    alive.metadata.deletion_timestamp = None;
+    assert!(!volume_gone(&alive, "c1", &report, at), "not being deleted");
+
+    let mut fresher = v.clone();
+    fresher.status.observed_at = Some(at + chrono::Duration::seconds(1));
+    assert!(
+        !volume_gone(&fresher, "c1", &report, at),
+        "observed after the report was taken"
+    );
+
+    let partial = ClusterStatus {
+        volumes_complete: false,
+        ..empty_complete_inventory()
+    };
+    assert!(!volume_gone(&v, "c1", &partial, at), "not all of them");
+}
+
+async fn delete_test_store() -> EtcdStore {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/finish-delete-test/{}", uuid::Uuid::new_v4());
+    EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to")
+}
+
+/// A volume recreated under the same name between listing and delete is not removed. (R3-F02)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_volume_recreated_under_the_same_name_survives_the_old_delete() {
+    let store = delete_test_store().await;
+    let t0 = chrono::Utc::now();
+    let listed = store
+        .create(&deleting_volume("data", t0))
+        .await
+        .expect("the old volume");
+    store
+        .delete::<controller_api::Volume>("data")
+        .await
+        .expect("the old volume goes");
+    let fresh = store
+        .create(&controller_api::resources::new_volume(
+            "data",
+            Default::default(),
+        ))
+        .await
+        .expect("a new volume under the same name");
+
+    let report = empty_complete_inventory();
+    finish_volume_delete(
+        &store,
+        &listed,
+        "c1",
+        &report,
+        t0 + chrono::Duration::seconds(5),
+    )
+    .await
+    .expect("finishing the delete");
+
+    let still: controller_api::Volume = store.get("data").await.expect("the new volume");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
+}
+
+/// A revision written after the listing is judged again; a write that keeps the verdict
+/// only costs a retry. (R3-F02)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_delete_after_a_concurrent_write_judges_the_fresh_revision() {
+    let store = delete_test_store().await;
+    let t0 = chrono::Utc::now();
+    let at = t0 + chrono::Duration::seconds(5);
+    let report = empty_complete_inventory();
+
+    let listed = store
+        .create(&deleting_volume("fresher", t0))
+        .await
+        .expect("a volume");
+    store
+        .mutate::<controller_api::Volume, _>("fresher", |v| {
+            v.status.observed_at = Some(at + chrono::Duration::seconds(1));
+        })
+        .await
+        .expect("a later observation");
+    finish_volume_delete(&store, &listed, "c1", &report, at)
+        .await
+        .expect("finishing the delete");
+    store
+        .get::<controller_api::Volume>("fresher")
+        .await
+        .expect("a fresher observation keeps it");
+
+    let listed = store
+        .create(&deleting_volume("touched", t0))
+        .await
+        .expect("a volume");
+    store
+        .mutate::<controller_api::Volume, _>("touched", |v| {
+            v.metadata.labels.insert("k".into(), "v".into());
+        })
+        .await
+        .expect("an unrelated write");
+    finish_volume_delete(&store, &listed, "c1", &report, at)
+        .await
+        .expect("finishing the delete");
+    assert!(matches!(
+        store.get::<controller_api::Volume>("touched").await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A snapshot recreated under the same name survives the old one's delete. (R3-F02)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_snapshot_recreated_under_the_same_name_survives_the_old_delete() {
+    let store = delete_test_store().await;
+    let t0 = chrono::Utc::now();
+    let spec = controller_api::VolumeSnapshotSpec {
+        volume: "data".into(),
+        ..Default::default()
+    };
+    let mut old = controller_api::resources::new_volume_snapshot("snap", spec.clone());
+    old.metadata.deletion_timestamp = Some(t0);
+    let listed = store.create(&old).await.expect("the old snapshot");
+    store
+        .delete::<controller_api::VolumeSnapshot>("snap")
+        .await
+        .expect("the old snapshot goes");
+    let fresh = store
+        .create(&controller_api::resources::new_volume_snapshot(
+            "snap", spec,
+        ))
+        .await
+        .expect("a new snapshot under the same name");
+
+    let report = empty_complete_inventory();
+    finish_snapshot_delete(
+        &store,
+        &listed,
+        "c1",
+        &report,
+        t0 + chrono::Duration::seconds(5),
+    )
+    .await
+    .expect("finishing the delete");
+    let still: controller_api::VolumeSnapshot = store.get("snap").await.expect("the new one");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
+}
+
+/// A vm bound to `cluster`, for the rebind tests below.
+fn bound_vm(name: &str, cluster: &str) -> Vm {
+    let mut v = controller_api::resources::new_vm(
+        name,
+        controller_api::VmSpec {
+            class: Default::default(),
+            cluster_selector: Default::default(),
+            node_selector: Default::default(),
+            anti_affinity: Vec::new(),
+            node_name: None,
+            cluster_name: Some(cluster.to_string()),
+            run_strategy: controller_api::RunStrategy::Stopped,
+            evacuation: Default::default(),
+            tenant: None,
+            vm: serde_json::json!({}),
+        },
+    );
+    v.metadata.uid = format!("u-{name}");
+    v
+}
+
+/// A report from the old cluster does not land on a rebound or recreated vm. (R3-F03)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_report_from_the_old_cluster_does_not_land_after_a_rebind_or_a_recreate() {
+    let store = delete_test_store().await;
+    let ours = |v: &Vm| v.spec.cluster_name.as_deref() == Some("c1");
+    let report = |uid: &str| ClusterStatus {
+        vms: vec![VmStatusReport {
+            id: uid.to_string(),
+            phase: "Failed".into(),
+            message: String::new(),
+            attached_volumes: Vec::new(),
+            node: String::new(),
+            volumes: Vec::new(),
+            reason: String::new(),
+            nics: Vec::new(),
+        }],
+        ..status(true, &[])
+    };
+
+    // Rebound: the listing says c1, the store says c2 by the time it lands.
+    let listed = vec![store.create(&bound_vm("web", "c1")).await.expect("the vm")];
+    store
+        .mutate::<Vm, _>("web", |v| v.spec.cluster_name = Some("c2".into()))
+        .await
+        .expect("rebound to c2");
+    ingest_phases(&store, "c1", &report("u-web"), &listed, ours, at(10)).await;
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert!(
+        after.status.reported.is_none(),
+        "c1's word must not land on a vm now bound to c2: {:?}",
+        after.status.reported
+    );
+
+    // Recreated: same name, same binding, another uid.
+    let listed = vec![store.create(&bound_vm("db", "c1")).await.expect("the vm")];
+    store.delete::<Vm>("db").await.expect("the old vm goes");
+    let mut fresh = bound_vm("db", "c1");
+    fresh.metadata.uid = "u-db-2".into();
+    store
+        .create(&fresh)
+        .await
+        .expect("a new vm under the same name");
+    ingest_phases(&store, "c1", &report("u-db"), &listed, ours, at(10)).await;
+    let after: Vm = store.get("db").await.expect("the new vm");
+    assert_eq!(after.metadata.uid, "u-db-2");
+    assert!(
+        after.status.reported.is_none(),
+        "a report about the old uid must not land on the new vm: {:?}",
+        after.status.reported
+    );
+}
+
+/// Node, disks and MAC lines from the old cluster do not land on a rebound vm. (R3-F03)
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_placement_from_the_old_cluster_does_not_land_after_a_rebind() {
+    let store = delete_test_store().await;
+    let ours = |v: &Vm| v.spec.cluster_name.as_deref() == Some("c1");
+    let listed = vec![store.create(&bound_vm("web", "c1")).await.expect("the vm")];
+    store
+        .mutate::<Vm, _>("web", |v| v.spec.cluster_name = Some("c2".into()))
+        .await
+        .expect("rebound to c2");
+    let report = ClusterStatus {
+        vms: vec![VmStatusReport {
+            id: "u-web".into(),
+            phase: "Running".into(),
+            message: String::new(),
+            attached_volumes: Vec::new(),
+            node: "old-node".into(),
+            volumes: Vec::new(),
+            reason: String::new(),
+            nics: Vec::new(),
+        }],
+        ..status(true, &[])
+    };
+    ingest_placements(&store, "c1", &report, &listed, ours).await;
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(after.status.node_name, None, "{:?}", after.status.node_name);
+}

@@ -9,11 +9,15 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Stdio;
 
 use agent_api::networking::NetworkError;
+use agent_api::subprocess::output_within;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
+
+/// How long one `vtysh` may run. Longer than `ip`'s deadline: applying a fragment of many
+/// prefixes makes bgpd work, and a timed-out apply is retried whole.
+const VTYSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One BGP peer.
 #[derive(Clone, Debug)]
@@ -136,17 +140,15 @@ impl Frr {
         }
     }
 
+    /// Run `vtysh`, bounded by [`VTYSH_DEADLINE`]: a wedged one would hold the announcement
+    /// lock and every later announcement behind it (R2-5).
     async fn vtysh(&self, args: &[&str]) -> anyhow::Result<String> {
         let mut cmd = tokio::process::Command::new(&self.cfg.vtysh);
         if let Some(dir) = &self.cfg.vty_socket {
             cmd.arg("--vty_socket").arg(dir);
         }
-        let out = cmd
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("running {}: {e}", self.cfg.vtysh.display()))?;
+        let what = format!("{} {}", self.cfg.vtysh.display(), args.join(" "));
+        let out = output_within(cmd.args(args), None, VTYSH_DEADLINE, &what).await?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() {
             anyhow::bail!(

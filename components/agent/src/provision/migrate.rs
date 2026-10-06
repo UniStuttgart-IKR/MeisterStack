@@ -248,18 +248,16 @@ impl Provisioner {
             }
             if started.elapsed() >= self.ceilings.migrate_out {
                 let _guard = ops.lock().await;
-                if let Ok(Some(mut record)) = self.store.get(id) {
-                    if record.operation.is_some()
-                        && record
-                            .migration
-                            .as_ref()
-                            .is_some_and(|m| m.id == migration_id && m.peer == peer)
-                    {
-                        record.migration.as_mut().unwrap().unknown =
-                            Some("send deadline elapsed; transfer outcome is unknown".into());
-                        if let Err(e) = self.store.put(id, &record) {
-                            error!(error = %e, "cannot record unknown outcome");
-                        }
+                if let Ok(Some(mut record)) = self.store.get(id)
+                    && record.operation.is_some()
+                    && let Some(attempt) = record.migration.as_mut()
+                    && attempt.id == migration_id
+                    && attempt.peer == peer
+                {
+                    attempt.unknown =
+                        Some("send deadline elapsed; transfer outcome is unknown".into());
+                    if let Err(e) = self.store.put(id, &record) {
+                        error!(error = %e, "cannot record unknown outcome");
                     }
                 }
                 return;

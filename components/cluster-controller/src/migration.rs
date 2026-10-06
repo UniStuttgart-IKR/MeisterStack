@@ -296,6 +296,7 @@ pub async fn reconcile_migrations(
     nodes: &Mutex<Vec<Candidate>>,
     timeouts: Timeouts,
     held: &[CapacityReservation],
+    vms: &[Vm],
     overcommit: Overcommit,
 ) -> anyhow::Result<()> {
     let migrations: Vec<VmMigration> = match store.list().await {
@@ -307,7 +308,7 @@ pub async fn reconcile_migrations(
     // orphaned promise is exactly the one whose migration is gone, so a
     // reaper that only ran when there were migrations could never reap the
     // last one.
-    reap_reservations(store, held, &migrations).await;
+    reap_reservations(store, held, &migrations, vms).await;
     if migrations.is_empty() {
         return Ok(());
     }
@@ -333,23 +334,27 @@ pub async fn reconcile_migrations(
     Ok(())
 }
 
-/// Remove reservations whose migration is terminal, deleted or absent.
-/// Compare the reservation revision when deleting so a reused name cannot lose
-/// a newer attempt's claim. Read migrations again after the pass's reservation
-/// snapshot so reservations created during this pass are not reaped from stale data.
+/// Remove reservations whose move is over: a migration's once terminal, deleted or absent;
+/// a placement's once its guest is bound, gone or deleting, or the claim is stale (R3-F05).
+/// Delete against the reservation revision so a reused name cannot lose a newer claim.
+/// Migrations are read again after the `held`/`vms` snapshot so claims created during
+/// this pass are not reaped from stale data. Reaping a placement early costs a retry, never
+/// room: its binding is written only while its claim stands.
 async fn reap_reservations(
     store: &EtcdStore,
     held: &[CapacityReservation],
     migrations: &[VmMigration],
+    vms: &[Vm],
 ) {
-    for orphan in controller_api::orphaned_reservations(held, migrations) {
+    for orphan in controller_api::orphaned_reservations(held, migrations, vms, Utc::now()) {
         let name = &orphan.metadata.name;
         match store
             .delete_if::<CapacityReservation>(name, &orphan.metadata.resource_version)
             .await
         {
             Ok(()) => info!(reservation = %name, node = %orphan.spec.node, vm = %orphan.spec.vm,
-                            "a reservation whose migration is over was given back"),
+                            claimant = ?orphan.spec.claimant,
+                            "a reservation whose move is over was given back"),
             Err(StoreError::NotFound(_)) => {}
             Err(e) => debug!(reservation = %name, error = %format!("{e:#}"),
                              "the reservation was not given back this pass"),
@@ -370,7 +375,7 @@ async fn reservations(store: &EtcdStore) -> anyhow::Result<Vec<CapacityReservati
 /// What `reserve` found at the key this migration writes its promise to.
 enum Reserved {
     /// This pass wrote it. Unique as a KEY, which is not yet the same as
-    /// fitting — see `confirm`.
+    /// fitting — see `claim_holds`.
     Fresh(CapacityReservation),
     /// A promise for this very migration was already standing: an earlier
     /// attempt of this record wrote it and the process died before the phase
@@ -452,25 +457,8 @@ async fn release(store: &EtcdStore, migration: &VmMigration) {
     }
 }
 
-/// Confirm capacity against reservations ordered by etcd revision.
-/// Different reservation keys can be created concurrently after the same usage
-/// check, so creation alone does not prove their total fits.
-/// `None` means the result could not be established; retain the reservation
-/// conservatively rather than interpreting unavailable evidence as rejection.
-async fn confirm(
-    store: &EtcdStore,
-    mine: &CapacityReservation,
-    overcommit: Overcommit,
-) -> Option<bool> {
-    let node: Node = store.get(&mine.spec.node).await.ok()?;
-    let vms: Vec<Vm> = store.list().await.ok()?;
-    let held = reservations(store).await.ok()?;
-    // The room BEFORE any promise, which is what the queue is measured
-    // against — read through the same function the candidate list is built
-    // with, so the two cannot drift apart.
-    let room = crate::reconcile::free_on(&mine.spec.node, &node.status.capacity, &vms, overcommit);
-    Some(controller_api::reservation_holds(room, mine, &held))
-}
+// The post-reservation fit check is `controller_api::capacity::claim_holds`, shared with
+// placement so both roads answer alike (R3-F05).
 
 /// One migration, one step.
 #[allow(clippy::too_many_arguments)]
@@ -515,18 +503,19 @@ async fn step(
         )
         .await;
     }
-    if migration.status.cancelling && !migration.status.phase().kind().is_final() {
-        if let Some(target) = &migration.status.target_node {
-            return abandon(
-                store,
-                dispatch,
-                &migration,
-                &vm,
-                target,
-                "migration cancelled".into(),
-            )
-            .await;
-        }
+    if migration.status.cancelling
+        && !migration.status.phase().kind().is_final()
+        && let Some(target) = &migration.status.target_node
+    {
+        return abandon(
+            store,
+            dispatch,
+            &migration,
+            &vm,
+            target,
+            "migration cancelled".into(),
+        )
+        .await;
     }
     match migration.status.phase().kind() {
         VmMigrationPhaseKind::Pending => {
@@ -708,21 +697,29 @@ async fn prepare(
         }
     };
 
-    // A unique KEY is not a sum. Two replicas writing two promises onto one
-    // node in the same millisecond both succeed, so the writer looks again
-    // and asks where in the queue it stands — see `confirm`, and
-    // `reservation_holds` for the order, which is etcd's own and therefore
-    // the same on every replica.
-    if confirm(store, &mine, overcommit).await == Some(false) {
-        return fail(
-            store,
-            migration,
-            format!(
-                "another migration promised the last of {target}'s room first; this record \
-                 ends here and the move can be asked for again"
-            ),
-        )
-        .await;
+    // A unique key is not a sum: concurrent creates on one node both succeed, so confirm
+    // the claim's place in etcd's revision order, placement claims included (R3-F05).
+    match controller_api::capacity::claim_holds(store, &mine, overcommit).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                store,
+                migration,
+                format!(
+                    "another claim took the last of {target}'s room first; this record \
+                     ends here and the move can be asked for again"
+                ),
+            )
+            .await;
+        }
+        // A failed read is not a passed check (R3-F04): end the step before any dispatch.
+        // The reservation stands (the node looks fuller) until the next pass adopts it.
+        Err(e) => {
+            return Err(e.context(format!(
+                "migration {name}: the room at {target} could not be confirmed; \
+                 nothing was prepared and the next pass asks again"
+            )));
+        }
     }
 
     // The claim before the command, exactly as every other dispatch in this
@@ -2173,10 +2170,13 @@ mod tests {
             rs.into_iter().map(|r| r.metadata.name.clone()).collect()
         };
 
+        let now = Utc::now();
         assert!(
             controller_api::orphaned_reservations(
                 std::slice::from_ref(&held),
-                std::slice::from_ref(&live)
+                std::slice::from_ref(&live),
+                &[],
+                now
             )
             .is_empty(),
             "a move that is still being carried keeps its room"
@@ -2200,7 +2200,9 @@ mod tests {
             assert_eq!(
                 name_of(controller_api::orphaned_reservations(
                     std::slice::from_ref(&held),
-                    std::slice::from_ref(&over)
+                    std::slice::from_ref(&over),
+                    &[],
+                    now
                 )),
                 vec![held.metadata.name.clone()],
                 "{phase:?}"
@@ -2211,7 +2213,9 @@ mod tests {
         assert_eq!(
             name_of(controller_api::orphaned_reservations(
                 std::slice::from_ref(&held),
-                std::slice::from_ref(&removed)
+                std::slice::from_ref(&removed),
+                &[],
+                now
             )),
             vec![held.metadata.name.clone()],
             "a record on its way out carries nothing"
@@ -2219,7 +2223,9 @@ mod tests {
         assert_eq!(
             name_of(controller_api::orphaned_reservations(
                 std::slice::from_ref(&held),
-                &[]
+                &[],
+                &[],
+                now
             )),
             vec![held.metadata.name.clone()],
             "and a record that is gone carries nothing either"
@@ -2231,34 +2237,20 @@ mod tests {
         assert_eq!(
             name_of(controller_api::orphaned_reservations(
                 std::slice::from_ref(&held),
-                std::slice::from_ref(&again)
+                std::slice::from_ref(&again),
+                &[],
+                now
             )),
             vec![held.metadata.name.clone()],
             "a later record of the same name is not this promise's migration"
         );
     }
 
-    /// An etcd of one's own, the way `reconcile::tests` takes one.
-    ///
-    /// `#[ignore]`: it needs an etcd. Start one and name it:
-    ///
-    /// ```text
-    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
-    ///   cargo test -p meister-cluster-controller -- --ignored reservation
-    /// ```
-    async fn test_store() -> EtcdStore {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-        let prefix = format!("/migration-reservation-test/{}", uuid::Uuid::new_v4());
-        EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to; see the function's note")
-    }
-
     #[tokio::test]
-    #[ignore = "needs an existing etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn timeout_retains_reservation_and_accepts_late_completion_reports() {
-        let store = std::sync::Arc::new(test_store().await);
+        let store =
+            std::sync::Arc::new(crate::test_etcd::fresh_store("migration-reservation-test").await);
         let guest = store.create(&vm("late-guest")).await.unwrap();
         let mut moving = migration("late-guest", VmMigrationPhaseKind::Running);
         moving.status.migration_id = Some(moving.metadata.uid.clone());
@@ -2297,7 +2289,15 @@ mod tests {
         assert!(!unknown.status.phase().kind().is_final());
         assert!(unknown.status.finished_at.is_none());
         let _: CapacityReservation = store.get(&promise.metadata.name).await.unwrap();
-        assert!(controller_api::orphaned_reservations(&[promise], &[unknown]).is_empty());
+        assert!(
+            controller_api::orphaned_reservations(
+                &[promise],
+                &[unknown],
+                std::slice::from_ref(&guest),
+                Utc::now()
+            )
+            .is_empty()
+        );
         for (node, outcome) in [("source", "Gone"), ("target", "Arrived")] {
             ingest_reports(
                 &store,
@@ -2323,12 +2323,81 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A confirmation that cannot be read ends the step before anything moves: the record
+    /// stays Pending, never Preparing, and no node is told anything. (R3-F04, R2-4)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_prepare_whose_room_cannot_be_confirmed_dispatches_nothing() {
+        let store =
+            std::sync::Arc::new(crate::test_etcd::fresh_store("migration-reservation-test").await);
+        let mut guest = vm("web-1");
+        guest.status.reported = Some(controller_api::VmReported::by(
+            "agent-1",
+            VmPhaseKind::Running,
+            controller_api::VmReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        guest.settle(Utc::now());
+        let guest = store.create(&guest).await.expect("the running guest");
+        let moving = store
+            .create(&migration("web-1", VmMigrationPhaseKind::Pending))
+            .await
+            .expect("the record");
+        // Both ends speak the attempt protocol; the destination has no Node object, so the
+        // confirmation's reading of it fails.
+        let speaking = |name: &str| {
+            let mut candidate = node(name);
+            candidate
+                .catalogue
+                .push(common::migration::ATTEMPT_PROTOCOL.to_string());
+            candidate
+        };
+        let nodes = Mutex::new(vec![speaking("agent-1"), speaking("agent-2")]);
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.attach("agent-1", &tx);
+        registry.attach("agent-2", &tx);
+        let dispatch = Dispatch::new(
+            registry,
+            store.clone(),
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        );
+
+        let outcome = prepare(
+            &store,
+            &dispatch,
+            &FirstFit,
+            &nodes,
+            &[],
+            Overcommit::default(),
+            &moving,
+            &guest,
+        )
+        .await;
+
+        let why = format!(
+            "{:#}",
+            outcome.expect_err("an unread room is not a confirmed one")
+        );
+        assert!(why.contains("could not be confirmed"), "{why}");
+        let still: VmMigration = store.get(&moving.metadata.name).await.expect("the record");
+        assert_eq!(still.status.phase().kind(), VmMigrationPhaseKind::Pending);
+        assert!(rx.try_recv().is_err(), "nothing was dispatched");
+    }
+
     /// The room goes back when the move ends — through `fail`, which is the
     /// one funnel every failure in this file reaches, `abandon` included.
     #[tokio::test]
-    #[ignore = "needs an etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_failed_migration_gives_its_room_back() {
-        let store = test_store().await;
+        let store = crate::test_etcd::fresh_store("migration-reservation-test").await;
         let guest = store
             .create(&whole_machine("web-1"))
             .await
@@ -2367,9 +2436,9 @@ mod tests {
     /// the migration's last phase: one sweep per pass, and a promise nobody
     /// is coming for is given back.
     #[tokio::test]
-    #[ignore = "needs an etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn the_reaper_takes_a_reservation_whose_migration_is_over() {
-        let store = test_store().await;
+        let store = crate::test_etcd::fresh_store("migration-reservation-test").await;
         let guest = store
             .create(&whole_machine("web-1"))
             .await
@@ -2392,20 +2461,28 @@ mod tests {
             .await
             .expect("the orphan");
 
+        // And a placement's claim for a bound guest: the leftover of a crash between
+        // binding and release (R3-F05).
+        store
+            .create(&CapacityReservation::for_placement(&guest, "agent-2"))
+            .await
+            .expect("the bound guest's leftover claim");
+
         let held: Vec<CapacityReservation> = store.list().await.expect("the listing");
-        assert_eq!(held.len(), 2);
+        assert_eq!(held.len(), 3);
         let migrations: Vec<VmMigration> = store.list().await.expect("the records");
-        reap_reservations(&store, &held, &migrations).await;
+        let vms: Vec<Vm> = store.list().await.expect("the guests");
+        reap_reservations(&store, &held, &migrations, &vms).await;
 
         let left: Vec<CapacityReservation> = store.list().await.expect("the listing");
         assert_eq!(
             left.iter().map(|r| &r.spec.migration).collect::<Vec<_>>(),
             vec![&live.metadata.name],
-            "the orphan went and the live one stayed"
+            "the orphans went and the live one stayed"
         );
 
         // And it is idempotent: a second pass finds nothing to take.
-        reap_reservations(&store, &left, &migrations).await;
+        reap_reservations(&store, &left, &migrations, &vms).await;
         let after: Vec<CapacityReservation> = store.list().await.expect("the listing");
         assert_eq!(after.len(), 1);
     }

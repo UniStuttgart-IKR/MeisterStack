@@ -192,8 +192,11 @@ resources! {
     };
     /// Room held on a node for a guest a live migration is moving there, for
     /// the length of the window in which nothing else can see it coming. See
-    /// `CapacityReservationSpec`.
-    CapacityReservation => "capacityreservations", "CapacityReservation";
+    /// `CapacityReservationSpec`. Dotted, because a placement's claim carries a
+    /// `.` that no migration name (a DNS label) can: the two roads share this
+    /// directory and never a key (R2-3).
+    CapacityReservation => "capacityreservations", "CapacityReservation",
+        crate::object::NameShape::Dotted;
     /// One credential, for one URL, for thirty seconds — and the second
     /// resource that expires by itself. Served by nobody: a client that could
     /// list these could read every other client's outstanding credential. See

@@ -362,9 +362,7 @@ pub(super) async fn requeue_snapshot(
 pub(super) async fn drop_snapshot(p: &Pass<'_>, snapshot: &VolumeSnapshot) -> anyhow::Result<()> {
     let name = snapshot.metadata.name.clone();
     let Some(node) = snapshot.status.node.clone() else {
-        p.store.delete::<VolumeSnapshot>(&name).await?;
-        info!(snapshot = %name, "snapshot deleted; no node ever had it");
-        return Ok(());
+        return drop_unplaced_snapshot(p, snapshot).await;
     };
     let reachable = {
         let nodes = p.nodes.lock().unwrap();
@@ -383,6 +381,21 @@ pub(super) async fn drop_snapshot(p: &Pass<'_>, snapshot: &VolumeSnapshot) -> an
             }),
         )
         .await?;
+    Ok(())
+}
+
+/// Delete a snapshot no node ever had, on the revision that was judged (R2-2, R3-F02): a
+/// snapshot recreated under the same name, or one placed on a node in between, survives.
+async fn drop_unplaced_snapshot(p: &Pass<'_>, snapshot: &VolumeSnapshot) -> anyhow::Result<()> {
+    let unplaced =
+        |s: &VolumeSnapshot| s.metadata.deletion_timestamp.is_some() && s.status.node.is_none();
+    let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+    let name = &snapshot.metadata.name;
+    match deletion::release_and_delete(p.store, snapshot, finalizer, unplaced).await? {
+        true => info!(snapshot = %name, "snapshot deleted; no node ever had it"),
+        false => debug!(snapshot = %name, "the snapshot moved on since it was listed; the next \
+                                            pass decides"),
+    }
     Ok(())
 }
 

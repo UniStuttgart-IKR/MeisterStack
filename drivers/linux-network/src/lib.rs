@@ -48,6 +48,12 @@ pub const DEFAULT_VXLAN_MTU: u32 = 1500 - VXLAN_OVERHEAD;
 /// for `lvs`.
 pub const DEFAULT_NFT: &str = "nft";
 
+/// How long an external command (`ip`, `nft`, `arping`) may run before it is killed (R3-F08).
+///
+/// Generous for commands that take milliseconds, but short enough that a wedged one costs one
+/// retried command instead of stalling the agent's serial command pump.
+pub(crate) const COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How this node reaches other VXLAN endpoints.
 #[derive(Clone, Debug)]
 pub struct VxlanConfig {
@@ -655,12 +661,20 @@ impl BridgeDriver for LinuxNetworkDriver {
         }
     }
 
-    async fn fall_silent(&self) -> networking::Result<Vec<networking::RouterId>> {
+    async fn silence_router(&self, id: &RouterId) -> networking::Result<()> {
+        // A node with no gateway slot never built a router, so none of them answers here.
+        match self.gateway.is_some() {
+            true => self.silence_router_impl(id).await,
+            false => Ok(()),
+        }
+    }
+
+    async fn fall_silent(&self) -> networking::Result<networking::Silencing> {
         // A node with no gateway slot holds no router and has nothing to stop
-        // saying — the same answer `sweep_routers` gives one line up.
+        // saying — the same answer `sweep_routers` gives.
         match self.gateway.is_some() {
             true => self.fall_silent_impl().await,
-            false => Ok(Vec::new()),
+            false => Ok(networking::Silencing::default()),
         }
     }
 }

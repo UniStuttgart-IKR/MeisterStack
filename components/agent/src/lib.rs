@@ -566,7 +566,10 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
 
     // One cache per agent, over the configured image directory: what it puts
     // there is exactly what the volume drivers look up.
-    let images = Arc::new(crate::images::Cache::new(cfg.paths.image_dir.clone()));
+    // The operator's egress policy applies; empty `[images] allowed_sources` fetches nowhere.
+    let images = Arc::new(
+        crate::images::Cache::new(cfg.paths.image_dir.clone()).with_egress(cfg.egress_policy()?),
+    );
     let provisioner = Arc::new(
         Provisioner::new(
             store.clone(),
@@ -836,7 +839,13 @@ async fn dial_forever(
         if let Some(wait) = wait {
             warn!(?wait, endpoints = of, "no controller answered, waiting");
         }
-        wait_out_the_backoff(agent, last_up, &mut silenced, wait.unwrap_or_default()).await;
+        wait_out_the_backoff(
+            agent.reconciler.drivers().bridge.as_deref(),
+            last_up,
+            &mut silenced,
+            wait.unwrap_or_default(),
+        )
+        .await;
     }
 }
 
@@ -846,28 +855,30 @@ fn should_fall_silent(last_seen: Instant, now: Instant, threshold: Duration) -> 
 }
 
 /// Wake at the earlier of redial backoff expiry or router-silencing deadline.
-/// Attempt silencing once per outage; a new established session resets the flag.
+/// Set `silenced` only after a complete pass (a new session resets it); a partial pass is
+/// retried once per backoff round, never in a busy loop (R3-F06).
 async fn wait_out_the_backoff(
-    agent: &Arc<Agent>,
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
     last_up: Instant,
     silenced: &mut bool,
     wait: Duration,
 ) {
     let until = Instant::now() + wait;
+    let mut tried_this_round = false;
     loop {
         let now = Instant::now();
-        if !*silenced && should_fall_silent(last_up, now, ROUTER_DEAD_MAN) {
+        if !*silenced && !tried_this_round && should_fall_silent(last_up, now, ROUTER_DEAD_MAN) {
             warn!(deadline = ?ROUTER_DEAD_MAN,
                   "no controller has answered for longer than the dead man's deadline; this \
                    node stops answering for its routers' addresses before the cluster can give \
                    them to a standby");
-            stop_speaking_for_every_router(agent).await;
-            *silenced = true;
+            tried_this_round = true;
+            *silenced = stop_speaking_for_every_router(bridge).await;
         }
         if now >= until {
             return;
         }
-        let next = match *silenced {
+        let next = match *silenced || tried_this_round {
             true => until,
             false => until.min(last_up + ROUTER_DEAD_MAN),
         };
@@ -893,22 +904,42 @@ async fn say_goodbye(agent: &Arc<Agent>) {
         );
     }
     // VMM transfers survive agent shutdown; shutdown does not authorize cleanup.
-    stop_speaking_for_every_router(agent).await;
+    // One-shot farewell: there is no next round to retry on, so the result is only logged.
+    let _ = stop_speaking_for_every_router(agent.reconciler.drivers().bridge.as_deref()).await;
 }
 
 /// Attempt to silence routers without destroying their namespaces. Called
-/// after the stopping report wait and after controller-session loss. Driver
-/// failure is logged; the ordering does not guarantee silence before promotion.
-async fn stop_speaking_for_every_router(agent: &Agent) {
-    let Some(bridge) = agent.reconciler.drivers().bridge.as_ref() else {
-        return;
+/// after the stopping report wait and after controller-session loss. Takes the
+/// bridge, not the agent, so a fake driver can test it.
+/// True only when every router namespace on this node is verifiably silent, whatever its record
+/// says (no bridge counts as silent); a driver error or partial `Silencing` is false so the
+/// caller retries (R3-F06, R2-1).
+async fn stop_speaking_for_every_router(
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
+) -> bool {
+    let Some(bridge) = bridge else {
+        return true;
     };
     match bridge.fall_silent().await {
-        Ok(silenced) if silenced.is_empty() => {}
-        Ok(silenced) => info!(?silenced, "this node's routers fell silent on the way out"),
-        Err(e) => warn!(error = %format!("{e:#}"),
-                        "this node's routers could not be silenced; it may still answer for \
-                         addresses its cluster has moved"),
+        Ok(outcome) if outcome.complete() => {
+            if !outcome.silenced.is_empty() {
+                info!(silenced = ?outcome.silenced, "this node's routers fell silent on the way out");
+            }
+            true
+        }
+        Ok(outcome) => {
+            warn!(silenced = ?outcome.silenced, failed = ?outcome.failed,
+                  "this node's routers could only be PARTIALLY silenced; the ones that failed \
+                   may still answer for addresses its cluster has moved, and are retried on the \
+                   next backoff round");
+            false
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"),
+                  "this node's routers could not be silenced; it may still answer for \
+                   addresses its cluster has moved, and are retried on the next backoff round");
+            false
+        }
     }
 }
 
@@ -1226,6 +1257,149 @@ mod tests {
              this end one keepalive interval plus its timeout, and the \
              controller's own clock started when the wire did"
         );
+    }
+
+    /// Bridge whose `fall_silent` answers a scripted sequence and counts calls (R3-F06).
+    #[derive(Default)]
+    struct ScriptedBridge {
+        answers: Mutex<
+            std::collections::VecDeque<
+                agent_api::networking::Result<agent_api::networking::Silencing>,
+            >,
+        >,
+        calls: Mutex<u32>,
+    }
+
+    impl ScriptedBridge {
+        fn new(
+            answers: Vec<agent_api::networking::Result<agent_api::networking::Silencing>>,
+        ) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::networking::BridgeDriver for ScriptedBridge {
+        async fn ensure(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn ensure_address(
+            &self,
+            _name: &str,
+            _addr: std::net::IpAddr,
+            _prefix_len: u8,
+        ) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn destroy(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn fall_silent(
+            &self,
+        ) -> agent_api::networking::Result<agent_api::networking::Silencing> {
+            *self.calls.lock().unwrap() += 1;
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the test scripted one answer per expected call")
+        }
+    }
+
+    fn router(n: u128) -> agent_api::networking::RouterId {
+        agent_api::networking::RouterId::from_u128(n)
+    }
+
+    /// A partial silencing pass must not be reported as complete (R3-F06).
+    #[tokio::test]
+    async fn a_router_that_failed_to_fall_silent_is_reported_as_partial_not_complete() {
+        let a = router(1);
+        let b = router(2);
+        let bridge = ScriptedBridge::new(vec![
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a],
+                failed: vec![b],
+            }),
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a, b],
+                failed: Vec::new(),
+            }),
+        ]);
+
+        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        assert!(
+            !complete,
+            "one router still answering is not a completed farewell"
+        );
+
+        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        assert!(complete, "the retry reached every router");
+        assert_eq!(*bridge.calls.lock().unwrap(), 2);
+    }
+
+    /// A driver error is as incomplete as a partial `Silencing` (R3-F06).
+    #[tokio::test]
+    async fn a_total_driver_failure_falling_silent_is_reported_as_incomplete() {
+        let bridge = ScriptedBridge::new(vec![Err(agent_api::networking::NetworkError::Backend(
+            anyhow!("the netns directory could not be read"),
+        ))]);
+        assert!(!stop_speaking_for_every_router(Some(&bridge)).await);
+    }
+
+    /// A node without a bridge driver has nothing to silence (R3-F06).
+    #[tokio::test]
+    async fn a_node_with_no_bridge_driver_has_nothing_to_silence() {
+        assert!(stop_speaking_for_every_router(None).await);
+    }
+
+    /// One silencing attempt per backoff round; a failed round is retried on the next (R3-F06).
+    #[tokio::test]
+    async fn a_failed_round_is_retried_on_the_next_backoff_round_and_not_inside_one() {
+        let a = router(1);
+        let b = router(2);
+        let bridge = ScriptedBridge::new(vec![
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a],
+                failed: vec![b],
+            }),
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a, b],
+                failed: Vec::new(),
+            }),
+        ]);
+        // Start past the dead-man deadline so the first iteration falls silent.
+        let last_up = Instant::now() - ROUTER_DEAD_MAN - Duration::from_millis(1);
+        let mut silenced = false;
+
+        wait_out_the_backoff(
+            Some(&bridge),
+            last_up,
+            &mut silenced,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            !silenced,
+            "a partial silencing must not be reported as complete"
+        );
+        assert_eq!(
+            *bridge.calls.lock().unwrap(),
+            1,
+            "one attempt per backoff round, not a busy retry for the rest of it"
+        );
+
+        wait_out_the_backoff(
+            Some(&bridge),
+            last_up,
+            &mut silenced,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(silenced, "the retry on the next round reached every router");
+        assert_eq!(*bridge.calls.lock().unwrap(), 2);
     }
 
     /// Router phase spellings must match the wire constants.

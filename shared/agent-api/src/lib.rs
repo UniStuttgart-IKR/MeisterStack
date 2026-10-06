@@ -12,6 +12,8 @@ pub mod resource_limits;
 /// The create document, shared with both controllers. See the module.
 pub mod spec;
 pub mod storage;
+/// Child processes with a deadline and a bounded reap. See the module.
+pub mod subprocess;
 pub mod types;
 pub mod vmm_user;
 

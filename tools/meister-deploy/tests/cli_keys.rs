@@ -762,7 +762,6 @@ fn a_host_that_was_never_resolved_is_read_out_of_the_inventory() {
     );
 }
 
-
 /// The refusals of `keys revoke` come before the CA is touched at all, and
 /// the log is what proves it: nothing ran.
 #[test]
@@ -972,7 +971,6 @@ fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
         "it says which of the two reasons it is: {said}"
     );
 }
-
 
 /// A fleet of one host, so that `retire` has nobody left to hand the list to
 /// and the test is about the operator's side alone.

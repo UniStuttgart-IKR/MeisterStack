@@ -223,8 +223,38 @@ impl EtcdStore {
         )
         .await?;
         observe_revision(resp.header());
-        let mut out = Vec::with_capacity(resp.kvs().len());
-        for kv in resp.kvs() {
+        Ok((Self::decode_range(resp.kvs()), resp.kvs().len()))
+    }
+
+    /// Two listings at one etcd revision, in one transaction. Separate lists can straddle a
+    /// bind-then-release and count a guest nowhere; capacity checks need one view (R3-F05).
+    pub async fn list2<A: Resource, B: Resource>(&self) -> Result<(Vec<A>, Vec<B>)> {
+        let txn = Txn::new().and_then(vec![
+            TxnOp::get(self.dir(A::RESOURCE), Some(GetOptions::new().with_prefix())),
+            TxnOp::get(self.dir(B::RESOURCE), Some(GetOptions::new().with_prefix())),
+        ]);
+        let resp = timed("list2", self.handle().txn(txn)).await?;
+        observe_revision(resp.header());
+        let mut ranges = resp.op_responses().into_iter().filter_map(|op| match op {
+            etcd_client::TxnOpResponse::Get(r) => Some(r),
+            _ => None,
+        });
+        // A missing range means the store did not answer, not an empty directory;
+        // treating it as empty would overfill a node.
+        let (Some(a), Some(b)) = (ranges.next(), ranges.next()) else {
+            return Err(StoreError::Invalid(format!(
+                "etcd answered a read of {} and {} with fewer than two ranges",
+                A::RESOURCE,
+                B::RESOURCE
+            )));
+        };
+        Ok((Self::decode_range(a.kvs()), Self::decode_range(b.kvs())))
+    }
+
+    /// Decode every object in a range, skipping undecodable ones.
+    fn decode_range<T: Resource>(kvs: &[etcd_client::KeyValue]) -> Vec<T> {
+        let mut out = Vec::with_capacity(kvs.len());
+        for kv in kvs {
             match Self::decode(kv.value(), kv.mod_revision()) {
                 Ok(obj) => out.push(obj),
                 // Error, not warn: an object the store cannot decode stays
@@ -234,7 +264,7 @@ impl EtcdStore {
                                  error = format!("{e:#}"), "skipping undecodable object"),
             }
         }
-        Ok((out, resp.kvs().len()))
+        out
     }
 
     /// Store a heartbeat under `<prefix>/leases/<resource>/<name>` without
@@ -311,8 +341,9 @@ impl EtcdStore {
     const MAX_NAME: usize = 63;
 
     /// Validate a bounded ASCII DNS-label name used in keys and downstream paths.
-    /// `NameShape::Dotted` additionally allows internal dots for image names and
-    /// addresses. Neither shape allows traversal, uppercase or whitespace.
+    /// `NameShape::Dotted` additionally allows internal dots, for the resources
+    /// that opt into it (see [`NameShape`]). Neither shape allows traversal,
+    /// uppercase or whitespace.
     fn check_name(name: &str, shape: NameShape) -> Result<()> {
         let invalid = |why: &str| {
             Err(StoreError::Invalid(format!(
@@ -477,6 +508,70 @@ impl EtcdStore {
                 "resource version conflict on {resource}/{name} (concurrent write)",
                 resource = T::RESOURCE
             )));
+        }
+        self.written(&name, &value, &resp).await
+    }
+
+    /// `update`, but only while `guard` still stands at the revision the caller read, in one
+    /// transaction (R3-F05). A placement binds under its capacity claim, so a claim reaped or
+    /// released after confirmation cannot become a binding. The guard is not rewritten, so its
+    /// own guarded release still matches. The conflict says whether object or guard moved.
+    pub async fn update_if_standing<T: Resource, G: Resource>(
+        &self,
+        obj: &T,
+        guard: &G,
+    ) -> Result<T> {
+        let name = obj.metadata().name.clone();
+        Self::check_name(&name, T::NAME_SHAPE)?;
+        let rev: i64 = obj.metadata().resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid object: metadata.resourceVersion must be set for updates".into(),
+            )
+        })?;
+        let guard_name = guard.metadata().name.clone();
+        let guard_rev: i64 = guard.metadata().resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid guard: metadata.resourceVersion must be set for a guarded update".into(),
+            )
+        })?;
+        let key = self.key(T::RESOURCE, &name);
+        let guard_key = self.key(G::RESOURCE, &guard_name);
+        let value = Self::encode(obj, chrono::Utc::now())?;
+        let txn = Txn::new()
+            .when(vec![
+                Compare::mod_revision(key.clone(), CompareOp::Equal, rev),
+                Compare::mod_revision(guard_key.clone(), CompareOp::Equal, guard_rev),
+            ])
+            // Same put as `update`, including the lease handling.
+            .and_then(vec![TxnOp::put(
+                key.clone(),
+                value.clone(),
+                Some(PutOptions::new().with_ignore_lease()),
+            )])
+            // On failure, read the guard back to tell which compare failed.
+            .or_else(vec![TxnOp::get(guard_key.clone(), None)]);
+        let resp = timed("update", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            let guard_stands = resp.op_responses().into_iter().any(|op| match op {
+                etcd_client::TxnOpResponse::Get(r) => r
+                    .kvs()
+                    .first()
+                    .is_some_and(|kv| kv.mod_revision() == guard_rev),
+                _ => false,
+            });
+            return Err(StoreError::Conflict(if guard_stands {
+                format!(
+                    "resource version conflict on {resource}/{name} (concurrent write)",
+                    resource = T::RESOURCE
+                )
+            } else {
+                format!(
+                    "{guard}/{guard_name} no longer stands as it was read; \
+                     {resource}/{name} was not written",
+                    guard = G::RESOURCE,
+                    resource = T::RESOURCE
+                )
+            }));
         }
         self.written(&name, &value, &resp).await
     }
@@ -919,6 +1014,34 @@ mod tests {
         assert_eq!(
             <crate::resources::Node as Resource>::NAME_SHAPE,
             NameShape::DnsLabel
+        );
+    }
+
+    /// The key a placement claims is one the store takes for a reservation and refuses for a
+    /// migration, so no migration's name can ever be a placement's claim (R2-3).
+    #[test]
+    fn no_migration_can_be_named_like_a_placement_claim() {
+        let vm = crate::resources::new_vm(
+            "web-1",
+            serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap(),
+        );
+        let claim = crate::resources::CapacityReservation::for_placement(&vm, "agent-1");
+        let name = &claim.metadata.name;
+        assert!(
+            EtcdStore::check_name(
+                name,
+                <crate::resources::CapacityReservation as Resource>::NAME_SHAPE
+            )
+            .is_ok(),
+            "{name:?} is stored as a reservation"
+        );
+        assert!(
+            EtcdStore::check_name(
+                name,
+                <crate::resources::VmMigration as Resource>::NAME_SHAPE
+            )
+            .is_err(),
+            "{name:?} is refused as a migration name"
         );
     }
 

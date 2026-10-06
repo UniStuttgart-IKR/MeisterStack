@@ -225,7 +225,6 @@ enum Verb {
     },
 }
 
-
 #[derive(Subcommand)]
 enum KeysCmd {
     /// Enroll an SSH key after matching a fingerprint verified through the host console
@@ -497,7 +496,6 @@ struct LookArgs {
     json: bool,
 }
 
-
 #[derive(Args)]
 struct VerifyArgs {
     /// The release to verify, from `build`
@@ -586,7 +584,6 @@ struct VerifyArgs {
     #[arg(long)]
     json: bool,
 }
-
 
 #[derive(Args)]
 struct BuildArgs {
@@ -1283,7 +1280,6 @@ fn look(args: &LookArgs) -> Result<Looked> {
     })
 }
 
-
 /// How long one service endpoint has to answer.
 const SERVICE_DEADLINE_SECS: u64 = 5;
 
@@ -1354,7 +1350,6 @@ fn service_checks(
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
-
 
 fn status(args: &LookArgs) -> Result<Answer> {
     let looked = look(args)?;
@@ -1665,7 +1660,6 @@ fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
 
-
 /// Normalize Nix options; reject conflicting values for the same setting.
 fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -1688,8 +1682,6 @@ fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, Str
     }
     Ok(out)
 }
-
-
 
 /// Build, measure and root a media derivation already bound into the release.
 fn image(args: &ImageArgs) -> Result<bool> {
@@ -1940,7 +1932,6 @@ fn install(args: &InstallArgs) -> Result<Answer> {
     Ok(Answer::Yes)
 }
 
-
 /// Resolve the inventory's signing-key reference; missing configuration is
 /// left for build validation to diagnose.
 fn signing_key(
@@ -1985,7 +1976,6 @@ fn signing_key(
         None => (None, None),
     }
 }
-
 
 /// Compute retention decisions before removing local roots and evidence.
 /// Dry-run prints the same decisions without applying them.
@@ -2054,7 +2044,6 @@ fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> 
     );
     Ok(true)
 }
-
 
 fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if args.offline && args.out.is_some() {
@@ -3121,7 +3110,6 @@ fn verify_approval(given: &[String]) -> Result<Option<String>> {
     Ok(found)
 }
 
-
 // ---------------------------------------------------------------------------
 // lane 3B: keys
 // ---------------------------------------------------------------------------
@@ -3277,7 +3265,6 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
         }),
     }
 }
-
 
 /// Everything `keys import` was told.
 struct KeysImportArgs<'a> {
@@ -3529,8 +3516,6 @@ fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
     Ok(Answer::Yes)
 }
 
-
-
 /// Everything `retire` was told.
 struct RetireArgs<'a> {
     host: &'a str,
@@ -3731,7 +3716,6 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     );
     Ok(answer)
 }
-
 
 /// The manifest, read through the same parser `validate --manifest` uses.
 fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFleet> {
@@ -4176,8 +4160,6 @@ fn keys_enroll(
     );
     Ok(true)
 }
-
-
 
 /// Arguments for revocation and CRL delivery planning.
 struct KeysRevokeArgs<'a> {

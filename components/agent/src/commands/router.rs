@@ -50,11 +50,48 @@ pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> 
     })
 }
 
+/// Read a router command, silencing a demotion before anything in it can be refused (NL2-2).
+///
+/// Everything else in the command can be refused (a NAT kind from a newer controller, a
+/// provider network this node no longer serves), and a refused demotion would leave the old
+/// namespace answering ARP for an address the controller has made active on another node. The
+/// driver's own pass silences a demotion again as its first step.
+async fn read_after_demotion(
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
+    r: proto::EnsureRouter,
+) -> anyhow::Result<RouterSpec> {
+    if !r.active {
+        silence_demoted(bridge, &r.id).await?;
+    }
+    router_spec(r)
+}
+
+/// Silence the router a demotion names, by its id alone. Only an id that does not parse names
+/// no namespace. A node without a bridge driver built none.
+async fn silence_demoted(
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
+    id: &str,
+) -> anyhow::Result<()> {
+    let Some(bridge) = bridge else {
+        return Ok(());
+    };
+    let id: RouterId = id.parse().context("router id")?;
+    bridge
+        .silence_router(&id)
+        .await
+        .with_context(|| format!("silencing router {id} ahead of its demotion"))
+}
+
 impl Agent {
-    /// Validate the provider-network capability, then ensure the router under
-    /// the operations lock. Repeated ensure requests also update active/standby state.
+    /// Silence a demotion first, then validate the provider-network capability and ensure the
+    /// router under the operations lock. Repeated ensure requests also update active/standby
+    /// state.
     pub(super) async fn handle_ensure_router(&self, r: proto::EnsureRouter) -> anyhow::Result<()> {
-        let spec = router_spec(r)?;
+        // Serialize router changes with VM provisioning because both mutate shared bridges, the
+        // silencing of a demotion included. The driver bounds every ip/nft call, so a wedged one
+        // cannot hold this lock (R3-F08).
+        let _guard = self.ops.lock().await;
+        let spec = read_after_demotion(self.reconciler.drivers().bridge.as_deref(), r).await?;
         cannot_serve(self.network.validate_router(&spec.physnet))?;
         let bridge = cannot_serve(
             self.reconciler
@@ -62,8 +99,6 @@ impl Agent {
                 .bridge()
                 .context("this node cannot build a router"),
         )?;
-        // Serialize router creation with VM provisioning because both mutate shared bridges.
-        let _guard = self.ops.lock().await;
         let state = bridge
             .ensure_router(&spec)
             .await
@@ -181,5 +216,86 @@ mod tests {
         let mut m = message();
         m.id = "not-a-uuid".into();
         assert!(router_spec(m).is_err());
+    }
+
+    /// A bridge that records which routers it was told to silence, or refuses to.
+    #[derive(Default)]
+    struct SilencingBridge {
+        silenced: std::sync::Mutex<Vec<RouterId>>,
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::networking::BridgeDriver for SilencingBridge {
+        async fn ensure(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn ensure_address(
+            &self,
+            _name: &str,
+            _addr: std::net::IpAddr,
+            _prefix_len: u8,
+        ) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn destroy(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn silence_router(&self, id: &RouterId) -> agent_api::networking::Result<()> {
+            if self.refuse {
+                return Err(agent_api::networking::NetworkError::Backend(anyhow!(
+                    "permission denied"
+                )));
+            }
+            self.silenced.lock().unwrap().push(*id);
+            Ok(())
+        }
+    }
+
+    /// A demotion this agent cannot read is silenced all the same, by its id (NL2-2, NL3-6).
+    #[tokio::test]
+    async fn a_demotion_the_agent_refuses_to_read_is_silenced_all_the_same() {
+        let mut m = message();
+        m.active = false;
+        m.nats = vec![nat("dnat-and-snat", "203.0.113.55", "10.7.1.9")];
+        let id: RouterId = m.id.parse().unwrap();
+        let bridge = SilencingBridge::default();
+
+        let err = read_after_demotion(Some(&bridge), m)
+            .await
+            .expect_err("the rest of it is refused");
+
+        assert!(err.to_string().contains("dnat-and-snat"), "{err:#}");
+        assert_eq!(*bridge.silenced.lock().unwrap(), [id]);
+    }
+
+    /// A promotion is read without silencing anything: the router is about to answer.
+    #[tokio::test]
+    async fn a_promotion_is_read_without_silencing_the_router() {
+        let bridge = SilencingBridge::default();
+
+        let spec = read_after_demotion(Some(&bridge), message())
+            .await
+            .expect("a well-formed promotion");
+
+        assert!(spec.active);
+        assert!(bridge.silenced.lock().unwrap().is_empty());
+    }
+
+    /// A demotion that cannot be silenced goes no further: the error is the answer (NL2-2).
+    #[tokio::test]
+    async fn a_demotion_that_cannot_be_silenced_is_an_error() {
+        let mut m = message();
+        m.active = false;
+        let bridge = SilencingBridge {
+            refuse: true,
+            ..Default::default()
+        };
+
+        let err = read_after_demotion(Some(&bridge), m)
+            .await
+            .expect_err("a router that may still answer is not demoted");
+
+        assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
     }
 }

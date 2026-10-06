@@ -120,6 +120,26 @@ pub struct AgentConfig {
     /// Storage driver sections. Filesystem is registered by default from `[paths]`.
     #[serde(default)]
     pub volume: Sections,
+    /// `[images]`: where this node may fetch base images from. Absent equals empty, which
+    /// fetches from nowhere; see [`ImagesConfig::allowed_sources`].
+    #[serde(default)]
+    pub images: ImagesConfig,
+}
+
+/// `[images]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// The image sources this node may fetch from: host names
+    /// (`cloud-images.ubuntu.com`), `*.domain` for every name below a domain,
+    /// `*` for any host name, and CIDRs (`10.0.8.0/24`).
+    ///
+    /// Empty (the default) fetches from nowhere: a member may create an image with any url,
+    /// and the fleet has no mirror that could be a safe default (R3-F10). Loopback,
+    /// link-local and metadata addresses are refused whatever this says; private ranges
+    /// need a CIDR here, a host name alone does not open them. Ports 80 and 443 only.
+    #[serde(default)]
+    pub allowed_sources: Vec<String>,
 }
 
 fn default_stop_grace_secs() -> u64 {
@@ -543,6 +563,7 @@ impl AgentConfig {
         config
             .parsed_bridge_addr()
             .context("[network] bridge_addr")?;
+        config.egress_policy()?;
 
         Ok(config)
     }
@@ -556,6 +577,12 @@ impl AgentConfig {
         config.paths.socket_gid()?;
 
         Ok(config)
+    }
+
+    /// Parse `[images] allowed_sources`; called at start-up and when the image cache is built.
+    pub fn egress_policy(&self) -> anyhow::Result<crate::images::egress::EgressPolicy> {
+        crate::images::egress::EgressPolicy::from_sources(&self.images.allowed_sources)
+            .context("[images] allowed_sources")
     }
 
     /// Parse guarded address ranges and resolve `nft`. Called during config
@@ -970,6 +997,10 @@ mod tests {
         assert!(nfs.mount_spec().unwrap().is_some());
         let managed: Vec<ManagedDevice> = one(&cfg.device, "device", "managed");
         assert_eq!(managed.len(), 1);
+        // And the image sources (R3-F10) are a list the node accepts.
+        assert_eq!(cfg.images.allowed_sources.len(), 2);
+        cfg.egress_policy()
+            .expect("the example's image sources parse");
 
         // Validate enabled overlay and capacity settings.
         let network = cfg
@@ -1162,6 +1193,38 @@ mod tests {
             (32, 64_000),
             "the machine wins"
         );
+    }
+
+    /// A typo in `[images] allowed_sources` stops the agent at config read (R3-F10).
+    #[test]
+    fn the_image_sources_are_parsed_when_the_config_is_read() {
+        assert!(
+            config_with("").images.allowed_sources.is_empty(),
+            "nothing by default"
+        );
+        let cfg = from_str::<AgentConfig>(
+            r#"
+            node_id = "n1"
+            [paths]
+            db_path = "/tmp/a.redb"
+            run_dir = "/tmp/run"
+            image_dir = "/tmp/img"
+            volume_dir = "/tmp/vol"
+            cgroup_root = "/sys/fs/cgroup/x"
+            [images]
+            allowed_sources = ["cloud-images.ubuntu.com", "*.example.org", "10.0.8.0/24"]
+            "#,
+        )
+        .expect("config parses");
+        cfg.egress_policy().expect("three shapes, all of them real");
+        let typo = AgentConfig {
+            images: ImagesConfig {
+                allowed_sources: vec!["https://cloud-images.ubuntu.com".into()],
+            },
+            ..cfg
+        };
+        let err = format!("{:#}", typo.egress_policy().unwrap_err());
+        assert!(err.contains("allowed_sources"), "{err}");
     }
 
     /// Malformed guarded CIDRs fail during config parsing.

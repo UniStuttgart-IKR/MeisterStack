@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use controller_api::{
-    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume,
+    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion,
     resources::{new_vm, new_volume},
 };
 use proto::cluster_plane_client::ClusterPlaneClient;
@@ -1003,9 +1003,48 @@ async fn handle_delete_secret(store: &EtcdStore, d: proto::DeleteSecret) -> anyh
         // same rule DestroyVolume follows.
         return Ok(());
     }
-    store.delete::<controller_api::Secret>(&d.name).await?;
+    delete_cloud_record(store, &current, &d.uid).await?;
     info!(secret = %d.name, "deleted for the cloud");
     Ok(())
+}
+
+/// Delete the record a cloud delete was judged against, on the revision it was judged at, never
+/// whatever its name names by the time of the delete (NL2-6, R3-F02).
+///
+/// A record that went, or became another object's, in between is the cloud's delete done. One
+/// that is still the cloud's is an error the cloud retries, never an ack for an object that is
+/// still here.
+async fn delete_cloud_record<T: controller_api::Resource>(
+    store: &EtcdStore,
+    checked: &T,
+    cloud_uid: &str,
+) -> anyhow::Result<()> {
+    let the_clouds = |obj: &T| obj.metadata().cloud_uid() == Some(cloud_uid);
+    if deletion::finish_delete(store, checked, the_clouds).await? {
+        return Ok(());
+    }
+    let done = |obj: &T| !the_clouds(obj);
+    answer_unwritten(store, &checked.metadata().name, done, "deleted").await
+}
+
+/// The answer to a cloud command whose guarded write did not land: done when the name names
+/// nothing any more or an object `done` holds for, otherwise an error the cloud retries, never
+/// an ack for an object of the cloud's that still waits on the command.
+async fn answer_unwritten<T: controller_api::Resource>(
+    store: &EtcdStore,
+    name: &str,
+    done: impl Fn(&T) -> bool,
+    doing: &str,
+) -> anyhow::Result<()> {
+    match store.get::<T>(name).await {
+        Err(StoreError::NotFound(_)) => Ok(()),
+        Ok(current) if done(&current) => Ok(()),
+        Ok(_) => bail!(
+            "{}/{name} changed while it was {doing}; not {doing} yet",
+            T::RESOURCE
+        ),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Mirror the provider network before creating or updating its router.
@@ -1142,7 +1181,7 @@ async fn handle_delete_router(store: &EtcdStore, d: proto::DeleteRouter) -> anyh
         warn!(router = %d.name, "delete for a name held by another router, nothing done");
         return Ok(());
     }
-    store.delete::<Router>(&d.name).await?;
+    delete_cloud_record(store, &current, &d.uid).await?;
     info!(router = %d.name, node = %current.status.active_node, "router deleted for the cloud");
     Ok(())
 }
@@ -1359,16 +1398,40 @@ async fn handle_release_volume(store: &EtcdStore, r: proto::ReleaseVolume) -> an
     if let Some(holder) = &current.status.attached_to {
         bail!("volume {} is still attached to vm {holder} here", r.name);
     }
-    store
-        .mutate::<Volume, _>(&r.name, |v| {
-            v.metadata
-                .finalizers
-                .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
-        })
-        .await?;
-    store.delete::<Volume>(&r.name).await?;
-    info!(volume = %r.name, "record released for the cloud; the bytes are untouched");
-    Ok(())
+    release_record(store, &current, &r).await
+}
+
+/// Release the record that was checked, on the revision it was judged at (R2-2, R3-F02).
+///
+/// The finalizer comes off `checked`'s uid only while the fresh revision is still the cloud's
+/// and unattached, and the delete names the revision that write produced. A record that went
+/// or became another volume's in between is a release done; one still here is a refusal the
+/// cloud retries, never an ack for bytes another cluster would then reopen.
+async fn release_record(
+    store: &EtcdStore,
+    checked: &Volume,
+    r: &proto::ReleaseVolume,
+) -> anyhow::Result<()> {
+    let releasable = |v: &Volume| {
+        v.metadata.cloud_uid() == Some(r.uid.as_str()) && v.status.attached_to.is_none()
+    };
+    let finalizer = controller_api::VOLUME_RELEASE_FINALIZER;
+    if deletion::release_and_delete(store, checked, finalizer, releasable).await? {
+        info!(volume = %r.name, "record released for the cloud; the bytes are untouched");
+        return Ok(());
+    }
+    match store.get::<Volume>(&r.name).await {
+        Err(StoreError::NotFound(_)) => Ok(()),
+        Ok(v) if v.metadata.cloud_uid() != Some(r.uid.as_str()) => Ok(()),
+        Ok(v) => match v.status.attached_to {
+            Some(holder) => bail!("volume {} is still attached to vm {holder} here", r.name),
+            None => bail!(
+                "volume {} changed while it was released; not released yet",
+                r.name
+            ),
+        },
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Result<()> {
@@ -1388,15 +1451,36 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<Vm, _>(&d.name, |v| {
-            if v.metadata.deletion_timestamp.is_none() {
+    mark_for_teardown(store, &current, &d.uid).await?;
+    info!(vm = %d.name, "marked for teardown by the cloud");
+    Ok(())
+}
+
+/// Mark the VM a cloud destroy was judged against for teardown, under the uid it was judged at,
+/// never whatever its name names by the time of the write (NL3-3).
+///
+/// A VM that went, became another cloud object's or was marked by someone else in between
+/// leaves the destroy nothing to do. One that is still the cloud's and unmarked is an error the
+/// cloud retries.
+async fn mark_for_teardown(store: &EtcdStore, checked: &Vm, cloud_uid: &str) -> anyhow::Result<()> {
+    let the_clouds = |v: &Vm| v.metadata.cloud_uid() == Some(cloud_uid);
+    let mut marked = false;
+    let written = store
+        .mutate_if::<Vm, _>(&checked.metadata.name, &checked.metadata.uid, |v| {
+            marked = the_clouds(v);
+            if marked && v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
         })
-        .await?;
-    info!(vm = %d.name, "marked for teardown by the cloud");
-    Ok(())
+        .await;
+    match written {
+        Ok(_) if marked => Ok(()),
+        Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
+            let done = |v: &Vm| !the_clouds(v) || v.is_deleting();
+            answer_unwritten(store, &checked.metadata.name, done, "marked for teardown").await
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Build one status and put it on the stream. False means the session is gone.
@@ -2806,37 +2890,15 @@ mod tests {
     }
 
     /// Repeated cloud creation updates an existing volume to the larger size.
-    /// Requires an external etcd:
-    ///
-    /// ```text
-    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
-    ///   cargo test -p meister-cluster-controller grown -- --ignored
-    /// ```
     #[tokio::test]
-    #[ignore = "needs an etcd; see the note above"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_create_for_a_volume_this_tier_holds_carries_the_grown_size() {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-        let prefix = format!("/cloud-volume-test/{}", uuid::Uuid::new_v4());
-        let store = EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to — see the note above");
-        let create = |gib: u64| proto::CreateVolume {
-            name: "data".into(),
-            spec_json: serde_json::to_string(&controller_api::VolumeSpec {
-                pool: "fast".into(),
-                size_gib: gib,
-                ..Default::default()
-            })
-            .unwrap(),
-            uid: "u-1".into(),
-            tenant: "acme".into(),
-        };
+        let store = crate::test_etcd::fresh_store("cloud-volume-test").await;
 
-        handle_create_volume(&store, create(10))
+        handle_create_volume(&store, create_volume("u-1", 10))
             .await
             .expect("made");
-        handle_create_volume(&store, create(20))
+        handle_create_volume(&store, create_volume("u-1", 20))
             .await
             .expect("the cloud grew it");
         let held: Volume = store.get("data").await.expect("the volume");
@@ -2845,11 +2907,264 @@ mod tests {
         assert_eq!(held.metadata.uid, "u-1", "and it is still the same bytes");
 
         // A late, older create does not shrink anything.
-        handle_create_volume(&store, create(10))
+        handle_create_volume(&store, create_volume("u-1", 10))
             .await
             .expect("a repeat is acked");
         let held: Volume = store.get("data").await.expect("the volume");
         assert_eq!(held.spec.size_gib, 20);
         assert_eq!(held.metadata.generation, 2);
+    }
+
+    /// The cloud's create for the volume `data` of `size_gib` in the pool `fast`, as `uid`.
+    fn create_volume(uid: &str, size_gib: u64) -> proto::CreateVolume {
+        proto::CreateVolume {
+            name: "data".into(),
+            spec_json: serde_json::to_string(&controller_api::VolumeSpec {
+                pool: "fast".into(),
+                size_gib,
+                ..Default::default()
+            })
+            .unwrap(),
+            uid: uid.into(),
+            tenant: "acme".into(),
+        }
+    }
+
+    /// A release judged on a record that was replaced under the same name before the write
+    /// takes nothing from the new record: its finalizer stays and it is not deleted. (R2-2)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_release_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = crate::test_etcd::fresh_store("cloud-release-test").await;
+        handle_create_volume(&store, create_volume("u-1", 1))
+            .await
+            .expect("the cloud's volume");
+        let checked: Volume = store
+            .get("data")
+            .await
+            .expect("the record the release read");
+        store.delete::<Volume>("data").await.expect("it goes");
+        handle_create_volume(&store, create_volume("u-2", 1))
+            .await
+            .expect("another cloud volume under the same name");
+        let release = proto::ReleaseVolume {
+            name: "data".into(),
+            uid: "u-1".into(),
+        };
+
+        release_record(&store, &checked, &release)
+            .await
+            .expect("nothing of u-1 is left here, which is a release done");
+
+        let still: Volume = store.get("data").await.expect("the new record");
+        assert_eq!(still.metadata.uid, "u-2");
+        assert!(
+            still
+                .metadata
+                .finalizers
+                .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string())
+        );
+    }
+
+    /// The record the release names goes, finalizer and all: the guard is not a wall. (R2-2)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_release_of_the_current_record_removes_it() {
+        let store = crate::test_etcd::fresh_store("cloud-release-test").await;
+        handle_create_volume(&store, create_volume("u-1", 1))
+            .await
+            .expect("the cloud's volume");
+        let release = proto::ReleaseVolume {
+            name: "data".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_release_volume(&store, release)
+            .await
+            .expect("released");
+
+        assert!(matches!(
+            store.get::<Volume>("data").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// `obj` stored as the cloud's object `cloud_uid`.
+    async fn stored_for_the_cloud<T: controller_api::Resource>(
+        store: &EtcdStore,
+        mut obj: T,
+        cloud_uid: &str,
+    ) -> T {
+        obj.metadata_mut().mark_managed_by_cloud(cloud_uid);
+        store.create(&obj).await.expect("the cloud's record")
+    }
+
+    fn secret() -> controller_api::Secret {
+        controller_api::Secret::declare("db", Default::default())
+    }
+
+    fn router() -> Router {
+        Router::declare("out", Default::default())
+    }
+
+    /// A secret delete judged on a record that was replaced under the same name before the
+    /// delete leaves the new record alone. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_secret_delete_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, secret(), "u-1").await;
+        store
+            .delete::<controller_api::Secret>("db")
+            .await
+            .expect("it goes");
+        stored_for_the_cloud(&store, secret(), "u-2").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a delete done");
+
+        let still: controller_api::Secret = store.get("db").await.expect("the new record");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+    }
+
+    /// A router delete judged on a record that was replaced under the same name before the
+    /// delete leaves the new record alone. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_router_delete_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, router(), "u-1").await;
+        store.delete::<Router>("out").await.expect("it goes");
+        stored_for_the_cloud(&store, router(), "u-2").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a delete done");
+
+        let still: Router = store.get("out").await.expect("the new record");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+    }
+
+    /// A delete whose record was recreated for the same cloud object is not acked: that object
+    /// is still here, and the cloud retries. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_is_not_acked_while_the_clouds_object_is_still_here() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, secret(), "u-1").await;
+        store
+            .delete::<controller_api::Secret>("db")
+            .await
+            .expect("it goes");
+        let fresh = stored_for_the_cloud(&store, secret(), "u-1").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect_err("the record judged is gone, the cloud's object is not");
+
+        let still: controller_api::Secret = store.get("db").await.expect("the new record");
+        assert_eq!(still.metadata.uid, fresh.metadata.uid);
+    }
+
+    /// The secret the delete names goes: the guard is not a wall. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_of_the_current_secret_removes_it() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        stored_for_the_cloud(&store, secret(), "u-1").await;
+        let delete = proto::DeleteSecret {
+            name: "db".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_delete_secret(&store, delete).await.expect("deleted");
+
+        assert!(matches!(
+            store.get::<controller_api::Secret>("db").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// The router the delete names goes: the guard is not a wall. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_of_the_current_router_removes_it() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        stored_for_the_cloud(&store, router(), "u-1").await;
+        let delete = proto::DeleteRouter {
+            name: "out".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_delete_router(&store, delete).await.expect("deleted");
+
+        assert!(matches!(
+            store.get::<Router>("out").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// The running VM `t`, stored as the cloud's object `cloud_uid`.
+    async fn stored_vm(store: &EtcdStore, cloud_uid: &str) -> Vm {
+        store
+            .create(&vm("t", Some(cloud_uid), VmPhaseKind::Running))
+            .await
+            .expect("the cloud's vm")
+    }
+
+    /// A destroy judged on a VM that was replaced under the same name before the write leaves
+    /// the new VM unmarked. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_judged_on_an_old_vm_leaves_the_recreated_one_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+        store.delete::<Vm>("t").await.expect("it goes");
+        stored_vm(&store, "u-2").await;
+
+        mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a destroy done");
+
+        let still: Vm = store.get("t").await.expect("the new vm");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+        assert!(!still.is_deleting());
+    }
+
+    /// A destroy whose VM was recreated for the same cloud object is not acked while that VM is
+    /// unmarked: the cloud retries and marks it. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_is_not_acked_while_the_clouds_vm_is_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+        store.delete::<Vm>("t").await.expect("it goes");
+        let fresh = stored_vm(&store, "u-1").await;
+
+        mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect_err("the vm judged is gone, the cloud's vm is not");
+
+        let still: Vm = store.get("t").await.expect("the new vm");
+        assert_eq!(still.metadata.uid, fresh.metadata.uid);
+        assert!(!still.is_deleting());
+    }
+
+    /// The VM the destroy names is marked for teardown: the guard is not a wall. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_of_the_current_vm_marks_it_for_teardown() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        stored_vm(&store, "u-1").await;
+        let destroy = proto::DestroyVm {
+            name: "t".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_destroy(&store, destroy).await.expect("marked");
+
+        let marked: Vm = store.get("t").await.expect("the vm, until its teardown");
+        assert!(marked.is_deleting());
     }
 }

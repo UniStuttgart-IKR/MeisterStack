@@ -444,9 +444,7 @@ pub(super) const REFUSAL_TTL: std::time::Duration = std::time::Duration::from_se
 /// Finalizer flow: tear down on the bound node (idempotent at the agent),
 /// then the object really goes away.
 pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> {
-    if let Some(node) = vm.spec.node_name.as_deref()
-        && vm.status.phase().kind() != VmPhaseKind::Pending
-    {
+    if let Some(node) = destroy_target(vm) {
         p.registry
             .send_command(
                 node,
@@ -457,18 +455,37 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
             )
             .await?;
     }
-    // Let go of what this VM was holding, in the same breath the object goes.
+    // The VM that was judged, under the judgement it was given: still deleting, and the Destroy
+    // above went where the revision being deleted would send it. One recreated under the same
+    // name since the listing is a new VM and is left alone (NL2-6); one rebound, or no longer
+    // Pending or newly so, is judged again by the next pass (NL3-2).
+    let judged = |v: &Vm| v.is_deleting() && destroy_target(v) == destroy_target(vm);
+    if !deletion::finish_delete(p.store, vm, judged).await? {
+        return Ok(());
+    }
+    info!("vm deleted");
+    // Let go of what this VM was holding once this call has removed it, and not before: a
+    // claim names the VM, not its uid, so a teardown that lost the name to a newer VM would
+    // release the newer one's claims (NL3-1). A crash between the two is answered by
+    // `note_claimant`, which finds no VM of this name holding the volume.
     //
     // The node has been told to tear down and has acked being told; whether
     // it has finished detaching is its own business and this tier cannot
     // wait for it, because the object is what would have carried the wait and
-    // the object is going. The gap that leaves is covered where it has to be:
+    // the object is gone. The gap that leaves is covered where it has to be:
     // the node refuses to deprovision a volume it still has open, so a delete
     // arriving in the window is answered and retried rather than obeyed.
     release_volumes(p, vm).await;
-    p.store.delete::<Vm>(&vm.metadata.name).await?;
-    info!("vm deleted");
     Ok(())
+}
+
+/// The node a teardown tells to destroy the instance: the bound one, unless the VM is still
+/// Pending, which the teardown takes as nothing started there to destroy.
+fn destroy_target(vm: &Vm) -> Option<&str> {
+    vm.spec
+        .node_name
+        .as_deref()
+        .filter(|_| vm.status.phase().kind() != VmPhaseKind::Pending)
 }
 
 /// Compare desired referenced disks with node-reported attachments.

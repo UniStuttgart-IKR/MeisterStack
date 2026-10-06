@@ -16,6 +16,10 @@ common = { package = "meister-common", path = "../common" }
 nix = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true }
+# The bounded subprocess helper's warning about a child it could not reap. See `subprocess`.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `start_paused`: the reap bound is asserted on the runtime's clock, not by waiting it out.
+tokio = { workspace = true, features = ["test-util"] }

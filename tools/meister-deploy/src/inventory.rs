@@ -84,7 +84,6 @@ pub enum BootMode {
     /// userland and reboots separately. Recovery from an unsuccessful boot requires the
     /// existing loader or console.
     Grub,
-
 }
 
 impl BootMode {
@@ -488,7 +487,6 @@ struct SchemaProbe {
     /// field", and this one has an answer: the provider moved.
     #[serde(default)]
     opennebula: Option<toml::Value>,
-
 }
 
 // ---------------------------------------------------------------------------

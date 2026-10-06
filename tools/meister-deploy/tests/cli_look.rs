@@ -508,8 +508,6 @@ fn check_is_exit_two_when_the_fleet_is_not_ready_and_says_why() {
     );
 }
 
-
-
 #[test]
 fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
     // Readiness does not exercise the operator control-plane reference needed for cordon.
@@ -553,8 +551,6 @@ fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
     assert!(why.contains("cli_config"), "{why}");
     assert!(why.contains("n1"), "{why}");
 }
-
-
 
 #[test]
 fn a_suite_that_does_work_on_the_fleet_is_not_something_check_does() {
@@ -808,8 +804,6 @@ fn gc_keeps_the_newest_and_removes_no_store_path() {
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
 }
 
-
-
 #[test]
 fn gc_leaves_the_snapshots_and_the_runs_alone_unless_it_is_asked() {
     let sandbox = Sandbox::new();
@@ -911,8 +905,6 @@ fn an_age_guard_keeps_what_the_count_would_have_taken() {
     assert!(stderr(&out).contains("14 day(s)"), "{}", stderr(&out));
 }
 
-
-
 // ---------------------------------------------------------------------------
 // the whole way through
 // ---------------------------------------------------------------------------
@@ -960,8 +952,6 @@ fn a_fleet_that_moved_is_planned_and_the_plan_is_read_back() {
         stdout(&out)
     );
 }
-
-
 
 /// Fixture inventory with n2 removed.
 const INVENTORY_WITHOUT_N2: &str = r#"

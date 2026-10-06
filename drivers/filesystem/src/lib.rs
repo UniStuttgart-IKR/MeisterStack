@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
 mod layout;
+mod staging;
 
 use agent_api::CgroupHandle;
 use agent_api::storage;
@@ -24,6 +25,9 @@ pub struct FilesystemDriverConfig {
     /// Sandbox for image probing and conversion; failure does not fall back to
     /// running the parser in the agent process.
     pub convert: agent_api::base_image::Sandbox,
+    /// This node's id, written into every staging file name so one node's start-up sweep
+    /// never removes another node's running copy on a shared pool (R3-F09).
+    pub host_id: String,
 }
 
 /// QCOW2 magic used by local format detection helpers.
@@ -47,18 +51,14 @@ nix::ioctl_write_int!(ficlone, 0x94, 9);
 /// Nonempty payload used by the reflink probe.
 const PROBE_BYTES: usize = 4096;
 
-/// Shared filename prefix for probe creation and leftover cleanup.
-const PROBE_PREFIX: &str = ".meister-reflink-probe-";
-
 /// Probe FICLONE support in the pool directory. Any failure selects
 /// NeedsQuiesce. This probe does not guarantee the separate copy path is atomic.
-fn probe_reflink(dir: &Path) -> SnapshotConsistency {
+fn probe_reflink(dir: &Path, host: &staging::HostTag) -> SnapshotConsistency {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    // PID-qualified probe names distinguish local agent processes sharing a directory.
-    let src_path = dir.join(format!("{PROBE_PREFIX}{}.src", std::process::id()));
-    let dst_path = dir.join(format!("{PROBE_PREFIX}{}.dst", std::process::id()));
+    // Host- and nonce-qualified names: a pid can collide between hosts sharing a pool (R3-F09).
+    let (src_path, dst_path) = staging::probe_pair(dir, host);
     // Whatever this probe leaves behind goes, on every path out of it.
     let cleanup = || {
         let _ = std::fs::remove_file(&src_path);
@@ -107,52 +107,26 @@ fn probe_reflink(dir: &Path) -> SnapshotConsistency {
     }
 }
 
+/// Test hook channels: report the staged path, then wait to be released.
+#[cfg(test)]
+type Hold = (
+    std::sync::mpsc::Sender<PathBuf>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 /// Manage raw block-volume files in one configured pool directory.
 pub struct FilesystemBlockDriver {
     config: FilesystemDriverConfig,
     /// Snapshot consistency selected by the startup FICLONE probe.
     snapshot_consistency: SnapshotConsistency,
+    /// This node as it appears in every staging file name (R3-F09).
+    host: staging::HostTag,
+    /// Test hook holding a snapshot between its copy and its rename, so a second
+    /// driver can start while the copy is open.
+    #[cfg(test)]
+    hold: std::sync::Mutex<Option<Hold>>,
     /// Per-instance reservations for copies that have not finished.
     room: layout::Room,
-}
-
-/// The suffix a snapshot copies into before it is renamed into place.
-const SNAP_TMP: &str = ".snap.tmp";
-
-/// Remove snapshot temporary files without a finished sibling, plus reflink
-/// probe files, at driver construction. This does not check writer liveness;
-/// concurrent users of a shared directory can still own these files.
-fn sweep_leftovers(dir: &Path) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            warn!(dir = %dir.display(), error = %e,
-                  "could not look through the pool for leftovers");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let what = if let Some(id) = name.strip_suffix(SNAP_TMP) {
-            if dir.join(format!("{id}.snap")).exists() {
-                continue;
-            }
-            "an unfinished snapshot was holding disk space nothing points at; removed"
-        } else if name.starts_with(PROBE_PREFIX) {
-            "a reflink probe died before it could clean up after itself; removed"
-        } else {
-            continue;
-        };
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(&path) {
-            Ok(()) => warn!(path = %path.display(), size_bytes = size, "{what}"),
-            Err(e) => warn!(path = %path.display(), error = %e,
-                            "a leftover in this pool could not be removed"),
-        }
-    }
 }
 
 impl FilesystemBlockDriver {
@@ -165,11 +139,17 @@ impl FilesystemBlockDriver {
         }
         std::fs::create_dir_all(&config.volume_dir).map_err(|e| StorageError::Backend(e.into()))?;
         // Sweep interrupted staging files before creating this startup's probe files.
-        sweep_leftovers(&config.volume_dir);
-        let snapshot_consistency = probe_reflink(&config.volume_dir);
+        // Only this host's files are provably dead: the nfs driver shares the pool
+        // across nodes, so `staging::sweep` waits out a foreign host's heartbeat (R3-F09).
+        let host = staging::HostTag::new(&config.host_id).map_err(StorageError::InvalidSpec)?;
+        staging::sweep(&config.volume_dir, &host);
+        let snapshot_consistency = probe_reflink(&config.volume_dir, &host);
         Ok(Self {
             config,
             snapshot_consistency,
+            host,
+            #[cfg(test)]
+            hold: Default::default(),
             room: layout::Room::default(),
         })
     }
@@ -281,7 +261,14 @@ impl VolumeProvider for FilesystemBlockDriver {
         }
 
         let src = self.base_image_for(spec).await?;
-        let tmp = layout::tmp_path(&self.config.volume_dir, id);
+        // Per-host, per-attempt staging name: concurrent attempts (retry, failover) never
+        // truncate each other's file. Moved into the blocking task so its heartbeat lasts
+        // exactly as long as the copy (R3-F09).
+        let tmp = staging::Staged::begin(staging::volume_build(
+            &self.config.volume_dir,
+            id,
+            &self.host,
+        ));
         let final_path = path.clone();
         let size = spec.size_bytes;
         let qemu_img = self.config.qemu_img.clone();
@@ -290,7 +277,7 @@ impl VolumeProvider for FilesystemBlockDriver {
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                layout::write_volume_file(src, &sandbox, &qemu_img, &tmp, &final_path, size)
+                layout::write_volume_file(src, &sandbox, &qemu_img, tmp.path(), &final_path, size)
             })
         })
         .await
@@ -304,10 +291,13 @@ impl VolumeProvider for FilesystemBlockDriver {
     #[instrument(skip_all, fields(volume_id = %handle.id))]
     async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
         let id = &handle.id;
-        for p in [
-            layout::tmp_path(&self.config.volume_dir, id),
-            layout::volume_path(&self.config.volume_dir, id),
-        ] {
+        let dir = &self.config.volume_dir;
+        // Remove every host's staging files for this volume: the owner is going away.
+        let mut doomed =
+            staging::staged_for(dir, id, false).map_err(|e| StorageError::Backend(e.into()))?;
+        doomed.push(staging::legacy_volume_build(dir, id));
+        doomed.push(layout::volume_path(dir, id));
+        for p in doomed {
             match tokio::fs::remove_file(&p).await {
                 Ok(()) => debug!(path = %p.display(), "volume file removed"),
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -394,20 +384,35 @@ impl VolumeProvider for FilesystemBlockDriver {
         // Reserve capacity before creating staging files and retain the guard
         // through the copy so concurrent snapshots account for these bytes.
         let _room = self.room_for_a_copy(source.len())?;
-        let tmp = self.config.volume_dir.join(format!("{id}{SNAP_TMP}"));
-        let (from, to, target) = (src.clone(), tmp.clone(), dst.clone());
+        // Per-host, per-attempt name with a heartbeat while the copy runs, so another host's
+        // sweep can tell it from a leftover. Moved into the blocking task so an abandoned
+        // caller does not stop the heartbeat (R3-F09).
+        let staged = staging::Staged::begin(staging::snapshot_copy(
+            &self.config.volume_dir,
+            id,
+            &self.host,
+        ));
+        let (from, target) = (src.clone(), dst.clone());
+        #[cfg(test)]
+        let hold = self.hold.lock().expect("the test hold").take();
         let span = Span::current();
         let size = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
             span.in_scope(|| {
+                let to = staged.path();
                 // Copy through a staging name so interrupted work cannot appear as a completed snapshot.
                 let copied = (|| -> std::io::Result<u64> {
-                    let size = layout::clone_or_copy(&from, &to)?;
-                    std::fs::rename(&to, &target)?;
+                    let size = layout::clone_or_copy(&from, to)?;
+                    #[cfg(test)]
+                    if let Some((staged_at, go)) = hold {
+                        let _ = staged_at.send(to.to_path_buf());
+                        let _ = go.recv();
+                    }
+                    std::fs::rename(to, &target)?;
                     Ok(size)
                 })();
                 // Remove the staging file after a returned copy or rename failure.
                 if copied.is_err() {
-                    match std::fs::remove_file(&to) {
+                    match std::fs::remove_file(to) {
                         Ok(()) => warn!(path = %to.display(),
                                         "removed the half-written copy of a failed snapshot"),
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -428,12 +433,13 @@ impl VolumeProvider for FilesystemBlockDriver {
 
     #[instrument(skip_all, fields(snapshot_id = %handle.id))]
     async fn drop_snapshot(&self, handle: &VolumeHandle) -> storage::Result<()> {
-        for p in [
-            self.config
-                .volume_dir
-                .join(format!("{}{SNAP_TMP}", handle.id)),
-            self.snapshot_path(&handle.id),
-        ] {
+        let dir = &self.config.volume_dir;
+        // Remove every host's staging copies of this snapshot: the owner is going away (R3-F09).
+        let mut doomed = staging::staged_for(dir, &handle.id, true)
+            .map_err(|e| StorageError::Backend(e.into()))?;
+        doomed.push(staging::legacy_snapshot_copy(dir, &handle.id));
+        doomed.push(self.snapshot_path(&handle.id));
+        for p in doomed {
             match tokio::fs::remove_file(&p).await {
                 Ok(()) => debug!(path = %p.display(), "snapshot removed"),
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -474,17 +480,29 @@ impl VolumeProvider for FilesystemBlockDriver {
                 spec.size_bytes
             )));
         }
-        let tmp = layout::tmp_path(&self.config.volume_dir, id);
-        let (from, to, target, size) = (src, tmp, path.clone(), spec.size_bytes);
+        // The same staging name `provision` uses, for the same reason.
+        let staged = staging::Staged::begin(staging::volume_build(
+            &self.config.volume_dir,
+            id,
+            &self.host,
+        ));
+        let (from, target, size) = (src, path.clone(), spec.size_bytes);
         let span = Span::current();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             span.in_scope(|| {
-                layout::clone_or_copy(&from, &to)?;
-                let f = std::fs::OpenOptions::new().write(true).open(&to)?;
-                f.set_len(size)?;
-                f.sync_all()?;
-                std::fs::rename(&to, &target)?;
-                Ok(())
+                let to = staged.path();
+                let done = (|| {
+                    layout::clone_or_copy(&from, to)?;
+                    let f = std::fs::OpenOptions::new().write(true).open(to)?;
+                    f.set_len(size)?;
+                    f.sync_all()?;
+                    std::fs::rename(to, &target)
+                })();
+                // Nonce names are never reused, so remove a failed attempt's file now.
+                if done.is_err() {
+                    let _ = std::fs::remove_file(to);
+                }
+                done
             })
         })
         .await
@@ -512,11 +530,18 @@ impl VolumeProvider for FilesystemBlockDriver {
         spec: &VolumeSpec,
     ) -> storage::Result<Option<VolumeHandle>> {
         let path = layout::volume_path(&self.config.volume_dir, id);
+        let dir = &self.config.volume_dir;
         let size = match Self::size_if_already_there(&path).await? {
             Some(size) => Some(size),
-            None => Self::size_if_already_there(&layout::tmp_path(&self.config.volume_dir, id))
-                .await?
-                .map(|_| 0),
+            // A staging file of any host counts, and the legacy name too.
+            None => {
+                let staged = staging::staged_for(dir, id, false)
+                    .map_err(|e| StorageError::Backend(e.into()))?;
+                let legacy = Self::size_if_already_there(&staging::legacy_volume_build(dir, id))
+                    .await?
+                    .is_some();
+                (legacy || !staged.is_empty()).then_some(0)
+            }
         };
         Ok(size.map(|size_bytes| VolumeHandle {
             id: *id,
@@ -573,6 +598,7 @@ impl VolumeAttacher for FilesystemBlockDriver {
 mod tests {
     use super::*;
     use agent_api::storage::VolumeSpec;
+    use staging::{PROBE_PREFIX, SNAP_TMP};
     use uuid::Uuid;
 
     /// Every destination this test's sandbox was asked to hand over or take
@@ -661,9 +687,20 @@ mod tests {
             volume_dir: volumes.clone(),
             qemu_img,
             convert: sandbox,
+            host_id: "test-node".into(),
         })
         .expect("the driver builds");
         (temp, driver, volumes, images, handed_over)
+    }
+
+    /// Every staging copy of this snapshot in the pool, of any host, under either name.
+    fn staged_copies(volumes: &Path, snap: &SnapshotId) -> Vec<String> {
+        std::fs::read_dir(volumes)
+            .expect("the pool")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{snap}{SNAP_TMP}")))
+            .collect()
     }
 
     fn spec(size_bytes: u64) -> VolumeSpec {
@@ -833,9 +870,24 @@ mod tests {
         want.base_image = Some("base.qcow2".to_string());
         driver.provision(&id, &want).await.expect("provisioned");
 
-        let tmp = volumes.join(format!("{id}.tmp"));
         let log = std::fs::read_to_string(root.join("systemd-run.log")).expect("the two runs");
         let lines: Vec<&str> = log.lines().collect();
+        // The staging name carries host and nonce (R3-F09): read it off the conversion's command.
+        let tmp = PathBuf::from(
+            lines[1]
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("BindPaths="))
+                .expect("a writable bind"),
+        );
+        assert_eq!(tmp.parent(), Some(volumes.as_path()));
+        assert!(
+            tmp.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("{id}.tmp.test-node."))),
+            "{}",
+            tmp.display()
+        );
+        assert!(!tmp.exists(), "and it was renamed into place");
         assert_eq!(lines.len(), 2, "the probe and the conversion: {log}");
         for line in &lines {
             for property in [
@@ -1174,7 +1226,7 @@ mod tests {
     fn the_probe_answers_for_the_pool_directory_and_leaves_nothing_in_it() {
         let (_temp, driver, volumes, _images) = driver("reflink");
 
-        let probed = probe_reflink(&volumes);
+        let probed = probe_reflink(&volumes, &driver.host);
         assert_eq!(
             driver.snapshot_support(),
             Some(probed),
@@ -1198,7 +1250,7 @@ mod tests {
         assert!(leftovers.is_empty(), "the probe cleaned up: {leftovers:?}");
 
         // Repeated probes and driver instances agree on the mount's reflink support.
-        assert_eq!(probe_reflink(&volumes), probed);
+        assert_eq!(probe_reflink(&volumes, &driver.host), probed);
 
         // Cross-check reflink support with `cp --reflink=always` so a broken probe
         // cannot pass merely by returning the same false value on every filesystem.
@@ -1230,7 +1282,7 @@ mod tests {
         // A directory that does not exist cannot be probed, and that is
         // `NeedsQuiesce` and not a panic: the safe direction costs a pause.
         assert_eq!(
-            probe_reflink(&volumes.join("no-such-pool")),
+            probe_reflink(&volumes.join("no-such-pool"), &driver.host),
             SnapshotConsistency::NeedsQuiesce
         );
 
@@ -1261,7 +1313,7 @@ mod tests {
             .expect_err("the copy cannot work");
 
         assert!(
-            !volumes.join(format!("{snap}{SNAP_TMP}")).exists(),
+            staged_copies(&volumes, &snap).is_empty(),
             "the half-written copy is gone"
         );
         assert!(
@@ -1287,11 +1339,14 @@ mod tests {
             volume_dir: volume_dir.clone(),
             qemu_img: PathBuf::from("qemu-img"),
             convert: agent_api::base_image::Sandbox::default(),
+            host_id: "test-node".into(),
         };
 
         let copying = FilesystemBlockDriver {
             config: config(&volumes),
             snapshot_consistency: SnapshotConsistency::NeedsQuiesce,
+            host: staging::HostTag::new("test-node").unwrap(),
+            hold: Default::default(),
             room: layout::Room::default(),
         };
 
@@ -1320,10 +1375,7 @@ mod tests {
             said.contains("not enough room") && said.contains("nothing has been written"),
             "the refusal says what an operator has to do: {said}"
         );
-        assert!(
-            !volumes.join(format!("{snap}{SNAP_TMP}")).exists(),
-            "and it means it"
-        );
+        assert!(staged_copies(&volumes, &snap).is_empty(), "and it means it");
 
         // A pool that reflinks is not asked the question at all: a clone of a
         // 4 TiB volume occupies no new extents, and refusing it over free
@@ -1331,6 +1383,8 @@ mod tests {
         let cloning = FilesystemBlockDriver {
             config: config(&volumes),
             snapshot_consistency: SnapshotConsistency::Atomic,
+            host: staging::HostTag::new("test-node").unwrap(),
+            hold: Default::default(),
             room: layout::Room::default(),
         };
         let nothing = cloning
@@ -1372,27 +1426,31 @@ mod tests {
             .expect("the room the first copy held is free again");
     }
 
-    /// Opening a pool removes temporary snapshots lacking a published counterpart.
-    /// This test uses abandoned files and does not establish safety with a concurrent writer.
+    /// Opening a pool removes this host's abandoned staging and probe files and
+    /// nothing else; foreign and legacy names are `staging`'s own tests (R3-F09).
     #[test]
     fn opening_a_pool_throws_away_what_a_killed_process_left() {
         let temp = tempfile::tempdir().expect("a temp dir");
         let root = temp.path().to_path_buf();
         let images = root.join("images");
         let volumes = root.join("volumes");
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&images).expect("a temp image dir");
         std::fs::create_dir_all(&volumes).expect("a temp volume dir");
 
-        let orphan = volumes.join("aaaa.snap.tmp");
-        let paired = volumes.join("bbbb.snap.tmp");
+        let me = staging::HostTag::new("test-node").unwrap();
+        let orphan = staging::snapshot_copy(&volumes, &SnapshotId::new_v4(), &me);
+        let half_volume = staging::volume_build(&volumes, &VolumeId::new_v4(), &me);
+        let (probe_src, probe_dst) = staging::probe_pair(&volumes, &me);
         let finished = volumes.join("bbbb.snap");
         let volume = volumes.join("cccc.raw");
-        // A pid this test does not have and never will: the point is that no
-        // process is asked about, not that this one is dead.
-        let probe_src = volumes.join(format!("{PROBE_PREFIX}424242.src"));
-        let probe_dst = volumes.join(format!("{PROBE_PREFIX}424242.dst"));
-        for p in [&orphan, &paired, &finished, &volume, &probe_src, &probe_dst] {
+        for p in [
+            &orphan,
+            &half_volume,
+            &finished,
+            &volume,
+            &probe_src,
+            &probe_dst,
+        ] {
             std::fs::write(p, b"x").expect("a file");
         }
 
@@ -1401,17 +1459,15 @@ mod tests {
             volume_dir: volumes.clone(),
             qemu_img: PathBuf::from("qemu-img"),
             convert: agent_api::base_image::Sandbox::default(),
+            host_id: "test-node".into(),
         })
         .expect("the driver builds");
 
         assert!(!orphan.exists(), "the unfinished copy is gone");
+        assert!(!half_volume.exists(), "and the unfinished volume");
         assert!(!probe_src.exists(), "and so is a probe that never returned");
         assert!(!probe_dst.exists(), "both halves of it");
-        assert!(paired.exists(), "the one with a finished snapshot is not");
-        assert!(
-            finished.exists(),
-            "and the snapshot itself certainly is not"
-        );
+        assert!(finished.exists(), "the snapshot itself certainly is not");
         assert!(volume.exists(), "nor is anything else in the pool");
 
         // The driver that has just been built ran its own probe on the way
@@ -1427,5 +1483,70 @@ mod tests {
             left.is_empty(),
             "the probe cleans up after itself: {left:?}"
         );
+    }
+
+    /// A second host starting on a shared pool leaves the first host's running snapshot copy
+    /// alone, lets it publish, and removes only its own orphans (R3-F09).
+    #[tokio::test]
+    async fn another_hosts_running_snapshot_survives_this_hosts_start() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().to_path_buf();
+        let images = root.join("images");
+        let volumes = root.join("volumes");
+        std::fs::create_dir_all(&images).expect("a temp image dir");
+        let config = |host: &str| FilesystemDriverConfig {
+            image_dir: images.clone(),
+            volume_dir: volumes.clone(),
+            qemu_img: PathBuf::from("qemu-img"),
+            convert: agent_api::base_image::Sandbox::default(),
+            host_id: host.into(),
+        };
+        let a = std::sync::Arc::new(FilesystemBlockDriver::new(config("node-a")).expect("A"));
+
+        let id = VolumeId::new_v4();
+        let backend = volumes.join(format!("{id}.raw"));
+        std::fs::write(&backend, b"the volume's bytes").expect("a volume");
+        let handle = VolumeHandle {
+            id,
+            backend: backend.to_string_lossy().into_owned(),
+            size_bytes: 18,
+            params: None,
+        };
+        let snap = SnapshotId::new_v4();
+
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *a.hold.lock().unwrap() = Some((staged_tx, go_rx));
+        let copying = tokio::spawn({
+            let a = a.clone();
+            let handle = handle.clone();
+            async move { a.snapshot(&handle, &snap).await }
+        });
+        let staged = tokio::task::spawn_blocking(move || staged_rx.recv().expect("A staged"))
+            .await
+            .unwrap();
+        assert!(
+            staged.exists(),
+            "A's copy is on the pool: {}",
+            staged.display()
+        );
+
+        // An orphan of B's own host, from B's previous agent.
+        let b_tag = staging::HostTag::new("node-b").unwrap();
+        let b_orphan = staging::snapshot_copy(&volumes, &SnapshotId::new_v4(), &b_tag);
+        std::fs::write(&b_orphan, b"dead").expect("B's orphan");
+
+        let _b = FilesystemBlockDriver::new(config("node-b")).expect("B starts");
+
+        assert!(staged.exists(), "B's start left A's running copy alone");
+        assert!(!b_orphan.exists(), "and removed its own host's orphan");
+
+        go_tx.send(()).expect("A goes on");
+        let taken = copying.await.unwrap().expect("A's snapshot publishes");
+        assert_eq!(
+            std::fs::read(taken.path()).expect("the snapshot"),
+            b"the volume's bytes"
+        );
+        assert!(!staged.exists(), "renamed into place");
     }
 }

@@ -940,6 +940,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
             qemu_img: PathBuf::from("qemu-img"),
             // Nothing here converts anything: these pools are raw files.
             convert: agent_api::base_image::Sandbox::default(),
+            host_id: "test-node".into(),
         })
         .expect("the filesystem driver builds");
     let mut storage: HashMap<String, Arc<dyn agent_api::storage::VolumeDriver>> = HashMap::new();
