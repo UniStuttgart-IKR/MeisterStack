@@ -972,12 +972,17 @@ pub enum PendingReason {
     /// A cloud-init secret cannot yet be resolved, such as an absent mirror,
     /// missing key or unavailable sealing key. Separate from storage readiness.
     SecretNotReady,
+    /// The room left on the nodes of a cluster that could otherwise take the
+    /// VM is not known: more VMs wait there for a node than its status lists.
+    /// Not `NoCapacity`, because nothing says the room is gone, and not a
+    /// node-level ask, because none of the VM's asks is what is missing.
+    RoomUnknown,
 }
 
 impl PendingReason {
     /// All reasons in declaration order, used to publish zero-valued metric series
     /// for categories with no pending VMs.
-    pub const ALL: [PendingReason; 12] = [
+    pub const ALL: [PendingReason; 13] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
         PendingReason::NodeUnhealthy,
@@ -990,6 +995,7 @@ impl PendingReason {
         PendingReason::VolumeNotReady,
         PendingReason::NoNodeForVolume,
         PendingReason::SecretNotReady,
+        PendingReason::RoomUnknown,
     ];
 
     /// Where this variant sits in `ALL` — the slot a `PendingTally` counts
@@ -1019,6 +1025,7 @@ impl PendingReason {
             PendingReason::VolumeNotReady => "volume-not-ready",
             PendingReason::SecretNotReady => "secret-not-ready",
             PendingReason::NoNodeForVolume => "no-node-for-volume",
+            PendingReason::RoomUnknown => "room-unknown",
         }
     }
 
@@ -1038,7 +1045,8 @@ impl PendingReason {
             | PendingReason::Unserved
             | PendingReason::Split
             | PendingReason::AntiAffinity
-            | PendingReason::NoNodeForVolume => VmReason::Unplaced,
+            | PendingReason::NoNodeForVolume
+            | PendingReason::RoomUnknown => VmReason::Unplaced,
         }
     }
 }
@@ -2858,7 +2866,8 @@ mod tests {
                 "anti-affinity",
                 "volume-not-ready",
                 "no-node-for-volume",
-                "secret-not-ready"
+                "secret-not-ready",
+                "room-unknown"
             ]
         );
         // and the sentence is still the sentence

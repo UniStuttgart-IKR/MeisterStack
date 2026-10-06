@@ -162,20 +162,53 @@ pub(super) async fn note_pending(
 pub(super) struct Ledger {
     pub(super) clusters: Vec<Candidate>,
     /// Keyed by cluster name, the same names `clusters` carries.
-    pub(super) nodes: BTreeMap<String, Vec<NodeRoom>>,
+    pub(super) nodes: BTreeMap<String, Rooms>,
 }
 
 impl Ledger {
     /// Offer `candidate` for this pass, beside the rooms of its nodes.
-    pub(super) fn offer(&mut self, candidate: Candidate, rooms: Vec<NodeRoom>) {
+    pub(super) fn offer(&mut self, candidate: Candidate, rooms: Rooms) {
         self.nodes.insert(candidate.name.clone(), rooms);
         self.clusters.push(candidate);
     }
 
     /// The rooms of `cluster`'s nodes this pass; none for a cluster this
-    /// pass did not list.
+    /// pass did not list or whose room it does not know.
     pub(super) fn rooms(&self, cluster: &str) -> &[NodeRoom] {
-        self.nodes.get(cluster).map_or(&[], Vec::as_slice)
+        self.nodes.get(cluster).map_or(&[], Rooms::nodes)
+    }
+
+    /// The clusters that could take `wanted` but for their room, which is not
+    /// known: usable, allowed by its volumes, and with more VMs waiting for a
+    /// node than their status lists. Each with how many more.
+    fn room_unknown_for(&self, wanted: &Wanted) -> Vec<(&str, u32)> {
+        self.clusters
+            .iter()
+            .filter(|c| controller_api::scheduler::is_usable(c) && wanted.allows_cluster(&c.name))
+            .filter_map(|c| match self.nodes.get(&c.name) {
+                Some(Rooms::Unknown { omitted }) => Some((c.name.as_str(), *omitted)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// What one pass may count on of a cluster's nodes. (IKR-B78)
+pub(super) enum Rooms {
+    /// What each node has left, as this cloud measures it.
+    Measured(Vec<NodeRoom>),
+    /// Not known: `omitted` more VMs wait there for a node than its status
+    /// lists, and what they ask is counted nowhere. Unknown is no room.
+    Unknown { omitted: u32 },
+}
+
+impl Rooms {
+    /// The rooms of the nodes; none where they are not known.
+    pub(super) fn nodes(&self) -> &[NodeRoom] {
+        match self {
+            Rooms::Measured(rooms) => rooms,
+            Rooms::Unknown { .. } => &[],
+        }
     }
 }
 
@@ -187,25 +220,18 @@ impl Ledger {
 /// order the passes that bound them booked them in. While the cluster's
 /// report and the VMs' volumes say what they said then, every pass assumes
 /// the node its binding assumed for each of them. (IKR-B78)
-pub(super) fn rooms_of(
-    cluster: &Cluster,
-    unreported: &[Booking],
-    overcommit: Overcommit,
-) -> Vec<NodeRoom> {
+pub(super) fn rooms_of(cluster: &Cluster, unreported: &[Booking], overcommit: Overcommit) -> Rooms {
+    if cluster.status.unplaced_omitted > 0 {
+        return Rooms::Unknown {
+            omitted: cluster.status.unplaced_omitted,
+        };
+    }
     let mut rooms =
         controller_api::node_rooms(&cluster.status.nodes, overcommit, &cluster.status.unplaced);
-    if cluster.status.unplaced_omitted > 0 {
-        // More waits there for a node than its report could carry: what is
-        // left on its nodes is not known, and unknown is no room.
-        for node in &mut rooms {
-            node.room = Capacity::default();
-        }
-        return rooms;
-    }
     for vm in unreported {
         vm.debit(&mut rooms);
     }
-    rooms
+    Rooms::Measured(rooms)
 }
 
 /// The VMs bound to `cluster` that it has not reported yet, in the order
@@ -323,10 +349,14 @@ impl<'a> Wanted<'a> {
 
     /// Whether `cluster`, whose nodes have `rooms`, can take the VM.
     pub(super) fn served_by(&self, cluster: &str, rooms: &[NodeRoom]) -> bool {
+        self.allows_cluster(cluster) && self.node.met_by_a_node(rooms)
+    }
+
+    /// Whether the VM's volumes let it go to `cluster` at all.
+    fn allows_cluster(&self, cluster: &str) -> bool {
         self.clusters
             .as_ref()
             .is_none_or(|w| w.iter().any(|n| n == cluster))
-            && self.node.met_by_a_node(rooms)
     }
 }
 
@@ -394,7 +424,7 @@ pub(super) fn pick_cluster(
     match scheduler.assign(vm, &allowed) {
         Some(pick) => {
             controller_api::spend(&mut ledger.clusters, &pick, vm);
-            if let Some(rooms) = ledger.nodes.get_mut(&pick) {
+            if let Some(Rooms::Measured(rooms)) = ledger.nodes.get_mut(&pick) {
                 wanted.node.debit(rooms);
             }
             Ok(pick)
@@ -402,8 +432,14 @@ pub(super) fn pick_cluster(
         // The sentence is measured against what was actually
         // offered. A cluster cut away for having no suitable node is
         // not a cluster that "had no room", and saying so would send
-        // an operator to look at the wrong thing.
-        None if allowed.is_empty() && listed > 0 => Err((listed, node_level_reason(vm, listed))),
+        // an operator to look at the wrong thing — and one cut away
+        // because its room is not known is neither, so it is asked
+        // about first.
+        None if allowed.is_empty() && listed > 0 => Err((
+            listed,
+            room_unknown_reason(&ledger.room_unknown_for(wanted))
+                .unwrap_or_else(|| node_level_reason(vm, listed)),
+        )),
         None => Err((
             allowed.len(),
             controller_api::pending_reason_of(vm, &allowed),
@@ -533,6 +569,28 @@ pub(super) fn reachable_nodes(
         }
         Some(controller_api::Locality::Networked) | None => None,
     }
+}
+
+/// Why the VM waits on clusters whose room is not known, naming each with
+/// how many VMs its status left out; None when there are none.
+pub(super) fn room_unknown_reason(
+    unknown: &[(&str, u32)],
+) -> Option<(controller_api::PendingReason, String)> {
+    if unknown.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = unknown
+        .iter()
+        .map(|(cluster, omitted)| format!("{cluster} ({omitted} more than its status lists)"))
+        .collect();
+    Some((
+        controller_api::PendingReason::RoomUnknown,
+        format!(
+            "the room left on the nodes of cluster {} is not known here: its list of the vms \
+             waiting there for a node was cut short, and nothing is placed there until fewer wait",
+            named.join(", ")
+        ),
+    ))
 }
 
 /// Why no cluster has a node for this VM, and under which category. Names

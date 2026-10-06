@@ -958,7 +958,9 @@ fn asking(mem_mib: u64) -> Vm {
 fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
     let name = cluster.metadata.name.clone();
     let mut ledger = Ledger::default();
-    ledger.nodes.insert(name.clone(), rooms(cluster, vms));
+    ledger
+        .nodes
+        .insert(name.clone(), booked_rooms(cluster, vms));
     ledger.clusters.push(Candidate {
         name: name.clone(),
         connected: true,
@@ -978,12 +980,17 @@ fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
 
 /// `rooms_of` with each unreported VM booked by its own asks, as
 /// `unreported_on` books a VM without volumes.
-fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
+fn booked_rooms(cluster: &Cluster, vms: &[Vm]) -> Rooms {
     let booked: Vec<Booking> = unreported(&cluster.metadata.name, vms)
         .into_iter()
         .map(|v| Booking::Where(Wanted::of(v, None, None)))
         .collect();
     rooms_of(cluster, &booked, Overcommit::default())
+}
+
+/// The node rooms of [`booked_rooms`]; none where they are not known.
+fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
+    booked_rooms(cluster, vms).nodes().to_vec()
 }
 
 /// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
@@ -1075,7 +1082,7 @@ fn a_vm_bound_but_not_reported_yet_is_booked_where_its_binding_booked_it() {
     .expect("bound");
     let booked =
         |rooms: &[NodeRoom]| -> Vec<u64> { rooms.iter().map(|r| r.room.mem_mib).collect() };
-    let at_binding = booked(&ledger.lock().unwrap().nodes["ikr-netlab"]);
+    let at_binding = booked(ledger.lock().unwrap().rooms("ikr-netlab"));
 
     ssd.spec.cluster_name = Some("ikr-netlab".into());
     let next_pass = booked(&rooms(&cluster, std::slice::from_ref(&ssd)));
@@ -1118,7 +1125,7 @@ fn vms_bound_in_two_passes_are_booked_in_the_order_they_were_bound() {
         &Wanted::of(&alpha, None, None),
     )
     .expect("alpha bound in the second pass");
-    let at_binding = left(&second.lock().unwrap().nodes["ikr-netlab"]);
+    let at_binding = left(second.lock().unwrap().rooms("ikr-netlab"));
     let alpha = bound(alpha, "alpha", 5);
 
     let third = left(&rooms(&cluster, &[alpha, zeta]));
@@ -1154,6 +1161,32 @@ fn a_cluster_whose_unplaced_list_was_cut_short_offers_no_room() {
     assert!(!Wanted::of(&asking(512), None, None).served_by("ikr-netlab", &rooms));
 }
 
+/// A VM that waits because the room of the cluster that could take it is not
+/// known says so, under its own category, and names the list that was cut
+/// short — not its own asks, none of which is what is missing.
+#[test]
+fn a_vm_waiting_on_a_cluster_whose_room_is_not_known_is_told_so() {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced_omitted = 3;
+    let ledger = ledger_of(&cluster, &[]);
+    let small = asking(512);
+
+    let (_, (category, sentence)) = pick_cluster(
+        &controller_api::FirstFit,
+        &ledger,
+        &small,
+        &Wanted::of(&small, None, None),
+    )
+    .expect_err("no room is known");
+
+    assert_eq!(category, controller_api::PendingReason::RoomUnknown);
+    assert!(
+        sentence.contains("ikr-netlab (3 more than its status lists)"),
+        "{sentence}"
+    );
+    assert!(sentence.contains("cut short"), "{sentence}");
+}
+
 /// A VM bound but not reported yet whose volumes cannot be read right now
 /// takes its room off every node it may be on, as one whose volume is gone:
 /// which of them it lands on is not known.
@@ -1171,6 +1204,7 @@ fn a_vm_whose_volumes_cannot_be_read_takes_room_off_every_node_it_may_be_on() {
     );
     for booked in [unreadable, gone] {
         let left: Vec<u64> = rooms_of(&netlab(4096), &[booked], Overcommit::default())
+            .nodes()
             .iter()
             .map(|r| r.room.mem_mib)
             .collect();
@@ -1217,12 +1251,16 @@ async fn unparsable<T: Resource>(prefix: &str, name: &str) {
 
 /// `netlab(mem_mib)`, connected and heard from now, in `store`.
 async fn connected_netlab(store: &EtcdStore, mem_mib: u64) {
-    let mut cluster = netlab(mem_mib);
+    connected(store, netlab(mem_mib)).await;
+}
+
+/// `cluster`, connected and heard from now, in `store`.
+async fn connected(store: &EtcdStore, mut cluster: Cluster) {
     cluster.status.connected = true;
     cluster.status.capacity.capabilities = vec!["hypervisor/cloud-hypervisor".to_string()];
     store.create(&cluster).await.expect("the cluster");
     store
-        .beat::<Cluster>("ikr-netlab", Utc::now())
+        .beat::<Cluster>(&cluster.metadata.name, Utc::now())
         .await
         .expect("its heartbeat");
 }
@@ -1250,6 +1288,31 @@ async fn a_preview_says_what_the_pass_would_decide() {
     assert_eq!(
         preview(asking(4096)).await,
         node_level_reason(&asking(4096), 1).1
+    );
+}
+
+/// A preview of a VM that waits on a cluster whose room is not known says
+/// that, and names the list that was cut short. (IKR-B78)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_preview_names_the_list_that_was_cut_short() {
+    let store = test_store("preview-test").await;
+    let mut cut_short = netlab(4096);
+    cut_short.status.unplaced_omitted = 2;
+    connected(&store, cut_short).await;
+
+    let preview = would_place(
+        &store,
+        &controller_api::FirstFit,
+        Overcommit::default(),
+        &asking(512),
+    )
+    .await
+    .expect("a preview");
+
+    assert_eq!(
+        Some(preview),
+        room_unknown_reason(&[("ikr-netlab", 2)]).map(|(_, sentence)| sentence)
     );
 }
 
