@@ -1560,6 +1560,98 @@ async fn a_refused_router_prefix_is_a_warning_on_the_router_its_tenant_sees() {
     assert!(said[0].spec.message.contains("floating pool late"));
 }
 
+/// A dispatch for a VM of a tenant that declares no network, whose router's prefix lies on a
+/// floating pool, sends the VM's other prefixes without it and says why on the router, as a
+/// warning its tenant sees. (RR6-4)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_dispatch_sends_without_a_refused_router_prefix_and_says_so_on_the_router() {
+    let store = test_store("rr6-4-dispatch").await;
+    store
+        .create(&controller_api::Tenant::declare(
+            "acme",
+            controller_api::TenantSpec::default(),
+        ))
+        .await
+        .expect("the tenant");
+    let router = store
+        .create(&controller_api::Router::declare(
+            "acme-out",
+            controller_api::RouterSpec {
+                tenant: "acme".into(),
+                provider_network: "ext".into(),
+                internal_addr: "10.42.0.1/24".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the router");
+    store
+        .create(&controller_api::RoutedSubnet::declare(
+            "acme-net",
+            controller_api::RoutedSubnetSpec {
+                tenant: "acme".into(),
+                cidr: "10.7.1.0/24".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("its routed subnet");
+    store
+        .create(&controller_api::FloatingPool::declare(
+            "late",
+            controller_api::FloatingPoolSpec {
+                cidrs: vec!["10.42.0.0/25".into()],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a pool on the router's prefix");
+    let vm = store
+        .create(&owned("web", Some("acme")))
+        .await
+        .expect("the vm");
+    let registry = Arc::new(crate::session::SessionRegistry::new());
+    let sent = registry.recording("cluster-1");
+
+    dispatch_create(
+        &store,
+        &registry,
+        "cluster-1",
+        &vm,
+        false,
+        &LazyBook::new(&common::net::Ipv4Ranges::default()),
+        "",
+    )
+    .await
+    .expect("a dispatch");
+
+    let sent = sent.lock().unwrap().clone();
+    let [cloud_command::Op::Create(create)] = sent.as_slice() else {
+        panic!("one create: {sent:?}");
+    };
+    assert_eq!(create.routed_subnets, ["10.7.1.0/24"]);
+    let said = controller_api::events::about(
+        &store,
+        controller_api::Router::KIND,
+        &router.metadata.uid,
+        "acme-out",
+    )
+    .await;
+    let warnings: Vec<_> = said
+        .iter()
+        .map(|e| (e.spec.reason.as_str(), e.spec.event_type))
+        .collect();
+    assert_eq!(
+        warnings,
+        [(
+            controller_api::events::reason::INSIDE_PREFIX_REFUSED,
+            controller_api::EventType::Warning
+        )]
+    );
+    assert!(said[0].spec.message.contains("floating pool late"));
+}
+
 /// `netlab(mem_mib)`, connected and heard from now, in `store`.
 async fn connected_netlab(store: &EtcdStore, mem_mib: u64) {
     connected(store, netlab(mem_mib)).await;

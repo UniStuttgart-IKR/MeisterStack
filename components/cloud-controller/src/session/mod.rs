@@ -464,21 +464,48 @@ impl SessionRegistry {
         cluster: &str,
         message: &str,
     ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        self.answering(cluster, message, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        asked
+    }
+
+    /// Open a session for `cluster` that refuses every command, and keep what each one asked.
+    pub(crate) fn recording(
+        self: &std::sync::Arc<Self>,
+        cluster: &str,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<cloud_command::Op>>> {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = sent.clone();
+        self.answering(cluster, "recorded and refused", move |op| {
+            kept.lock().unwrap().extend(op);
+        });
+        sent
+    }
+
+    /// Open a session for `cluster` that hands what each command asks to `seen`, before it
+    /// refuses the command with `message`.
+    fn answering(
+        self: &std::sync::Arc<Self>,
+        cluster: &str,
+        message: &str,
+        mut seen: impl FnMut(Option<cloud_command::Op>) + Send + 'static,
+    ) {
         let (tx, mut rx) = mpsc::channel(4);
         self.open(None, cluster, &tx, Utc::now(), None);
-        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (registry, counted) = (self.clone(), asked.clone());
+        let registry = self.clone();
         let message = message.to_string();
         tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.recv().await {
                 if let Some(proto::cloud_message::Kind::Command(cmd)) = msg.kind {
-                    counted.fetch_add(1, Ordering::SeqCst);
+                    seen(cmd.op);
                     let refusal = controller_api::Refusal::plain(message.clone());
                     registry.pending.resolve(&cmd.request_id, Err(refusal));
                 }
             }
         });
-        asked
     }
 }
 
