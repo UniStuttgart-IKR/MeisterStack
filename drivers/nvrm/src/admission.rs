@@ -195,8 +195,9 @@ fn refuse_unbounded_under_budget(
         return Err(DeviceError::InvalidSpec(format!(
             "device {id} sets no VRAM limit, and this node holds its nvrm devices to a \
              budget of {budget} MiB that such a backend could exceed alone; give the \
-             node a default cap ([device.nvrm.defaults] vram_limit_mib) or the device a \
-             profile that sets a limit or a vgpu_type"
+             device a vgpu_type, or a profile that sets vram_limit_mib or \
+             vram_profile_mib (a default cap for the whole node would be refused \
+             beside every vgpu_type)"
         )));
     }
     if live.iter().any(|c| c.is_unbounded()) {
@@ -326,8 +327,12 @@ pub(crate) mod tests {
             .to_string();
         assert!(said.contains("sets no VRAM limit"), "{said}");
         assert!(
-            said.contains("vram_limit_mib"),
+            said.contains("vgpu_type") && said.contains("vram_limit_mib"),
             "and says what to set: {said}"
+        );
+        assert!(
+            !said.contains("[device.nvrm.defaults]"),
+            "a node default cap is refused beside a vgpu_type, so it is no way out: {said}"
         );
         refuse_budget_overrun(&[&capped(1024)], &unlimited(), None, &device())
             .expect("no budget to exceed");
