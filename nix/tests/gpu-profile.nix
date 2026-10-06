@@ -83,8 +83,10 @@ let
   # nixpkgs' default driver, which is not the version the stub targets.
   unpinnedHost = hostWith stub [ driver amd ];
 
-  # The cases of the profile's own assertions, told apart by their tags (./lib.nix).
+  # The kernel parameters of a host as one string, padded so a parameter is matched whole.
   paramsOf = c: " ${lib.concatStringsSep " " c.boot.kernelParams} ";
+
+  # The cases of the profile's own assertions, told apart by their tags (./lib.nix).
   intelHost = hostWith null [ driver intel ];
   unknownHost = hostWith null [ driver ];
   forcedIntel = hostWith null [ driver { meisterstack.gpuProfile.iommuVendor = "intel"; } ];
@@ -123,9 +125,8 @@ pkgs.runCommand "gpu-profile" { } ''
   # And it says so, once, where an operator sees it. The host carries other
   # warnings of its own (the agent's `network-online.target` ordering, 1A
   # §8 point 5), so what is asked for is THIS one and not an empty list.
-  ${lib.optionalString (!(lib.any (w: tagOf w == "no-gpu-backend") without.warnings)) ''
-    echo "-> a fleet with no GPU stack got no warning about it"; exit 1
-  ''}
+  ${require (lib.any (w: tagOf w == "no-gpu-backend") without.warnings)
+    "a fleet with no GPU stack got no warning about it"}
 
   # The profile's assertions: a host that meets them has none failed, and each way of not
   # meeting one fails exactly that one.
@@ -157,10 +158,8 @@ pkgs.runCommand "gpu-profile" { } ''
   ${require (unpinnedHost.hardware.nvidia.package.version != stubDriverVersion)
     "nixpkgs' default driver is the stub's version, so the mismatch case shows nothing"}
   ${require (failsOnly unpinnedHost "driver-version") "a host on another driver version than the GPU stack's was not refused"}
-  ${lib.optionalString (lib.any (w: tagOf w == "no-gpu-backend") with'.warnings) ''
-    echo "-> a fleet WITH the GPU stack was warned about not having it"
-    exit 1
-  ''}
+  ${require (!(lib.any (w: tagOf w == "no-gpu-backend") with'.warnings))
+    "a fleet WITH the GPU stack was warned about not having it"}
   echo "  ok   both branches of the template's GPU profile parse, the driver version is pinned"
   touch $out
 ''
