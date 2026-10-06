@@ -19,7 +19,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::effects::{Clock, Entry, Files};
+use crate::effects::{Clock, Entry, Files, ProcessState, Processes, RealProcesses};
 use crate::ids::sha256_hex;
 use crate::observation::{BootedKernel, Lock, Txn, TxnState};
 use crate::observe::{ACTIVATE_STATUS_SCHEMA, ActivateStatus};
@@ -129,7 +129,6 @@ pub struct ForcedRetirement {
     pub was: TxnState,
 }
 
-
 /// One transaction, on disk, on the target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +154,6 @@ pub struct TxnRecord {
     /// Present only after forced retirement; omitted for compatibility with older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_by_force: Option<ForcedRetirement>,
-
 }
 
 impl TxnRecord {
@@ -216,28 +214,83 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-
-
-/// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
-/// <time>`. `None` for anything this program did not write.
-fn deciding_pid(held: &str) -> Option<u32> {
-    let rest = held.split_once(" pid ")?.1;
-    let digits = rest.split_whitespace().next()?;
-    digits.parse().ok()
+/// The process a `<id>.deciding` file names. A pid alone is reused, so
+/// the lock also carries when the kernel started that pid and in which
+/// boot: `<verb> pid <n> start <ticks> boot <id> at <time>`. A lock written
+/// before start and boot were recorded, or by a process that could not read
+/// its own, names the pid alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holder {
+    pid: u32,
+    start: Option<u64>,
+    boot: Option<String>,
 }
 
-/// Check local process existence with signal 0; EPERM also means the process exists.
-fn is_running(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
+impl Holder {
+    /// This process, as the kernel names it.
+    fn me(processes: &dyn Processes) -> Holder {
+        let pid = processes.own_pid();
+        let start = match processes.state_of(pid) {
+            ProcessState::Running { start } => Some(start),
+            ProcessState::Gone | ProcessState::Unreadable => None,
+        };
+        Holder {
+            pid,
+            start,
+            boot: processes.boot_id(),
+        }
     }
-    matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Ok(()) | Err(nix::errno::Errno::EPERM)
-    )
+
+    /// The contents of the lock file this holder writes for `what`.
+    fn claim(&self, what: &str, at: DateTime<Utc>) -> String {
+        let mut claim = format!("{what} pid {}", self.pid);
+        if let Some(start) = self.start {
+            claim.push_str(&format!(" start {start}"));
+        }
+        if let Some(boot) = &self.boot {
+            claim.push_str(&format!(" boot {boot}"));
+        }
+        format!("{claim} at {at}")
+    }
+
+    /// The holder out of a lock file; `None` for anything this program did
+    /// not write.
+    fn parse(held: &str) -> Option<Holder> {
+        let mut words = held.split_once(" pid ")?.1.split_whitespace();
+        let mut holder = Holder {
+            pid: words.next()?.parse().ok()?,
+            start: None,
+            boot: None,
+        };
+        while let (Some(key), Some(value)) = (words.next(), words.next()) {
+            match key {
+                "start" => holder.start = Some(value.parse().ok()?),
+                "boot" => holder.boot = Some(value.to_string()),
+                _ => break,
+            }
+        }
+        Some(holder)
+    }
+
+    /// Certainly not running any more: its boot is over, its pid is free or
+    /// a zombie, or another process has started under the pid since. What
+    /// the kernel cannot settle counts as running, a lock naming its pid
+    /// alone included. Taking the lock of a holder that still runs would let
+    /// two decisions run at once, and the record say one system while the
+    /// machine runs the other; keeping the lock of a dead one costs a
+    /// deadline that waits, gives up and says so.
+    fn is_gone(&self, processes: &dyn Processes) -> bool {
+        if let (Some(then), Some(now)) = (&self.boot, processes.boot_id())
+            && *then != now
+        {
+            return true;
+        }
+        match processes.state_of(self.pid) {
+            ProcessState::Gone => true,
+            ProcessState::Running { start } => self.start.is_some_and(|then| then != start),
+            ProcessState::Unreadable => false,
+        }
+    }
 }
 
 /// A live process holds this transaction’s decision lock.
@@ -245,7 +298,7 @@ fn is_running(pid: u32) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeingDecided {
     pub id: String,
-    /// The record as it stands: `<verb> pid <n> at <time>`.
+    /// The record as it stands: `<verb> pid <n> start <ticks> boot <id> at <time>`.
     pub holder: String,
 }
 
@@ -274,8 +327,6 @@ pub enum RevertAsker {
     Force,
 }
 
-
-
 /// The state of the machine, and the tools to change it.
 pub struct Helper<'a> {
     pub runner: &'a dyn Runner,
@@ -293,6 +344,8 @@ pub struct Helper<'a> {
     pub timer_path: String,
     /// Directory containing this host’s private keys and certificates.
     pub pki_dir: PathBuf,
+    /// Who holds a decision lock, and whether that holder still lives.
+    pub processes: &'a dyn Processes,
 }
 
 impl<'a> Helper<'a> {
@@ -312,7 +365,14 @@ impl<'a> Helper<'a> {
             own_exe: own_exe.into(),
             timer_path: SYSTEM_PATH.to_string(),
             pki_dir: PathBuf::from(DEFAULT_PKI_DIR),
+            processes: &RealProcesses,
         }
+    }
+
+    /// The process identity a test models instead of this process's.
+    pub fn with_processes(mut self, processes: &'a dyn Processes) -> Helper<'a> {
+        self.processes = processes;
+        self
     }
 
     /// Where the keys are, for a host whose `meisterstack.pki.dir` is not
@@ -812,11 +872,11 @@ impl<'a> Helper<'a> {
     // -----------------------------------------------------------------
 
     /// Serialize decisions for one transaction with an exclusive-create lock file.
-    /// A dead local holder can be reclaimed; malformed lock contents require review.
+    /// A holder known to be dead can be reclaimed; malformed lock contents require review.
     fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let path = self.txn_dir().join(format!("{id}.deciding"));
         self.files.create_dir_all(&self.txn_dir())?;
-        let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
+        let mine = Holder::me(self.processes).claim(what, self.clock.now());
         self.hold_decision(id, &path, &mine)?;
         let out = f();
         // Release only a lock whose contents still match this process’s claim.
@@ -839,7 +899,7 @@ impl<'a> Helper<'a> {
 
     /// Acquire `<id>.deciding`; reclaim a dead holder by renaming its record.
     /// Recheck the claimed record and restore a live holder without overwriting a new lock.
-    /// A live PID, including this process’s PID, prevents acquisition.
+    /// A holder that may still run, this process included, prevents acquisition.
     fn hold_decision(&self, id: &str, path: &Path, mine: &str) -> Result<()> {
         // Retry boundedly if the holder disappears between create and read.
         for _ in 0..4 {
@@ -849,8 +909,8 @@ impl<'a> Helper<'a> {
             let Some(held) = self.files.read_if_present(path)? else {
                 continue;
             };
-            match deciding_pid(&held) {
-                Some(pid) if is_running(pid) => {
+            match Holder::parse(&held) {
+                Some(holder) if !holder.is_gone(self.processes) => {
                     return Err(BeingDecided {
                         id: id.to_string(),
                         holder: held.trim().to_string(),
@@ -867,15 +927,17 @@ impl<'a> Helper<'a> {
                 ),
             }
             // Claim the stale record before attempting a fresh exclusive create.
-            let claim =
-                path.with_file_name(format!("{id}.deciding.taken-by-{}", std::process::id()));
+            let claim = path.with_file_name(format!(
+                "{id}.deciding.taken-by-{}",
+                self.processes.own_pid()
+            ));
             if self.files.rename(path, &claim).is_err() {
                 // Retry from the start if another contender reclaimed the stale record.
                 continue;
             }
             let carried = self.files.read_to_string(&claim).unwrap_or_default();
-            if let Some(pid) = deciding_pid(&carried)
-                && is_running(pid)
+            if let Some(holder) = Holder::parse(&carried)
+                && !holder.is_gone(self.processes)
             {
                 match self.files.create_new(path, carried.as_bytes(), 0o600) {
                     Ok(()) => {
@@ -1503,8 +1565,6 @@ impl<'a> Helper<'a> {
         self.pki_dir.join(format!("{}.key", kind.as_str()))
     }
 
-
-
     /// `<pki.dir>/<kind>.key`, `.key.next` or `.key.prev`.
     pub fn key_path_with(&self, kind: KeyKind, suffix: Option<&str>) -> PathBuf {
         self.pki_dir.join(match suffix {
@@ -1525,14 +1585,87 @@ impl<'a> Helper<'a> {
         self.txn_dir().join(format!("keys-{}.json", kind.as_str()))
     }
 
-    /// Infer rotation progress from `.next` and `.prev` files. Completed/reverted records
-    /// resolve the state only when no temporary pairs remain. Partial file layouts become
-    /// inconsistent; the four switch renames are not an atomic pair replacement.
+    /// Which of the six files of this key's rotation are on the disk.
+    fn key_files(&self, kind: KeyKind) -> KeyFiles {
+        let there = |path: PathBuf| self.files.exists(&path);
+        KeyFiles {
+            key: there(self.key_path_with(kind, None)),
+            crt: there(self.cert_path_with(kind, None)),
+            key_next: there(self.key_path_with(kind, Some("next"))),
+            crt_next: there(self.cert_path_with(kind, Some("next"))),
+            key_prev: there(self.key_path_with(kind, Some("prev"))),
+            crt_prev: there(self.cert_path_with(kind, Some("prev"))),
+        }
+    }
+
+    /// The rotation files of this key that are on the disk, for a person.
+    fn key_files_listed(&self, kind: KeyKind) -> String {
+        let listed: Vec<String> = [None, Some("next"), Some("prev")]
+            .into_iter()
+            .flat_map(|suffix| {
+                [
+                    self.key_path_with(kind, suffix),
+                    self.cert_path_with(kind, suffix),
+                ]
+            })
+            .filter(|path| self.files.exists(path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if listed.is_empty() {
+            "none of them".to_string()
+        } else {
+            listed.join(", ")
+        }
+    }
+
+    /// Why a layout other than a whole step is not a state of the rotation,
+    /// and which verb, if any, resolves it.
+    fn key_layout_reason(&self, kind: KeyKind, layout: KeyLayout, on_disk: KeyFiles) -> String {
+        let files = self.key_files_listed(kind);
+        match layout {
+            KeyLayout::SwitchStopped => format!(
+                "the {kind} key files on this host are a switch that stopped in the middle: \
+                 {files}. Both pairs are whole; `meister-activate keys switch --kind {kind}` \
+                 finishes it, and `meister-activate keys revert --kind {kind}` puts back the \
+                 pair that was in use."
+            ),
+            KeyLayout::RevertStopped => format!(
+                "the {kind} key files on this host are a revert that stopped in the middle: \
+                 {files}. The pair that was in use before the switch is whole; \
+                 `meister-activate keys revert --kind {kind}` finishes putting it back."
+            ),
+            KeyLayout::RemoveStopped => format!(
+                "the {kind} key files on this host are a removal that stopped in the middle: \
+                 {files}. The new pair is in use and the old key is gone; \
+                 `meister-activate keys remove --kind {kind}` finishes it."
+            ),
+            _ if on_disk.crt_next && !on_disk.key_next => format!(
+                "{} is there and {} is not: a certificate without the key it belongs to.",
+                self.cert_path_with(kind, Some("next")).display(),
+                self.key_path_with(kind, Some("next")).display()
+            ),
+            _ => format!(
+                "the {kind} key files on this host are {files}, and no step of a rotation \
+                 leaves that. This tool will not touch them; a person has to decide which \
+                 pair belongs in use."
+            ),
+        }
+    }
+
+    /// Read rotation progress off the six files. The record decides only
+    /// where the files cannot: a rotation that was finished or taken back
+    /// leaves the pair in use and nothing beside it either way. Every
+    /// state but `none` needs a whole pair in use or, mid-step, a whole
+    /// pair aside; a layout no step leaves is inconsistent.
     pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
-        let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
-        let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
-        let key_prev = self.files.exists(&self.key_path_with(kind, Some("prev")));
-        let crt_prev = self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let on_disk = self.key_files(kind);
+        let KeyFiles {
+            key_next,
+            crt_next,
+            key_prev,
+            crt_prev,
+            ..
+        } = on_disk;
         let prev = key_prev || crt_prev;
         let record = match self.files.read_to_string(&self.keys_record_path(kind)) {
             Ok(text) => match KeysRecord::from_json(
@@ -1557,48 +1690,32 @@ impl<'a> Helper<'a> {
             },
             Err(_) => None,
         };
-        // The record wins only where the disk cannot speak: a rotation that
-        // was finished or taken back leaves nothing behind either way.
-        let finished = record
-            .as_ref()
-            .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
-            .map(|r| r.state);
-        let (state, reason) = match (key_next, crt_next, key_prev, crt_prev) {
+        let layout = on_disk.layout();
+        let (state, reason) = match layout {
+            KeyLayout::Empty => match &record {
+                None => (KeysState::None, None),
+                Some(record) => (
+                    KeysState::Inconsistent,
+                    Some(format!(
+                        "{} says this rotation is {}, and there is no {kind} key or \
+                         certificate on this host at all.",
+                        self.keys_record_path(kind).display(),
+                        record.state
+                    )),
+                ),
+            },
+            KeyLayout::InUse => (self.settled_state(kind, record.as_ref()), None),
+            KeyLayout::Prepared => (KeysState::Prepared, None),
+            KeyLayout::Overlap => (KeysState::Overlap, None),
             // The switch, whole: the prepared pair is in and the pair it
             // replaced is beside it.
-            (false, false, true, true) => (KeysState::Switched, None),
-            (true, true, false, false) => (KeysState::Overlap, None),
-            (true, false, false, false) => (KeysState::Prepared, None),
-            (false, true, false, false) => (
+            KeyLayout::Switched => (KeysState::Switched, None),
+            KeyLayout::SwitchStopped
+            | KeyLayout::RevertStopped
+            | KeyLayout::RemoveStopped
+            | KeyLayout::Unknown => (
                 KeysState::Inconsistent,
-                Some(format!(
-                    "{} is there and {} is not: a certificate without the key it belongs to.",
-                    self.cert_path_with(kind, Some("next")).display(),
-                    self.key_path_with(kind, Some("next")).display()
-                )),
-            ),
-            (false, false, false, false) => (finished.unwrap_or(KeysState::None), None),
-            // Other layouts containing `.prev` indicate an interrupted switch requiring inspection.
-            _ => (
-                KeysState::Inconsistent,
-                Some(format!(
-                    "the {kind} key files on this host are a switch that stopped in the \
-                     middle: {}. The pair that was in use is what `.prev` holds; finish it or \
-                     put it back by hand, and this tool will not do either on its own.",
-                    [
-                        self.key_path_with(kind, None),
-                        self.cert_path_with(kind, None),
-                        self.key_path_with(kind, Some("next")),
-                        self.cert_path_with(kind, Some("next")),
-                        self.key_path_with(kind, Some("prev")),
-                        self.cert_path_with(kind, Some("prev")),
-                    ]
-                    .iter()
-                    .filter(|path| self.files.exists(path))
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-                )),
+                Some(self.key_layout_reason(kind, layout, on_disk)),
             ),
         };
         Ok(KeysView {
@@ -1612,6 +1729,42 @@ impl<'a> Helper<'a> {
         })
     }
 
+    /// The pair in use and nothing beside it: a rotation finished, taken
+    /// back, or never begun, and only the record can say which. A record
+    /// whose last write did not happen still names both certificates of
+    /// its switch, and the one in use tells a finished removal (the new one)
+    /// from a finished revert (the old one).
+    fn settled_state(&self, kind: KeyKind, record: Option<&KeysRecord>) -> KeysState {
+        let Some(record) = record else {
+            return KeysState::None;
+        };
+        match record.state {
+            KeysState::Confirmed | KeysState::Reverted => record.state,
+            KeysState::Overlap | KeysState::Switched => {
+                let in_use = self.digest_of(&self.cert_path_with(kind, None));
+                match (&record.previous_sha256, &record.sha256) {
+                    (Some(old), Some(new)) if old != new && in_use.as_ref() == Some(new) => {
+                        KeysState::Confirmed
+                    }
+                    (Some(old), Some(new)) if old != new && in_use.as_ref() == Some(old) => {
+                        KeysState::Reverted
+                    }
+                    _ => KeysState::None,
+                }
+            }
+            KeysState::None | KeysState::Prepared | KeysState::Inconsistent => KeysState::None,
+        }
+    }
+
+    /// The record of this key's rotation, if there is one this program can read.
+    fn stored_keys_record(&self, kind: KeyKind) -> Option<KeysRecord> {
+        let text = self
+            .files
+            .read_to_string(&self.keys_record_path(kind))
+            .ok()?;
+        KeysRecord::from_json(&text, "the key transaction").ok()
+    }
+
     fn write_keys_record(&self, record: &KeysRecord) -> Result<()> {
         self.files.create_dir_all(&self.txn_dir())?;
         let kind = KeyKind::parse(&record.kind)?;
@@ -1619,48 +1772,62 @@ impl<'a> Helper<'a> {
             .write_atomic(&self.keys_record_path(kind), &record.to_json()?, 0o600)
     }
 
-    /// Replace a prepared key/certificate pair through four ordered renames.
-    /// Move the old certificate and key aside, then install the new key and certificate.
-    /// Readers may observe a missing or mismatched pair between renames.
+    /// Replace the pair in use with the prepared one through four ordered renames.
+    /// Readers may observe a missing or mismatched pair between renames; a
+    /// switch that stopped part of the way is finished by running it again.
     pub fn keys_switch(&self, kind: KeyKind, run_id: Option<&str>) -> Result<KeysRecord> {
-        let key_next = self.key_path_with(kind, Some("next"));
-        let crt_next = self.cert_path_with(kind, Some("next"));
-        if !self.files.exists(&key_next) || !self.files.exists(&crt_next) {
-            bail!(
-                "there is no prepared {} pair on this host: {} and {} both have to be there. \
-                 `keygen --suffix next` makes the key and the rotation's `overlap` step \
-                 delivers the certificate.",
-                kind,
-                key_next.display(),
-                crt_next.display()
-            );
+        match self.key_files(kind).layout() {
+            KeyLayout::Overlap | KeyLayout::SwitchStopped => {}
+            _ => bail!(
+                "there is no prepared {kind} pair beside a whole pair in use on this host \
+                 ({}): `{}` and `{}` both have to be there. `keygen --suffix next` makes the \
+                 key and the rotation's `overlap` step delivers the certificate.",
+                self.key_files_listed(kind),
+                self.key_path_with(kind, Some("next")).display(),
+                self.cert_path_with(kind, Some("next")).display()
+            ),
         }
-        let key = self.key_path_with(kind, None);
-        let crt = self.cert_path_with(kind, None);
-        let key_prev = self.key_path_with(kind, Some("prev"));
-        let crt_prev = self.cert_path_with(kind, Some("prev"));
-        let previous = self.digest_of(&crt);
-
-        // Move the old certificate aside before replacing its key.
-        if self.files.exists(&crt) {
-            self.files.rename(&crt, &crt_prev)?;
-        }
-        if self.files.exists(&key) {
-            self.files.rename(&key, &key_prev)?;
-        }
-        self.files.rename(&key_next, &key)?;
-        self.files.rename(&crt_next, &crt)?;
+        let mut record = self.switch_intent(kind, run_id)?;
+        self.move_the_prepared_pair_in(kind)?;
         // The owner travels with the file, so nothing is chowned here; the
         // key was written 0600 `meister:meister` when it was made.
 
+        record.state = KeysState::Switched;
+        record.changed_at = self.clock.now();
+        self.write_keys_record(&record)?;
+        Ok(record)
+    }
+
+    /// Before the first rename, the record names this switch: both
+    /// certificates, and `overlap`, which is what the disk still says. A
+    /// revert or removal that is finished on the disk and not in the record
+    /// is then read off the certificate in use (`settled_state`), never off
+    /// the record of an earlier rotation. A switch that stopped keeps the
+    /// intent it wrote.
+    fn switch_intent(&self, kind: KeyKind, run_id: Option<&str>) -> Result<KeysRecord> {
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        let old = if self.files.exists(&crt_prev) {
+            crt_prev
+        } else {
+            self.cert_path_with(kind, None)
+        };
+        let previous_sha256 = self.digest_of(&old);
+        let sha256 = self.digest_of(&self.cert_path_with(kind, Some("next")));
+        if let Some(record) = self.stored_keys_record(kind)
+            && record.state == KeysState::Overlap
+            && record.previous_sha256 == previous_sha256
+            && record.sha256 == sha256
+        {
+            return Ok(record);
+        }
         let now = self.clock.now();
         let record = KeysRecord {
             schema: KEYS_SCHEMA.to_string(),
             kind: kind.as_str().to_string(),
-            state: KeysState::Switched,
+            state: KeysState::Overlap,
             run_id: run_id.map(str::to_string),
-            previous_sha256: previous,
-            sha256: self.digest_of(&crt),
+            previous_sha256,
+            sha256,
             started_at: now,
             changed_at: now,
             reason: None,
@@ -1669,32 +1836,48 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// Restore the `.prev` pair and discard the current pair; retain the rollback reason.
-    pub fn keys_revert(&self, kind: KeyKind, because: Option<&str>) -> Result<KeysRecord> {
-        let key_prev = self.key_path_with(kind, Some("prev"));
-        let crt_prev = self.cert_path_with(kind, Some("prev"));
-        if !self.files.exists(&key_prev) || !self.files.exists(&crt_prev) {
-            bail!(
-                "there is nothing to go back to for {kind}: {} and {} are not both here. A \
-                 rotation that has not switched is taken back by deleting the `.next` pair, \
-                 and one that has been confirmed cannot be taken back at all.",
-                key_prev.display(),
-                crt_prev.display()
-            );
-        }
+    /// Old certificate aside, old key aside, new key in, new certificate in.
+    /// A key in use is the old one exactly while `.next` still holds the
+    /// new key; every step is skipped once it is done.
+    fn move_the_prepared_pair_in(&self, kind: KeyKind) -> Result<()> {
         let key = self.key_path_with(kind, None);
         let crt = self.cert_path_with(kind, None);
-        self.files.remove_file(&crt)?;
-        self.files.remove_file(&key)?;
-        self.files.rename(&key_prev, &key)?;
-        self.files.rename(&crt_prev, &crt)?;
+        let key_next = self.key_path_with(kind, Some("next"));
+        if self.files.exists(&crt) {
+            self.files
+                .rename(&crt, &self.cert_path_with(kind, Some("prev")))?;
+        }
+        if self.files.exists(&key_next) {
+            if self.files.exists(&key) {
+                self.files
+                    .rename(&key, &self.key_path_with(kind, Some("prev")))?;
+            }
+            self.files.rename(&key_next, &key)?;
+        }
+        self.files
+            .rename(&self.cert_path_with(kind, Some("next")), &crt)
+    }
+
+    /// Restore the `.prev` pair and discard the current pair; retain the rollback reason.
+    /// A revert that stopped part of the way is finished by running it again.
+    pub fn keys_revert(&self, kind: KeyKind, because: Option<&str>) -> Result<KeysRecord> {
+        match self.key_files(kind).layout() {
+            KeyLayout::Switched | KeyLayout::SwitchStopped | KeyLayout::RevertStopped => {}
+            _ => bail!(
+                "there is nothing to go back to for {kind}: the files on this host ({}) are \
+                 not a switch with the old pair whole beside it. A rotation that has not \
+                 switched is taken back by deleting the `.next` pair, and one that has been \
+                 confirmed cannot be taken back at all.",
+                self.key_files_listed(kind)
+            ),
+        }
+        self.put_the_old_pair_back(kind)?;
+        let crt = self.cert_path_with(kind, None);
 
         let now = self.clock.now();
-        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
-            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
-                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
-            Err(_) => KeysRecord::new(kind, None, now),
-        };
+        let mut record = self
+            .stored_keys_record(kind)
+            .unwrap_or_else(|| KeysRecord::new(kind, None, now));
         record.state = KeysState::Reverted;
         record.reason = Some(because.unwrap_or("the rotation was taken back").to_string());
         record.sha256 = self.digest_of(&crt);
@@ -1703,25 +1886,65 @@ impl<'a> Helper<'a> {
         Ok(record)
     }
 
-    /// The last step: the pair that was replaced is dropped and the record
-    /// says the rotation is over.
-    pub fn keys_remove(&self, kind: KeyKind) -> Result<KeysRecord> {
+    /// Drop the new pair, the halves a switch has not moved in yet first,
+    /// and each half in use before its old half comes back. While `.prev`
+    /// holds the old certificate, a certificate in use is the new one, and
+    /// while it holds the old key, so is a key in use; every step is skipped
+    /// once it is done.
+    fn put_the_old_pair_back(&self, kind: KeyKind) -> Result<()> {
+        let key = self.key_path_with(kind, None);
+        let crt = self.cert_path_with(kind, None);
         let key_prev = self.key_path_with(kind, Some("prev"));
         let crt_prev = self.cert_path_with(kind, Some("prev"));
-        if !self.files.exists(&key_prev) && !self.files.exists(&crt_prev) {
-            bail!(
-                "there is no replaced {kind} pair on this host, so this rotation has either \
-                 not switched yet or has already been finished."
-            );
+        for prepared in [
+            self.cert_path_with(kind, Some("next")),
+            self.key_path_with(kind, Some("next")),
+        ] {
+            if self.files.exists(&prepared) {
+                self.files.remove_file(&prepared)?;
+            }
         }
+        if self.files.exists(&crt) {
+            self.files.remove_file(&crt)?;
+        }
+        if self.files.exists(&key_prev) {
+            if self.files.exists(&key) {
+                self.files.remove_file(&key)?;
+            }
+            self.files.rename(&key_prev, &key)?;
+        }
+        self.files.rename(&crt_prev, &crt)
+    }
+
+    /// The last step: the pair that was replaced is dropped and the record
+    /// says the rotation is over.
+    ///
+    /// Only a whole new pair in use lets the old one go: anywhere else the
+    /// pair in `.prev` may be the only whole one left.
+    pub fn keys_remove(&self, kind: KeyKind) -> Result<KeysRecord> {
+        match self.key_files(kind).layout() {
+            KeyLayout::Switched | KeyLayout::RemoveStopped => {}
+            KeyLayout::Empty | KeyLayout::InUse | KeyLayout::Prepared | KeyLayout::Overlap => {
+                bail!(
+                    "there is no replaced {kind} pair on this host, so this rotation has either \
+                     not switched yet or has already been finished."
+                )
+            }
+            KeyLayout::SwitchStopped | KeyLayout::RevertStopped | KeyLayout::Unknown => bail!(
+                "the {kind} pair in use on this host is not the whole new one ({}), so the \
+                 pair in `.prev` may be the only whole one left and nothing was removed. \
+                 `meister-activate keys status --kind {kind}` says what resolves it.",
+                self.key_files_listed(kind)
+            ),
+        }
+        let key_prev = self.key_path_with(kind, Some("prev"));
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
         self.files.remove_file(&key_prev)?;
         self.files.remove_file(&crt_prev)?;
         let now = self.clock.now();
-        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
-            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
-                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
-            Err(_) => KeysRecord::new(kind, None, now),
-        };
+        let mut record = self
+            .stored_keys_record(kind)
+            .unwrap_or_else(|| KeysRecord::new(kind, None, now));
         record.state = KeysState::Confirmed;
         record.changed_at = now;
         record.sha256 = self.digest_of(&self.cert_path_with(kind, None));
@@ -1736,10 +1959,7 @@ impl<'a> Helper<'a> {
             .ok()
             .map(|bytes| format!("sha256:{}", crate::ids::sha256_hex(&bytes)))
     }
-
 }
-
-
 
 pub const KEYS_SCHEMA: &str = "meister-deploy/activate-keys/1";
 
@@ -1760,7 +1980,9 @@ pub enum KeysState {
     Confirmed,
     /// The old pair is back in use and the new one is gone.
     Reverted,
-    /// The disk says something this tool has no rule for.
+    /// Not a whole step of a rotation: a verb that stopped between two of
+    /// its effects, and the reason names the verb that finishes it, or a
+    /// layout no step leaves, which a person has to resolve.
     Inconsistent,
 }
 
@@ -1849,7 +2071,72 @@ pub struct KeysView {
     pub record: Option<KeysRecord>,
 }
 
+/// Which of the six files of one key's rotation are on the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyFiles {
+    key: bool,
+    crt: bool,
+    key_next: bool,
+    crt_next: bool,
+    key_prev: bool,
+    crt_prev: bool,
+}
 
+/// What the six files say. A layout that one of the three verbs leaves
+/// when it stops between two of its effects has a name here, so that the
+/// verb that resolves it can be named too; anything else is `Unknown`, and
+/// no verb touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyLayout {
+    /// No pair, and no rotation.
+    Empty,
+    /// The pair in use, alone.
+    InUse,
+    Prepared,
+    Overlap,
+    /// `keys switch` stopped between its renames.
+    SwitchStopped,
+    Switched,
+    /// `keys revert` stopped after deleting some of the new pair; the old
+    /// pair is whole.
+    RevertStopped,
+    /// `keys remove` stopped after deleting the old key; the new pair is in use.
+    RemoveStopped,
+    Unknown,
+}
+
+impl KeyFiles {
+    fn layout(self) -> KeyLayout {
+        let KeyFiles {
+            key,
+            crt,
+            key_next,
+            crt_next,
+            key_prev,
+            crt_prev,
+        } = self;
+        match (key, crt, key_next, crt_next, key_prev, crt_prev) {
+            (false, false, false, false, false, false) => KeyLayout::Empty,
+            (true, true, false, false, false, false) => KeyLayout::InUse,
+            (true, true, true, false, false, false) => KeyLayout::Prepared,
+            (true, true, true, true, false, false) => KeyLayout::Overlap,
+            // The certificate went aside; the key too; the new key came in.
+            (true, false, true, true, false, true)
+            | (false, false, true, true, true, true)
+            | (true, false, false, true, true, true) => KeyLayout::SwitchStopped,
+            (true, true, false, false, true, true) => KeyLayout::Switched,
+            // The new certificate is gone; the new key too; the old key is
+            // back; and, from a stopped switch, the prepared certificate is gone.
+            (true, false, false, false, true, true)
+            | (false, false, false, false, true, true)
+            | (true, false, false, false, false, true)
+            | (true, false, true, false, false, true)
+            | (false, false, true, false, true, true) => KeyLayout::RevertStopped,
+            (true, true, false, false, false, true) => KeyLayout::RemoveStopped,
+            _ => KeyLayout::Unknown,
+        }
+    }
+}
 
 /// Host key purpose: identity for outbound authentication, serving for TLS endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1975,7 +2262,13 @@ pub fn ok_reply(what: &str, value: serde_json::Value) -> serde_json::Value {
 }
 
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
+mod key_fixtures;
+
+#[cfg(test)]
 mod tests {
+    use super::key_fixtures::{key_layout, rotating, switched_layout};
     use super::*;
     use crate::effects::{FakeClock, MemFiles};
     use crate::run::{Matcher, Output, Policy, StrictFake};
@@ -2479,7 +2772,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
     #[test]
     fn a_confirm_and_a_timer_revert_do_not_both_win() {
         let files = host();
@@ -2508,7 +2800,6 @@ mod tests {
         // is still armed.
         runner.verify().unwrap();
     }
-
 
     #[test]
     fn a_decision_whose_process_is_gone_does_not_block_the_next_one() {
@@ -2543,8 +2834,6 @@ mod tests {
         );
         runner.verify().unwrap();
     }
-
-
 
     /// A record in the state a crash between the two steps leaves behind.
     fn confirming(id: &str) -> TxnRecord {
@@ -2752,8 +3041,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn a_second_revert_is_the_same_answer_and_runs_nothing() {
         let files = host();
@@ -2943,8 +3230,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn an_inconsistent_record_can_be_put_aside_by_a_person_with_a_sentence() {
         // An inconsistent record requires explicit, audited retirement.
@@ -3039,8 +3324,6 @@ mod tests {
         assert!(!text.contains("retired_by_force"), "{text}");
     }
 
-
-
     #[test]
     fn a_transaction_id_is_a_file_name_and_nothing_more() {
         let files = host();
@@ -3121,7 +3404,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
     #[test]
     fn two_operators_carrying_one_run_do_not_both_hold_the_host() {
         let files = host();
@@ -3144,7 +3426,6 @@ mod tests {
         assert_eq!(helper.read_lock().unwrap().unwrap(), first);
         runner.verify().unwrap();
     }
-
 
     #[test]
     fn two_takeovers_of_one_run_leave_exactly_one_holder_of_the_host() {
@@ -3176,8 +3457,6 @@ mod tests {
         runner.verify().unwrap();
     }
 
-
-
     #[test]
     fn a_takeover_of_a_host_the_taking_run_already_holds_is_the_answer_yes() {
         // The fleet anchor and host lock step may attempt the same takeover twice.
@@ -3202,8 +3481,6 @@ mod tests {
         assert!(err.contains("held by the run run-b, not by run-a"), "{err}");
         runner.verify().unwrap();
     }
-
-
 
     #[test]
     fn gc_keeps_the_current_the_booted_and_n_others() {
@@ -3307,8 +3584,6 @@ mod tests {
             .to_string();
         assert!(err.contains("activate-txn/2"), "{err}");
     }
-
-
 
     const PKI: &str = "/var/lib/meisterstack/pki";
 
@@ -3512,8 +3787,6 @@ mod tests {
         }
     }
 
-
-
     /// A prepared key lies BESIDE the one in use, and nothing that is
     /// running notices it is there.
     #[test]
@@ -3572,15 +3845,6 @@ mod tests {
         assert_eq!(one.public_key_sha256, two.public_key_sha256);
     }
 
-    /// A rotation with a prepared pair, ready to switch.
-    fn rotating() -> MemFiles {
-        MemFiles::new()
-            .given(format!("{PKI}/identity.key"), "old key\n")
-            .given(format!("{PKI}/identity.crt"), "old certificate\n")
-            .given(format!("{PKI}/identity.key.next"), "new key\n")
-            .given(format!("{PKI}/identity.crt.next"), "new certificate\n")
-    }
-
     /// The five states, read off the DISK. The record is the story of a
     /// rotation; the files are what it actually did.
     #[test]
@@ -3597,7 +3861,7 @@ mod tests {
             KeysState::None
         );
 
-        let prepared = MemFiles::new().given(format!("{PKI}/identity.key.next"), "k\n");
+        let prepared = key_layout(&[("key", "old"), ("crt", "old"), ("key.next", "new")]);
         assert_eq!(
             helper(&runner, &prepared, &clock)
                 .keys_status(KeyKind::Identity)
@@ -3615,11 +3879,7 @@ mod tests {
             KeysState::Overlap
         );
 
-        let switched = MemFiles::new()
-            .given(format!("{PKI}/identity.key"), "new key\n")
-            .given(format!("{PKI}/identity.crt"), "new certificate\n")
-            .given(format!("{PKI}/identity.key.prev"), "old key\n")
-            .given(format!("{PKI}/identity.crt.prev"), "old certificate\n");
+        let switched = switched_layout();
         assert_eq!(
             helper(&runner, &switched, &clock)
                 .keys_status(KeyKind::Identity)
@@ -3630,7 +3890,7 @@ mod tests {
 
         // A certificate with no key beside it is a state this tool has no
         // rule for, and it says so rather than guessing.
-        let half = MemFiles::new().given(format!("{PKI}/identity.crt.next"), "c\n");
+        let half = key_layout(&[("crt.next", "new")]);
         let view = helper(&runner, &half, &clock)
             .keys_status(KeyKind::Identity)
             .unwrap();
@@ -3638,64 +3898,280 @@ mod tests {
         assert!(view.reason.unwrap().contains("without the key"));
     }
 
-
+    /// A revert deletes the new pair before it puts the old one back.
+    /// Stopped in between, `.prev` is the only whole pair: not a switch,
+    /// and the reason names the verb that finishes it.
     #[test]
-    fn keys_status_names_every_half_switch() {
-        // Check each partial layout between the four switch renames: old certificate aside,
-        // old key aside, then new key installed. None is a completed switch.
-        let runner = StrictFake::new();
-        let clock = clock();
-        let key = format!("{PKI}/identity.key");
-        let crt = format!("{PKI}/identity.crt");
-        let key_next = format!("{PKI}/identity.key.next");
-        let crt_next = format!("{PKI}/identity.crt.next");
-        let key_prev = format!("{PKI}/identity.key.prev");
-        let crt_prev = format!("{PKI}/identity.crt.prev");
-
-        for (after, there) in [
-            (
-                "the certificate went aside",
-                vec![&key, &key_next, &crt_next, &crt_prev],
-            ),
-            (
-                "the key went aside too",
-                vec![&key_next, &crt_next, &key_prev, &crt_prev],
-            ),
-            (
-                "the new key came in",
-                vec![&key, &crt_next, &key_prev, &crt_prev],
-            ),
+    fn a_revert_stopped_after_its_deletions_is_not_read_as_switched() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in [
+            vec![("key", "new"), ("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key.prev", "old"), ("crt.prev", "old")],
         ] {
-            let files = there.iter().fold(MemFiles::new(), |files, path| {
-                files.given((*path).clone(), "x\n")
-            });
+            let files = key_layout(&there);
             let view = helper(&runner, &files, &clock)
                 .keys_status(KeyKind::Identity)
                 .unwrap();
-            assert_eq!(
-                view.state,
-                KeysState::Inconsistent,
-                "after {after} the switch is not finished"
-            );
+            assert_eq!(view.state, KeysState::Inconsistent, "{there:?}");
             let reason = view.reason.unwrap_or_default();
-            assert!(
-                reason.contains("stopped in the middle"),
-                "{after}: {reason}"
+            assert!(reason.contains("keys revert"), "{there:?}: {reason}");
+        }
+    }
+
+    /// Stopped between its renames, a revert leaves the old key in use and
+    /// the old certificate aside. Neither half is lost, and running the
+    /// revert again finishes it.
+    #[test]
+    fn a_revert_stopped_between_its_renames_is_finished_by_running_it_again() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = key_layout(&[("key", "old"), ("crt.prev", "old")]);
+        let helper = helper(&runner, &files, &clock);
+        let view = helper.keys_status(KeyKind::Identity).unwrap();
+        assert_eq!(view.state, KeysState::Inconsistent);
+        assert!(view.reason.unwrap_or_default().contains("keys revert"));
+
+        let record = helper
+            .keys_revert(KeyKind::Identity, Some("the session did not come back"))
+            .unwrap();
+        assert_eq!(record.state, KeysState::Reverted);
+        let whole = key_layout(&[("key", "old"), ("crt", "old")]);
+        assert_eq!(files.contents_under(PKI), whole.contents_under(PKI));
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
+    }
+
+    /// A switch, stopped after each of its first three renames.
+    fn switches_stopped_in_the_middle() -> [Vec<(&'static str, &'static str)>; 3] {
+        [
+            vec![
+                ("key", "old"),
+                ("key.next", "new"),
+                ("crt.next", "new"),
+                ("crt.prev", "old"),
+            ],
+            vec![
+                ("key.next", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+            vec![
+                ("key", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+        ]
+    }
+
+    /// Wherever a switch stopped, running it again finishes it: the new
+    /// pair in use, the old one whole beside it.
+    #[test]
+    fn a_switch_stopped_in_the_middle_is_finished_by_running_it_again() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let switched = switched_layout();
+        for there in switches_stopped_in_the_middle() {
+            let files = key_layout(&there);
+            let record = helper(&runner, &files, &clock)
+                .keys_switch(KeyKind::Identity, Some("run-7"))
+                .unwrap();
+            assert_eq!(
+                files.contents_under(PKI),
+                switched.contents_under(PKI),
+                "{there:?}"
             );
-            // And it says what is on the disk, which is what a person needs.
-            for path in &there {
-                assert!(reason.contains(path.as_str()), "{after}: {reason}");
+            assert_eq!(
+                record.previous_sha256,
+                Some(format!("sha256:{}", crate::ids::sha256_hex(b"old crt\n"))),
+                "{there:?}"
+            );
+        }
+    }
+
+    /// And wherever it stopped, `keys revert` takes it back whole: the old
+    /// pair in use, and nothing of the new one left, `.next` included.
+    #[test]
+    fn a_switch_stopped_in_the_middle_is_taken_back_whole() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let in_use = key_layout(&[("key", "old"), ("crt", "old")]);
+        for there in switches_stopped_in_the_middle() {
+            let files = key_layout(&there);
+            let record = helper(&runner, &files, &clock)
+                .keys_revert(KeyKind::Identity, Some("taken back"))
+                .unwrap();
+            assert_eq!(record.state, KeysState::Reverted, "{there:?}");
+            assert_eq!(
+                files.contents_under(PKI),
+                in_use.contents_under(PKI),
+                "{there:?}"
+            );
+        }
+    }
+
+    /// A rotation replaces the pair in use; with none whole, there is
+    /// nothing to switch from, and nothing is moved.
+    #[test]
+    fn a_switch_needs_a_whole_pair_in_use_to_replace() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = key_layout(&[("key.next", "new"), ("crt.next", "new")]);
+        let before = files.contents_under(PKI);
+        let err = helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole pair in use"), "{err}");
+        assert_eq!(files.contents_under(PKI), before);
+    }
+
+    /// A switch names itself in the record before it moves a file.
+    #[test]
+    fn a_switch_writes_its_record_before_its_first_rename() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        let attempts = files.attempts();
+        let record = attempts
+            .iter()
+            .position(|a| a.ends_with("keys-identity.json"))
+            .expect("the record was written");
+        let rename = attempts
+            .iter()
+            .position(|a| a.starts_with("rename"))
+            .expect("a file was moved");
+        assert!(record < rename, "{attempts:#?}");
+    }
+
+    /// A revert writes its record last. Without that write, the old
+    /// certificate in use still says the rotation was taken back.
+    #[test]
+    fn a_revert_finished_on_the_disk_but_not_in_its_record_reads_reverted() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        helper.put_the_old_pair_back(KeyKind::Identity).unwrap();
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
+    }
+
+    /// A removal writes its record last. Without that write, the new
+    /// certificate in use and no old pair still say the rotation is over.
+    #[test]
+    fn a_removal_finished_on_the_disk_but_not_in_its_record_reads_confirmed() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        for old in ["key.prev", "crt.prev"] {
+            files
+                .remove_file(Path::new(&format!("{PKI}/identity.{old}")))
+                .unwrap();
+        }
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Confirmed
+        );
+    }
+
+    /// The record of a finished rotation stays on the disk until the next
+    /// switch replaces it. A switch that moved its files and a revert that
+    /// put them back, neither of them recorded, read as taken back, not as
+    /// the earlier rotation's `confirmed`.
+    #[test]
+    fn the_record_of_an_earlier_rotation_does_not_decide_this_one() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        let files = rotating();
+        let helper = helper(&runner, &files, &clock);
+        helper.keys_switch(KeyKind::Identity, None).unwrap();
+        helper.keys_remove(KeyKind::Identity).unwrap();
+        files
+            .write_atomic(
+                Path::new(&format!("{PKI}/identity.key.next")),
+                b"newer key\n",
+                0o600,
+            )
+            .unwrap();
+        files
+            .write_atomic(
+                Path::new(&format!("{PKI}/identity.crt.next")),
+                b"newer certificate\n",
+                0o644,
+            )
+            .unwrap();
+
+        helper.switch_intent(KeyKind::Identity, None).unwrap();
+        helper.move_the_prepared_pair_in(KeyKind::Identity).unwrap();
+        helper.put_the_old_pair_back(KeyKind::Identity).unwrap();
+        assert_eq!(
+            helper.keys_status(KeyKind::Identity).unwrap().state,
+            KeysState::Reverted
+        );
+    }
+
+    /// `keys remove` deletes `.prev` only behind a whole new pair in use;
+    /// anywhere else `.prev` may hold the only whole pair on the host.
+    #[test]
+    fn remove_never_deletes_the_only_whole_pair() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in [
+            vec![("key", "new"), ("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key.prev", "old"), ("crt.prev", "old")],
+            vec![("key", "old"), ("crt.prev", "old")],
+            vec![
+                ("key.next", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+            vec![
+                ("key", "new"),
+                ("crt.next", "new"),
+                ("key.prev", "old"),
+                ("crt.prev", "old"),
+            ],
+        ] {
+            let files = key_layout(&there);
+            let before = files.paths();
+            let err = helper(&runner, &files, &clock)
+                .keys_remove(KeyKind::Identity)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("nothing was removed"), "{there:?}: {err}");
+            assert_eq!(files.paths(), before, "{there:?}");
+        }
+    }
+
+    /// None of the layouts between the four renames of a switch is a
+    /// switch, and each names what is on the disk, which is what a person
+    /// needs. The layout after the last rename is one.
+    #[test]
+    fn keys_status_names_every_half_switch() {
+        let (runner, clock) = (StrictFake::new(), clock());
+        for there in switches_stopped_in_the_middle() {
+            let files = key_layout(&there);
+            let view = helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap();
+            assert_eq!(view.state, KeysState::Inconsistent, "{there:?}");
+            let reason = view.reason.unwrap_or_default();
+            assert!(reason.contains("stopped in the middle"), "{reason}");
+            for (name, _) in &there {
+                let path = format!("{PKI}/identity.{name}");
+                assert!(reason.contains(&path), "{path} in {reason}");
             }
         }
-
-        // The one tuple that IS a finished switch still is one.
-        let whole = [&key, &crt, &key_prev, &crt_prev]
-            .iter()
-            .fold(MemFiles::new(), |files, path| {
-                files.given((*path).clone(), "x\n")
-            });
         assert_eq!(
-            helper(&runner, &whole, &clock)
+            helper(&runner, &switched_layout(), &clock)
                 .keys_status(KeyKind::Identity)
                 .unwrap()
                 .state,
@@ -3720,7 +4196,7 @@ mod tests {
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.crt")).unwrap(),
-            b"new certificate\n".to_vec()
+            b"new crt\n".to_vec()
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.key.prev")).unwrap(),
@@ -3731,17 +4207,11 @@ mod tests {
         assert_eq!(record.run_id.as_deref(), Some("run-7"));
         assert_eq!(
             record.previous_sha256,
-            Some(format!(
-                "sha256:{}",
-                crate::ids::sha256_hex(b"old certificate\n")
-            ))
+            Some(format!("sha256:{}", crate::ids::sha256_hex(b"old crt\n")))
         );
         assert_eq!(
             record.sha256,
-            Some(format!(
-                "sha256:{}",
-                crate::ids::sha256_hex(b"new certificate\n")
-            ))
+            Some(format!("sha256:{}", crate::ids::sha256_hex(b"new crt\n")))
         );
         // And it is on the disk, where a resume reads it.
         assert_eq!(
@@ -3794,7 +4264,7 @@ mod tests {
         );
         assert_eq!(
             files.content(format!("{PKI}/identity.crt")).unwrap(),
-            b"old certificate\n".to_vec()
+            b"old crt\n".to_vec()
         );
         assert!(files.content(format!("{PKI}/identity.key.prev")).is_none());
         assert!(files.content(format!("{PKI}/identity.key.next")).is_none());
@@ -3880,8 +4350,6 @@ mod tests {
         );
     }
 
-
-
     fn deciding_path(helper: &Helper<'_>) -> PathBuf {
         helper.txn_dir().join("run-1.deciding")
     }
@@ -3923,7 +4391,7 @@ mod tests {
                 0o600,
             )
             .unwrap();
-        let mine = format!("confirm pid {} at ", std::process::id());
+        let mine = format!("confirm pid {} start ", std::process::id());
         let out = helper
             .deciding("run-1", "confirm", || {
                 let held = files.read_to_string(&path).unwrap();
@@ -3937,15 +4405,151 @@ mod tests {
         assert!(!files.exists(&claim), "no claim is left lying about");
     }
 
+    /// The kernel a decision lock asks, set by hand: one boot, and the pids
+    /// that run in it. Pid 7 is this process.
+    struct ProcessTable {
+        boot: &'static str,
+        running: Vec<(u32, ProcessState)>,
+    }
+
+    impl Processes for ProcessTable {
+        fn own_pid(&self) -> u32 {
+            7
+        }
+
+        fn boot_id(&self) -> Option<String> {
+            Some(self.boot.to_string())
+        }
+
+        fn state_of(&self, pid: u32) -> ProcessState {
+            self.running
+                .iter()
+                .find(|(running, _)| *running == pid)
+                .map_or(ProcessState::Gone, |(_, state)| *state)
+        }
+    }
+
+    /// pid 41 started 1000 ticks into boot `b-1`, and took the lock.
+    const HELD_BY_41: &str = "revert pid 41 start 1000 boot b-1 at 2026-09-22 11:00:00 UTC";
+
+    /// Whether a decision takes over the lock `held` describes, on a host
+    /// whose kernel says `kernel`.
+    fn takes_over(held: &str, kernel: &ProcessTable) -> bool {
+        let files = host();
+        let (runner, clock) = (StrictFake::new(), clock());
+        let helper = helper(&runner, &files, &clock).with_processes(kernel);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        files
+            .write_atomic(&deciding_path(&helper), held.as_bytes(), 0o600)
+            .unwrap();
+        match helper.deciding("run-1", "confirm", || Ok(())) {
+            Ok(()) => true,
+            Err(e) if e.downcast_ref::<BeingDecided>().is_some() => false,
+            Err(e) => panic!("{e:#}"),
+        }
+    }
+
+    fn running(start: u64) -> ProcessState {
+        ProcessState::Running { start }
+    }
+
+    /// pid 1 runs beside this process. A lock that names pid 1 alone cannot
+    /// be told from its holder, so it counts as running.
+    fn pid_1_runs() -> ProcessTable {
+        ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (1, running(1))],
+        }
+    }
+
+    #[test]
+    fn a_lock_whose_holder_still_runs_is_not_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(1000))],
+        };
+        assert!(!takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// DCT-H1: the holder died and its pid went to another process. Signal 0
+    /// says "running"; the start time says it is somebody else.
+    #[test]
+    fn a_lock_whose_pid_another_process_has_now_is_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(3000))],
+        };
+        assert!(takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// Every process of an earlier boot is gone, whatever runs under its
+    /// pid and since when.
+    #[test]
+    fn a_lock_from_an_earlier_boot_is_taken_over() {
+        let kernel = ProcessTable {
+            boot: "b-2",
+            running: vec![(7, running(5000)), (41, running(1000))],
+        };
+        assert!(takes_over(HELD_BY_41, &kernel));
+    }
+
+    /// What the kernel cannot settle counts as running: a lock that names
+    /// its pid alone while that pid runs, and a holder whose start time
+    /// cannot be read.
+    #[test]
+    fn a_lock_whose_holder_cannot_be_told_from_another_process_is_not_taken_over() {
+        let pid_alone = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, running(3000))],
+        };
+        assert!(!takes_over(
+            "revert pid 41 at 2026-09-22 11:00:00 UTC",
+            &pid_alone
+        ));
+        let unreadable = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (41, ProcessState::Unreadable)],
+        };
+        assert!(!takes_over(HELD_BY_41, &unreadable));
+    }
+
+    #[test]
+    fn a_lock_names_its_holder_by_pid_start_and_boot() {
+        let files = host();
+        let (runner, clock) = (StrictFake::new(), clock());
+        let kernel = ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000))],
+        };
+        let helper = helper(&runner, &files, &clock).with_processes(&kernel);
+        let held = helper
+            .deciding("run-1", "confirm", || {
+                Ok(files.read_to_string(&deciding_path(&helper)).unwrap())
+            })
+            .unwrap();
+        assert!(
+            held.starts_with("confirm pid 7 start 5000 boot b-1 at "),
+            "{held}"
+        );
+        assert_eq!(
+            Holder::parse(&held),
+            Some(Holder {
+                pid: 7,
+                start: Some(5000),
+                boot: Some("b-1".to_string()),
+            })
+        );
+    }
+
     #[test]
     fn a_decision_being_made_by_a_running_process_is_refused_as_such() {
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
-        let helper = helper(&runner, &files, &clock);
+        let kernel = pid_1_runs();
+        let helper = helper(&runner, &files, &clock).with_processes(&kernel);
         let path = deciding_path(&helper);
         files.create_dir_all(&helper.txn_dir()).unwrap();
-        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
         files
             .write_atomic(&path, b"revert pid 1 at 2026-09-22 11:00:00 UTC", 0o600)
             .unwrap();
@@ -3983,8 +4587,6 @@ mod tests {
             "revert pid 1 at 2026-09-22 11:30:00 UTC"
         );
     }
-
-
 
     /// A runner under which one command takes a while.
     struct Slow<'a> {
@@ -4129,9 +4731,9 @@ mod tests {
         let files = host();
         let quiet = StrictFake::new();
         let clock = clock();
-        let helper = helper(&quiet, &files, &clock);
+        let kernel = pid_1_runs();
+        let helper = helper(&quiet, &files, &clock).with_processes(&kernel);
         files.create_dir_all(&helper.txn_dir()).unwrap();
-        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
         files
             .write_atomic(
                 &helper.txn_dir().join("d1.deciding"),
