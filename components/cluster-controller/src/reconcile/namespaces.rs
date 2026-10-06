@@ -494,35 +494,16 @@ mod tests {
     }
 
     /// Concurrent namespace claims through shared etcd must allocate distinct entries.
-    /// Run this ignored test with:
-    ///
-    /// ```text
-    /// etcd --data-dir /tmp/ms-runde4-controller-etcd \
-    /// --listen-client-urls http://127.0.0.1:3790 \
-    /// --advertise-client-urls http://127.0.0.1:3790 \
-    /// --listen-peer-urls http://127.0.0.1:3791 \
-    /// --initial-advertise-peer-urls http://127.0.0.1:3791 \
-    /// --initial-cluster default=http://127.0.0.1:3791
-    ///
-    /// MEISTER_TEST_ETCD=http://127.0.0.1:3790 \
-    /// cargo test -p meister-cluster-controller -- --ignored
-    /// ```
     #[tokio::test]
-    #[ignore = "needs an etcd; see the note above"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn two_replicas_assigning_at_once_hand_out_two_namespaces() {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
         // A prefix per run, so a failed one leaves nothing the next trips on.
-        let prefix = format!("/namespaces-test/{}", uuid::Uuid::new_v4());
+        let prefix = crate::test_etcd::fresh_prefix("namespaces-test");
         // Two replicas: two connections, one store underneath. That is what a
         // three-replica cluster is, with the third left out because two is
         // what it takes to race.
-        let one = EtcdStore::connect(std::slice::from_ref(&endpoint), &prefix)
-            .await
-            .expect("an etcd to talk to — see the note above");
-        let two = EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to");
+        let one = crate::test_etcd::connect(&prefix).await;
+        let two = crate::test_etcd::connect(&prefix).await;
 
         let mut fabric = StoragePool::declare(
             "fabric",

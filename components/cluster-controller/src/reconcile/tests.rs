@@ -2625,14 +2625,9 @@ fn scripted_node(
 /// The next pass retries the notification without growing the backend again.
 /// Requires etcd.
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/resize-test/{}", uuid::Uuid::new_v4());
-    let store = EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to");
+    let store = crate::test_etcd::fresh_store("resize-test").await;
 
     // `web` runs on agent-2 and holds `data`, whose bytes are on agent-1:
     // the shared-pool shape, two machines, two halves.
@@ -2752,16 +2747,6 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
     assert!(held.status.phase().message().is_none());
 }
 
-/// A store under a fresh prefix of the test etcd, for the release and placement tests below.
-async fn fresh_store() -> EtcdStore {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/reconcile-test/{}", uuid::Uuid::new_v4());
-    EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to")
-}
-
 /// A pass with no nodes and nothing held; a test puts in the candidates it needs.
 fn quiet_pass<'a>(
     store: &'a EtcdStore,
@@ -2785,9 +2770,9 @@ fn quiet_pass<'a>(
 /// A volume recreated under the same name after the listing survives the old one's release:
 /// its finalizer stays and it is not deleted. (R2-2)
 #[tokio::test]
-#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
-    let store = fresh_store().await;
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
     let mut old = controller_api::resources::new_volume("data", Default::default());
     old.metadata.deletion_timestamp = Some(Utc::now());
     let listed = store.create(&old).await.expect("the old volume");
@@ -2822,9 +2807,9 @@ async fn a_volume_recreated_under_the_same_name_survives_the_old_release() {
 /// A snapshot recreated under the same name after the listing survives the old one's drop.
 /// (R2-2)
 #[tokio::test]
-#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
-    let store = fresh_store().await;
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
     let spec = controller_api::VolumeSnapshotSpec {
         volume: "data".into(),
         ..Default::default()
@@ -2862,9 +2847,9 @@ async fn a_snapshot_recreated_under_the_same_name_survives_the_old_drop() {
 /// The listed snapshot itself still goes when no node ever had it: the guard is a guard, not
 /// a wall. (R2-2)
 #[tokio::test]
-#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_snapshot_no_node_ever_had_is_deleted() {
-    let store = fresh_store().await;
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
     let mut old = controller_api::resources::new_volume_snapshot(
         "snap",
         controller_api::VolumeSnapshotSpec {
@@ -2889,9 +2874,9 @@ async fn a_snapshot_no_node_ever_had_is_deleted() {
 
 /// The listed volume itself still goes: the guard is a guard, not a wall. (R2-2)
 #[tokio::test]
-#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_volume_nothing_holds_is_released_and_deleted() {
-    let store = fresh_store().await;
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
     let mut old = controller_api::resources::new_volume("data", Default::default());
     old.metadata.deletion_timestamp = Some(Utc::now());
     let listed = store.create(&old).await.expect("a deleting volume");
@@ -2949,9 +2934,9 @@ fn compute_node(name: &str) -> (Candidate, controller_api::Node) {
 /// A placement decided on a snapshot in which the last slot was free yields to the migration
 /// claim the store took first: the guest stays unbound and its own claim is given back. (R2-4)
 #[tokio::test]
-#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_placement_onto_a_slot_a_migration_claimed_first_leaves_the_guest_unbound() {
-    let store = fresh_store().await;
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
     let (candidate, node) = compute_node("agent-2");
     store.create(&node).await.expect("the machine");
     let flying = store

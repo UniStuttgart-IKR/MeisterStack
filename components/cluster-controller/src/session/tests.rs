@@ -422,14 +422,9 @@ fn a_disk_dropped_from_the_spec_but_still_held_is_released() {
 /// Removing the final referenced disk clears attachment status and converges
 /// hot-plug reconciliation. Requires external etcd; see the namespace test setup.
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn the_last_volume_removed_from_the_spec_clears_the_status() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/attach-test/{}", uuid::Uuid::new_v4());
-    let store = EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to");
+    let store = crate::test_etcd::fresh_store("attach-test").await;
 
     // Running on n1, spec references no disk any more, but the status still
     // carries the one report wrote before the spec was cleared.
@@ -482,14 +477,9 @@ async fn the_last_volume_removed_from_the_spec_clears_the_status() {
 /// A stale report of a disk the spec dropped keeps it on the status, keeps the
 /// generation open and leaves the release visible to the reconciler (R3-F01).
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_stale_report_after_a_detach_keeps_the_release_visible() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/attach-test/{}", uuid::Uuid::new_v4());
-    let store = EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to");
+    let store = crate::test_etcd::fresh_store("attach-test").await;
 
     let data = store
         .create(&controller_api::resources::new_volume(
@@ -796,16 +786,9 @@ fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
 /// Reports buffered on a superseded session cannot overwrite current node or
 /// VM evidence. Requires external etcd; see the namespace test setup.
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_report_on_a_superseded_session_changes_nothing() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/superseded-test/{}", uuid::Uuid::new_v4());
-    let store = Arc::new(
-        EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to"),
-    );
+    let store = Arc::new(crate::test_etcd::fresh_store("superseded-test").await);
     // What a Hello leaves behind: the node, and a VM bound to it.
     store
         .create(&Node::declare("n1", NodeSpec::default()))
@@ -893,14 +876,9 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
 /// stale, rejecting an old node's report after rebinding. Requires external etcd;
 /// see the namespace test setup.
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_report_from_the_old_node_does_not_land_after_the_vm_was_rebound() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/rebind-test/{}", uuid::Uuid::new_v4());
-    let store = EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to");
+    let store = crate::test_etcd::fresh_store("rebind-test").await;
 
     // Bound to n1, and the snapshot `ingest_phases` is handed below is taken
     // HERE — before the rebind, exactly the staleness a cached `VmIndex` can
@@ -1060,14 +1038,9 @@ fn a_gone_from_a_node_that_is_no_longer_home_leaves_the_volume_where_it_is() {
 /// A vm bound again between the listing and the write keeps its holder and reschedule
 /// count. (R3-F03)
 #[tokio::test]
-#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+#[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_vm_bound_again_after_the_listing_is_not_let_go() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-    let prefix = format!("/letgo-test/{}", uuid::Uuid::new_v4());
-    let store = EtcdStore::connect(&[endpoint], &prefix)
-        .await
-        .expect("an etcd to talk to");
+    let store = crate::test_etcd::fresh_store("letgo-test").await;
 
     // Unbound, still held by n1: the shape `letting_go` picks.
     let mut web = vm("u-web");

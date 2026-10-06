@@ -2203,27 +2203,11 @@ mod tests {
         );
     }
 
-    /// An etcd of one's own, the way `reconcile::tests` takes one.
-    ///
-    /// `#[ignore]`: it needs an etcd. Start one and name it:
-    ///
-    /// ```text
-    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
-    ///   cargo test -p meister-cluster-controller -- --ignored reservation
-    /// ```
-    async fn test_store() -> EtcdStore {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-        let prefix = format!("/migration-reservation-test/{}", uuid::Uuid::new_v4());
-        EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to; see the function's note")
-    }
-
     #[tokio::test]
-    #[ignore = "needs an existing etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn timeout_retains_reservation_and_accepts_late_completion_reports() {
-        let store = std::sync::Arc::new(test_store().await);
+        let store =
+            std::sync::Arc::new(crate::test_etcd::fresh_store("migration-reservation-test").await);
         let guest = store.create(&vm("late-guest")).await.unwrap();
         let mut moving = migration("late-guest", VmMigrationPhaseKind::Running);
         moving.status.migration_id = Some(moving.metadata.uid.clone());
@@ -2299,9 +2283,10 @@ mod tests {
     /// A confirmation that cannot be read ends the step before anything moves: the record
     /// stays Pending, never Preparing, and no node is told anything. (R3-F04, R2-4)
     #[tokio::test]
-    #[ignore = "needs an etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_prepare_whose_room_cannot_be_confirmed_dispatches_nothing() {
-        let store = std::sync::Arc::new(test_store().await);
+        let store =
+            std::sync::Arc::new(crate::test_etcd::fresh_store("migration-reservation-test").await);
         let mut guest = vm("web-1");
         guest.status.reported = Some(controller_api::VmReported::by(
             "agent-1",
@@ -2367,9 +2352,9 @@ mod tests {
     /// The room goes back when the move ends — through `fail`, which is the
     /// one funnel every failure in this file reaches, `abandon` included.
     #[tokio::test]
-    #[ignore = "needs an etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_failed_migration_gives_its_room_back() {
-        let store = test_store().await;
+        let store = crate::test_etcd::fresh_store("migration-reservation-test").await;
         let guest = store
             .create(&whole_machine("web-1"))
             .await
@@ -2408,9 +2393,9 @@ mod tests {
     /// the migration's last phase: one sweep per pass, and a promise nobody
     /// is coming for is given back.
     #[tokio::test]
-    #[ignore = "needs an etcd; see test_store"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn the_reaper_takes_a_reservation_whose_migration_is_over() {
-        let store = test_store().await;
+        let store = crate::test_etcd::fresh_store("migration-reservation-test").await;
         let guest = store
             .create(&whole_machine("web-1"))
             .await

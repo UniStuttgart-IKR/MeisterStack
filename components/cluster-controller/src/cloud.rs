@@ -2830,37 +2830,15 @@ mod tests {
     }
 
     /// Repeated cloud creation updates an existing volume to the larger size.
-    /// Requires an external etcd:
-    ///
-    /// ```text
-    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
-    ///   cargo test -p meister-cluster-controller grown -- --ignored
-    /// ```
     #[tokio::test]
-    #[ignore = "needs an etcd; see the note above"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_create_for_a_volume_this_tier_holds_carries_the_grown_size() {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-        let prefix = format!("/cloud-volume-test/{}", uuid::Uuid::new_v4());
-        let store = EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to — see the note above");
-        let create = |gib: u64| proto::CreateVolume {
-            name: "data".into(),
-            spec_json: serde_json::to_string(&controller_api::VolumeSpec {
-                pool: "fast".into(),
-                size_gib: gib,
-                ..Default::default()
-            })
-            .unwrap(),
-            uid: "u-1".into(),
-            tenant: "acme".into(),
-        };
+        let store = crate::test_etcd::fresh_store("cloud-volume-test").await;
 
-        handle_create_volume(&store, create(10))
+        handle_create_volume(&store, create_volume("u-1", 10))
             .await
             .expect("made");
-        handle_create_volume(&store, create(20))
+        handle_create_volume(&store, create_volume("u-1", 20))
             .await
             .expect("the cloud grew it");
         let held: Volume = store.get("data").await.expect("the volume");
@@ -2869,7 +2847,7 @@ mod tests {
         assert_eq!(held.metadata.uid, "u-1", "and it is still the same bytes");
 
         // A late, older create does not shrink anything.
-        handle_create_volume(&store, create(10))
+        handle_create_volume(&store, create_volume("u-1", 10))
             .await
             .expect("a repeat is acked");
         let held: Volume = store.get("data").await.expect("the volume");
@@ -2877,21 +2855,13 @@ mod tests {
         assert_eq!(held.metadata.generation, 2);
     }
 
-    async fn release_test_store() -> EtcdStore {
-        let endpoint = std::env::var("MEISTER_TEST_ETCD")
-            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
-        let prefix = format!("/cloud-release-test/{}", uuid::Uuid::new_v4());
-        EtcdStore::connect(&[endpoint], &prefix)
-            .await
-            .expect("an etcd to talk to — see the note above")
-    }
-
-    fn create_volume(uid: &str) -> proto::CreateVolume {
+    /// The cloud's create for the volume `data` of `size_gib` in the pool `fast`, as `uid`.
+    fn create_volume(uid: &str, size_gib: u64) -> proto::CreateVolume {
         proto::CreateVolume {
             name: "data".into(),
             spec_json: serde_json::to_string(&controller_api::VolumeSpec {
                 pool: "fast".into(),
-                size_gib: 1,
+                size_gib,
                 ..Default::default()
             })
             .unwrap(),
@@ -2903,10 +2873,10 @@ mod tests {
     /// A release judged on a record that was replaced under the same name before the write
     /// takes nothing from the new record: its finalizer stays and it is not deleted. (R2-2)
     #[tokio::test]
-    #[ignore = "needs an etcd; see the note above"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_release_judged_on_an_old_record_leaves_the_recreated_one_alone() {
-        let store = release_test_store().await;
-        handle_create_volume(&store, create_volume("u-1"))
+        let store = crate::test_etcd::fresh_store("cloud-release-test").await;
+        handle_create_volume(&store, create_volume("u-1", 1))
             .await
             .expect("the cloud's volume");
         let checked: Volume = store
@@ -2914,7 +2884,7 @@ mod tests {
             .await
             .expect("the record the release read");
         store.delete::<Volume>("data").await.expect("it goes");
-        handle_create_volume(&store, create_volume("u-2"))
+        handle_create_volume(&store, create_volume("u-2", 1))
             .await
             .expect("another cloud volume under the same name");
         let release = proto::ReleaseVolume {
@@ -2938,10 +2908,10 @@ mod tests {
 
     /// The record the release names goes, finalizer and all: the guard is not a wall. (R2-2)
     #[tokio::test]
-    #[ignore = "needs an etcd; see the note above"]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
     async fn a_release_of_the_current_record_removes_it() {
-        let store = release_test_store().await;
-        handle_create_volume(&store, create_volume("u-1"))
+        let store = crate::test_etcd::fresh_store("cloud-release-test").await;
+        handle_create_volume(&store, create_volume("u-1", 1))
             .await
             .expect("the cloud's volume");
         let release = proto::ReleaseVolume {

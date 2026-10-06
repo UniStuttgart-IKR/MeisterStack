@@ -14,6 +14,8 @@ mod logs;
 mod migration;
 mod reconcile;
 mod session;
+#[cfg(test)]
+mod test_etcd;
 
 use std::sync::Arc;
 use std::time::Duration;
