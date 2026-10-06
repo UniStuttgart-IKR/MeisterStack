@@ -83,6 +83,9 @@ impl Provisioner {
         }
 
         refuse_devices(&id, &spec.devices)?;
+        // Inert while every device is refused above: a vm reaching this line
+        // has none to admit. It stays so that reception, should it ever
+        // carry devices, admits them like provision and restart do.
         self.check_device_admission(&id, &spec).await?;
         anyhow::ensure!(
             self.store.claim_migration(&id, migration_id, false)?,

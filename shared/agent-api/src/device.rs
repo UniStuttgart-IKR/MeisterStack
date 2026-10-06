@@ -137,9 +137,10 @@ pub trait DeviceDriver: Send + Sync {
     /// agent restart and a stopped VM keeps what it was admitted to.
     ///
     /// The agent admits before every `create` of a VM's devices (provision,
-    /// restart, reception) and writes the VM's record under the same
-    /// operations lock, so a driver that shares a resource between VMs
-    /// accounts for it here, against the store, and not in `create`.
+    /// restart) and writes the VM's record under the same operations lock, so
+    /// a driver that shares a resource between VMs accounts for it here,
+    /// against the store, and not in `create`. Reception of a migrating VM
+    /// refuses devices outright and never gets this far.
     async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
