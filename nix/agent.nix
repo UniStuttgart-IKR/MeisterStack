@@ -503,8 +503,9 @@ in
           RestartSec = 2;
           Environment = "RUST_LOG=info";
 
-          # Allow netlink for link, route, and nftables configuration.
-          RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK";
+          # Allow netlink for link, route, and nftables configuration, and packet sockets
+          # for the gratuitous ARP an activated router sends with arping (IKR-B75).
+          RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET AF_VSOCK";
 
           # No mount namespace of its own for an agent that mounts (IKR-B69). Every path
           # sandbox (ProtectHome, ProtectSystem, PrivateTmp, ReadOnlyPaths, InaccessiblePaths,

@@ -35,6 +35,9 @@ let
   ownMountNamespace = unit:
     lib.any (key: unit ? ${key} && !(unset unit.${key})) namespacing;
 
+  families = unit:
+    lib.sort lib.lessThan (lib.filter (f: f != "") (lib.splitString " " unit.RestrictAddressFamilies));
+
   root = agentUnit { };
   computeOnly = agentUnit { meisterstack.agent.unprivileged = true; };
   unprivilegedMounting = agentUnit {
@@ -49,6 +52,12 @@ let
       !(ownMountNamespace unprivilegedMounting);
     "an agent that cannot mount keeps the home directories closed" =
       computeOnly.ProtectHome or false;
+
+    # IKR-B75: arping opens an AF_PACKET socket, and nothing beyond it is opened.
+    "the agent may open packet sockets for gratuitous ARP and no other new family" =
+      lib.all (unit: families unit == lib.sort lib.lessThan [
+        "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" "AF_PACKET" "AF_VSOCK"
+      ]) [ root computeOnly ];
   };
 
   broken = lib.attrNames (lib.filterAttrs (_: holds: !holds) expectations);
