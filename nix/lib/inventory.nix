@@ -510,8 +510,9 @@ let
           boot.loader.efi.canTouchEfiVariables = lib.mkDefault (h.boot == "uefi");
           boot.loader.grub.enable = lib.mkDefault false;
 
-          # For installable hosts, require the boot mode and disk layout to agree on
-          # whether an EFI system partition exists.
+          # Every host must bind its metrics where the fleet's Prometheus scrapes
+          # them. For installable hosts, also require the boot mode and disk layout
+          # to agree on whether an EFI system partition exists.
           assertions = metricsBindAssertions h config ++ lib.optionals (h.install != null) [
             {
               assertion = h.boot != "uefi" || config.meisterstack.install.hasEsp;
