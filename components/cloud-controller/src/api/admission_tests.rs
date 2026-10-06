@@ -1530,3 +1530,50 @@ async fn a_patch_whose_lost_claim_was_not_put_back_says_so_and_is_not_run_again(
     );
     assert_eq!(stands.spec.network_prefixes, ["10.30.0.0/24"]);
 }
+
+// --- NL6-2: a tenant's create asks about its network after the write too -----
+
+/// A tenant created with a network that a pool, written between the create's check and its
+/// write, lies on is taken back and refused naming the pool. (NL6-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenant_created_onto_a_pool_written_after_its_check_is_taken_back() {
+    let st = cloud_with_routers("nl6-2").await;
+    let tenant = unique("t");
+    let checked = pause(&tenant);
+
+    let (answer, ()) = tokio::join!(
+        create_tenant(
+            State(st.clone()),
+            DryRun::default(),
+            Json(tenant_with_network(&tenant, &["10.30.0.0/24"])),
+        ),
+        async {
+            checked.arrived().await;
+            st.store
+                .create(&pool_on_10_30("between"))
+                .await
+                .expect("a pool between the check and the write");
+            checked.release().await;
+        },
+    );
+
+    let refused = answer
+        .err()
+        .expect("the network lost to the pool before it");
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.message()
+    );
+    assert!(
+        refused.message().contains("floating pool between"),
+        "{}",
+        refused.message()
+    );
+    assert!(matches!(
+        st.store.get::<Tenant>(&tenant).await,
+        Err(StoreError::NotFound(_))
+    ));
+}

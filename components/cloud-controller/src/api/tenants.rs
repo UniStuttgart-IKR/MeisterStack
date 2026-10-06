@@ -28,7 +28,8 @@ pub(super) async fn list_tenants(
 
 /// Allocate a server-owned VNI before storing the tenant. The counter CAS gives
 /// concurrent creates distinct networks; a create that fails after it, at the
-/// store, may consume a VNI, while one refused for its own input does not.
+/// store or because its network lost a claim written at the same moment, may
+/// consume a VNI, while one refused for its own input does not.
 /// Dry-run reads the next candidate without advancing the counter.
 pub(super) async fn create_tenant(
     State(st): State<ApiState>,
@@ -59,10 +60,13 @@ pub(super) async fn create_tenant(
     tenant.spec.vni = Some(vni);
     tenant.spec.network_prefixes = prefixes;
     tenant.metadata.labels = body.metadata.labels;
-    let created = match dry.preview(&tenant) {
-        Some(preview) => preview,
-        None => st.store.create(&tenant).await?,
-    };
+    if let Some(preview) = dry.preview(&tenant) {
+        return Ok((StatusCode::CREATED, Json(preview)));
+    }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&tenant.metadata.name).await;
+    let created = st.store.create(&tenant).await?;
+    settle_network_claim(&st, &created, &[], take_back(&st, &created)).await?;
     info!(tenant = %created.metadata.name, vni, "tenant created");
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -113,25 +117,17 @@ pub(super) async fn update_tenant(
     #[cfg(test)]
     super::admission_tests::admission_gate(&name).await;
     let updated = st.store.update(&body).await?;
-
-    // And the question again from inside the store, as a pool or a routed subnet
-    // asks it after its write: one written at the same moment was not in the
-    // listing the check above read. (RR5-6) This handler asks once; a PATCH
-    // without a resourceVersion runs it again on a 409 (`patch_with_retry`),
-    // and that round judges the tenant as it was put back. A put back that
-    // failed answers `claim_not_taken_back`, which is not run again. (NL6-3)
-    if network_prefixes_judged(
-        &updated.spec.network_prefixes,
+    // This handler asks once; a PATCH without a resourceVersion runs it again on
+    // a 409 (`patch_with_retry`), and that round judges the tenant as it was put
+    // back. A put back that failed answers `claim_not_taken_back`, which is not
+    // run again. (NL6-3)
+    settle_network_claim(
+        &st,
+        &updated,
         &current.spec.network_prefixes,
-    ) {
-        settle_claim(
-            &name,
-            "tenant",
-            network_lost_claim(&st, &updated).await,
-            put_back(&st, &current, &updated),
-        )
-        .await?;
-    }
+        put_back(&st, &current, &updated),
+    )
+    .await?;
     Ok(Json(updated))
 }
 
@@ -158,6 +154,24 @@ async fn checked_network_prefixes(
     }
     let taken = off_limits_to_network_prefixes(st, tenant).await?;
     canonical_network_prefixes(declared, &taken)
+}
+
+/// A tenant's network asked about again from inside the store after its write, as a pool or a
+/// routed subnet asks after its own: one written at the same moment was not in the listing the
+/// check before the write read. `undo` takes the write back when it lost (RR5-6). The create
+/// and the update of a tenant take this one road, and only a write judged on its prefixes over
+/// the `before` ones (`network_prefixes_judged`) is asked again. (NL6-2)
+async fn settle_network_claim(
+    st: &ApiState,
+    written: &Tenant,
+    before: &[String],
+    undo: impl std::future::Future<Output = Result<(), ApiError>>,
+) -> Result<(), ApiError> {
+    if !network_prefixes_judged(&written.spec.network_prefixes, before) {
+        return Ok(());
+    }
+    let lost = network_lost_claim(st, written).await;
+    settle_claim(&written.metadata.name, "tenant", lost, undo).await
 }
 
 /// The claim a tenant's network that is already in the store turns out to have lost: what
