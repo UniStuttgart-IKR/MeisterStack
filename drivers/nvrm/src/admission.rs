@@ -318,7 +318,10 @@ pub(crate) mod tests {
             .expect_err("it could take the rest and more")
             .to_string();
         assert!(said.contains("sets no VRAM limit"), "{said}");
-        assert!(said.contains("vram_limit_mib"), "and says what to set: {said}");
+        assert!(
+            said.contains("vram_limit_mib"),
+            "and says what to set: {said}"
+        );
         refuse_budget_overrun(&[&capped(1024)], &unlimited(), None, &device())
             .expect("no budget to exceed");
     }
