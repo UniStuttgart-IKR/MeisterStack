@@ -10,6 +10,7 @@
 //! ownership checks reject it (R3-F07).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use agent_api::networking::{
@@ -233,6 +234,83 @@ pub fn garp_command<'a>(arping: &'a str, netns: &'a str, address: &'a str) -> Ve
     ]
 }
 
+/// One IPv4 address on a router leg: the host address and its prefix length.
+type LegAddress = (Ipv4Addr, u8);
+
+/// Read `a.b.c.d/len`, or a bare address, which `ip` takes as a /32.
+fn parse_leg_address(raw: &str) -> Option<LegAddress> {
+    let raw = raw.trim();
+    let (address, len) = raw.split_once('/').unwrap_or((raw, "32"));
+    let len = len.parse::<u8>().ok().filter(|len| *len <= 32)?;
+    Some((address.parse().ok()?, len))
+}
+
+fn leg_address_arg((address, len): &LegAddress) -> String {
+    format!("{address}/{len}")
+}
+
+/// What each leg of a router carries: its own address on both, and the floating /32s on the
+/// external one, so that the active router answers ARP for them.
+fn wanted_leg_addresses(
+    spec: &RouterSpec,
+) -> networking::Result<[(&'static str, Vec<LegAddress>); 2]> {
+    let parse = |raw: &str| {
+        parse_leg_address(raw).ok_or_else(|| {
+            NetworkError::InvalidSpec(format!("the router address {raw:?} is not an IPv4 address"))
+        })
+    };
+    let mut external = vec![parse(&spec.external_addr)?];
+    for nat in spec.nats.iter().filter(|n| n.kind == NatKind::DnatAndSnat) {
+        let floating = parse(address_of(&nat.external_ip))?;
+        let floating = (floating.0, 32);
+        if !external.contains(&floating) {
+            external.push(floating);
+        }
+    }
+    Ok([
+        (LEG_EXTERNAL, external),
+        (LEG_INTERNAL, vec![parse(&spec.internal_addr)?]),
+    ])
+}
+
+/// The IPv4 addresses an `ip -o -4 addr show` listing names. A line that names one this
+/// cannot read is an error: a leg whose addresses are unknown is not one to change.
+fn listed_leg_addresses(listing: &str) -> networking::Result<Vec<LegAddress>> {
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        let mut words = line.split_whitespace();
+        if !words.any(|word| word == "inet") {
+            continue;
+        }
+        let raw = words.next().unwrap_or_default();
+        let address = parse_leg_address(raw).ok_or_else(|| {
+            NetworkError::Backend(anyhow::anyhow!(
+                "`ip addr show` named an address this driver cannot read: {line:?}"
+            ))
+        })?;
+        out.push(address);
+    }
+    Ok(out)
+}
+
+/// What to take off a leg, and what to put on it, so that it carries exactly `wanted`.
+fn address_changes(
+    present: &[LegAddress],
+    wanted: &[LegAddress],
+) -> (Vec<LegAddress>, Vec<LegAddress>) {
+    let stale = present
+        .iter()
+        .filter(|a| !wanted.contains(a))
+        .copied()
+        .collect();
+    let missing = wanted
+        .iter()
+        .filter(|a| !present.contains(a))
+        .copied()
+        .collect();
+    (stale, missing)
+}
+
 /// Suppress replies for all local addresses when standby.
 fn arp_ignore(active: bool) -> &'static str {
     match active {
@@ -361,6 +439,58 @@ impl crate::LinuxNetworkDriver {
             .ip(&["netns", "exec", netns, "sysctl", "-n", key])
             .await?;
         Ok(value.trim().to_string())
+    }
+
+    /// The IPv4 addresses one leg of a router's namespace carries now.
+    async fn leg_addresses_present(
+        &self,
+        netns: &str,
+        leg: &str,
+    ) -> networking::Result<Vec<LegAddress>> {
+        let listing = self
+            .ip(&["-n", netns, "-o", "-4", "addr", "show", "dev", leg])
+            .await?;
+        listed_leg_addresses(&listing)
+    }
+
+    /// Give a leg exactly `wanted`, touching nothing it carries already (IKR-B70).
+    ///
+    /// Deleting the router's external address makes the kernel drop every connection
+    /// masqueraded behind it, so a pass that flushed and re-added the addresses cut every
+    /// tenant's connections, every few seconds. Stale addresses go first, and the leg is read
+    /// again after: deleting a primary address takes the secondaries of its subnet with it, so
+    /// a delete that fails is judged by what is left, and what is missing by what is there.
+    async fn converge_leg_addresses(
+        &self,
+        netns: &str,
+        leg: &str,
+        wanted: &[LegAddress],
+    ) -> networking::Result<()> {
+        let mut present = self.leg_addresses_present(netns, leg).await?;
+        let (stale, _) = address_changes(&present, wanted);
+        if !stale.is_empty() {
+            for address in &stale {
+                let address = leg_address_arg(address);
+                self.ip_again(&["-n", netns, "addr", "del", &address, "dev", leg])
+                    .await;
+            }
+            present = self.leg_addresses_present(netns, leg).await?;
+            let (left, _) = address_changes(&present, wanted);
+            if !left.is_empty() {
+                let left: Vec<String> = left.iter().map(leg_address_arg).collect();
+                return Err(NetworkError::Backend(anyhow::anyhow!(
+                    "{leg} in {netns} still carries {} after deleting it",
+                    left.join(", ")
+                )));
+            }
+        }
+        let (_, missing) = address_changes(&present, wanted);
+        for address in &missing {
+            let address = leg_address_arg(address);
+            self.ip(&["-n", netns, "addr", "add", &address, "dev", leg])
+                .await?;
+        }
+        Ok(())
     }
 
     /// Program nftables inside a router's namespace.
@@ -598,7 +728,7 @@ impl crate::LinuxNetworkDriver {
     }
 
     /// Ensure namespace, veths, addresses, routes, NAT and ARP mode.
-    /// Address replacement runs on every call; obsolete explicit subnet routes are not removed.
+    /// Addresses are converged, not replaced; obsolete explicit subnet routes are not removed.
     #[instrument(skip_all, fields(router = %spec.id, physnet = %spec.physnet,
                                   vni = spec.vxlan_id, active = spec.active))]
     pub(crate) async fn ensure_router_impl(
@@ -708,22 +838,10 @@ impl crate::LinuxNetworkDriver {
             self.set_arp_mode(&netns, &ROUTER_LEGS, false).await?;
         }
 
-        for (leg, addr) in [
-            (LEG_EXTERNAL, &spec.external_addr),
-            (LEG_INTERNAL, &spec.internal_addr),
-        ] {
-            // Flush and set, not add: the spec is the truth, and a router that
-            // was re-addressed must not keep answering for the address it had.
-            self.ip_again(&["-n", &netns, "addr", "flush", "dev", leg])
-                .await;
-            self.ip(&["-n", &netns, "addr", "add", addr, "dev", leg])
-                .await?;
-        }
-        // Assign floating /32s externally so the active router can answer provider ARP.
-        for nat in spec.nats.iter().filter(|n| n.kind == NatKind::DnatAndSnat) {
-            let fip = format!("{}/32", address_of(&nat.external_ip));
-            self.ip(&["-n", &netns, "addr", "add", &fip, "dev", LEG_EXTERNAL])
-                .await?;
+        // The spec is the truth: a router that was re-addressed must not keep answering for the
+        // address it had, and one whose addresses are right keeps them and its connections.
+        for (leg, wanted) in wanted_leg_addresses(spec)? {
+            self.converge_leg_addresses(&netns, leg, &wanted).await?;
         }
 
         self.ip(&[
@@ -772,10 +890,10 @@ impl crate::LinuxNetworkDriver {
 
         // Activation last: a new or standby router starts answering ARP only after its rules
         // and its active record are in place. A router that was active already is never
-        // silenced by a pass that ensures it again, failed steps included (R2-1). It does not
-        // answer throughout, though: the flush above takes its addresses, and the routes over
-        // them, until they are set again, for a moment on every pass and until a retry when an
-        // add or the default route fails (NL2-3).
+        // silenced by a pass that ensures it again, failed steps included (R2-1). A pass over a
+        // router whose addresses are right takes none of them away (IKR-B70); one that
+        // re-addresses it answers for the new address once it is added, or after a retry when
+        // that add or the default route fails (NL2-3).
         if spec.active {
             self.activate(&netns, spec, recorded_active).await?;
         }
@@ -2030,5 +2148,174 @@ exit 0
         assert_eq!(phase, RouterPhase::Failed);
         assert_eq!(reason, Some(RouterReason::DriverUnreachable));
         assert!(message.contains("command not found"), "{message}");
+    }
+
+    /// A fake `ip` that logs every call to `<dir>/ip.log` and keeps one leg's addresses in
+    /// `<dir>/addresses`, starting with `addresses`: `addr show` lists them as
+    /// `ip -o -4 addr show dev <leg>` prints them, `addr del` and `addr add` change them.
+    fn addressed_driver(dir: &Path, addresses: &[&str]) -> crate::LinuxNetworkDriver {
+        let state = dir.join("addresses");
+        let lines: String = addresses.iter().map(|a| format!("{a}\n")).collect();
+        std::fs::write(&state, lines).expect("the leg's addresses");
+        let ip = format!(
+            r#"echo "$*" >> '{log}'
+case "$*" in
+"-n "*" -o -4 addr show dev "*)
+  while read -r a; do echo "3: $8    inet $a scope global $8\       valid_lft forever"; done < '{state}';;
+"-n "*" addr del "*) awk -v a="$5" '$0 != a' '{state}' > '{state}.new' && mv '{state}.new' '{state}';;
+"-n "*" addr add "*) echo "$5" >> '{state}';;
+esac
+exit 0
+"#,
+            log = dir.join("ip.log").display(),
+            state = state.display(),
+        );
+        fake_driver(dir, &ip)
+    }
+
+    /// The address changes the fake `ip` was asked for, in order.
+    fn address_calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|call| {
+                [" addr del ", " addr add ", " addr flush "]
+                    .iter()
+                    .any(|verb| call.contains(verb))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn addressed(raw: &[&str]) -> Vec<LegAddress> {
+        raw.iter()
+            .map(|a| parse_leg_address(a).expect("an address"))
+            .collect()
+    }
+
+    /// IKR-B70: a pass over a leg whose addresses are right deletes, flushes and adds nothing,
+    /// so the connections masqueraded behind them live on.
+    #[tokio::test]
+    async fn a_leg_that_carries_its_addresses_already_is_left_alone() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let log = temp.path().join("ip.log");
+        let d = addressed_driver(temp.path(), &["203.0.113.10/24", "203.0.113.55/32"]);
+
+        d.converge_leg_addresses(
+            "meister-rt-x",
+            LEG_EXTERNAL,
+            &addressed(&["203.0.113.10/24", "203.0.113.55/32"]),
+        )
+        .await
+        .expect("nothing to do");
+
+        assert!(address_calls(&log).is_empty(), "{:?}", address_calls(&log));
+    }
+
+    /// A floating address the spec no longer holds is taken off, and nothing else is.
+    #[tokio::test]
+    async fn a_floating_address_given_up_is_the_only_one_taken_off() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let log = temp.path().join("ip.log");
+        let d = addressed_driver(temp.path(), &["203.0.113.10/24", "203.0.113.55/32"]);
+
+        d.converge_leg_addresses(
+            "meister-rt-x",
+            LEG_EXTERNAL,
+            &addressed(&["203.0.113.10/24"]),
+        )
+        .await
+        .expect("one address goes");
+
+        assert_eq!(
+            address_calls(&log),
+            ["-n meister-rt-x addr del 203.0.113.55/32 dev ext"]
+        );
+    }
+
+    /// An address that is still there after its delete fails the pass: a leg whose addresses
+    /// are not what the spec says is not a router to activate.
+    #[tokio::test]
+    async fn an_address_that_will_not_go_fails_the_pass() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let ip = "case \"$*\" in\n\"-n \"*\" -o -4 addr show dev \"*) \
+                  echo \"3: $8    inet 203.0.113.55/32 scope global $8\";;\n\
+                  \"-n \"*\" addr del \"*) echo 'Operation not permitted' >&2; exit 2;;\n\
+                  esac\nexit 0\n";
+        let d = fake_driver(temp.path(), ip);
+
+        let err = d
+            .converge_leg_addresses("meister-rt-x", LEG_EXTERNAL, &[])
+            .await
+            .expect_err("the floating address stayed");
+
+        assert!(format!("{err:#}").contains("still carries"), "{err:#}");
+    }
+
+    /// A re-addressed router gives the old address up before it takes the new one: deleting a
+    /// primary address would take a secondary of its subnet with it.
+    #[tokio::test]
+    async fn a_re_addressed_leg_gives_the_old_address_up_first() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let log = temp.path().join("ip.log");
+        let d = addressed_driver(temp.path(), &["10.7.1.1/24"]);
+
+        d.converge_leg_addresses("meister-rt-x", LEG_INTERNAL, &addressed(&["10.7.1.2/24"]))
+            .await
+            .expect("re-addressed");
+
+        assert_eq!(
+            address_calls(&log),
+            [
+                "-n meister-rt-x addr del 10.7.1.1/24 dev int",
+                "-n meister-rt-x addr add 10.7.1.2/24 dev int",
+            ]
+        );
+    }
+
+    /// The external leg carries the router's address and every floating /32 once; the inside
+    /// leg carries the router's inside address.
+    #[test]
+    fn each_leg_wants_its_own_address_and_the_outside_one_the_floating_ones() {
+        let mut router = spec(true);
+        router.nats = vec![
+            NatRule {
+                kind: NatKind::DnatAndSnat,
+                external_ip: "203.0.113.55".into(),
+                logical_ip: "10.7.1.9".into(),
+            },
+            NatRule {
+                kind: NatKind::DnatAndSnat,
+                external_ip: "203.0.113.55/32".into(),
+                logical_ip: "10.7.1.9".into(),
+            },
+            NatRule {
+                kind: NatKind::Snat,
+                external_ip: "203.0.113.10".into(),
+                logical_ip: String::new(),
+            },
+        ];
+
+        let [(outside, external), (inside, internal)] =
+            wanted_leg_addresses(&router).expect("addresses");
+
+        assert_eq!((outside, inside), (LEG_EXTERNAL, LEG_INTERNAL));
+        assert_eq!(external, addressed(&["203.0.113.10/24", "203.0.113.55/32"]));
+        assert_eq!(internal, addressed(&["10.7.1.1/24"]));
+    }
+
+    /// `ip -o -4 addr show` is read address by address, and a line that names one this driver
+    /// cannot read makes the leg unknown rather than empty.
+    #[test]
+    fn an_address_listing_is_read_and_an_unreadable_one_is_an_error() {
+        let listing = "3: ext    inet 203.0.113.10/24 brd 203.0.113.255 scope global ext\\       \
+                       valid_lft forever preferred_lft forever\n\
+                       3: ext    inet 203.0.113.55/32 scope global ext\\       valid_lft forever\n";
+        assert_eq!(
+            listed_leg_addresses(listing).expect("two addresses"),
+            addressed(&["203.0.113.10/24", "203.0.113.55/32"])
+        );
+        assert!(listed_leg_addresses("3: ext inet nonsense scope global ext\n").is_err());
+        assert!(listed_leg_addresses("").expect("no address").is_empty());
     }
 }

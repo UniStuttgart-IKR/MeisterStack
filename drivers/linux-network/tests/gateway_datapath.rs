@@ -131,6 +131,11 @@ fn counter(netns: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no count on: {line}"))
 }
 
+/// The connection tracking table of a namespace, one flow per line.
+fn conntrack(netns: &str) -> String {
+    inside(netns, &["cat", "/proc/net/nf_conntrack"])
+}
+
 fn spec(id: RouterId, active: bool) -> RouterSpec {
     RouterSpec {
         id,
@@ -315,6 +320,23 @@ async fn a_guest_reaches_the_outside_and_the_outside_reaches_it_back() {
     assert!(
         counter(&netns, "snat") > snat_before,
         "that one behind the router's own address"
+    );
+
+    // --- 3b. ensured again, it keeps its connections -----------------------
+    println!("\n=== 3b. ensured again, it keeps its connections ===");
+    // IKR-B70: deleting the external address makes the kernel drop every flow masqueraded
+    // behind it, so a pass over a router that is right must not take its addresses away.
+    let masqueraded = format!("src={PLAIN_ADDR} dst={OUTSIDE_ADDR}");
+    assert!(
+        conntrack(&netns).contains(&masqueraded),
+        "the ping above left a masqueraded flow"
+    );
+    d.ensure_router(&spec(id, true))
+        .await
+        .expect("the same router, ensured again");
+    assert!(
+        conntrack(&netns).contains(&masqueraded),
+        "and an ensure that changes nothing keeps it"
     );
 
     // --- 4. in, through the floating address ------------------------------
