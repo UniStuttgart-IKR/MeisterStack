@@ -197,6 +197,7 @@ pub(super) fn cluster_facts_are_news(
     total: u32,
     vms: u32,
     nodes: &[controller_api::NodeSummary],
+    unplaced: &[controller_api::Capacity],
     capacity: Option<&proto::ClusterCapacity>,
 ) -> bool {
     if !status.connected
@@ -204,6 +205,7 @@ pub(super) fn cluster_facts_are_news(
         || status.nodes_total != total
         || status.vms != vms
         || status.nodes != nodes
+        || status.unplaced != unplaced
     {
         return true;
     }
@@ -234,6 +236,14 @@ pub(super) async fn ingest_cluster_facts(
     // for ever — the same rule the VM phases below follow and the same rule
     // the tier below follows about what an agent reported.
     let nodes: Vec<controller_api::NodeSummary> = status.nodes.iter().map(node_summary).collect();
+    let unplaced: Vec<controller_api::Capacity> = status
+        .unplaced
+        .iter()
+        .map(|d| controller_api::Capacity {
+            vcpus: d.vcpus,
+            mem_mib: d.mem_mib,
+        })
+        .collect();
     // The beat in its own key (D-C7), and the object only when the cluster's
     // own facts moved.
     store.beat::<Cluster>(cluster, at).await?;
@@ -244,6 +254,7 @@ pub(super) async fn ingest_cluster_facts(
         total,
         vms,
         &nodes,
+        &unplaced,
         capacity.as_ref(),
     ) {
         return Ok(());
@@ -255,6 +266,7 @@ pub(super) async fn ingest_cluster_facts(
             c.status.nodes_total = total;
             c.status.vms = vms;
             c.status.nodes = nodes.clone();
+            c.status.unplaced = unplaced.clone();
             if let Some(cap) = &capacity {
                 c.status.capacity.vcpus = cap.vcpus;
                 c.status.capacity.mem_mib = cap.mem_mib;

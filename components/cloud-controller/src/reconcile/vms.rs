@@ -19,10 +19,9 @@ pub(super) async fn reconcile_vm(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
-    overcommit: Overcommit,
     vm: Vm,
 ) -> anyhow::Result<()> {
     let context = birth_trace(&vm).unwrap_or_else(telemetry::TraceParent::root);
@@ -36,7 +35,7 @@ pub(super) async fn reconcile_vm(
         span,
         &context,
         reconcile_vm_traced(
-            store, registry, scheduler, sessions, clusters, book, pending, overcommit, vm, context,
+            store, registry, scheduler, sessions, ledger, book, pending, vm, context,
         ),
     )
     .await
@@ -61,10 +60,9 @@ pub(super) async fn reconcile_vm_traced(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
-    overcommit: Overcommit,
     vm: Vm,
     context: telemetry::TraceParent,
 ) -> anyhow::Result<()> {
@@ -86,10 +84,7 @@ pub(super) async fn reconcile_vm_traced(
     }
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        return place(
-            store, registry, scheduler, clusters, pending, overcommit, vm, &outgoing,
-        )
-        .await;
+        return place(store, registry, scheduler, ledger, pending, vm, &outgoing).await;
     };
 
     let Some(report) = current_report(registry, &vm, &cluster) else {
@@ -142,14 +137,12 @@ fn current_report(
 /// that already has something of ours: an old binding that has to be given up
 /// first, a storage answer that no cluster satisfies, and otherwise the
 /// scheduler's pick.
-#[allow(clippy::too_many_arguments)]
 async fn place(
     store: &EtcdStore,
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     pending: &PendingTally,
-    overcommit: Overcommit,
     vm: Vm,
     outgoing: &str,
 ) -> anyhow::Result<()> {
@@ -166,9 +159,9 @@ async fn place(
     // a sum and its catalogue a union, so a cluster can look able to
     // serve a VM that no single node of it can — and until this the
     // answer was found one tier down, after the VM had been sent there.
-    let node_level = match servable_clusters(store, &vm, overcommit).await? {
-        Servable::Clusters(names) => names,
-        Sentence(reason) => {
+    let wanted = match wanted(store, &vm).await? {
+        Ok(wanted) => wanted,
+        Err(reason) => {
             pending.note(controller_api::PendingReason::VolumeNotReady);
             return note_pending(
                 store,
@@ -179,7 +172,8 @@ async fn place(
             .await;
         }
     };
-    match pick_cluster(scheduler, clusters, &vm, &node_level) {
+    let picked = pick_cluster(scheduler, ledger, &vm, &wanted);
+    match picked {
         Ok(pick) => bind(store, vm, pick).await,
         Err((known, (category, reason))) => {
             // Say WHY on the object and not only in this replica's debug
@@ -194,43 +188,6 @@ async fn place(
             debug!(known, "no schedulable cluster, staying pending");
             note_pending(store, &vm, category, reason).await
         }
-    }
-}
-
-/// Decide and SPEND under one lock, and let go before anything awaits — see
-/// the cluster tier's `place` for why the binding and not the API edge is the
-/// authority.
-///
-/// `Err` carries how many candidates the sentence was measured against,
-/// beside the category and the sentence itself.
-fn pick_cluster(
-    scheduler: &dyn Scheduler,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
-    vm: &Vm,
-    node_level: &[String],
-) -> Result<String, (usize, (controller_api::PendingReason, String))> {
-    let mut clusters = clusters.lock().unwrap();
-    let allowed: Vec<Candidate> = clusters
-        .iter()
-        .filter(|c| node_level.iter().any(|n| n == &c.name))
-        .cloned()
-        .collect();
-    match scheduler.assign(vm, &allowed) {
-        Some(pick) => {
-            controller_api::spend(&mut clusters, &pick, vm);
-            Ok(pick)
-        }
-        // The sentence is measured against what was actually
-        // offered. A cluster cut away for having no suitable node is
-        // not a cluster that "had no room", and saying so would send
-        // an operator to look at the wrong thing.
-        None if allowed.is_empty() && !clusters.is_empty() => {
-            Err((clusters.len(), node_level_reason(vm, clusters.len())))
-        }
-        None => Err((
-            allowed.len(),
-            controller_api::pending_reason_of(vm, &allowed),
-        )),
     }
 }
 

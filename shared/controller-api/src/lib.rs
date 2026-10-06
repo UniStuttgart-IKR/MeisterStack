@@ -101,11 +101,12 @@ pub use rest::{
     schema_document, schema_has_field, schema_of, serve, statuses,
 };
 pub use scheduler::{
-    Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, Hosted, NodeDemand, Overcommit,
-    PendingReason, PendingTally, Scheduler, SchedulerConfig, Spread, VolumeBinding, bound_on,
-    feasible, feasible_for_volumes, free_on, hold, hosted_on, narrow_allowed, pending_reason,
-    pending_reason_of, preferred, preferred_for_volumes, reservation_holds, reserved_on,
-    selector_for, selects, spend, volume_nodes_unusable, volume_pending_reason,
+    Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, Hosted, NodeDemand, NodeRoom,
+    Overcommit, PendingReason, PendingTally, Scheduler, SchedulerConfig, Spread, VolumeBinding,
+    bound_on, feasible, feasible_for_volumes, free_on, hold, hosted_on, narrow_allowed, node_rooms,
+    pending_reason, pending_reason_of, preferred, preferred_for_volumes, reservation_holds,
+    reserved_on, selector_for, selects, spend, unplaced_demand, volume_nodes_unusable,
+    volume_pending_reason,
 };
 pub use store::{EtcdStore, Fence, PassTrigger, StoreError};
 pub use stuck::{

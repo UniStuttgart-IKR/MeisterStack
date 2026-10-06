@@ -40,9 +40,9 @@ pub(crate) async fn would_place(
     overcommit: Overcommit,
     vm: &Vm,
 ) -> anyhow::Result<String> {
-    let names = match servable_clusters(store, vm, overcommit).await? {
-        Servable::Clusters(names) => names,
-        Sentence(reason) => return Ok(reason),
+    let wanted = match wanted(store, vm).await? {
+        Ok(wanted) => wanted,
+        Err(reason) => return Ok(reason),
     };
     let now = Utc::now();
     let vms = store.list::<Vm>().await?;
@@ -50,7 +50,14 @@ pub(crate) async fn would_place(
     // since D-C7.
     let beats = store.beats::<Cluster>().await?;
     let mut clusters = Vec::new();
+    let mut names = Vec::new();
     for cluster in store.list::<Cluster>().await? {
+        if wanted.served_by(
+            &cluster.metadata.name,
+            &rooms_of(&cluster, &vms, overcommit),
+        ) {
+            names.push(cluster.metadata.name.clone());
+        }
         let name = cluster.metadata.name;
         let connected = cluster.status.connected
             && !controller_api::heartbeat_expired(beats.get(&name).copied(), now);
@@ -142,27 +149,99 @@ pub(super) async fn note_pending(
     Ok(())
 }
 
-/// The clusters that have at least one node able to run this VM — or a
-/// sentence saying why the question cannot be answered yet.
-pub(super) enum Servable {
-    Clusters(Vec<String>),
-    /// A volume this VM names is not ready, or not there. The VM waits; it is
-    /// not a refusal, and it must not be turned into "no cluster has room".
-    Sentence(String),
+/// What one pass may still hand out, spent under one lock so that the VMs it
+/// binds see each other: each cluster's aggregate, and the room on each of
+/// its nodes. With the aggregate alone a burst of creates bound more to one
+/// cluster than any of its nodes holds. (IKR-B78)
+#[derive(Default)]
+pub(super) struct Ledger {
+    pub(super) clusters: Vec<Candidate>,
+    /// Keyed by cluster name, the same names `clusters` carries.
+    pub(super) nodes: BTreeMap<String, Vec<NodeRoom>>,
 }
 
-pub(super) use Servable::Sentence;
+impl Ledger {
+    /// The rooms of `cluster`'s nodes this pass; none for a cluster this
+    /// pass did not list.
+    fn rooms(&self, cluster: &str) -> &[NodeRoom] {
+        self.nodes.get(cluster).map_or(&[], Vec::as_slice)
+    }
+}
 
-/// Narrow cluster candidates to those with ONE node that takes this VM: its
-/// selector, the locality of its referenced volumes, its class and its size.
-/// These need node-level facts that a cluster's sum cannot express: a cluster
+/// The rooms of `cluster`'s nodes as this cloud measures them: what it
+/// reported, less what it holds without a node and what this cloud bound to
+/// it that it has not reported yet. Neither is in any node's bound sum yet.
+pub(super) fn rooms_of(cluster: &Cluster, vms: &[Vm], overcommit: Overcommit) -> Vec<NodeRoom> {
+    let name = cluster.metadata.name.as_str();
+    let unreported = vms
+        .iter()
+        .filter(|v| v.spec.cluster_name.as_deref() == Some(name) && !reported_by(v, name))
+        .map(Capacity::wanted_by);
+    let unplaced: Vec<Capacity> = cluster
+        .status
+        .unplaced
+        .iter()
+        .copied()
+        .chain(unreported)
+        .collect();
+    controller_api::node_rooms(&cluster.status.nodes, overcommit, &unplaced)
+}
+
+/// Whether `cluster` has said anything about this VM: from then on it counts
+/// the VM itself, on a node or among what it holds unplaced.
+fn reported_by(vm: &Vm, cluster: &str) -> bool {
+    vm.status
+        .reported
+        .as_ref()
+        .is_some_and(|r| r.node == cluster)
+}
+
+/// What a VM asks before a cluster is chosen: the clusters its volumes allow
+/// (`None`: any), and what ONE node of the chosen one has to give it — its
+/// selector, the locality of its volumes, its class and its size. A cluster
 /// of two half-full nodes has room in total for a VM neither node can take,
 /// and binding it there leaves it Pending a tier down (IKR-B78).
-pub(super) async fn servable_clusters(
+pub(super) struct Wanted<'a> {
+    clusters: Option<Vec<String>>,
+    node: controller_api::NodeDemand<'a>,
+}
+
+impl<'a> Wanted<'a> {
+    /// `vm`'s own asks, within the clusters and nodes its volumes allow
+    /// (`None`: any).
+    pub(super) fn of(
+        vm: &'a Vm,
+        clusters: Option<Vec<String>>,
+        allowed: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            clusters,
+            node: controller_api::NodeDemand {
+                selector: &vm.spec.node_selector,
+                allowed,
+                size: Capacity::wanted_by(vm),
+                class: vm.spec.class(),
+            },
+        }
+    }
+
+    /// Whether `cluster`, whose nodes have `rooms`, can take the VM.
+    pub(super) fn served_by(&self, cluster: &str, rooms: &[NodeRoom]) -> bool {
+        self.clusters
+            .as_ref()
+            .is_none_or(|w| w.iter().any(|n| n == cluster))
+            && self.node.met_by_a_node(rooms)
+    }
+}
+
+/// What `vm` wants of a cluster — or a sentence saying why the question
+/// cannot be answered yet: a volume this VM names is not ready, or not there.
+/// The VM waits; it is not a refusal, and it must not be turned into "no
+/// cluster has room".
+pub(super) async fn wanted<'a>(
     store: &EtcdStore,
-    vm: &Vm,
-    overcommit: Overcommit,
-) -> anyhow::Result<Servable> {
+    vm: &'a Vm,
+) -> anyhow::Result<OrSentence<Wanted<'a>>> {
     let names = vm.spec.referenced_volumes();
 
     // Intersect the clusters serving every referenced volume, then apply node
@@ -172,18 +251,18 @@ pub(super) async fn servable_clusters(
     for name in &names {
         let (volume, pool) = match volume_and_pool(store, name).await? {
             Ok(pair) => pair,
-            Err(sentence) => return Ok(Sentence(sentence)),
+            Err(sentence) => return Ok(Err(sentence)),
         };
         let serving = match pool_serving(&pool, name) {
             Ok(serving) => serving,
-            Err(sentence) => return Ok(Sentence(sentence)),
+            Err(sentence) => return Ok(Err(sentence)),
         };
         wanted = Some(match narrow_clusters(wanted, serving, name) {
             Ok(both) => both,
-            Err(sentence) => return Ok(Sentence(sentence)),
+            Err(sentence) => return Ok(Err(sentence)),
         });
         if volume.status.phase().kind() != controller_api::VolumePhaseKind::Ready {
-            return Ok(Sentence(format!(
+            return Ok(Err(format!(
                 "volume {name} is {}",
                 volume.status.phase().kind().as_str()
             )));
@@ -191,26 +270,49 @@ pub(super) async fn servable_clusters(
         allowed = controller_api::narrow_allowed(allowed, reachable_nodes(&volume, &pool));
     }
 
-    let demand = controller_api::NodeDemand {
-        selector: &vm.spec.node_selector,
-        allowed,
-        size: Capacity::wanted_by(vm),
-        class: vm.spec.class(),
-        overcommit,
-    };
-    let servable = store
-        .list::<Cluster>()
-        .await?
-        .into_iter()
-        .filter(|c| {
-            wanted
-                .as_ref()
-                .is_none_or(|w| w.iter().any(|n| n == &c.metadata.name))
-        })
-        .filter(|c| demand.met_by_a_node(&c.status.nodes))
-        .map(|c| c.metadata.name)
+    Ok(Ok(Wanted::of(vm, wanted, allowed)))
+}
+
+/// Decide and SPEND under one lock, and let go before anything awaits — see
+/// the cluster tier's `place` for why the binding and not the API edge is the
+/// authority. The VM's size comes off the chosen cluster's aggregate and off
+/// the node it is assumed to land on, so the next VM of the pass measures
+/// what is left. (IKR-B78)
+///
+/// `Err` carries how many candidates the sentence was measured against,
+/// beside the category and the sentence itself.
+pub(super) fn pick_cluster(
+    scheduler: &dyn Scheduler,
+    ledger: &std::sync::Mutex<Ledger>,
+    vm: &Vm,
+    wanted: &Wanted,
+) -> Result<String, (usize, (controller_api::PendingReason, String))> {
+    let mut ledger = ledger.lock().unwrap();
+    let allowed: Vec<Candidate> = ledger
+        .clusters
+        .iter()
+        .filter(|c| wanted.served_by(&c.name, ledger.rooms(&c.name)))
+        .cloned()
         .collect();
-    Ok(Servable::Clusters(servable))
+    let listed = ledger.clusters.len();
+    match scheduler.assign(vm, &allowed) {
+        Some(pick) => {
+            controller_api::spend(&mut ledger.clusters, &pick, vm);
+            if let Some(rooms) = ledger.nodes.get_mut(&pick) {
+                wanted.node.debit(rooms);
+            }
+            Ok(pick)
+        }
+        // The sentence is measured against what was actually
+        // offered. A cluster cut away for having no suitable node is
+        // not a cluster that "had no room", and saying so would send
+        // an operator to look at the wrong thing.
+        None if allowed.is_empty() && listed > 0 => Err((listed, node_level_reason(vm, listed))),
+        None => Err((
+            allowed.len(),
+            controller_api::pending_reason_of(vm, &allowed),
+        )),
+    }
 }
 
 /// An answer, or the sentence that says why there is none yet. The outer

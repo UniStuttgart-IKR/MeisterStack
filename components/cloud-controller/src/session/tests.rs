@@ -119,6 +119,7 @@ async fn a_cluster_with_no_session_is_named_in_the_refusal() {
 fn status(complete: bool, uids: &[&str]) -> ClusterStatus {
     ClusterStatus {
         nodes: Vec::new(),
+        unplaced: Vec::new(),
         routers: Vec::new(),
         routers_complete: true,
         nodes_ready: 1,
@@ -421,6 +422,7 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
         2,
         3,
         &nodes,
+        &[],
         Some(&capacity)
     ));
 
@@ -436,7 +438,7 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
 
     // The second, identical one: nothing.
     assert!(
-        !cluster_facts_are_news(&status, 2, 2, 3, &nodes, Some(&capacity)),
+        !cluster_facts_are_news(&status, 2, 2, 3, &nodes, &[], Some(&capacity)),
         "the same report twice is one write"
     );
 
@@ -447,6 +449,7 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
         2,
         3,
         &nodes,
+        &[],
         Some(&capacity)
     ));
     assert!(cluster_facts_are_news(
@@ -455,11 +458,12 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
         2,
         4,
         &nodes,
+        &[],
         Some(&capacity)
     ));
     let one_down = vec![summary("agent-1a", true), summary("agent-1b", false)];
     assert!(
-        cluster_facts_are_news(&status, 2, 2, 3, &one_down, Some(&capacity)),
+        cluster_facts_are_news(&status, 2, 2, 3, &one_down, &[], Some(&capacity)),
         "a node that went not-ready is news even while the counts agree"
     );
     assert!(cluster_facts_are_news(
@@ -468,6 +472,7 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
         2,
         3,
         &nodes,
+        &[],
         Some(&proto::ClusterCapacity {
             vcpus: 32,
             ..capacity.clone()
@@ -476,7 +481,22 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
 
     // A report with no capacity block says nothing about capacity, and
     // nothing is what it writes.
-    assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, None));
+    assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, &[], None));
+
+    // A VM waiting down there for a node changes no count and is news.
+    let waiting = [controller_api::Capacity {
+        vcpus: 1,
+        mem_mib: 1024,
+    }];
+    assert!(cluster_facts_are_news(
+        &status,
+        2,
+        2,
+        3,
+        &nodes,
+        &waiting,
+        Some(&capacity)
+    ));
 }
 
 /// Only a complete image inventory can prove that a path image is absent.

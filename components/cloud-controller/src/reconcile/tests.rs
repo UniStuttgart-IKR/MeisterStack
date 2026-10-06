@@ -853,49 +853,139 @@ fn a_fresh_report_does_not_stand_in_for_a_hand_down() {
 
 // --- IKR-B78: a cluster is offered only where one node can take the VM -----
 
-/// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
-/// cluster had room, the cloud bound, and the VM sat Pending a tier down.
-#[tokio::test]
-#[ignore = "needs an etcd; see api::admission_tests"]
-async fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
-    let store = test_store("placement-test").await;
-    let node = |name: &str| controller_api::NodeSummary {
+/// A ready node of 4 vCPUs and `mem_mib`, nothing bound.
+fn reported_node(name: &str, mem_mib: u64) -> controller_api::NodeSummary {
+    controller_api::NodeSummary {
         name: name.into(),
         ready: true,
         schedulable: true,
         vcpus: 4,
-        mem_mib: 2048,
+        mem_mib,
         ..Default::default()
-    };
+    }
+}
+
+/// The cluster `ikr-netlab` with two nodes of `mem_mib` each.
+fn netlab(mem_mib: u64) -> Cluster {
     let mut cluster = Cluster::declare("ikr-netlab", Default::default());
-    cluster.status.nodes = vec![node("cobra0"), node("cobra1")];
-    store.create(&cluster).await.expect("the cluster");
+    cluster.status.nodes = vec![
+        reported_node("cobra0", mem_mib),
+        reported_node("cobra1", mem_mib),
+    ];
+    cluster.status.capacity.vcpus = 8;
+    cluster.status.capacity.mem_mib = 2 * mem_mib;
+    cluster
+}
 
-    let asking = |mem_mib: u64| {
-        let mut v = vm();
-        v.spec.vm = serde_json::json!({ "vcpus": 1, "memory_mib": mem_mib });
-        v
-    };
-    let offered = |servable| match servable {
-        Servable::Clusters(names) => names,
-        Sentence(why) => panic!("no storage asked, yet: {why}"),
-    };
-    let none = offered(
-        servable_clusters(&store, &asking(4096), Overcommit::default())
-            .await
-            .expect("an answer"),
-    );
-    assert!(none.is_empty(), "{none:?}");
-    let one = offered(
-        servable_clusters(&store, &asking(1024), Overcommit::default())
-            .await
-            .expect("an answer"),
-    );
-    assert_eq!(one, vec!["ikr-netlab".to_string()]);
+/// `vm()`, unbound, asking for one vCPU and `mem_mib`.
+fn asking(mem_mib: u64) -> Vm {
+    let mut v = vm();
+    v.spec.cluster_name = None;
+    v.spec.vm = serde_json::json!({ "vcpus": 1, "memory_mib": mem_mib });
+    v
+}
 
-    let (category, sentence) = node_level_reason(&asking(4096), 1);
+/// The pass's ledger over one cluster, as `expire_and_collect_clusters`
+/// builds it.
+fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
+    let name = cluster.metadata.name.clone();
+    let mut ledger = Ledger::default();
+    ledger
+        .nodes
+        .insert(name.clone(), rooms_of(cluster, vms, Overcommit::default()));
+    ledger.clusters.push(Candidate {
+        name: name.clone(),
+        connected: true,
+        alive: true,
+        schedulable: true,
+        unhealthy: Vec::new(),
+        free: free_on(&name, &cluster.status.capacity, vms, Overcommit::default()),
+        catalogue: vec!["hypervisor/cloud-hypervisor".to_string()],
+        kind: CandidateKind::Cluster,
+        labels: Default::default(),
+        accepts: Vec::new(),
+        hosted: Vec::new(),
+        machine: None,
+    });
+    std::sync::Mutex::new(ledger)
+}
+
+/// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
+/// cluster had room, the cloud bound, and the VM sat Pending a tier down.
+#[test]
+fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
+    let rooms = rooms_of(&netlab(2048), &[], Overcommit::default());
+    let too_big = asking(4096);
+    assert!(!Wanted::of(&too_big, None, None).served_by("ikr-netlab", &rooms));
+    let fits = asking(1024);
+    assert!(Wanted::of(&fits, None, None).served_by("ikr-netlab", &rooms));
+
+    let (category, sentence) = node_level_reason(&too_big, 1);
     assert_eq!(category, controller_api::PendingReason::NoCapacity);
     assert!(sentence.contains("4096 MiB"), "{sentence}");
+}
+
+/// A burst of creates in one pass: each 2560 MiB VM fits the cluster's sum
+/// three times over two 4096 MiB nodes, and only one fits each node. The
+/// third is not bound, because the first two took their room off a node
+/// and not only off the sum.
+#[test]
+fn vms_bound_in_one_pass_take_their_room_off_the_nodes() {
+    let ledger = ledger_of(&netlab(4096), &[]);
+    let burst: Vec<Vm> = (0..3).map(|_| asking(2560)).collect();
+    let picked: Vec<bool> = burst
+        .iter()
+        .map(|v| {
+            pick_cluster(
+                &controller_api::FirstFit,
+                &ledger,
+                v,
+                &Wanted::of(v, None, None),
+            )
+            .is_ok()
+        })
+        .collect();
+    assert_eq!(picked, [true, true, false]);
+}
+
+/// A VM bound to the cluster that it has not reported yet holds a node's
+/// room as surely as one it placed; one it reported is in its own numbers
+/// and is not counted twice.
+#[test]
+fn a_vm_bound_but_not_reported_yet_holds_a_nodes_room() {
+    let cluster = netlab(4096);
+    let mut sent = asking(3072);
+    sent.spec.cluster_name = Some("ikr-netlab".into());
+    let rooms = rooms_of(&cluster, std::slice::from_ref(&sent), Overcommit::default());
+    let roomy: Vec<u64> = rooms.iter().map(|r| r.room.mem_mib).collect();
+    assert_eq!(roomy, [1024, 4096]);
+
+    sent.status.reported = Some(controller_api::VmReported::by(
+        "ikr-netlab",
+        VmPhaseKind::Pending,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(0),
+    ));
+    let rooms = rooms_of(&cluster, std::slice::from_ref(&sent), Overcommit::default());
+    assert!(rooms.iter().all(|r| r.room.mem_mib == 4096));
+}
+
+/// What the cluster holds without a node comes off a node before the next
+/// VM is measured.
+#[test]
+fn what_a_cluster_holds_unplaced_holds_a_nodes_room() {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced = vec![
+        Capacity {
+            vcpus: 1,
+            mem_mib: 3072,
+        };
+        2
+    ];
+    let rooms = rooms_of(&cluster, &[], Overcommit::default());
+    let four = asking(2048);
+    assert!(!Wanted::of(&four, None, None).served_by("ikr-netlab", &rooms));
 }
 
 // --- IKR-B81: a write lands on the object that was judged -------------------

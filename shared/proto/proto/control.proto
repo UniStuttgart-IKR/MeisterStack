@@ -664,6 +664,17 @@ message ClusterStatus {
   // Cloud-managed secret UIDs and generations held by the cluster. The cloud
   // avoids resending unchanged copies and removes mirrors absent upstream.
   repeated SecretStateReport secrets = 13;
+  // What each VM this cluster holds without a node asks for, cluster-local
+  // VMs included: room no node's bound_* carries yet. The cloud takes it off
+  // the nodes before it measures one node's room for a VM. Empty from an
+  // older cluster.
+  repeated VmDemand unplaced = 16;
+}
+
+// What one VM asks of the one machine it will run on.
+message VmDemand {
+  uint32 vcpus = 1;
+  uint64 mem_mib = 2;
 }
 
 // One mirrored secret, as the cluster holding it sees it.

@@ -1713,6 +1713,15 @@ async fn build_status(
         secrets: reported_secrets,
         pools: reported_pools,
         nodes: reported_nodes,
+        // What waits here for a node, so the cloud does not count its room
+        // as free. (IKR-B78)
+        unplaced: controller_api::unplaced_demand(&vms)
+            .into_iter()
+            .map(|c| proto::VmDemand {
+                vcpus: c.vcpus,
+                mem_mib: c.mem_mib,
+            })
+            .collect(),
         routers: reported_routers,
         routers_complete,
         // Passed through unchanged: this tier keeps no Image objects, and a
@@ -2295,13 +2304,6 @@ mod tests {
         assert!(up.conditions.is_empty());
     }
 
-    /// The evidence of a drain, on the road that carries the ask.
-    ///
-    /// `spec.drain` says somebody asked; this says what came of it, and it is
-    /// what an operator watching a drain is actually waiting for. Absent on a
-    /// machine nobody is emptying, and that absence is the whole reason it is
-    /// a submessage: a block of zeroes would give every node in the fleet a
-    /// drain column reading `0 moved, 0 leaving, 0 staying`.
     /// IKR-B78: what a node's VMs ask for travels up beside its capacity, so
     /// the cloud can tell one node's room from the cluster's sum.
     #[test]
@@ -2314,6 +2316,13 @@ mod tests {
         assert_eq!((up.bound_vcpus, up.bound_mem_mib), (3, 3072));
     }
 
+    /// The evidence of a drain, on the road that carries the ask.
+    ///
+    /// `spec.drain` says somebody asked; this says what came of it, and it is
+    /// what an operator watching a drain is actually waiting for. Absent on a
+    /// machine nobody is emptying, and that absence is the whole reason it is
+    /// a submessage: a block of zeroes would give every node in the fleet a
+    /// drain column reading `0 moved, 0 leaving, 0 staying`.
     #[test]
     fn the_numbers_of_a_drain_travel_up_beside_the_ask() {
         let quiet = node_report(&node("manacor", true, false), false, Default::default());

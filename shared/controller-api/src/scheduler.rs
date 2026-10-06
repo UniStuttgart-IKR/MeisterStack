@@ -17,7 +17,18 @@ use crate::resources::{AntiAffinity, CapacityReservation, NodeSummary, StoragePo
 
 /// CPU and memory supply or demand. Storage capacity is excluded because
 /// drivers and pools own backend-specific space admission.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
 pub struct Capacity {
     pub vcpus: u32,
     pub mem_mib: u64,
@@ -612,32 +623,51 @@ pub struct NodeDemand<'a> {
     pub size: Capacity,
     /// The workload class one node must accept, as `VmSpec::class` reads it.
     pub class: &'a str,
-    /// The allowance a node's capacity gives, as the cloud applies it to a
-    /// cluster's sum.
-    pub overcommit: Overcommit,
 }
 
 impl NodeDemand<'_> {
     /// Require ONE usable node satisfying the selector, the volume constraints,
     /// the class and the room before binding a VM to this cluster.
-    pub fn met_by_a_node(&self, nodes: &[NodeSummary]) -> bool {
-        nodes.iter().any(|n| {
-            n.ready
-                && n.schedulable
-                // Apply the node-health veto before cloud placement, matching node scheduling.
-                && !n.conditions.iter().any(crate::NodeCondition::vetoes_placement)
-                && selects(self.selector, &n.labels)
+    pub fn met_by_a_node(&self, rooms: &[NodeRoom]) -> bool {
+        self.node_for(rooms).is_some()
+    }
+
+    /// Take this VM's size off the node it is assumed to land on, so the next
+    /// VM measured against `rooms` in the same pass sees it. False when no
+    /// node takes it.
+    pub fn debit(&self, rooms: &mut [NodeRoom]) -> bool {
+        let Some(at) = self.node_for(rooms) else {
+            return false;
+        };
+        rooms[at].room = rooms[at].room.minus(self.size);
+        true
+    }
+
+    /// Of the nodes that take this VM, the one with the most room.
+    fn node_for(&self, rooms: &[NodeRoom]) -> Option<usize> {
+        roomiest(rooms, self.size, |r| {
+            selects(self.selector, &r.node.labels)
                 && self
                     .allowed
                     .as_ref()
-                    .is_none_or(|allowed| allowed.iter().any(|a| a == &n.name))
-                && crate::resources::accepts_class(&n.accepts, self.class)
-                && self.size.fits_in(self.room_on(n))
+                    .is_none_or(|allowed| allowed.iter().any(|a| a == &r.node.name))
+                && crate::resources::accepts_class(&r.node.accepts, self.class)
         })
     }
+}
 
-    /// What one node has left, as its cluster reported the VMs bound to it.
-    fn room_on(&self, node: &NodeSummary) -> Capacity {
+/// One reported node as the cloud measures it within a pass: what its
+/// cluster said, and the room left on it once the VMs counted against it are
+/// taken off. (IKR-B78)
+#[derive(Clone, Debug)]
+pub struct NodeRoom {
+    pub node: NodeSummary,
+    pub room: Capacity,
+}
+
+impl NodeRoom {
+    /// What `node` has left, as its cluster reported the VMs bound to it.
+    pub fn reported(node: &NodeSummary, overcommit: Overcommit) -> Self {
         let capacity = Capacity {
             vcpus: node.vcpus,
             mem_mib: node.mem_mib,
@@ -646,8 +676,67 @@ impl NodeDemand<'_> {
             vcpus: node.bound_vcpus,
             mem_mib: node.bound_mem_mib,
         };
-        self.overcommit.allowance(capacity).minus(bound)
+        Self {
+            node: node.clone(),
+            room: overcommit.allowance(capacity).minus(bound),
+        }
     }
+
+    /// Up, willing and without a vetoing condition: a node a VM can land on.
+    fn usable(&self) -> bool {
+        self.node.ready
+            && self.node.schedulable
+            // Apply the node-health veto before cloud placement, matching node scheduling.
+            && !self
+                .node
+                .conditions
+                .iter()
+                .any(crate::NodeCondition::vetoes_placement)
+    }
+}
+
+/// The rooms of one cluster's nodes, less `unplaced`: what VMs ask for that
+/// the cluster holds without a node yet, or that are bound to it and not
+/// reported by it yet. Neither is in any node's bound sum, and both will
+/// land on one. Each comes off the node with the most room it fits, which is
+/// the assumption that never overstates what the next VM finds; the next
+/// report says where they really went. One no node takes takes no room: it
+/// waits down there.
+pub fn node_rooms(
+    nodes: &[NodeSummary],
+    overcommit: Overcommit,
+    unplaced: &[Capacity],
+) -> Vec<NodeRoom> {
+    let mut rooms: Vec<NodeRoom> = nodes
+        .iter()
+        .map(|n| NodeRoom::reported(n, overcommit))
+        .collect();
+    for size in unplaced {
+        if let Some(at) = roomiest(&rooms, *size, |_| true) {
+            rooms[at].room = rooms[at].room.minus(*size);
+        }
+    }
+    rooms
+}
+
+/// Of the usable rooms `takes` accepts and `size` fits in, the one with the
+/// most room — memory first, then vCPUs, then the name, so two passes over
+/// one report assume the same.
+fn roomiest(
+    rooms: &[NodeRoom],
+    size: Capacity,
+    takes: impl Fn(&NodeRoom) -> bool,
+) -> Option<usize> {
+    rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.usable() && takes(r) && size.fits_in(r.room))
+        .max_by(|(_, a), (_, b)| {
+            (a.room.mem_mib, a.room.vcpus)
+                .cmp(&(b.room.mem_mib, b.room.vcpus))
+                .then_with(|| b.node.name.cmp(&a.node.name))
+        })
+        .map(|(at, _)| at)
 }
 
 /// Intersect another volume's allowed nodes. None imposes no restriction;
@@ -1168,6 +1257,16 @@ pub fn free_on(
             mem_mib: capacity.mem_mib,
         })
         .minus(bound_on(node, vms))
+}
+
+/// What each VM a cluster holds without a node asks for: the half of its
+/// demand no node's bound sum carries yet. One entry per VM, because each
+/// lands on one machine. A VM on its way out will land nowhere. (IKR-B78)
+pub fn unplaced_demand(vms: &[Vm]) -> Vec<Capacity> {
+    vms.iter()
+        .filter(|v| v.spec.node_name.is_none() && !v.is_deleting())
+        .map(Capacity::wanted_by)
+        .collect()
 }
 
 /// What the VMs bound to `node` ask for, Pending included. The used half of
@@ -3070,9 +3169,8 @@ mod tests {
             allowed: None,
             size: Capacity::default(),
             class: crate::resources::CLASS_VM,
-            overcommit: Overcommit::default(),
         };
-        assert!(anywhere.met_by_a_node(&[node]));
+        assert!(anywhere.met_by_a_node(&rooms(&[node])));
     }
 
     /// Unknown reported health conditions still veto placement and remain visible
@@ -3249,6 +3347,11 @@ mod tests {
         }
     }
 
+    /// The nodes as their cluster reported them, nothing unplaced.
+    fn rooms(nodes: &[NodeSummary]) -> Vec<NodeRoom> {
+        node_rooms(nodes, Overcommit::default(), &[])
+    }
+
     /// The same summary with one condition on it — a machine that is up,
     /// willing, and has just said it cannot act.
     fn wedged_summary(name: &str, labels: &[(&str, &str)]) -> NodeSummary {
@@ -3271,23 +3374,22 @@ mod tests {
             allowed: None,
             size: Capacity::default(),
             class: crate::resources::CLASS_VM,
-            overcommit: Overcommit::default(),
         };
-        assert!(demand.met_by_a_node(&[summary("a", true, true, &[("disk", "nvme")])]));
-        assert!(!demand.met_by_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
-        assert!(!demand.met_by_a_node(&[]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("a", true, true, &[("disk", "nvme")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", true, true, &[("disk", "sata")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[])));
 
         // A node that is down or drained does not count, which is the whole
         // reason to ask before the binding rather than after it.
-        assert!(!demand.met_by_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
-        assert!(!demand.met_by_a_node(&[summary("a", true, false, &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", false, true, &[("disk", "nvme")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", true, false, &[("disk", "nvme")])])));
         // A reachable but unhealthy matching node cannot satisfy cloud placement.
-        assert!(!demand.met_by_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&rooms(&[wedged_summary("a", &[("disk", "nvme")])])));
         // One healthy machine beside it is enough, as it always was.
-        assert!(demand.met_by_a_node(&[
+        assert!(demand.met_by_a_node(&rooms(&[
             wedged_summary("a", &[("disk", "nvme")]),
             summary("b", true, true, &[("disk", "nvme")]),
-        ]));
+        ])));
     }
 
     /// And the volume half: a node-local disk pins the VM to one machine, so
@@ -3300,13 +3402,12 @@ mod tests {
             allowed: Some(vec!["manacor".to_string()]),
             size: Capacity::default(),
             class: crate::resources::CLASS_VM,
-            overcommit: Overcommit::default(),
         };
-        assert!(demand.met_by_a_node(&[
+        assert!(demand.met_by_a_node(&rooms(&[
             summary("soller", true, true, &[]),
             summary("manacor", true, true, &[])
-        ]));
-        assert!(!demand.met_by_a_node(&[summary("soller", true, true, &[])]));
+        ])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("soller", true, true, &[])])));
     }
 
     /// Both halves at once, which is the case that made them one question:
@@ -3321,14 +3422,13 @@ mod tests {
             allowed: Some(vec!["manacor".to_string()]),
             size: Capacity::default(),
             class: crate::resources::CLASS_VM,
-            overcommit: Overcommit::default(),
         };
-        assert!(demand.met_by_a_node(&[summary("manacor", true, true, &[("zone", "a")])]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("manacor", true, true, &[("zone", "a")])])));
         assert!(
-            !demand.met_by_a_node(&[
+            !demand.met_by_a_node(&rooms(&[
                 summary("manacor", true, true, &[("zone", "b")]),
                 summary("soller", true, true, &[("zone", "a")])
-            ]),
+            ])),
             "one node has the labels and the other has the disk: neither can run it"
         );
     }
@@ -3362,11 +3462,10 @@ mod tests {
             allowed: None,
             size: Capacity::default(),
             class: crate::resources::CLASS_VM,
-            overcommit: Overcommit::default(),
         };
-        assert!(demand.met_by_a_node(&[summary("a", true, true, &[])]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("a", true, true, &[])])));
         assert!(
-            !demand.met_by_a_node(&[]),
+            !demand.met_by_a_node(&rooms(&[])),
             "but a cluster with no nodes serves nothing"
         );
     }
@@ -3382,18 +3481,17 @@ mod tests {
             allowed: None,
             size: Capacity { vcpus: 1, mem_mib },
             class,
-            overcommit: Overcommit::default(),
         };
         let two = [summary("a", true, true, &[]), summary("b", true, true, &[])];
-        assert!(asking(4096, crate::resources::CLASS_VM).met_by_a_node(&two));
-        assert!(!asking(12_288, crate::resources::CLASS_VM).met_by_a_node(&two));
+        assert!(asking(4096, crate::resources::CLASS_VM).met_by_a_node(&rooms(&two)));
+        assert!(!asking(12_288, crate::resources::CLASS_VM).met_by_a_node(&rooms(&two)));
 
         let mut busy = two.clone();
         for node in &mut busy {
             node.bound_mem_mib = 6144;
         }
         assert!(
-            !asking(4096, crate::resources::CLASS_VM).met_by_a_node(&busy),
+            !asking(4096, crate::resources::CLASS_VM).met_by_a_node(&rooms(&busy)),
             "4 GiB free in all and 2 GiB on each"
         );
 
@@ -3401,7 +3499,90 @@ mod tests {
         for node in &mut routers_only {
             node.accepts = vec!["router".to_string()];
         }
-        assert!(!asking(1024, crate::resources::CLASS_VM).met_by_a_node(&routers_only));
+        assert!(!asking(1024, crate::resources::CLASS_VM).met_by_a_node(&rooms(&routers_only)));
+    }
+
+    /// IKR-B78 within one pass: two 4 GiB VMs bound in the same pass do not
+    /// both fit a node with 6 GiB of room, so the second sees the first.
+    #[test]
+    fn a_vm_bound_in_the_same_pass_takes_its_room_off_a_node() {
+        let none = BTreeMap::new();
+        let four_gib = NodeDemand {
+            selector: &none,
+            allowed: None,
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 4096,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut one = summary("a", true, true, &[]);
+        one.bound_mem_mib = 2048;
+        let mut ledger = rooms(&[one]);
+        assert!(four_gib.debit(&mut ledger));
+        assert!(!four_gib.met_by_a_node(&ledger));
+        assert!(!four_gib.debit(&mut ledger), "no node takes the second");
+    }
+
+    /// What a cluster holds unplaced, and what is bound there unreported, comes
+    /// off the node with the most room; one no node takes takes nothing.
+    #[test]
+    fn unplaced_demand_comes_off_the_roomiest_node_it_fits() {
+        let mut small = summary("a", true, true, &[]);
+        small.mem_mib = 4096;
+        let big = summary("b", true, true, &[]);
+        let unplaced = [
+            Capacity {
+                vcpus: 1,
+                mem_mib: 2048,
+            },
+            Capacity {
+                vcpus: 1,
+                mem_mib: 65_536,
+            },
+        ];
+        let ledger = node_rooms(&[small, big], Overcommit::default(), &unplaced);
+        assert_eq!(
+            ledger[0].room.mem_mib, 4096,
+            "the smaller node keeps its room"
+        );
+        assert_eq!(
+            ledger[1].room.mem_mib, 6144,
+            "the 2 GiB came off the bigger one"
+        );
+    }
+
+    /// An unplaced VM lands only on a node it can land on: not a drained one.
+    #[test]
+    fn unplaced_demand_does_not_come_off_a_node_that_takes_nothing() {
+        let drained = summary("a", true, false, &[]);
+        let ledger = node_rooms(
+            &[drained],
+            Overcommit::default(),
+            &[Capacity {
+                vcpus: 1,
+                mem_mib: 1024,
+            }],
+        );
+        assert_eq!(ledger[0].room.mem_mib, 8192);
+    }
+
+    /// What a cluster reports as unplaced: each VM without a node, one entry
+    /// each, and not one on its way out.
+    #[test]
+    fn unplaced_demand_is_each_vm_without_a_node_that_stays() {
+        let waiting = sized(2, 2048);
+        let mut placed = sized(1, 1024);
+        placed.spec.node_name = Some("agent-1a".into());
+        let mut leaving = sized(4, 4096);
+        leaving.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        assert_eq!(
+            unplaced_demand(&[waiting, placed, leaving]),
+            [Capacity {
+                vcpus: 2,
+                mem_mib: 2048
+            }]
+        );
     }
 
     /// A storage-only node can provision disks but cannot host VMs.

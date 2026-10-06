@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger,
+    Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, NodeRoom, Overcommit, PassTrigger,
     PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhaseKind, heartbeat_expired,
     lifecycle_command,
 };
@@ -206,10 +206,10 @@ async fn pass(
     // the estate per pass, because two readings could disagree about which
     // cluster a VM is on.
     let vms_for_drain = vms.clone();
-    let clusters = expire_and_collect_clusters(store, &sessions, &vms, overcommit).await?;
-    telemetry::metrics::objects().set_count(Cluster::KIND, clusters.len() as i64);
+    let ledger = expire_and_collect_clusters(store, &sessions, &vms, overcommit).await?;
+    telemetry::metrics::objects().set_count(Cluster::KIND, ledger.clusters.len() as i64);
     // Behind a mutex because a pass SPENDS it — see the cluster tier's twin.
-    let clusters = std::sync::Mutex::new(clusters);
+    let ledger = std::sync::Mutex::new(ledger);
     // And one reading of the address book, but only if somebody asks for it:
     // most passes dispatch nothing, and those must go on costing nothing.
     let book = OnceCell::new();
@@ -217,7 +217,7 @@ async fn pass(
     for vm in vms {
         let name = vm.metadata.name.clone();
         if let Err(e) = reconcile_vm(
-            store, registry, scheduler, &sessions, &clusters, &book, &pending, overcommit, vm,
+            store, registry, scheduler, &sessions, &ledger, &book, &pending, vm,
         )
         .await
         {
@@ -408,9 +408,9 @@ async fn expire_and_collect_clusters(
     sessions: &HashSet<String>,
     vms: &[Vm],
     overcommit: Overcommit,
-) -> anyhow::Result<Vec<Candidate>> {
+) -> anyhow::Result<Ledger> {
     let now = Utc::now();
-    let mut out = Vec::new();
+    let mut out = Ledger::default();
     // Rebuilt from this listing every pass: a cluster taken out of the
     // inventory must LOSE its age rather than keep the last one for ever.
     telemetry::metrics::sessions().reset_heartbeats();
@@ -418,11 +418,13 @@ async fn expire_and_collect_clusters(
     // key since D-C7.
     let beats = store.beats::<Cluster>().await?;
     for cluster in store.list::<Cluster>().await? {
+        let rooms = rooms_of(&cluster, vms, overcommit);
         let name = cluster.metadata.name;
         let heard = beats.get(&name).copied();
         publish_heartbeat_age(&name, heard, now);
         let connected = still_connected(store, &name, &cluster.status, heard, now).await;
-        out.push(Candidate {
+        out.nodes.insert(name.clone(), rooms);
+        out.clusters.push(Candidate {
             connected: connected && sessions.contains(&name),
             // One view at this tier: a cloud has one session per cluster
             // group and no second opinion to reconcile against.
