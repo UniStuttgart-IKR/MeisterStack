@@ -3001,6 +3001,41 @@ async fn a_namesake_whose_node_has_the_disk_open_does_not_repoint_it() {
     assert_eq!(data.status.node.as_deref(), Some("agent-1"));
 }
 
+/// A claim from before claims carried a uid, whose claimant is already found gone while a node
+/// still has the bytes open, is not carried by a VM made again under its name: a claim of
+/// unknown uid is nobody's to carry. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_does_not_carry_a_gone_claimants_record_of_unknown_uid() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1"]).await;
+    store
+        .mutate::<Volume, _>("data", |v| {
+            v.status.attached_uid = None;
+            v.status.claimant_gone = true;
+        })
+        .await
+        .expect("a gone claim from before claims carried a uid");
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("an unknown uid carries nothing");
+
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
+    assert_eq!(data.status.attached_uid, None);
+}
+
 /// A VM recreated under the same name after the listing survives the old one's teardown,
 /// and so does its claim on a volume both of them name. (NL2-6, NL3-1)
 #[tokio::test]

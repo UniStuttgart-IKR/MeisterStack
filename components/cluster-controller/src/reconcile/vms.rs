@@ -741,9 +741,13 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
 }
 
 /// Whether `vm` may move this volume's record to its node: nobody holds the
-/// volume, or the claim is this VM's own as `held_by` reads it.
+/// volume, or the claim is this VM object's by uid (`claimed_by`). A claim
+/// from before claims carried a uid is nobody's to carry: by its name alone a
+/// VM made again under it would carry the record of a claimant already found
+/// gone. The claimant pass binds such a claim to its VM or lets it fall, and
+/// the wait lasts until then. (IKR-B81)
 fn may_carry(status: &controller_api::VolumeStatus, vm: &Vm) -> bool {
-    status.attached_to.is_none() || status.held_by(&vm.metadata.name, &vm.metadata.uid)
+    status.attached_to.is_none() || status.claimed_by(&vm.metadata.uid)
 }
 
 /// The claim is somebody else's, and since D4 it may still be standing after

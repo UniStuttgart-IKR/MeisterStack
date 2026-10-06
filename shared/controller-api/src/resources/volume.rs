@@ -319,10 +319,10 @@ impl VolumeStatus {
         self.attached_to.is_some() && self.attached_uid.as_deref() == Some(uid)
     }
 
-    /// Whether the VM `name`/`uid` may let go of this claim or carry it along:
-    /// by uid, or — for a claim from before claims carried a uid — by the name
-    /// it was written under, which is the only VM it can be from. Taking a
-    /// claim (`claimed_by`) never accepts a name.
+    /// Whether the VM `name`/`uid` may let go of this claim: by uid, or — for
+    /// a claim from before claims carried a uid — by the name it was written
+    /// under. Taking a claim or carrying its record along (`claimed_by`)
+    /// never accepts a name.
     pub fn held_by(&self, name: &str, uid: &str) -> bool {
         match self.attached_uid.as_deref() {
             Some(held) => held == uid,

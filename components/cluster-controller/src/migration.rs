@@ -1394,16 +1394,15 @@ fn close_volumes_at(vm: &Vm, node: &str) {
 
 /// Move referenced volume homes that still name the source to the destination.
 /// Failures are logged after the migration succeeds; there is no retry here.
-/// Only a volume this guest holds (`VolumeStatus::held_by`): a volume made under a
-/// referenced name since, or held by another object, is not this migration's to
-/// move. (IKR-B81)
+/// Only a volume this guest object claims (`VolumeStatus::claimed_by`): a volume
+/// made under a referenced name since, held by another object, or claimed from
+/// before claims carried a uid is not this migration's to move; the last waits
+/// for the claimant pass to bind it. (IKR-B81)
 async fn move_volume_home(store: &EtcdStore, vm: &Vm, from: &str, to: &str) {
     for name in vm.spec.referenced_volumes() {
         let moved = store
             .mutate::<Volume, _>(&name, |v| {
-                if v.status.node.as_deref() == Some(from)
-                    && v.status.held_by(&vm.metadata.name, &vm.metadata.uid)
-                {
+                if v.status.node.as_deref() == Some(from) && v.status.claimed_by(&vm.metadata.uid) {
                     v.status.node = Some(to.to_string());
                 }
             })
