@@ -102,6 +102,7 @@ impl FetchUrl {
             t if t.starts_with('?') => format!("/{t}"),
             t => t.to_string(),
         };
+        check_no_pattern(&path)?;
         Ok(Self {
             scheme,
             host,
@@ -134,6 +135,20 @@ impl FetchUrl {
     /// Whether the port is one of [`ALLOWED_PORTS`].
     pub fn port_allowed(&self) -> bool {
         ALLOWED_PORTS.contains(&self.port)
+    }
+}
+
+/// Refuse `[ ] { }` in the path and query: curl reads them as a pattern of several URLs, so a
+/// URL holding them is not one fetch of one checked URL (R2-7). The node passes `--globoff`
+/// too; this keeps the strict-subset claim true for every reader.
+fn check_no_pattern(path: &str) -> Result<(), String> {
+    match path.contains(['[', ']', '{', '}']) {
+        true => Err(
+            "the url's path may not contain [ ] { }, which curl reads as a pattern of \
+                     several urls; write them percent-encoded (%5B %5D %7B %7D)"
+                .into(),
+        ),
+        false => Ok(()),
     }
 }
 
@@ -427,6 +442,22 @@ mod tests {
                 .unwrap()
                 .port_allowed()
         );
+    }
+
+    /// A path curl would expand into several URLs is refused; an IPv6 host keeps its brackets.
+    /// (R2-7)
+    #[test]
+    fn a_path_curl_would_read_as_a_pattern_is_refused() {
+        for bad in [
+            "http://a.example/img{1,2}.raw",
+            "http://a.example/img[1-9].raw",
+            "http://a.example/x?part[]=1",
+            "http://[2001:db8::1]/x{a,b}",
+        ] {
+            assert!(FetchUrl::parse(bad).is_err(), "{bad} should be refused");
+        }
+        assert!(FetchUrl::parse("http://a.example/img%7B1%7D.raw").is_ok());
+        assert!(FetchUrl::parse("http://[2001:db8::1]/x").is_ok());
     }
 
     #[test]

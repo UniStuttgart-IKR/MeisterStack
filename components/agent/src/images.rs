@@ -576,6 +576,8 @@ const BOUND_GRACE: Duration = Duration::from_secs(30);
 fn curl_argv(pinned: &Pinned, bounds: &Bounds, max_time: Duration) -> Vec<String> {
     let mut argv = vec![
         "-q".to_string(),
+        // `[ ]` and `{ }` are a URL, not a pattern of several (R2-7).
+        "--globoff".to_string(),
         "--fail".to_string(),
         "--silent".to_string(),
         "--show-error".to_string(),
@@ -1028,6 +1030,10 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--location" || a == "-L"),
             "redirects are followed here, after a check, and never by curl"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--globoff"),
+            "a url is one url, never a pattern curl expands"
         );
         for flag in ["--fail", "--silent", "--show-error"] {
             assert!(argv.iter().any(|a| a == flag), "{flag} is still passed");
