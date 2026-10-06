@@ -84,6 +84,30 @@ pub fn overlay_device(vni: u32) -> String {
     format!("mvx{vni}")
 }
 
+/// Parse this driver's VXLAN device naming convention.
+fn overlay_device_vni(name: &str) -> Option<u32> {
+    name.strip_prefix("mvx")?.parse().ok()
+}
+
+/// Whether `key` is the short form of an id that tap and router veth names carry: the first
+/// eight hex digits of its simple form.
+pub(crate) fn is_short_key(key: &str) -> bool {
+    key.len() == 8
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether this driver names a link `name` for guests' or tenants' frames: a tap, an overlay's
+/// bridge or VXLAN device, a provider bridge or the host end of a router's leg.
+fn is_tenant_link(name: &str) -> bool {
+    LinuxNetworkDriver::is_tap_name(name)
+        || overlay_vni(name).is_some()
+        || overlay_device_vni(name).is_some()
+        || name.starts_with(router::PROVIDER_PREFIX)
+        || router::is_router_veth(name)
+}
+
 /// Refuse cleanup when the recorded bridge belongs to another naming scheme.
 /// Legacy records without a bridge name use this driver's conventional name.
 fn not_this_drivers_overlay(vni: u32, recorded: Option<&str>) -> Option<String> {
@@ -125,7 +149,9 @@ pub(crate) fn kernel_has_ipv6() -> bool {
 /// and MLD reports through it: into every tenant overlay, which VXLAN carries on to other
 /// hosts, showing tenants the host's interfaces and MACs. The guests' own IPv6 is bridged and
 /// stays as it is. Called before the link first goes up, so that it never has an address, and
-/// on every ensure, which mends links made before.
+/// again whenever the link is ensured: a tap on every start of its guest, an overlay with every
+/// NIC or router on it, a provider bridge at every agent start. Links made before that are
+/// mended at agent start by [`host_ipv6_off_where_still_on`].
 pub(crate) async fn host_ipv6_off(link: &str) -> networking::Result<()> {
     if !kernel_has_ipv6() {
         return Ok(());
@@ -136,6 +162,64 @@ pub(crate) async fn host_ipv6_off(link: &str) -> networking::Result<()> {
             anyhow::Error::new(e).context(format!("turning the host's IPv6 off on {link}")),
         )
     })
+}
+
+/// Turn the host's IPv6 off on every link of this driver's naming where it is still on, and
+/// name those links (IKR-B77).
+///
+/// A guest that kept running across the agent's restart keeps its tap, and the overlay it hangs
+/// on, as an agent before IKR-B77 made them: with the host's IPv6 on until the guest's next
+/// start. Every link is tried; the error names those that refused.
+async fn host_ipv6_off_where_still_on() -> networking::Result<Vec<String>> {
+    if !kernel_has_ipv6() {
+        return Ok(Vec::new());
+    }
+    let mut mended = Vec::new();
+    let mut refused = Vec::new();
+    for link in tenant_links_with_host_ipv6().await? {
+        match host_ipv6_off(&link).await {
+            Ok(()) => mended.push(link),
+            Err(e) => {
+                warn!(link = %link, error = %format!("{e:#}"),
+                      "the host's IPv6 could not be turned off on this link");
+                refused.push(link);
+            }
+        }
+    }
+    match refused.is_empty() {
+        true => Ok(mended),
+        false => Err(NetworkError::Backend(anyhow::anyhow!(
+            "the host's IPv6 stays on on {}",
+            refused.join(", ")
+        ))),
+    }
+}
+
+/// The links of this driver's naming whose IPv6 switch is not off, as the kernel's per-link
+/// settings show them. A switch that cannot be read counts as on: unknown is not off.
+async fn tenant_links_with_host_ipv6() -> networking::Result<Vec<String>> {
+    let unlisted = |e: std::io::Error| {
+        NetworkError::Backend(anyhow::Error::new(e).context(format!("listing {IPV6_CONF}")))
+    };
+    let mut entries = tokio::fs::read_dir(IPV6_CONF).await.map_err(unlisted)?;
+    let mut links = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(unlisted)? {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_tenant_link(&name) {
+            continue;
+        }
+        let switch = entry.path().join("disable_ipv6");
+        let off = tokio::fs::read_to_string(&switch)
+            .await
+            .is_ok_and(|value| value.trim() == "1");
+        if !off {
+            links.push(name);
+        }
+    }
+    links.sort_unstable();
+    Ok(links)
 }
 
 /// Map the lower 24 VNI bits to an administratively scoped IPv4 multicast group.
@@ -248,6 +332,11 @@ impl LinuxNetworkDriver {
 
     fn tap_name(id: &NicId) -> String {
         format!("msk{}", &id.simple().to_string()[..8])
+    }
+
+    /// Whether `name` is one [`Self::tap_name`] gives.
+    fn is_tap_name(name: &str) -> bool {
+        name.strip_prefix("msk").is_some_and(is_short_key)
     }
 
     async fn link_index(&self, name: &str) -> networking::Result<Option<u32>> {
@@ -802,6 +891,12 @@ impl NicDriver for LinuxNetworkDriver {
         self.nft.reap(live_taps).await;
     }
 
+    /// The host's IPv6 off on the taps and wires an agent before IKR-B77 left it on, for the
+    /// guests still running on them.
+    async fn mend_existing_links(&self) -> networking::Result<Vec<String>> {
+        host_ipv6_off_where_still_on().await
+    }
+
     #[instrument(level = "trace", skip_all, fields(nic_id = %id))]
     async fn get(&self, id: &NicId) -> networking::Result<Nic> {
         let tap = Self::tap_name(id);
@@ -851,6 +946,39 @@ mod tests {
             "tap-4f2c",
         ] {
             assert_eq!(overlay_vni(other), None, "{other}");
+        }
+    }
+
+    /// IKR-B77: the startup mend touches the links this driver names for guests' and tenants'
+    /// frames, and no link an operator named.
+    #[test]
+    fn only_this_drivers_tenant_links_are_mended() {
+        let router = RouterId::from_u128(0x1a2b_3c4d_5e6f_0000_0000_0000_0000_0000);
+        for ours in [
+            LinuxNetworkDriver::tap_name(&NicId::from_u128(0x77)),
+            overlay_bridge(10_003),
+            overlay_device(10_003),
+            router::provider_bridge("ext"),
+            router::veth_external(&router),
+            router::veth_internal(&router),
+        ] {
+            assert!(is_tenant_link(&ours), "{ours}");
+        }
+        for other in [
+            "eth0",
+            "lo",
+            "all",
+            "default",
+            "meister_br0",
+            "msk",
+            "msk1234567",
+            "msk1234567g",
+            "mskABCDEF01",
+            "mvx",
+            "rtx-uplink",
+            "rti1a2b3c4d5",
+        ] {
+            assert!(!is_tenant_link(other), "{other}");
         }
     }
 

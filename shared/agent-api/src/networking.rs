@@ -70,6 +70,13 @@ pub trait NicDriver: Send + Sync {
     /// Remove stale per-tap host state, such as nftables chains, using the
     /// agent's persisted live-tap inventory at startup. Default: no extra state.
     async fn reap(&self, _live_taps: &[String]) {}
+
+    /// Bring the host side of links this driver made before, which guests still running
+    /// across an agent restart keep using, to what it makes today; name the links changed.
+    /// Called once at startup, before reconciliation. Default: nothing to bring up to date.
+    async fn mend_existing_links(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait::async_trait]

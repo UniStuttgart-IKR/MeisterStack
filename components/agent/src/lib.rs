@@ -491,6 +491,21 @@ async fn sweep_what_no_record_names(
     Ok(())
 }
 
+/// Bring the links an older agent made, which guests still running here keep using, to what
+/// the driver makes today. Logged and not fatal: a link left as it was is no worse than it was
+/// before this agent started, and a node that refused to start would serve nobody.
+async fn mend_existing_links(networking: Option<&Arc<dyn agent_api::networking::NicDriver>>) {
+    let Some(driver) = networking else {
+        return;
+    };
+    match driver.mend_existing_links().await {
+        Ok(mended) if mended.is_empty() => {}
+        Ok(mended) => info!(?mended, "links made by an older agent brought up to date"),
+        Err(e) => warn!(error = %format!("{e:#}"),
+                        "links made by an older agent could not all be brought up to date"),
+    }
+}
+
 /// None means the inventory cannot authorize removal of any guest's filters.
 fn live_taps_for_sweep(store: &Store) -> anyhow::Result<Option<Vec<String>>> {
     let mut taps = Vec::new();
@@ -609,6 +624,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         bridge_driver.as_ref(),
     )
     .await?;
+    mend_existing_links(networking_driver.as_ref()).await;
 
     if let Err(e) = reconciler.reconcile_all(Trigger::Startup).await {
         // Periodic reconciliation retries this startup failure.

@@ -565,3 +565,46 @@ async fn the_host_speaks_no_ipv6_on_the_wires_it_builds() {
     NicDriver::destroy(&d, &nic).await.expect("the tap goes");
     d.destroy_router(&id).await.expect("the router goes");
 }
+
+/// Set the host's IPv6 switch of a link of this namespace, as an agent before IKR-B77 left it.
+fn set_host_ipv6_disabled(link: &str, disabled: bool) {
+    let path = format!("/proc/sys/net/ipv6/conf/{link}/disable_ipv6");
+    std::fs::write(&path, if disabled { "1" } else { "0" })
+        .unwrap_or_else(|e| panic!("writing {path}: {e}"));
+}
+
+/// IKR-B77: the taps and overlays an older agent made, which running guests keep using, have
+/// the host's IPv6 turned off at agent start; a link of another name is left as it is.
+#[tokio::test]
+#[ignore = "needs its own network and mount namespace; see the module note"]
+async fn the_startup_mend_turns_the_host_ipv6_off_on_links_made_before() {
+    let _kernel = KERNEL.lock().await;
+    let state = tempfile::Builder::new()
+        .prefix("ms-neutron-agent-b77-mend-")
+        .tempdir()
+        .expect("a state directory");
+    let older = ["msk0b77aaaa", "meister-vx10011", "mvx10011"];
+    let operators = "opr0b77";
+    for link in older.into_iter().chain([operators]) {
+        ip(&["link", "add", link, "type", "dummy"]);
+        ip(&["link", "set", link, "up"]);
+        set_host_ipv6_disabled(link, false);
+    }
+    let d = driver(state.path());
+
+    let mended = NicDriver::mend_existing_links(&d)
+        .await
+        .expect("every link was mended");
+
+    for link in older {
+        assert!(mended.iter().any(|m| m == link), "{link} in {mended:?}");
+        assert!(host_ipv6_disabled(link), "{link} has the host's IPv6 on");
+    }
+    assert!(
+        !host_ipv6_disabled(operators),
+        "a link this driver does not name is not its to change"
+    );
+    for link in older.into_iter().chain([operators]) {
+        ip(&["link", "del", link]);
+    }
+}

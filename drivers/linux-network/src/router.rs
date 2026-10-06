@@ -83,6 +83,13 @@ pub fn veth_internal(id: &RouterId) -> String {
     format!("rti{}", router_key(id))
 }
 
+/// Whether `name` is one [`veth_external`] or [`veth_internal`] gives.
+pub(crate) fn is_router_veth(name: &str) -> bool {
+    ["rtx", "rti"]
+        .into_iter()
+        .any(|prefix| name.strip_prefix(prefix).is_some_and(crate::is_short_key))
+}
+
 /// Validate provider names against the 15-byte generated bridge-name limit.
 pub fn check_physnet_name(physnet: &str) -> networking::Result<()> {
     const MAX: usize = 15;
