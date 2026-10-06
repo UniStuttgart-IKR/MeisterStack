@@ -542,6 +542,29 @@ pub struct VmStatus {
     /// say when the cluster was last told. (IKR-B74)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed_down: Option<HandedDown>,
+    /// The last hand-down the cluster refused, while no later one was acked.
+    /// Cloud tier only. A cluster that refuses a re-send of a VM it holds
+    /// goes on reporting the VM, and every report used to start a pass that
+    /// asked the same again: the refusal is what holds the next ask back.
+    /// (IKR-B74)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hand_down_refused: Option<HandDownRefused>,
+}
+
+/// A hand-down the cluster refused, and the intent it carried.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HandDownRefused {
+    pub at: DateTime<Utc>,
+    /// The `metadata.generation` the refused hand-down carried.
+    pub generation: u64,
+    /// The `metadata.labels` it carried: labels move no generation, and a
+    /// label edit is new intent as much as a spec edit is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// The cluster's own sentence, kept after its next report has replaced
+    /// the refusal in the phase.
+    pub message: String,
 }
 
 /// A hand-down the cluster acked.

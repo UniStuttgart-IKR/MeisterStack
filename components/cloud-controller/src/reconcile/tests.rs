@@ -817,8 +817,60 @@ fn a_missing_vm_or_a_new_generation_is_dispatched_at_once() {
 #[test]
 fn only_a_dispatch_after_the_intent_counts_as_told() {
     let v = stopping(10);
-    assert!(handed_down_since(&v, at(5), at(11)));
-    assert!(!handed_down_since(&v, at(12), at(13)));
+    assert!(answered_since(&v, at(5), at(11)));
+    assert!(!answered_since(&v, at(12), at(13)));
+}
+
+/// `stopping(10)` with a new generation the cluster refused at `at(refused)`.
+fn refused_at(refused: i64) -> Vm {
+    let mut v = stopping(10);
+    v.metadata.generation += 1;
+    v.status.hand_down_refused = Some(controller_api::HandDownRefused {
+        at: at(refused),
+        generation: v.metadata.generation,
+        labels: v.metadata.labels.clone(),
+        message: "the shape of a vm is fixed once it exists".into(),
+    });
+    v
+}
+
+/// The same loop over a detour: a cluster that refuses a re-send goes on
+/// reporting the VM, and each report started a pass that asked again. The
+/// refusal holds the same intent back for `RETELL_AFTER`, held or missing.
+#[test]
+fn an_intent_the_cluster_refused_lately_is_not_asked_again() {
+    let v = refused_at(20);
+    assert!(!must_hand_down(&v, false, at(21)), "refused a second ago");
+    assert!(!must_hand_down(&v, true, at(21)), "missing is no news");
+    assert!(
+        !must_hand_down(&v, false, at(49)),
+        "still inside the window"
+    );
+    assert!(must_hand_down(&v, false, at(50)), "asked again after it");
+}
+
+/// What was refused is that intent and no other: an edit since goes down at
+/// once.
+#[test]
+fn new_intent_after_a_refusal_goes_down_at_once() {
+    let mut edited = refused_at(20);
+    edited.metadata.generation += 1;
+    assert!(must_hand_down(&edited, false, at(21)));
+    let mut relabelled = refused_at(20);
+    relabelled
+        .metadata
+        .labels
+        .insert("app".into(), "web".into());
+    assert!(must_hand_down(&relabelled, false, at(21)));
+}
+
+/// A refusal after an evacuation mark answers it as an ack would: the stop
+/// is asked once per window, refused or not.
+#[test]
+fn a_refusal_after_the_intent_counts_as_answered() {
+    let v = refused_at(20);
+    assert!(answered_since(&v, at(15), at(21)));
+    assert!(!answered_since(&v, at(25), at(26)));
 }
 
 /// A label-only edit of a bound, acked VM goes down at once: labels move no
@@ -1035,6 +1087,45 @@ async fn a_stamp_for_an_old_reservation_leaves_the_new_one_alone() {
         new.status.observed_generation, 0,
         "nothing travelled for it"
     );
+}
+
+/// The lab's loop end to end: a cluster that keeps the VM and refuses its
+/// re-send is asked once over three passes, and the refusal is on the VM.
+/// Each pass is one the cluster's report started. (IKR-B74)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_cluster_that_refuses_a_resend_is_asked_once_in_three_passes() {
+    let store = test_store("refused-test").await;
+    let registry = Arc::new(crate::session::SessionRegistry::new());
+    let asked = registry.refusing("cluster-1", "the shape of a vm is fixed once it exists");
+    // Stored at generation 1 and never acked: a generation to send.
+    let held = store.create(&vm()).await.expect("a bound vm");
+    let report = crate::session::Report {
+        at: Utc::now(),
+        uids: [held.metadata.uid.clone()].into_iter().collect(),
+        routers: None,
+    };
+
+    for _ in 0..3 {
+        let listed: Vm = store.get("t").await.expect("the vm");
+        hand_down(
+            &store,
+            &registry,
+            &OnceCell::new(),
+            &listed,
+            "cluster-1",
+            &report,
+            "",
+        )
+        .await
+        .expect("a pass");
+    }
+
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let after: Vm = store.get("t").await.expect("the vm");
+    let refusal = after.status.hand_down_refused.expect("the refusal is kept");
+    assert_eq!(refusal.generation, held.metadata.generation);
+    assert!(refusal.message.contains("shape"), "{}", refusal.message);
 }
 
 /// The teardown of a VM that was never placed deletes that VM and not one

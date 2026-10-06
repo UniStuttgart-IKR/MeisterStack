@@ -233,12 +233,18 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     }
 }
 
-/// How long a cluster that acked a VM's intent is left to act on it before the
-/// same intent is sent again. A lifecycle drift stands for a whole stop grace
-/// or boot; sent every pass, each ack's write was the watch event that started
-/// the next pass, and one stopping guest cost tens of commands a second.
-/// (IKR-B74)
+/// How long a cluster that answered a VM's intent is left with its answer
+/// before the same intent is sent again. A lifecycle drift stands for a whole
+/// stop grace or boot; sent every pass, each ack's write was the watch event
+/// that started the next pass, and one stopping guest cost tens of commands a
+/// second. A refusal is written as well, and the cluster's next report starts
+/// a pass just the same. (IKR-B74)
 const RETELL_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
+/// Whether an answer given at `at` is still the cluster's word at `now`.
+fn answered_lately(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(at) < RETELL_AFTER
+}
 
 /// Whether the cluster acked a hand-down of this VM within [`RETELL_AFTER`]:
 /// then telling it the same again is noise. Only the ack's own record counts,
@@ -247,18 +253,36 @@ pub(super) fn handed_down_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
     vm.status
         .handed_down
         .as_ref()
-        .is_some_and(|h| now.signed_duration_since(h.at) < RETELL_AFTER)
+        .is_some_and(|h| answered_lately(h.at, now))
 }
 
-/// [`handed_down_lately`], and no earlier than `intent`: a hand-down from
-/// before an intent says nothing about it.
-pub(super) fn handed_down_since(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    handed_down_lately(vm, now)
+/// Whether the cluster refused this VM's current intent — its generation and
+/// its labels — within [`RETELL_AFTER`]: asking again gets the same no. New
+/// intent is not what was refused and goes down at once. (IKR-B74)
+pub(super) fn refused_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
+    vm.status.hand_down_refused.as_ref().is_some_and(|r| {
+        answered_lately(r.at, now)
+            && r.generation == vm.metadata.generation
+            && r.labels == vm.metadata.labels
+    })
+}
+
+/// [`handed_down_lately`] or [`refused_lately`], by an answer no earlier than
+/// `intent`: an answer from before an intent says nothing about it.
+pub(super) fn answered_since(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let acked = handed_down_lately(vm, now)
         && vm
             .status
             .handed_down
             .as_ref()
-            .is_some_and(|h| h.at >= intent)
+            .is_some_and(|h| h.at >= intent);
+    let refused = refused_lately(vm, now)
+        && vm
+            .status
+            .hand_down_refused
+            .as_ref()
+            .is_some_and(|r| r.at >= intent);
+    acked || refused
 }
 
 /// Whether the cluster's copy may wear other labels than the VM: edited since
@@ -273,11 +297,15 @@ pub(super) fn labels_unsent(vm: &Vm) -> bool {
 
 /// Whether the VM has to go down to its cluster now: the cluster lacks it, or
 /// has not been sent the current spec generation or labels, or its phase
-/// still disagrees with the intent it acked longer than [`RETELL_AFTER`] ago.
+/// still disagrees with the intent it acked longer than [`RETELL_AFTER`] ago —
+/// unless the cluster refused exactly this intent within that window.
 /// Generation changes include disk hot-plug and runStrategy edits; the drift
 /// arm is the repair for a cluster that lost what it acked, not the way
 /// intent travels.
 pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool {
+    if refused_lately(vm, now) {
+        return false;
+    }
     let stale = vm.metadata.generation > vm.status.observed_generation;
     let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some()
         && !handed_down_lately(vm, now);
@@ -286,7 +314,7 @@ pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool
 
 /// Dispatch what [`must_hand_down`] says has to go down.
 /// `observedGeneration` records acknowledged dispatch, not guest readiness.
-async fn hand_down(
+pub(super) async fn hand_down(
     store: &EtcdStore,
     registry: &SessionRegistry,
     book: &OnceCell<AddressBook>,
@@ -647,8 +675,9 @@ pub(super) async fn evacuate(
                 // Level-triggered: the same dispatch until the phase moves,
                 // idempotent at the cluster because what changes down there
                 // is one object's desired state. Once per `RETELL_AFTER`
-                // after the mark, not once per pass. (IKR-B74)
-                if handed_down_since(vm, mark.since, Utc::now()) {
+                // after the mark, acked or refused, not once per pass.
+                // (IKR-B74)
+                if answered_since(vm, mark.since, Utc::now()) {
                     return Ok(());
                 }
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
@@ -741,6 +770,9 @@ pub(super) async fn dispatch_create(
                         at: Utc::now(),
                         labels: vm.metadata.labels.clone(),
                     });
+                    // Answered: whatever was refused before is not the
+                    // cluster's word any more.
+                    v.status.hand_down_refused = None;
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has
@@ -774,6 +806,15 @@ pub(super) async fn dispatch_create(
                     ));
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     v.status.observed_at = Some(Utc::now());
+                    // What was refused, so the same is not asked again before
+                    // `RETELL_AFTER`: the cluster's next report replaces the
+                    // phase above, and every report starts a pass. (IKR-B74)
+                    v.status.hand_down_refused = Some(controller_api::HandDownRefused {
+                        at: Utc::now(),
+                        generation: dispatched,
+                        labels: vm.metadata.labels.clone(),
+                        message: msg.clone(),
+                    });
                 })
                 .await?;
         }

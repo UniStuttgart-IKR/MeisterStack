@@ -454,6 +454,34 @@ impl SessionRegistry {
     }
 }
 
+/// A cluster as a reconcile test meets it, without a cluster.
+#[cfg(test)]
+impl SessionRegistry {
+    /// Open a session for `cluster` that refuses every command with `message`,
+    /// and count the commands it is sent.
+    pub(crate) fn refusing(
+        self: &std::sync::Arc<Self>,
+        cluster: &str,
+        message: &str,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let (tx, mut rx) = mpsc::channel(4);
+        self.open(None, cluster, &tx, Utc::now(), None);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (registry, counted) = (self.clone(), asked.clone());
+        let message = message.to_string();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = rx.recv().await {
+                if let Some(proto::cloud_message::Kind::Command(cmd)) = msg.kind {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let refusal = controller_api::Refusal::plain(message.clone());
+                    registry.pending.resolve(&cmd.request_id, Err(refusal));
+                }
+            }
+        });
+        asked
+    }
+}
+
 pub fn service(
     registry: std::sync::Arc<SessionRegistry>,
     store: std::sync::Arc<EtcdStore>,
