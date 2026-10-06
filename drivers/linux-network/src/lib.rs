@@ -671,7 +671,7 @@ impl BridgeDriver for LinuxNetworkDriver {
 
     async fn fall_silent(&self) -> networking::Result<networking::Silencing> {
         // A node with no gateway slot holds no router and has nothing to stop
-        // saying — the same answer `sweep_routers` gives one line up.
+        // saying — the same answer `sweep_routers` gives.
         match self.gateway.is_some() {
             true => self.fall_silent_impl().await,
             false => Ok(networking::Silencing::default()),
