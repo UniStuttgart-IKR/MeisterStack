@@ -1028,10 +1028,11 @@ impl crate::LinuxNetworkDriver {
 
     /// Set the ARP mode of `legs`: answering for an active router, `arp_ignore=8` for a standby.
     ///
-    /// A pass names both [`ROUTER_LEGS`], because a standby must be silent towards the tenant
-    /// as well as towards the fabric: an ARP reply on the overlay would make it the tenant's
-    /// default gateway. The dead man names the legs the kernel lists. Every leg is tried even
-    /// when one fails, so a silencing pass never leaves a leg it could reach.
+    /// Building a router names both [`ROUTER_LEGS`], because a standby must be silent towards
+    /// the tenant as well as towards the fabric: an ARP reply on the overlay would make it the
+    /// tenant's default gateway. Silencing (`silence_legs`: the dead man, a demotion, unnamed
+    /// namespaces) names the legs the kernel lists. Every leg is tried even when one fails, so a
+    /// silencing pass never leaves a leg it could reach.
     async fn set_arp_mode(
         &self,
         netns: &str,
