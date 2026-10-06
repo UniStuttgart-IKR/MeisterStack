@@ -58,6 +58,20 @@ fn an_unknown_key_is_refused_and_named() {
     assert!(out.stdout.is_empty(), "nothing on stdout: {:?}", out.stdout);
 }
 
+/// Routed pools that do not parse are refused before anything else is asked: the pass keeps
+/// routers' prefixes off them, and a list it cannot read keeps nothing off. (NL6-1)
+#[test]
+fn routed_pools_that_do_not_parse_are_refused_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.toml");
+    std::fs::write(&path, "routed_pools = [\"10.7.0.0/33\"]\n").unwrap();
+
+    let out = check(&path, None);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("routed_pools"), "{said}");
+}
+
 #[test]
 fn an_auth_chain_that_cannot_stand_is_refused_without_reading_a_single_key() {
     // `check_chain`'s half of the refusals: a chain that names a link it has

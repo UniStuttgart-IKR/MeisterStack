@@ -72,6 +72,11 @@ impl Ipv4Range {
         self.start <= other.end && other.start <= self.end
     }
 
+    /// Whether every address of `other` is in this range, guard included.
+    pub fn covers(&self, other: &Ipv4Range) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
     pub fn first(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.start)
     }
@@ -411,6 +416,19 @@ mod tests {
             !a.overlaps(&r("10.0.1.0/24")),
             "adjacent is not overlapping"
         );
+    }
+
+    /// A range covers another only when it holds all of it; overlapping is not enough.
+    #[test]
+    fn a_range_covers_what_lies_wholly_inside_it() {
+        let a = r("10.30.0.0/16");
+        assert!(a.covers(&r("10.30.4.0/24")));
+        assert!(a.covers(&a), "itself");
+        assert!(
+            !a.covers(&r("10.30.0.0/15")),
+            "a wider one overlaps but sticks out"
+        );
+        assert!(!r("10.30.4.0/24").covers(&a));
     }
 
     /// Every way of writing nonsense, refused by name — these messages end up

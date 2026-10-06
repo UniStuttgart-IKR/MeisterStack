@@ -210,21 +210,19 @@ async fn off_limits_to_network_prefixes(
     tenant: &str,
 ) -> Result<Vec<(String, common::net::Ipv4Range)>, ApiError> {
     let pools = floating::all_pools(&st.store).await?;
-    let others: Vec<RoutedSubnet> = floating::all_subnets(&st.store)
-        .await?
-        .into_iter()
-        .filter(|s| s.spec.tenant != tenant)
-        .collect();
-    let routed_pools = common::net::Ipv4Ranges::parse(&st.routed_pools)
-        .map_err(|e| invalid(format!("routed_pools in the cloud config: {e}")))?;
-    let mut taken = floating::occupied(&pools, &others, None);
-    taken.extend(
-        routed_pools
-            .ranges()
-            .iter()
-            .map(|range| ("the routed pools".to_string(), *range)),
-    );
-    Ok(taken)
+    let subnets = floating::all_subnets(&st.store).await?;
+    Ok(controller_api::address_space::off_limits_to_tenant(
+        tenant,
+        &pools,
+        &subnets,
+        &routed_pools(st)?,
+    ))
+}
+
+/// The routed pools from the cloud config, which subnets are cut from.
+pub(super) fn routed_pools(st: &ApiState) -> Result<common::net::Ipv4Ranges, ApiError> {
+    common::net::Ipv4Ranges::parse(&st.routed_pools)
+        .map_err(|e| invalid(format!("routed_pools in the cloud config: {e}")))
 }
 
 /// Every tenant's network prefixes but those of `except`, each with its name for a refusal:
@@ -244,16 +242,9 @@ pub(super) async fn network_prefixes_taken(
              decode); refusing rather than overlapping one",
         ));
     }
-    Ok(tenants
-        .iter()
-        .filter(|t| Some(t.metadata.name.as_str()) != except)
-        .flat_map(|t| {
-            t.spec.network_prefixes.iter().filter_map(|prefix| {
-                let range = prefix.parse::<common::net::Ipv4Range>().ok()?;
-                Some((format!("tenant {}'s network", t.metadata.name), range))
-            })
-        })
-        .collect())
+    Ok(controller_api::address_space::tenant_networks(
+        &tenants, except,
+    ))
 }
 
 /// `declared` as CIDRs of their network address, sorted and each once, or why not: an entry

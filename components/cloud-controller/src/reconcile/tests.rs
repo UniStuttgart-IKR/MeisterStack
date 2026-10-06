@@ -509,10 +509,6 @@ fn book() -> AddressBook {
             // that keeps it unable to matter is the one under test.
             ip("203.0.113.4", "other", Some("web")),
         ],
-        subnets: vec![
-            net("acme-net", "acme", "10.7.1.0/24"),
-            net("other-net", "other", "10.7.2.0/24"),
-        ],
         // acme has a way out; the prefix its guests source from is the one
         // behind that router, and it belongs on the same list.
         routers: vec![{
@@ -526,6 +522,16 @@ fn book() -> AddressBook {
                 },
             )
         }],
+        claimed: controller_api::address_space::ClaimedSpace {
+            pools: Vec::new(),
+            subnets: vec![
+                net("acme-net", "acme", "10.7.1.0/24"),
+                net("other-net", "other", "10.7.2.0/24"),
+            ],
+            tenants: Vec::new(),
+            provider_networks: Vec::new(),
+            routed_pools: Default::default(),
+        },
     }
 }
 
@@ -587,13 +593,63 @@ fn a_tenants_declared_network_prefix_outlives_its_router() {
     );
 }
 
+/// A router of a tenant that declares no network whose prefix lies on somebody else's claim,
+/// here a floating pool made since the router was, is kept off its tenant's taps, and the
+/// router is named with why. (NL6-1)
+#[test]
+fn a_router_prefix_on_somebody_elses_claim_is_kept_off_the_taps() {
+    let mut book = book();
+    book.claimed
+        .pools
+        .push(controller_api::FloatingPool::declare(
+            "late",
+            controller_api::FloatingPoolSpec {
+                cidrs: vec!["10.42.0.0/25".into()],
+                ..Default::default()
+            },
+        ));
+
+    let web = book.for_vm(&owned("web", Some("acme")), &[]);
+    assert_eq!(web.source_prefixes, ["10.7.1.0/24"]);
+    let refused: Vec<(&str, &str)> = web
+        .refused
+        .iter()
+        .map(|r| (r.router.as_str(), r.tenant.as_str()))
+        .collect();
+    assert_eq!(refused, [("acme-out", "acme")]);
+    assert!(
+        web.refused[0].why.contains("floating pool late"),
+        "{}",
+        web.refused[0].why
+    );
+}
+
+/// A router of a tenant that declares its network whose prefix lies off that network is kept
+/// off the taps, and the declared network stays on them. (NL6-1)
+#[test]
+fn a_router_prefix_off_the_declared_network_is_kept_off_the_taps() {
+    let book = book();
+    let declared = ["10.30.0.0/24".to_string()];
+
+    let web = book.for_vm(&owned("web", Some("acme")), &declared);
+    assert_eq!(web.source_prefixes, ["10.30.0.0/24", "10.7.1.0/24"]);
+    assert_eq!(web.refused.len(), 1);
+    assert!(
+        web.refused[0]
+            .why
+            .contains("not inside tenant acme's network"),
+        "{}",
+        web.refused[0].why
+    );
+}
+
 /// A tenant with no routed subnet and no router is known by its declared prefixes alone, and
 /// one with nothing declared either is known by nothing, as before the field existed.
 #[test]
 fn a_tenant_without_routers_or_subnets_is_known_by_its_declared_prefixes_alone() {
     let mut book = book();
     book.routers.clear();
-    book.subnets.clear();
+    book.claimed.subnets.clear();
     let declared = ["10.30.0.0/24".to_string(), "10.31.0.0/24".to_string()];
     assert_eq!(
         book.for_vm(&owned("idle", Some("acme")), &declared)
@@ -622,7 +678,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     for ip in &mut book.reservations {
         ip.metadata.generation = 3;
     }
-    for net in &mut book.subnets {
+    for net in &mut book.claimed.subnets {
         net.metadata.generation = 5;
     }
 
@@ -1371,11 +1427,39 @@ async fn an_address_book_is_not_read_past_a_router_that_does_not_decode() {
     let (store, prefix) = test_area("address-book").await;
     unparsable::<controller_api::Router>(&prefix, "broken").await;
 
-    let refused = AddressBook::read(&store)
+    let refused = AddressBook::read(&store, &common::net::Ipv4Ranges::default())
         .await
         .err()
         .expect("no book out of a partial list of routers");
     assert!(format!("{refused:#}").contains("router"), "{refused:#}");
+}
+
+/// A router prefix kept off its tenant's taps is a warning event on the router, which its
+/// tenant sees. (NL6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_refused_router_prefix_is_a_warning_on_the_router_its_tenant_sees() {
+    let store = test_store("refused-prefix").await;
+    let refused = RefusedPrefix {
+        router: "acme-out".into(),
+        uid: "u-1".into(),
+        tenant: "acme".into(),
+        why: "10.42.0.0/24 overlaps floating pool late (10.42.0.0-10.42.0.127)".into(),
+    };
+
+    note_refused_prefixes(&store, std::slice::from_ref(&refused)).await;
+
+    let said =
+        controller_api::events::about(&store, controller_api::Router::KIND, "u-1", "acme-out")
+            .await;
+    assert_eq!(said.len(), 1);
+    assert_eq!(
+        said[0].spec.reason,
+        controller_api::events::reason::INSIDE_PREFIX_REFUSED
+    );
+    assert_eq!(said[0].spec.event_type, controller_api::EventType::Warning);
+    assert_eq!(said[0].spec.tenant.as_deref(), Some("acme"));
+    assert!(said[0].spec.message.contains("floating pool late"));
 }
 
 /// `netlab(mem_mib)`, connected and heard from now, in `store`.
@@ -1542,7 +1626,7 @@ async fn a_cluster_that_refuses_a_resend_is_asked_once_in_three_passes() {
         hand_down(
             &store,
             &registry,
-            &OnceCell::new(),
+            &LazyBook::new(&common::net::Ipv4Ranges::default()),
             &listed,
             "cluster-1",
             &report,
@@ -1643,7 +1727,7 @@ async fn an_evacuation_letting_the_binding_go_leaves_no_time_it_was_made() {
         &crate::session::SessionRegistry::new(),
         &stopped,
         "cluster-1",
-        &OnceCell::new(),
+        &LazyBook::new(&common::net::Ipv4Ranges::default()),
         "",
     )
     .await

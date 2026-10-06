@@ -50,6 +50,9 @@ pub mod reason {
     /// provider network or host bridge of its own choosing. Managed on, never
     /// created again so. (IKR-B67)
     pub const TENANT_WIRE_KEPT: &str = "TenantWireKept";
+    /// A router's inside prefix is kept off its tenant's taps: it lies off the tenant's
+    /// declared network, or on somebody else's claim. The message says which. (NL6-1)
+    pub const INSIDE_PREFIX_REFUSED: &str = "InsidePrefixRefused";
 }
 
 /// What is being written down. Built by the caller, spent by `record`.
@@ -358,6 +361,7 @@ mod tests {
             reason::PHASE_CHANGED,
             reason::PEER_LOST,
             reason::PEER_READY,
+            reason::INSIDE_PREFIX_REFUSED,
         ] {
             assert!(!word.contains(' '), "{word}");
             assert!(!word.is_empty());

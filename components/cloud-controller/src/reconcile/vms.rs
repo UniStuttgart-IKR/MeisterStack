@@ -20,7 +20,7 @@ pub(super) async fn reconcile_vm(
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
     ledger: &std::sync::Mutex<Ledger>,
-    book: &OnceCell<AddressBook>,
+    book: &LazyBook<'_>,
     pending: &PendingTally,
     vm: Vm,
 ) -> anyhow::Result<()> {
@@ -61,7 +61,7 @@ pub(super) async fn reconcile_vm_traced(
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
     ledger: &std::sync::Mutex<Ledger>,
-    book: &OnceCell<AddressBook>,
+    book: &LazyBook<'_>,
     pending: &PendingTally,
     vm: Vm,
     context: telemetry::TraceParent,
@@ -335,7 +335,7 @@ pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool
 pub(super) async fn hand_down(
     store: &EtcdStore,
     registry: &SessionRegistry,
-    book: &OnceCell<AddressBook>,
+    book: &LazyBook<'_>,
     vm: &Vm,
     cluster: &str,
     report: &crate::session::Report,
@@ -661,7 +661,7 @@ pub(super) async fn evacuate(
     registry: &SessionRegistry,
     vm: &Vm,
     cluster: &str,
-    book: &OnceCell<AddressBook>,
+    book: &LazyBook<'_>,
     traceparent: &str,
 ) -> anyhow::Result<()> {
     let Some(mark) = vm.status.evacuating.clone() else {
@@ -747,17 +747,15 @@ pub(super) async fn dispatch_create(
     cluster: &str,
     vm: &Vm,
     missing: bool,
-    book: &OnceCell<AddressBook>,
+    book: &LazyBook<'_>,
     traceparent: &str,
 ) -> anyhow::Result<()> {
     let name = vm.metadata.name.clone();
     // The first dispatch of the pass pays for the two listings; every other
     // one reads the same book. See `AddressBook`.
     let network = tenant_network(store, vm.spec.tenant.as_deref()).await?;
-    let addresses = book
-        .get_or_try_init(|| AddressBook::read(store))
-        .await?
-        .for_vm(vm, &network.prefixes);
+    let addresses = book.get(store).await?.for_vm(vm, &network.prefixes);
+    note_refused_prefixes(store, &addresses.refused).await;
     let op = cloud_command::Op::Create(proto::CreateVm {
         name: name.clone(),
         uid: vm.metadata.uid.clone(),

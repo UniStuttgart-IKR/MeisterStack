@@ -210,7 +210,8 @@ pub(super) async fn get_router(
     Ok(Json(router))
 }
 
-/// Create a router after validating its tenant, provider network and subnets.
+/// Create a router after validating its tenant, provider network, subnets and
+/// inside prefix (`check_inside_prefix`, asked again after the write).
 /// Reject another router for the same tenant and provider network: duplicate
 /// SNAT paths could return traffic through a different conntrack instance.
 pub(super) async fn create_router(
@@ -271,14 +272,60 @@ pub(super) async fn create_router(
         },
     );
     router.metadata.labels = body.metadata.labels.clone();
-    let created = match dry.preview(&router) {
-        Some(preview) => preview,
-        None => st.store.create(&router).await?,
-    };
+    check_inside_prefix(&st, &router).await?;
+    if let Some(preview) = dry.preview(&router) {
+        return Ok((StatusCode::CREATED, Json(preview)));
+    }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&router.metadata.name).await;
+    let created = st.store.create(&router).await?;
+    settle_claim(
+        &created.metadata.name,
+        "router",
+        inside_prefix_lost(&st, &created).await,
+        take_back(&st, &created),
+    )
+    .await?;
     info!(router = %created.metadata.name, tenant = %owner,
           network = %created.spec.provider_network, snat = created.spec.snat,
           "router created");
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// The field a router's inside address is named by in a refusal.
+const INTERNAL_ADDR: &str = "spec.internalAddr";
+
+/// Refuse a router whose inside prefix its tenant's guests may not be let send from (NL6-1):
+/// an inside address that is no address with its prefix length (422), and a prefix off the
+/// tenant's declared network or, with none declared, on somebody else's claim (409).
+async fn check_inside_prefix(
+    st: &ApiState,
+    router: &controller_api::Router,
+) -> Result<(), ApiError> {
+    controller_api::address_space::inside_prefix(router)
+        .map_err(|why| invalid_field(INTERNAL_ADDR, why))?;
+    match inside_prefix_lost(st, router).await? {
+        Some(why) => Err(conflict(why)),
+        None => Ok(()),
+    }
+}
+
+/// Why the prefix behind `router` may not go onto its tenant's taps, asked of the store as it is
+/// now: before the write, and after it, when a claim written at the same moment is visible.
+/// The prefix yields to every claim it is found on whatever the revisions say: pools, routed
+/// subnets and tenants' networks do not look at routers, an administrator's claim outranks a
+/// tenant's word, and the pass keeps a prefix that lost off the taps anyway. (NL6-1)
+async fn inside_prefix_lost(
+    st: &ApiState,
+    router: &controller_api::Router,
+) -> Result<Option<String>, ApiError> {
+    if router.spec.internal_addr.is_empty() {
+        return Ok(None);
+    }
+    let claimed =
+        controller_api::address_space::ClaimedSpace::read(&st.store, routed_pools(st)?).await?;
+    let declared = claimed.network_of(&router.spec.tenant);
+    Ok(claimed.opened_by_router(router, declared).err())
 }
 
 /// Refuse a routed subnet that does not exist or is another tenant's.
@@ -323,9 +370,10 @@ fn other_router_on<'a>(
 ///
 /// The tenant and the provider network are what the router IS — its overlay
 /// leg and its external leg — and an address is already cut out of that
-/// network's allocation for it. The two that stay editable are the two an
-/// operator changes their mind about: `snat` and `routedSubnets`, which are
-/// what it DOES, and both take effect on the next pass.
+/// network's allocation for it. What stays editable is what an operator
+/// changes their mind about, what it DOES: `snat`, `routedSubnets` and the
+/// inside address, each held to the create's rule and taking effect on the
+/// next pass.
 pub(super) const ROUTER_OWNED: &[Owned] = &[
     Owned::immutable(
         "spec.tenant",
@@ -359,12 +407,31 @@ pub(super) async fn update_router(
     // too; checked at create alone, an update could announce another
     // tenant's prefix.
     check_routed_subnets(&st, &body.spec.routed_subnets, &current.spec.tenant).await?;
+    // So is `internalAddr`, judged when it moves: an edit of something else is
+    // not refused for a claim made on its prefix since, which the pass keeps off
+    // the taps anyway. (NL6-1)
+    let inside_moved = body.spec.internal_addr != current.spec.internal_addr;
+    if inside_moved {
+        check_inside_prefix(&st, &body).await?;
+    }
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => Ok(Json(st.store.update(&body).await?)),
+    if let Some(preview) = dry.preview(&body) {
+        return Ok(Json(preview));
     }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&name).await;
+    let updated = st.store.update(&body).await?;
+    if inside_moved {
+        settle_claim(
+            &name,
+            "router",
+            inside_prefix_lost(&st, &updated).await,
+            put_back(&st, &current, &updated),
+        )
+        .await?;
+    }
+    Ok(Json(updated))
 }
 
 /// Mark a bound router for asynchronous cluster teardown. Floating reservations

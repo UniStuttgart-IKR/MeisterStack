@@ -8,6 +8,9 @@
 
 use super::*;
 
+use common::net::Ipv4Ranges;
+use controller_api::address_space::{self, ClaimedSpace};
+
 /// What a VM may source from, resolved where the objects are.
 ///
 /// The same split `tenant_network` makes and for the same reason: the FloatingIp
@@ -35,6 +38,29 @@ pub(super) struct Addresses {
     /// travelled, and claiming it had would make `APPLIED` a lie in exactly
     /// the window the column exists to show.
     pub(super) carried: Vec<Carried>,
+    /// The routers of the VM's tenant whose inside prefix is kept off `source_prefixes`, and
+    /// why: said on the router by `note_refused_prefixes`. (NL6-1)
+    pub(super) refused: Vec<RefusedPrefix>,
+}
+
+/// A router whose inside prefix is kept off its tenant's taps, and why. (NL6-1)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RefusedPrefix {
+    pub(super) router: String,
+    pub(super) uid: String,
+    pub(super) tenant: String,
+    pub(super) why: String,
+}
+
+impl RefusedPrefix {
+    fn of(router: &controller_api::Router, why: String) -> Self {
+        Self {
+            router: router.metadata.name.clone(),
+            uid: router.metadata.uid.clone(),
+            tenant: router.spec.tenant.clone(),
+            why,
+        }
+    }
 }
 
 /// One object a `CreateVm` was built out of, as it was when it was read.
@@ -64,29 +90,35 @@ impl Carried {
 /// must observe allocation changes.
 pub(super) struct AddressBook {
     pub(super) reservations: Vec<controller_api::FloatingIp>,
-    pub(super) subnets: Vec<controller_api::RoutedSubnet>,
     /// The tenants' routers, for the prefix their inside leg is on.
     pub(super) routers: Vec<controller_api::Router>,
+    /// The address space claimed in the cloud: the routed subnets a tenant's guests send
+    /// from, and what the prefix behind a router may not lie on. (NL6-1)
+    pub(super) claimed: ClaimedSpace,
 }
 
-/// The PREFIX a router's inside address is on: `10.30.0.1/24` → `10.30.0.0/24`.
-///
-/// The address is the router's own and the prefix is the tenant's, and it is
-/// the prefix the guests source from. Written out rather than passed through,
-/// because a tap allow-list holding `10.30.0.1/24` would read as the single
-/// host in some renderings and as the whole subnet in others — and this list
-/// is what decides whether a tenant's packets live or die.
-fn inside_prefix(addr: &str) -> Option<String> {
-    let (host, bits) = addr.split_once('/')?;
-    let bits: u32 = bits.parse().ok()?;
-    let host: std::net::Ipv4Addr = host.parse().ok()?;
-    let mask = if bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - bits.min(32))
-    };
-    let network = std::net::Ipv4Addr::from(u32::from(host) & mask);
-    Some(format!("{network}/{bits}"))
+/// The pass's `AddressBook`, read by the first dispatch that asks for it: most passes
+/// dispatch nothing, and those must go on costing nothing.
+pub(super) struct LazyBook<'a> {
+    book: OnceCell<AddressBook>,
+    /// The routed pools from the cloud config, which a router's prefix may not lie on.
+    routed_pools: &'a Ipv4Ranges,
+}
+
+impl<'a> LazyBook<'a> {
+    pub(super) fn new(routed_pools: &'a Ipv4Ranges) -> Self {
+        Self {
+            book: OnceCell::new(),
+            routed_pools,
+        }
+    }
+
+    /// The book, read on the first call of the pass.
+    pub(super) async fn get(&self, store: &EtcdStore) -> anyhow::Result<&AddressBook> {
+        self.book
+            .get_or_try_init(|| AddressBook::read(store, self.routed_pools))
+            .await
+    }
 }
 
 /// Every router, refusing to answer from a partial list: a router that did not decode would
@@ -104,14 +136,15 @@ async fn all_routers(store: &EtcdStore) -> anyhow::Result<Vec<controller_api::Ro
 }
 
 impl AddressBook {
-    /// Through the three readers that refuse to answer from a partial list —
-    /// an undecodable object here is an address handed to the wrong VM, or a
-    /// prefix taken off a tap that sends from it.
-    pub(super) async fn read(store: &EtcdStore) -> anyhow::Result<Self> {
+    /// Through readers that refuse to answer from a partial list — an
+    /// undecodable object here is an address handed to the wrong VM, a prefix
+    /// taken off a tap that sends from it, or a claim a router's prefix is not
+    /// kept off.
+    pub(super) async fn read(store: &EtcdStore, routed_pools: &Ipv4Ranges) -> anyhow::Result<Self> {
         Ok(Self {
             reservations: controller_api::floating::all_reservations(store).await?,
-            subnets: controller_api::floating::all_subnets(store).await?,
             routers: all_routers(store).await?,
+            claimed: ClaimedSpace::read(store, routed_pools.clone()).await?,
         })
     }
 
@@ -138,13 +171,15 @@ impl AddressBook {
             .collect();
         floating_ips.sort();
 
+        let (network, refused) = self.network_prefixes(tenant, declared);
         let mut source_prefixes: Vec<String> = self
+            .claimed
             .subnets
             .iter()
             .filter(|s| s.spec.tenant == tenant)
             .map(|s| s.spec.cidr.clone())
+            .chain(network)
             .collect();
-        source_prefixes.extend(self.network_prefixes(tenant, declared));
         source_prefixes.sort();
         source_prefixes.dedup();
 
@@ -154,7 +189,8 @@ impl AddressBook {
             .filter(mine)
             .map(|ip| Carried::of(ip, controller_api::FloatingIp::RESOURCE))
             .chain(
-                self.subnets
+                self.claimed
+                    .subnets
                     .iter()
                     .filter(|s| s.spec.tenant == tenant)
                     .map(|s| Carried::of(s, controller_api::RoutedSubnet::RESOURCE)),
@@ -169,26 +205,56 @@ impl AddressBook {
             floating_ips,
             source_prefixes,
             carried,
+            refused,
         }
     }
 
-    /// The prefixes of `tenant`'s overlay network: those `declared` on the tenant, which hold
-    /// whether a router is there or not, and the one behind each of its routers, which goes
-    /// with the router. A guest addresses itself out of them, and SNAT behind a router needs
-    /// them too, so they are on the allowlist whatever routed subnets the tenant has. (NL5-1)
-    fn network_prefixes<'a>(
-        &'a self,
-        tenant: &'a str,
-        declared: &'a [String],
-    ) -> impl Iterator<Item = String> + 'a {
-        let behind_routers = self
-            .routers
-            .iter()
-            .filter(move |r| r.spec.tenant == tenant)
-            .map(|r| r.spec.internal_addr.as_str())
-            .filter(|addr| !addr.is_empty())
-            .filter_map(inside_prefix);
-        declared.iter().cloned().chain(behind_routers)
+    /// The prefixes of `tenant`'s overlay network, and the routers whose prefix is kept off
+    /// them. A guest addresses itself out of them, and SNAT behind a router needs them too, so
+    /// they are on the allowlist whatever routed subnets the tenant has. (NL5-1)
+    ///
+    /// The network `declared` on the tenant holds whether a router is there or not. The prefix
+    /// behind each of its routers is added where `ClaimedSpace::opened_by_router` opens it,
+    /// and goes with the router; with a network declared, a router's prefix lies inside it and
+    /// adds nothing, or is refused. A prefix that lies on somebody else's claim is never
+    /// opened, whatever was admitted when the router was written. (NL6-1)
+    fn network_prefixes(
+        &self,
+        tenant: &str,
+        declared: &[String],
+    ) -> (Vec<String>, Vec<RefusedPrefix>) {
+        let mut prefixes = declared.to_vec();
+        let mut refused = Vec::new();
+        for router in self.routers.iter().filter(|r| r.spec.tenant == tenant) {
+            match self.claimed.opened_by_router(router, declared) {
+                Ok(opened) => prefixes.extend(opened.map(|p| address_space::cidr_of(&p))),
+                Err(why) => refused.push(RefusedPrefix::of(router, why)),
+            }
+        }
+        (prefixes, refused)
+    }
+}
+
+/// Say that a router's inside prefix is kept off its tenant's taps: in the log, and as an event
+/// on the router, which its tenant sees. Every dispatch that leaves it off says so again, and
+/// the event counts them. (NL6-1)
+pub(super) async fn note_refused_prefixes(store: &EtcdStore, refused: &[RefusedPrefix]) {
+    for r in refused {
+        warn!(router = %r.router, tenant = %r.tenant, why = %r.why,
+              "a router's inside prefix is kept off its tenant's taps");
+        events::record(
+            store,
+            Happening {
+                kind: controller_api::Router::KIND,
+                name: &r.router,
+                uid: &r.uid,
+                reason: events::reason::INSIDE_PREFIX_REFUSED,
+                message: format!("its inside prefix is kept off the tenant's taps: {}", r.why),
+                event_type: EventType::Warning,
+                tenant: Some(&r.tenant),
+            },
+        )
+        .await;
     }
 }
 

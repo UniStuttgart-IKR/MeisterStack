@@ -8,6 +8,7 @@
 //! policy and scheduler traits defined here. See `docs/API.md` and
 //! `docs/CONTROL_PLANE.md` for their integration.
 
+pub mod address_space;
 pub mod auth;
 pub mod capacity;
 pub mod command;

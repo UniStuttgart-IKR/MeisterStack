@@ -53,8 +53,7 @@ pub(super) async fn choose_subnet_cidr(
     taken.extend(network_prefixes_taken(st, Some(&spec.tenant)).await?);
 
     if spec.cidr.is_empty() {
-        let supers = common::net::Ipv4Ranges::parse(&st.routed_pools)
-            .map_err(|e| invalid(format!("routed_pools in the cloud config: {e}")))?;
+        let supers = routed_pools(st)?;
         if supers.is_empty() {
             return Err(invalid(
                 "this cloud has no routed_pools configured, so a subnet cannot be cut; \

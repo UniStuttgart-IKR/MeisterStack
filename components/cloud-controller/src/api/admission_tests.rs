@@ -1796,3 +1796,243 @@ async fn a_routed_subnet_whose_question_after_its_write_has_no_answer_is_taken_b
         Err(StoreError::NotFound(_))
     ));
 }
+
+// --- NL6-1: the prefix behind a router is the tenant's word, held to its claims
+
+/// `cloud_with_routers` with its provider network `ext` on 10.172.0.0/24, and a tenant of its
+/// own, which declares `network`.
+async fn cloud_for_a_router(what: &str, network: &[&str]) -> (ApiState, String) {
+    let st = cloud_with_routers(what).await;
+    st.store
+        .create(&ProviderNetwork::declare(
+            "ext",
+            controller_api::ProviderNetworkSpec {
+                physnet: "ext".into(),
+                cidr: "10.172.0.0/24".into(),
+                allocation: vec!["10.172.0.16-10.172.0.63".into()],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the provider network");
+    let tenant = unique("t");
+    st.store
+        .create(&tenant_with_network(&tenant, network))
+        .await
+        .expect("the tenant");
+    (st, tenant)
+}
+
+/// A router called `name` of `tenant` on `ext`, whose inside address is `inside`.
+fn router_of(name: &str, tenant: &str, inside: &str) -> controller_api::Router {
+    controller_api::Router::declare(
+        name,
+        controller_api::RouterSpec {
+            tenant: tenant.into(),
+            provider_network: "ext".into(),
+            internal_addr: inside.into(),
+            ..Default::default()
+        },
+    )
+}
+
+/// A create of `body` by a member of its tenant.
+async fn create_router_as_member(
+    st: &ApiState,
+    body: controller_api::Router,
+) -> Result<controller_api::Router, ApiError> {
+    let (caller, role, tenant) = member(&body.spec.tenant);
+    create_router(
+        State(st.clone()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .map(|(_, Json(router))| router)
+}
+
+/// A PUT of `body` by a member of its tenant.
+async fn update_router_as_member(
+    st: &ApiState,
+    body: controller_api::Router,
+) -> Result<controller_api::Router, ApiError> {
+    let (caller, role, tenant) = member(&body.spec.tenant);
+    update_router(
+        State(st.clone()),
+        Path(body.metadata.name.clone()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .map(|Json(router)| router)
+}
+
+/// A pool called `name` on `cidr`, written past every check.
+async fn pool_on(st: &ApiState, name: &str, cidr: &str) {
+    st.store
+        .create(&FloatingPool::declare(
+            name,
+            controller_api::FloatingPoolSpec {
+                cidrs: vec![cidr.into()],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a pool");
+}
+
+/// A router whose prefix lies off its tenant's declared network is refused. (NL6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_prefix_off_its_tenants_declared_network_is_refused() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-off-network", &["10.30.0.0/24"]).await;
+    let refused = create_router_as_member(&st, router_of(&unique("r"), &tenant, "10.31.0.1/24"))
+        .await
+        .expect_err("off the network");
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.message()
+    );
+    assert!(
+        refused.message().contains("not inside tenant"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// A router whose prefix lies inside its tenant's declared network is created.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_prefix_inside_its_tenants_declared_network_is_admitted() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-in-network", &["10.30.0.0/16"]).await;
+    create_router_as_member(&st, router_of(&unique("r"), &tenant, "10.30.4.1/24"))
+        .await
+        .expect("inside the network");
+}
+
+/// A router of a tenant without a declared network whose prefix lies on a floating pool is
+/// refused, naming the pool. (NL6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn an_undeclared_tenants_router_prefix_on_a_floating_pool_is_refused() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-on-pool", &[]).await;
+    let refused = create_router_as_member(&st, router_of(&unique("r"), &tenant, "198.51.100.1/24"))
+        .await
+        .expect_err("on the pool");
+    assert!(
+        refused.message().contains("floating pool lab"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// An inside address with no prefix length is refused by its field.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_inside_address_without_a_prefix_length_is_refused_by_its_field() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-no-length", &[]).await;
+    let refused = create_router_as_member(&st, router_of(&unique("r"), &tenant, "10.60.0.1"))
+        .await
+        .expect_err("no prefix length");
+    assert_eq!(refused.field(), Some("spec.internalAddr"));
+}
+
+/// A router whose prefix a pool written between the create's check and its write lies on is
+/// taken back and refused, naming the pool. (NL6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_created_onto_a_pool_written_after_its_check_is_taken_back() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-create-race", &[]).await;
+    let name = unique("r");
+    let checked = pause(&name);
+
+    let (answer, ()) = tokio::join!(
+        create_router_as_member(&st, router_of(&name, &tenant, "10.60.0.1/24")),
+        async {
+            checked.arrived().await;
+            pool_on(&st, "between", "10.60.0.0/25").await;
+            checked.release().await;
+        },
+    );
+
+    let refused = answer.expect_err("the prefix lies on the pool");
+    assert!(
+        refused.message().contains("floating pool between"),
+        "{}",
+        refused.message()
+    );
+    assert!(matches!(
+        st.store.get::<controller_api::Router>(&name).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// An update that moves a router's inside address onto a floating pool is refused.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_moved_onto_a_floating_pool_is_refused() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-move", &[]).await;
+    let mut moved = create_router_as_member(&st, router_of(&unique("r"), &tenant, "10.60.0.1/24"))
+        .await
+        .expect("a router");
+    moved.spec.internal_addr = "198.51.100.1/24".into();
+
+    let refused = update_router_as_member(&st, moved)
+        .await
+        .expect_err("onto the pool");
+    assert!(
+        refused.message().contains("floating pool lab"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// An update that moves a router's prefix onto a pool written between the update's check and
+/// its write is put back. (NL6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_moved_onto_a_pool_written_after_its_check_is_put_back() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-move-race", &[]).await;
+    let name = unique("r");
+    let mut moved = create_router_as_member(&st, router_of(&name, &tenant, "10.60.0.1/24"))
+        .await
+        .expect("a router");
+    moved.spec.internal_addr = "10.61.0.1/24".into();
+    let checked = pause(&name);
+
+    let (answer, ()) = tokio::join!(update_router_as_member(&st, moved), async {
+        checked.arrived().await;
+        pool_on(&st, "between", "10.61.0.0/25").await;
+        checked.release().await;
+    });
+
+    answer.expect_err("the new prefix lies on the pool");
+    let back: controller_api::Router = st.store.get(&name).await.expect("the router");
+    assert_eq!(back.spec.internal_addr, "10.60.0.1/24");
+}
+
+/// An edit that leaves a router's inside address as it stands is not judged on it again, so a
+/// pool made on its prefix since does not block a change of something else.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_edit_that_leaves_its_inside_address_is_not_judged_on_it() {
+    let (st, tenant) = cloud_for_a_router("nl6-1-unchanged", &[]).await;
+    let mut edited = create_router_as_member(&st, router_of(&unique("r"), &tenant, "10.60.0.1/24"))
+        .await
+        .expect("a router");
+    pool_on(&st, "since", "10.60.0.0/25").await;
+    edited.spec.snat = !edited.spec.snat;
+
+    let updated = update_router_as_member(&st, edited.clone())
+        .await
+        .expect("snat is not the inside address");
+    assert_eq!(updated.spec.snat, edited.spec.snat);
+}

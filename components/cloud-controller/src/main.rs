@@ -252,7 +252,14 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
         vni_base: file
             .vni_base
             .unwrap_or(controller_api::vni::DEFAULT_VNI_BASE),
-        routed_pools: file.routed_pools.unwrap_or_default(),
+        routed_pools: {
+            // Checked here for the reason the admission factors are below: the
+            // pass keeps routers' prefixes off these, and a list it cannot read
+            // would be a list nothing is kept off. (NL6-1)
+            let routed_pools = file.routed_pools.unwrap_or_default();
+            common::net::Ipv4Ranges::parse(&routed_pools).context("routed_pools")?;
+            routed_pools
+        },
         admission: {
             // Checked here and not at the first placement: an operator who
             // wrote a factor this control plane will not honour should learn
@@ -536,8 +543,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let registry = registry.clone();
         let scheduler = cfg.scheduler.clone();
         let overcommit = cfg.admission;
+        let routed_pools =
+            common::net::Ipv4Ranges::parse(&cfg.routed_pools).context("routed_pools")?;
         tokio::spawn(async move {
-            reconcile::run(store, registry, scheduler, overcommit).await;
+            reconcile::run(store, registry, scheduler, overcommit, routed_pools).await;
         });
     }
 

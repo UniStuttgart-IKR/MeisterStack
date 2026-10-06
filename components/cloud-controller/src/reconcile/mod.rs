@@ -67,11 +67,14 @@ pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     }
 }
 
+/// `routed_pools` are those of the cloud config, which subnets are cut from and which the
+/// prefix behind a router may not lie on.
 pub async fn run(
     store: Arc<EtcdStore>,
     registry: Arc<SessionRegistry>,
     scheduler: Arc<dyn Scheduler>,
     overcommit: Overcommit,
+    routed_pools: common::net::Ipv4Ranges,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
     // The same cadence as one tier down and for the same reason: a
@@ -89,7 +92,14 @@ pub async fn run(
             warn!(error = format!("{e:#}"), "deadline pass failed");
         }
         let clock = telemetry::metrics::Timer::start();
-        let outcome = pass(&store, &registry, scheduler.as_ref(), overcommit).await;
+        let outcome = pass(
+            &store,
+            &registry,
+            scheduler.as_ref(),
+            overcommit,
+            &routed_pools,
+        )
+        .await;
         // Around the whole pass, and a failed pass still took the time it
         // took — the same measurement as one tier down, so a slow lap can be
         // compared between the two.
@@ -192,6 +202,7 @@ async fn pass(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     overcommit: Overcommit,
+    routed_pools: &common::net::Ipv4Ranges,
 ) -> anyhow::Result<()> {
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
@@ -212,7 +223,7 @@ async fn pass(
     let ledger = std::sync::Mutex::new(ledger);
     // And one reading of the address book, but only if somebody asks for it:
     // most passes dispatch nothing, and those must go on costing nothing.
-    let book = OnceCell::new();
+    let book = LazyBook::new(routed_pools);
     let pending = PendingTally::new();
     for vm in vms {
         let name = vm.metadata.name.clone();
