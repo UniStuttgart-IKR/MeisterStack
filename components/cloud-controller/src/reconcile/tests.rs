@@ -1176,12 +1176,44 @@ fn a_vm_waiting_on_a_cluster_whose_room_is_not_known_is_told_so() {
     assert!(sentence.contains("cut short"), "{sentence}");
 }
 
+/// A VM larger than every node of a cluster whose room is not known is not
+/// waiting for that room: no node would hold it whatever the cut list says,
+/// so it is told there is no capacity for its size. (NL4-2)
+#[test]
+fn a_vm_larger_than_every_node_of_a_cluster_of_unknown_room_is_told_no_capacity() {
+    // Two nodes of 4096 MiB: their sum would hold it, neither does.
+    let (category, sentence) = told(&ledger_of_unknown_room(), &asking(6144));
+
+    assert_eq!(category, controller_api::PendingReason::NoCapacity);
+    assert!(sentence.contains("6144 MiB"), "{sentence}");
+}
+
+/// What a node reports it has left is the most it has before the VMs its
+/// cluster's status left out are counted: a VM no node's reported room holds
+/// is told there is no capacity, not that the room is unknown. (NL4-2)
+#[test]
+fn a_vm_no_reported_room_of_a_cluster_of_unknown_room_holds_is_told_no_capacity() {
+    let mut cluster = unknown_room(netlab(4096));
+    for node in &mut cluster.status.nodes {
+        node.bound_mem_mib = 3072;
+    }
+
+    let (category, sentence) = told(&ledger_of(&cluster, &[]), &asking(2048));
+
+    assert_eq!(category, controller_api::PendingReason::NoCapacity);
+    assert!(sentence.contains("2048 MiB"), "{sentence}");
+}
+
 /// `netlab(4096)` with three more VMs waiting there for a node than its
 /// status lists, as the pass's ledger.
 fn ledger_of_unknown_room() -> std::sync::Mutex<Ledger> {
-    let mut cluster = netlab(4096);
+    ledger_of(&unknown_room(netlab(4096)), &[])
+}
+
+/// `cluster` with three more VMs waiting there for a node than its status lists.
+fn unknown_room(mut cluster: Cluster) -> Cluster {
     cluster.status.unplaced_omitted = 3;
-    ledger_of(&cluster, &[])
+    cluster
 }
 
 /// What `pick_cluster` says of `vm` over `ledger`, which places it nowhere.

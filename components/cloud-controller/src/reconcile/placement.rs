@@ -179,16 +179,15 @@ impl Ledger {
     }
 
     /// The clusters whose room is not known and whose nodes could take
-    /// `wanted` if they had room: allowed by its volumes, and with a usable
-    /// node its node-level asks allow. Each with how many more VMs wait there
-    /// for a node than its status lists.
+    /// `wanted` if they had the room they report: allowed by its volumes, and
+    /// with a usable node its node-level asks allow whose reported room holds
+    /// its size. Each with how many more VMs wait there for a node than its
+    /// status lists.
     fn served_but_for_room(&self, wanted: &Wanted) -> Vec<(&Candidate, u32)> {
         self.clusters
             .iter()
             .filter_map(|c| match self.nodes.get(&c.name) {
-                Some(Rooms::Unknown { omitted, nodes })
-                    if wanted.served_room_aside(&c.name, nodes) =>
-                {
+                Some(Rooms::Unknown { omitted, at_most }) if wanted.served_by(&c.name, at_most) => {
                     Some((c, *omitted))
                 }
                 _ => None,
@@ -202,13 +201,15 @@ pub(super) enum Rooms {
     /// What each node has left, as this cloud measures it.
     Measured(Vec<NodeRoom>),
     /// Not known: `omitted` more VMs wait there for a node than its status
-    /// lists, and what they ask is counted nowhere. Unknown is no room. The
-    /// `nodes` as reported still say what the cluster could take but for
-    /// room, which is what tells a VM waiting for that room from one this
-    /// cluster would never take.
+    /// lists, and what they ask is counted nowhere. Unknown is no room. What
+    /// is known is `at_most`: the room each node reports, its allowance less
+    /// what is bound to it, before anything waiting there is counted. No node
+    /// has more left than that, so a VM none of them holds even so is one
+    /// this cluster has no room for, known; a VM one of them would hold waits
+    /// for the room nobody can see. (NL4-2)
     Unknown {
         omitted: u32,
-        nodes: Vec<controller_api::NodeSummary>,
+        at_most: Vec<NodeRoom>,
     },
 }
 
@@ -234,7 +235,7 @@ pub(super) fn rooms_of(cluster: &Cluster, unreported: &[Booking], overcommit: Ov
     if cluster.status.unplaced_omitted > 0 {
         return Rooms::Unknown {
             omitted: cluster.status.unplaced_omitted,
-            nodes: cluster.status.nodes.clone(),
+            at_most: controller_api::node_rooms(&cluster.status.nodes, overcommit, &[]),
         };
     }
     let mut rooms =
@@ -363,12 +364,6 @@ impl<'a> Wanted<'a> {
         self.allows_cluster(cluster) && self.node.met_by_a_node(rooms)
     }
 
-    /// Whether `cluster`, whose `nodes` have room not known, could take the
-    /// VM if they had room for it.
-    fn served_room_aside(&self, cluster: &str, nodes: &[controller_api::NodeSummary]) -> bool {
-        self.allows_cluster(cluster) && self.node.allowed_on_a_node(nodes)
-    }
-
     /// Whether the VM's volumes let it go to `cluster` at all.
     fn allows_cluster(&self, cluster: &str) -> bool {
         self.clusters
@@ -455,10 +450,12 @@ pub(super) fn pick_cluster(
 /// Measured against what was actually offered: a cluster cut away for having
 /// no suitable node is not a cluster that "had no room", and saying so would
 /// send an operator to look at the wrong thing. A cluster whose room is not
-/// known is offered as if its nodes had room. Where the scheduler would take
-/// one of those, that room is all the VM waits for and the sentence says so;
-/// one it would refuse whatever its room is weighed with the rest, so the
-/// sentence names what it lacks and not a room nobody can see. (IKR-B78)
+/// known is offered as if its nodes had the room they report, and no more:
+/// one whose nodes would not hold the VM even so is not waited on (NL4-2).
+/// Where the scheduler would take one of those, that room is all the VM waits
+/// for and the sentence says so; one it would refuse whatever its room is
+/// weighed with the rest, so the sentence names what it lacks and not a room
+/// nobody can see. (IKR-B78)
 fn why_none(
     scheduler: &dyn Scheduler,
     ledger: &Ledger,
