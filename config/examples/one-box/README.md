@@ -7,9 +7,9 @@ SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 # One-box deployment
 
 A one-box fleet combines cloud, cluster, agent, and optional addon roles on one
-machine. Additional agents can join the same cluster. Use the schema-2
-[one-box inventory](../../../examples/fleet/one-box.toml) as a topology example
-and the [operator template](../../../templates/operator/) for the deployment
+machine. Additional agents can join the same cluster. Use meister-deploy's
+schema-2 one-box inventory (`examples/fleet/one-box.toml` there) as a topology
+example and its operator template (`templates/operator/`) for the deployment
 repository. See [Deployment](../../../docs/DEPLOYMENT.md) for installation and
 rollout commands and [Nix integration](../../../docs/NIX.md) for module behavior.
 

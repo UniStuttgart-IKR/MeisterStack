@@ -8,14 +8,14 @@ also requires checking source/vendor hashes and patch compatibility.
 Patches 0001-0003 are Leandro's series, copied unchanged from `patches/` at
 Leandro revision `73eb2985f32098500d851520710439d30f7c3ffe` (the rewrite of
 2026-09-23 against the vhost-user specification). This is the one place that
-records the revision; the Nix package and the operator template refer here.
+records the revision; the Nix package and meister-deploy's operator template refer here.
 Leandro's `patches/README.md` is the reference for the message
 formats, the negotiated protocol features, the verification record and the
 upstreaming notes; its `patches/REVIEW-vhost-user.md` lists what the previous
 series got wrong. Keep these three identical to Leandro's: the vhost-user channel
 between Cloud Hypervisor and `vhost-user-nvrm` only negotiates a shared-memory
 window when both ends are on the same series. A fleet that declares the
-`leandro` input is held to that: `mkFleet` asserts on every host that the
+`leandro` input is held to that: meister-deploy's `mkFleet` asserts on every host that the
 input's `patches/`, searched recursively as Leandro's package does, holds
 exactly the patches here except MeisterStack's own, under the same relative
 paths and with the same bytes
