@@ -372,7 +372,7 @@ fn normal<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
     about(vm, reason, message, EventType::Normal)
 }
 
-fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
+pub(crate) fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
     about(vm, reason, message, EventType::Warning)
 }
 

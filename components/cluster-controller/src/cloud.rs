@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use controller_api::{
-    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion,
+    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion, events,
     resources::{new_vm, new_volume},
 };
 use proto::cluster_plane_client::ClusterPlaneClient;
@@ -791,7 +791,9 @@ async fn handle_create(
     // Every vm the cloud sends is a tenant's. The cloud refuses these fields
     // at its own edge; a cloud from before that rule must not get a tenant's
     // tap onto a provider network or a host bridge through this one.
-    controller_api::vni::check_tenant_nics(&spec.vm).map_err(|e| anyhow!("{}", e.message()))?;
+    let own_wire = controller_api::vni::check_tenant_nics(&spec.vm)
+        .err()
+        .map(|e| e.message().to_string());
 
     // The truth is made at the edge. The cloud resolved the tenant's VNI and
     // sent it alongside; this is where it becomes part of the spec, before
@@ -800,20 +802,30 @@ async fn handle_create(
     // node with an overlay. From here down nothing knows what a tenant is.
     bind_nics(&c, &mut spec.vm);
 
-    match store
-        .create(&declared_for_cloud(&c, &spec, traceparent))
-        .await
-    {
-        Ok(_) => {
-            info!(vm = %c.name, "created for the cloud");
-            return Ok(());
+    if own_wire.is_none() {
+        match store
+            .create(&declared_for_cloud(&c, &spec, traceparent))
+            .await
+        {
+            Ok(_) => {
+                info!(vm = %c.name, "created for the cloud");
+                return Ok(());
+            }
+            Err(StoreError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
         }
-        Err(StoreError::AlreadyExists(_)) => {}
-        Err(e) => return Err(e.into()),
     }
 
-    let current: Vm = store.get(&c.name).await?;
+    let current: Vm = match (store.get(&c.name).await, own_wire.as_deref()) {
+        (Ok(current), _) => current,
+        // Nothing of the cloud's here yet: a new VM, and the rule holds.
+        (Err(StoreError::NotFound(_)), Some(why)) => bail!("{why}"),
+        (Err(e), _) => return Err(e.into()),
+    };
     refuse_unless_ours(&current, &c)?;
+    if let Some(why) = own_wire {
+        note_own_wire_kept(store, &current, &why).await;
+    }
     let shape_moved = shape_moved(&current, &spec, &c.name)?;
     // `evacuation` drifts like `runStrategy` does and for the same reason:
     // both are the owner's INTENT, both are mutable at the cloud's edge, and
@@ -836,6 +848,27 @@ async fn handle_create(
         placement_moved,
     );
     Ok(())
+}
+
+/// A cloud VM stored before the tenant-NIC rule keeps its own wire: a re-send
+/// manages it on (stop, start, drift), since the NIC set of a VM that exists
+/// cannot change through this road (`shape_moved`), and refusing it would
+/// leave a running VM nobody can stop from the cloud and a phase that flaps
+/// between the refusal and the cluster's report. It is said, on the VM and in
+/// the log, so an operator can recreate it. (IKR-B67)
+async fn note_own_wire_kept(store: &EtcdStore, vm: &Vm, why: &str) {
+    warn!(vm = %vm.metadata.name, why, "a tenant vm from before the nic rule keeps its own wire");
+    events::record(
+        store,
+        crate::reconcile::warning(
+            vm,
+            events::reason::TENANT_WIRE_KEPT,
+            format!(
+                "stored before the rule and kept as it is; recreate it to drop the wire: {why}"
+            ),
+        ),
+    )
+    .await;
 }
 
 /// The cloud VM's own labels under this tier's ownership marks: what the
@@ -2563,29 +2596,74 @@ mod tests {
         assert_eq!(spec["nics"][0]["routed_subnets"][0], "10.7.1.0/24");
     }
 
-    /// IKR-B67 one tier down: a cloud from before the rule does not get a
-    /// tenant's tap onto the provider segment through this session.
-    #[tokio::test]
-    async fn a_cloud_vm_whose_nic_picks_its_own_wire_is_refused_before_it_is_stored() {
-        // Refused before any read, so the lazy client never dials.
-        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/b67-test")
-            .await
-            .expect("the etcd client is built lazily");
-        let c = proto::CreateVm {
+    /// A cloud create whose first NIC picks the provider network `ext`.
+    fn on_its_own_wire(run_strategy: &str) -> proto::CreateVm {
+        proto::CreateVm {
             spec_json: serde_json::json!({
                 "tenant": "acme",
+                "runStrategy": run_strategy,
                 "vm": { "vcpus": 1, "nics": [{ "physnet": "ext" }] },
             })
             .to_string(),
             ..create(Some(10_007), &[], &[])
-        };
+        }
+    }
+
+    /// IKR-B67 one tier down: a cloud from before the rule does not get a
+    /// tenant's tap onto the provider segment through this session.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_whose_nic_picks_its_own_wire_is_refused_before_it_is_stored() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
         let why = format!(
             "{:#}",
-            handle_create(&store, c, "")
+            handle_create(&store, on_its_own_wire("Running"), "")
                 .await
                 .expect_err("a tap on ext")
         );
         assert!(why.contains("nics[0].physnet"), "{why}");
+        assert!(matches!(
+            store.get::<Vm>("web-1").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// One stored before the rule is managed on, not stranded: a stop reaches
+    /// it, and the wire it kept is said on the VM. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_stored_before_the_nic_rule_is_managed_on_and_said() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let c = on_its_own_wire("Running");
+        let spec: VmSpec = serde_json::from_str(&c.spec_json).unwrap();
+        let stored = store
+            .create(&declared_for_cloud(&c, &spec, ""))
+            .await
+            .expect("a vm from before the rule");
+
+        handle_create(&store, on_its_own_wire("Stopped"), "")
+            .await
+            .expect("managed on");
+
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Stopped
+        );
+        let said: controller_api::Event = store
+            .get(&events::name_of(
+                Vm::KIND,
+                &stored.metadata.uid,
+                "web-1",
+                events::reason::TENANT_WIRE_KEPT,
+            ))
+            .await
+            .expect("the kept wire is said");
+        assert!(
+            said.spec.message.contains("nics[0].physnet"),
+            "{}",
+            said.spec.message
+        );
     }
 
     #[test]

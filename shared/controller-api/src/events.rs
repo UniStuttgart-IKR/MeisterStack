@@ -46,6 +46,10 @@ pub mod reason {
     pub const MIGRATING: &str = "Migrating";
     /// Router active-node change, including failover without a phase change.
     pub const ACTIVE_CHANGED: &str = "ActiveChanged";
+    /// A tenant's VM stored before the tenant-NIC rule still hangs on a
+    /// provider network or host bridge of its own choosing. Managed on, never
+    /// created again so. (IKR-B67)
+    pub const TENANT_WIRE_KEPT: &str = "TenantWireKept";
 }
 
 /// What is being written down. Built by the caller, spent by `record`.
