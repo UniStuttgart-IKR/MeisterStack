@@ -918,8 +918,9 @@ message CreateVmMigration {
   // Where to. Empty = the cluster's scheduler chooses, which is what an
   // operator who did not say `--to` asked for.
   string target_node = 3;
-  // Whose guest this is. Carried and not enforced at the cluster, the same
-  // rule `CreateVm` follows: the cluster keeps no directory.
+  // Unused by the cluster: whose a migration is follows the guest it moves,
+  // never this field. Still filled by the cloud for clusters older than that
+  // rule, and kept on the wire only for them. (IKR-B72)
   string tenant = 4;
   // The cloud vm's uid. The cluster moves only the copy that carries it as
   // its cloud uid: a cluster-local vm of the same name is not the cloud's to
