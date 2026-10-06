@@ -51,48 +51,65 @@ pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> 
     })
 }
 
-/// Read a router command, silencing a demotion before anything in it can be refused (NL2-2).
+/// Read a router command after taking back what it withdraws, before anything in it can be
+/// refused (NL2-2, NL-A2).
 ///
 /// Everything else in the command can be refused (a NAT kind from a newer controller, a
-/// provider network this node no longer serves), and a refused demotion would leave the old
-/// namespace answering ARP for an address the controller has made active on another node. The
-/// driver's own pass silences a demotion again as its first step.
-async fn read_after_demotion(
+/// provider network this node no longer serves). A refused demotion would leave the old
+/// namespace answering ARP for an address the controller has made active on another node, and
+/// a refused withdrawal of the sole-gateway claim would leave the dead man keeping the router
+/// answering while another node claims its provider network (IKR-B76). The driver's own pass
+/// takes both back again as its first steps.
+async fn read_after_withdrawals(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
     r: proto::EnsureRouter,
 ) -> anyhow::Result<RouterSpec> {
-    if !r.active {
-        silence_demoted(bridge, &r.id).await?;
-    }
+    take_back_withdrawn(bridge, &r).await?;
     router_spec(r)
 }
 
-/// Silence the router a demotion names, by its id alone. Only an id that does not parse names
-/// no namespace. A node without a bridge driver built none.
-async fn silence_demoted(
+/// Take back what a router command withdraws, by the router's id alone: the sole-gateway claim
+/// the command no longer makes, then a demotion's silencing. Both are tried even when the first
+/// fails, and the first failure is the answer. Only an id that does not parse names no router.
+/// A node without a bridge driver built none.
+async fn take_back_withdrawn(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
-    id: &str,
+    r: &proto::EnsureRouter,
 ) -> anyhow::Result<()> {
     let Some(bridge) = bridge else {
         return Ok(());
     };
-    let id: RouterId = id.parse().context("router id")?;
-    bridge
-        .silence_router(&id)
-        .await
-        .with_context(|| format!("silencing router {id} ahead of its demotion"))
+    if r.sole_gateway && r.active {
+        return Ok(());
+    }
+    let id: RouterId = r.id.parse().context("router id")?;
+    let withdrawn = match r.sole_gateway {
+        true => Ok(()),
+        false => bridge
+            .withdraw_sole_gateway(&id)
+            .await
+            .with_context(|| format!("withdrawing router {id}'s sole-gateway claim")),
+    };
+    let silenced = match r.active {
+        true => Ok(()),
+        false => bridge
+            .silence_router(&id)
+            .await
+            .with_context(|| format!("silencing router {id} ahead of its demotion")),
+    };
+    withdrawn.and(silenced)
 }
 
 impl Agent {
-    /// Silence a demotion first, then validate the provider-network capability and ensure the
-    /// router under the operations lock. Repeated ensure requests also update active/standby
-    /// state.
+    /// Take back what the command withdraws first (a demotion, the sole-gateway claim), then
+    /// validate the provider-network capability and ensure the router under the operations
+    /// lock. Repeated ensure requests also update active/standby state.
     pub(super) async fn handle_ensure_router(&self, r: proto::EnsureRouter) -> anyhow::Result<()> {
         // Serialize router changes with VM provisioning because both mutate shared bridges, the
         // silencing of a demotion included. The driver bounds every ip/nft call, so a wedged one
         // cannot hold this lock (R3-F08).
         let _guard = self.ops.lock().await;
-        let spec = read_after_demotion(self.reconciler.drivers().bridge.as_deref(), r).await?;
+        let spec = read_after_withdrawals(self.reconciler.drivers().bridge.as_deref(), r).await?;
         cannot_serve(self.network.validate_router(&spec.physnet))?;
         let bridge = cannot_serve(
             self.reconciler
@@ -230,15 +247,22 @@ mod tests {
         assert!(router_spec(m).is_err());
     }
 
-    /// A bridge that records which routers it was told to silence, or refuses to.
+    /// A bridge that records the routers it was told to silence and whose sole-gateway claim
+    /// it was told to withdraw, or refuses either.
     #[derive(Default)]
-    struct SilencingBridge {
+    struct RecordingBridge {
         silenced: std::sync::Mutex<Vec<RouterId>>,
-        refuse: bool,
+        withdrawn: std::sync::Mutex<Vec<RouterId>>,
+        refuse_silence: bool,
+        refuse_withdrawal: bool,
+    }
+
+    fn denied() -> agent_api::networking::NetworkError {
+        agent_api::networking::NetworkError::Backend(anyhow!("permission denied"))
     }
 
     #[async_trait::async_trait]
-    impl agent_api::networking::BridgeDriver for SilencingBridge {
+    impl agent_api::networking::BridgeDriver for RecordingBridge {
         async fn ensure(&self, _name: &str) -> agent_api::networking::Result<()> {
             Ok(())
         }
@@ -254,12 +278,17 @@ mod tests {
             Ok(())
         }
         async fn silence_router(&self, id: &RouterId) -> agent_api::networking::Result<()> {
-            if self.refuse {
-                return Err(agent_api::networking::NetworkError::Backend(anyhow!(
-                    "permission denied"
-                )));
+            if self.refuse_silence {
+                return Err(denied());
             }
             self.silenced.lock().unwrap().push(*id);
+            Ok(())
+        }
+        async fn withdraw_sole_gateway(&self, id: &RouterId) -> agent_api::networking::Result<()> {
+            if self.refuse_withdrawal {
+                return Err(denied());
+            }
+            self.withdrawn.lock().unwrap().push(*id);
             Ok(())
         }
     }
@@ -271,9 +300,9 @@ mod tests {
         m.active = false;
         m.nats = vec![nat("dnat-and-snat", "203.0.113.55", "10.7.1.9")];
         let id: RouterId = m.id.parse().unwrap();
-        let bridge = SilencingBridge::default();
+        let bridge = RecordingBridge::default();
 
-        let err = read_after_demotion(Some(&bridge), m)
+        let err = read_after_withdrawals(Some(&bridge), m)
             .await
             .expect_err("the rest of it is refused");
 
@@ -284,9 +313,9 @@ mod tests {
     /// A promotion is read without silencing anything: the router is about to answer.
     #[tokio::test]
     async fn a_promotion_is_read_without_silencing_the_router() {
-        let bridge = SilencingBridge::default();
+        let bridge = RecordingBridge::default();
 
-        let spec = read_after_demotion(Some(&bridge), message())
+        let spec = read_after_withdrawals(Some(&bridge), message())
             .await
             .expect("a well-formed promotion");
 
@@ -299,15 +328,71 @@ mod tests {
     async fn a_demotion_that_cannot_be_silenced_is_an_error() {
         let mut m = message();
         m.active = false;
-        let bridge = SilencingBridge {
-            refuse: true,
+        let bridge = RecordingBridge {
+            refuse_silence: true,
             ..Default::default()
         };
 
-        let err = read_after_demotion(Some(&bridge), m)
+        let err = read_after_withdrawals(Some(&bridge), m)
             .await
             .expect_err("a router that may still answer is not demoted");
 
         assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
+    }
+
+    /// NL-A2: an active router's command that no longer makes the sole-gateway claim and that
+    /// this agent refuses to read withdraws the claim all the same, by the router's id, so the
+    /// dead man does not keep the router answering for it.
+    #[tokio::test]
+    async fn a_withdrawn_sole_gateway_claim_is_taken_back_although_the_command_is_refused() {
+        let mut m = message();
+        m.nats = vec![nat("dnat-and-snat", "203.0.113.55", "10.7.1.9")];
+        let id: RouterId = m.id.parse().unwrap();
+        let bridge = RecordingBridge::default();
+
+        let err = read_after_withdrawals(Some(&bridge), m)
+            .await
+            .expect_err("the rest of it is refused");
+
+        assert!(err.to_string().contains("dnat-and-snat"), "{err:#}");
+        assert_eq!(*bridge.withdrawn.lock().unwrap(), [id]);
+        assert!(
+            bridge.silenced.lock().unwrap().is_empty(),
+            "and an active router is not silenced"
+        );
+    }
+
+    /// A command that makes the sole-gateway claim withdraws nothing: the pass records it.
+    #[tokio::test]
+    async fn a_sole_gateway_command_is_read_without_withdrawing_its_claim() {
+        let mut m = message();
+        m.sole_gateway = true;
+        let bridge = RecordingBridge::default();
+
+        read_after_withdrawals(Some(&bridge), m)
+            .await
+            .expect("a well-formed command");
+
+        assert!(bridge.withdrawn.lock().unwrap().is_empty());
+    }
+
+    /// A demotion whose claim cannot be withdrawn is silenced all the same, and the failed
+    /// withdrawal is the answer.
+    #[tokio::test]
+    async fn a_demotion_whose_claim_cannot_be_withdrawn_is_silenced_all_the_same() {
+        let mut m = message();
+        m.active = false;
+        let id: RouterId = m.id.parse().unwrap();
+        let bridge = RecordingBridge {
+            refuse_withdrawal: true,
+            ..Default::default()
+        };
+
+        let err = read_after_withdrawals(Some(&bridge), m)
+            .await
+            .expect_err("a claim that may stand is not withdrawn");
+
+        assert!(format!("{err:#}").contains("sole-gateway claim"), "{err:#}");
+        assert_eq!(*bridge.silenced.lock().unwrap(), [id]);
     }
 }

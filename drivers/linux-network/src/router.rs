@@ -769,6 +769,8 @@ impl crate::LinuxNetworkDriver {
         } else {
             self.silence_router_impl(&spec.id).await?;
         }
+        // A caller that refuses the command before this pass withdraws the claim through
+        // `withdraw_sole_gateway` (NL-A2).
         Self::record_not_sole_gateway(&g.state_dir, spec).await?;
         if !g.physnets.contains_key(&spec.physnet) {
             let mut have: Vec<&str> = g.physnets.keys().map(String::as_str).collect();
@@ -1149,6 +1151,14 @@ impl crate::LinuxNetworkDriver {
             return Ok(());
         }
         Self::withdraw_claim(dir, &spec.id, |spec| &mut spec.sole_gateway).await
+    }
+
+    /// Withdraw router `id`'s sole-gateway claim from its record and touch nothing else, for a
+    /// command the agent may refuse before any pass runs (NL-A2). A pass withdraws it again
+    /// through `record_not_sole_gateway`.
+    pub(crate) async fn withdraw_sole_gateway_impl(&self, id: &RouterId) -> networking::Result<()> {
+        let dir = &self.gateway()?.state_dir;
+        Self::withdraw_claim(dir, id, |spec| &mut spec.sole_gateway).await
     }
 
     /// Clear one claim of router `id`'s record, the field `claim` names, and store the record
@@ -2015,6 +2025,37 @@ exit 0
         assert!(outcome.kept.is_empty(), "{outcome:?}");
         assert_eq!(outcome.silenced, [active.id]);
         assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
+    }
+
+    /// NL-A2: a sole-gateway claim withdrawn ahead of a command lets the dead man silence the
+    /// router, and nothing in the kernel is touched to withdraw it.
+    #[tokio::test]
+    async fn a_sole_gateway_claim_withdrawn_ahead_of_a_command_lets_the_dead_man_silence() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let sole = RouterSpec {
+            sole_gateway: true,
+            ..spec(true)
+        };
+        let netns = router_netns(&sole.id);
+        write_record(dir, &sole);
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
+        );
+
+        d.withdraw_sole_gateway_impl(&sole.id)
+            .await
+            .expect("withdrawn");
+        assert!(
+            std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+            "withdrawing a claim runs no ip"
+        );
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert!(outcome.kept.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.silenced, [sole.id]);
     }
 
     /// NL-A3: withdrawing one claim clears that field of the record and leaves the other

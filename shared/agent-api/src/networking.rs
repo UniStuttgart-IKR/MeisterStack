@@ -177,6 +177,16 @@ pub trait BridgeDriver: Send + Sync {
         Ok(())
     }
 
+    /// Withdraw one router's sole-gateway claim (`RouterSpec::sole_gateway`) from what this node
+    /// holds of it, without touching the router. Used ahead of a command that no longer makes
+    /// the claim, before the rest of it is read, so a command this node refuses cannot leave the
+    /// dead man keeping the router answering while another node claims its provider network
+    /// (NL-A2). A router this node holds no record of makes no claim; the default builds no
+    /// router and has no claim to withdraw.
+    async fn withdraw_sole_gateway(&self, _id: &RouterId) -> Result<()> {
+        Ok(())
+    }
+
     /// Silence all local routers without destroying their namespaces. Used on
     /// shutdown and by the dead man to stop stale ARP and routing activity
     /// before another gateway takes over. A later `EnsureRouter` can reactivate
@@ -484,6 +494,18 @@ mod tests {
         assert!(
             NoGatewaySlot
                 .silence_router(&RouterId::from_u128(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A driver that builds no router holds no sole-gateway claim, so withdrawing one is done
+    /// (NL-A2).
+    #[tokio::test]
+    async fn withdrawing_the_claim_of_a_router_that_was_never_built_is_done() {
+        assert!(
+            NoGatewaySlot
+                .withdraw_sole_gateway(&RouterId::from_u128(1))
                 .await
                 .is_ok()
         );

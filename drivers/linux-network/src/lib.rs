@@ -801,6 +801,14 @@ impl BridgeDriver for LinuxNetworkDriver {
         }
     }
 
+    async fn withdraw_sole_gateway(&self, id: &RouterId) -> networking::Result<()> {
+        // A node with no gateway slot holds no router record, so none claims anything here.
+        match self.gateway.is_some() {
+            true => self.withdraw_sole_gateway_impl(id).await,
+            false => Ok(()),
+        }
+    }
+
     async fn fall_silent(&self) -> networking::Result<networking::Silencing> {
         // A node with no gateway slot holds no router and has nothing to stop
         // saying — the same answer `sweep_routers` gives.
