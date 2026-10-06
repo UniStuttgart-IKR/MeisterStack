@@ -7,9 +7,9 @@ SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 # Deployment reference
 
 The [deployment guide](../docs/DEPLOYMENT.md) describes runtime modes, prerequisites,
-privileges and recovery limits. [Nix](../docs/NIX.md) explains packages, service
-modules and inventory rendering. meister-deploy, a repository of its own, keeps the
-operator template and the example fleets that provide configuration starting points.
+privileges and recovery limits. [Nix](../docs/NIX.md) explains packages and service
+modules. meister-deploy, a repository of its own, renders fleet inventories and keeps
+the operator template and the example fleets that provide configuration starting points.
 
 The legacy context-image renderer and lab-specific push workflow live outside this
 repository. `provider-opennebula` reads selected provider metadata; it does not
