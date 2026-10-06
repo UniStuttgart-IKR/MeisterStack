@@ -11,18 +11,26 @@
 //! A child past its deadline is killed and reaped within [`REAP_BOUND`]. One still not reaped
 //! then (uninterruptible sleep on a dead mount) is not waited for: a background task keeps
 //! waiting for it, so no caller is held longer than its deadline plus the bound.
+//!
+//! Memory is bounded the same way: a child that writes more than [`OUTPUT_CAP`] to stdout or
+//! stderr is killed and reaped as well (N5).
 
 use std::future::Future;
 use std::io;
 use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
 /// How long a killed child may take to be reaped before it is left to the background.
 pub const REAP_BOUND: Duration = Duration::from_secs(5);
+
+/// How many bytes of each of stdout and stderr a run keeps. The largest answer expected here is
+/// `nft -j` listing every tap's chain, a few KiB per guest, so the cap leaves room for thousands
+/// of guests. More is a broken or hostile child, and the agent's memory is not its to fill.
+pub const OUTPUT_CAP: usize = 16 << 20;
 
 /// Why a bounded run produced no exit status.
 #[derive(Debug, thiserror::Error)]
@@ -41,11 +49,18 @@ pub enum RunError {
     },
     #[error("{what} did not answer within {}s and was stopped", .deadline.as_secs())]
     TimedOut { what: String, deadline: Duration },
+    #[error("{what} wrote more than {cap} bytes to {stream} and was stopped")]
+    OutputTooLarge {
+        what: String,
+        stream: &'static str,
+        cap: usize,
+    },
 }
 
 /// Run `command` to its exit within `deadline`: `input` on stdin (none means `/dev/null`),
-/// stdout and stderr drained together, the exit waited for. Past the deadline or on a failed
-/// pipe the child is killed and reaped, bounded, and the run is an error naming `what`.
+/// stdout and stderr drained together up to [`OUTPUT_CAP`] each, the exit waited for. Past the
+/// deadline or the cap, or on a failed pipe, the child is killed and reaped, bounded, and the
+/// run is an error naming `what`.
 pub async fn output_within(
     command: &mut Command,
     input: Option<&[u8]>,
@@ -65,13 +80,18 @@ pub async fn output_within(
             what: what.to_string(),
             source,
         })?;
-    match tokio::time::timeout(deadline, talk(&mut child, input)).await {
+    match tokio::time::timeout(deadline, talk(&mut child, input, OUTPUT_CAP)).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(source)) => {
+        Ok(Err(stopped)) => {
             kill_and_reap(child, what).await;
-            Err(RunError::Io {
-                what: what.to_string(),
-                source,
+            let what = what.to_string();
+            Err(match stopped {
+                Stopped::Io(source) => RunError::Io { what, source },
+                Stopped::TooLarge { stream } => RunError::OutputTooLarge {
+                    what,
+                    stream,
+                    cap: OUTPUT_CAP,
+                },
             })
         }
         Err(_) => {
@@ -84,9 +104,26 @@ pub async fn output_within(
     }
 }
 
-/// Feed stdin, drain stdout and stderr, then wait; the three pipes at once, so a child blocked
-/// on one of them never stalls the others.
-async fn talk(child: &mut Child, input: Option<&[u8]>) -> io::Result<Output> {
+/// Why talking to a child stopped before its exit.
+#[derive(Debug)]
+enum Stopped {
+    Io(io::Error),
+    /// The child wrote more than the cap to this stream.
+    TooLarge {
+        stream: &'static str,
+    },
+}
+
+impl From<io::Error> for Stopped {
+    fn from(e: io::Error) -> Self {
+        Stopped::Io(e)
+    }
+}
+
+/// Feed stdin, drain stdout and stderr up to `cap` bytes each, then wait; the three pipes at
+/// once, so a child blocked on one of them never stalls the others. The first pipe to fail or
+/// overflow ends the talk at once rather than waiting for the others.
+async fn talk(child: &mut Child, input: Option<&[u8]>, cap: usize) -> Result<Output, Stopped> {
     let stdin = child.stdin.take();
     let mut stdout = child
         .stdout
@@ -104,24 +141,36 @@ async fn talk(child: &mut Child, input: Option<&[u8]>) -> io::Result<Output> {
         match stdin.write_all(input).await {
             // A child that stops reading says why in its status and on stderr.
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-            written => written,
+            written => written.map_err(Stopped::Io),
         }
     };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let (fed, read_out, read_err) = tokio::join!(
+    let (_, out, err) = tokio::try_join!(
         feed,
-        stdout.read_to_end(&mut out),
-        stderr.read_to_end(&mut err)
-    );
-    fed?;
-    read_out?;
-    read_err?;
+        read_capped(&mut stdout, cap, "stdout"),
+        read_capped(&mut stderr, cap, "stderr")
+    )?;
     let status = child.wait().await?;
     Ok(Output {
         status,
         stdout: out,
         stderr: err,
     })
+}
+
+/// Read `stream` to its end, but never more than `cap` bytes of it: one byte past the cap is
+/// read only to tell "exactly the cap" from "more".
+async fn read_capped<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    cap: usize,
+    name: &'static str,
+) -> Result<Vec<u8>, Stopped> {
+    let mut out = Vec::new();
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    stream.take(limit).read_to_end(&mut out).await?;
+    match out.len() > cap {
+        true => Err(Stopped::TooLarge { stream: name }),
+        false => Ok(out),
+    }
 }
 
 /// Kill `child` and reap it within [`REAP_BOUND`]; one that will not die in time is left to a
@@ -239,6 +288,50 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"said\n");
+    }
+
+    /// A child that never stops printing is stopped at the cap, not followed into memory (N5).
+    #[tokio::test]
+    async fn a_child_that_prints_without_end_is_stopped_at_the_cap() {
+        let deadline = Duration::from_secs(60);
+        let outcome = output_within(&mut Command::new("yes"), None, deadline, "yes").await;
+        assert!(
+            matches!(
+                outcome,
+                Err(RunError::OutputTooLarge {
+                    stream: "stdout",
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// The cap holds for stderr as well, which every caller reads into its error (N5).
+    #[tokio::test]
+    async fn a_child_that_complains_without_end_is_stopped_at_the_cap() {
+        let deadline = Duration::from_secs(60);
+        let outcome = output_within(&mut sh("yes >&2"), None, deadline, "yes").await;
+        assert!(
+            matches!(
+                outcome,
+                Err(RunError::OutputTooLarge {
+                    stream: "stderr",
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// Output up to the cap is kept whole: the cap is a ceiling, not a truncation (N5).
+    #[tokio::test]
+    async fn output_of_exactly_the_cap_is_kept_whole() {
+        let mut stream: &[u8] = &[b'x'; 64];
+        let kept = read_capped(&mut stream, 64, "stdout")
+            .await
+            .expect("at the cap");
+        assert_eq!(kept.len(), 64);
     }
 
     /// A child that exits without reading its input still reports its status and its words.
