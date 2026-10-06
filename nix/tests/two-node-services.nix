@@ -120,14 +120,28 @@ pkgs.testers.runNixOSTest {
     def install(machine, stem, cert):
         machine.succeed(f"cat > {pki}/{stem}.crt <<'EOF'\n{cert}EOF", f"chmod 644 {pki}/{stem}.crt")
 
+    def held_back_by_its_condition(machine, unit):
+        """Down because a condition was checked and failed, not because the
+        process started without its keys and is crash-looping, which is
+        down between two restarts as well."""
+        shown = machine.succeed(
+            "systemctl show -p ConditionResult -p ConditionTimestampMonotonic "
+            f"-p ExecMainStartTimestampMonotonic -p NRestarts {unit}"
+        )
+        props = dict(line.split("=", 1) for line in shown.splitlines())
+        assert props["ConditionResult"] == "no" and props["ConditionTimestampMonotonic"] != "0", \
+            f"{unit}: no condition of it was checked and failed: {props}"
+        assert props["ExecMainStartTimestampMonotonic"] == "0" and props["NRestarts"] == "0", \
+            f"{unit} ran without its keys: {props}"
+
     start_all()
     cp.wait_for_unit("multi-user.target")
     n1.wait_for_unit("multi-user.target")
 
     with subtest("no unit starts before its keys are there"):
-        cp.fail("systemctl is-active meister-cloud-controller")
-        cp.fail("systemctl is-active meister-cluster-controller")
-        n1.fail("systemctl is-active meister-agent")
+        held_back_by_its_condition(cp, "meister-cloud-controller")
+        held_back_by_its_condition(cp, "meister-cluster-controller")
+        held_back_by_its_condition(n1, "meister-agent")
 
     with subtest("every host gets its keys from a CA it never sees"):
         cp.succeed("meister-ca --dir /root/ca --init", "meister-ca --dir /root/ca --admin root")
