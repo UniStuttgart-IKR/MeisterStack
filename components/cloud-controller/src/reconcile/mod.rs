@@ -507,4 +507,4 @@ pub fn status_is_current(vm: &Vm, reported_at: DateTime<Utc>) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

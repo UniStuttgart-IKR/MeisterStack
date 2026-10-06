@@ -159,13 +159,15 @@ async fn off_limits_to_network_prefixes(
 /// Every tenant's network prefixes but those of `except`, each with its name for a refusal:
 /// what a floating pool or a routed subnet may not overlap, for the reason the prefixes may
 /// not overlap them. Read from a list that is all of them, since a tenant that did not decode
-/// could hide the prefix a pool would land on.
+/// could hide the prefix a pool would land on; list and count come from one response, so a
+/// tenant created or deleted in between neither refuses a pool for nothing nor hides one that
+/// did not decode. (RR5-3)
 pub(super) async fn network_prefixes_taken(
     st: &ApiState,
     except: Option<&str>,
 ) -> Result<Vec<(String, common::net::Ipv4Range)>, ApiError> {
-    let tenants = st.store.list::<Tenant>().await?;
-    if tenants.len() != st.store.count::<Tenant>().await? {
+    let (tenants, keys) = st.store.list_counted::<Tenant>().await?;
+    if tenants.len() != keys {
         return Err(conflict(
             "cannot tell which prefixes the tenants' networks hold (some tenant objects did not \
              decode); refusing rather than overlapping one",

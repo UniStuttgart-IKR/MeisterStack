@@ -1045,3 +1045,36 @@ async fn a_tenants_network_prefixes_are_checked_when_they_change() {
     assert_eq!(updated.spec.network_prefixes, ["10.30.0.0/24"]);
     assert_eq!(updated.spec.quota.max_vms, Some(3));
 }
+
+/// A floating pool is refused while a tenant does not decode: which prefixes its network holds
+/// cannot be told, and the pool could land on them. (RR5-3)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_floating_pool_is_refused_while_a_tenant_does_not_decode() {
+    let prefix = fresh_prefix("rr5-3");
+    let st = replica(&prefix).await;
+    crate::reconcile::tests::unparsable::<Tenant>(&prefix, "broken").await;
+
+    let pool = FloatingPool::declare(
+        "lab",
+        controller_api::FloatingPoolSpec {
+            cidrs: vec!["198.51.100.0/24".into()],
+            ..Default::default()
+        },
+    );
+    let refused = create_floating_pool(State(st.clone()), DryRun::default(), Json(pool))
+        .await
+        .err()
+        .expect("no pool over a tenant list that is not all of them");
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.message()
+    );
+    assert!(
+        refused.message().contains("did not decode"),
+        "{}",
+        refused.message()
+    );
+}

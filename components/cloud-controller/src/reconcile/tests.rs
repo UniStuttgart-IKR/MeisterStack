@@ -1348,8 +1348,8 @@ async fn test_store(area: &str) -> EtcdStore {
 
 /// A record of kind `T` called `name` under `prefix` that no reader can parse,
 /// written past the store, which only writes what parses. The key is the
-/// store's own layout.
-async fn unparsable<T: Resource>(prefix: &str, name: &str) {
+/// store's own layout. The API's admission tests write theirs with it too.
+pub(crate) async fn unparsable<T: Resource>(prefix: &str, name: &str) {
     let mut etcd = etcd_client::Client::connect([test_etcd()], None)
         .await
         .expect("an etcd to talk to");
