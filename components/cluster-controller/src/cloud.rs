@@ -1454,8 +1454,11 @@ async fn handle_destroy_snapshot(
     if current.is_deleting() {
         return Ok(());
     }
-    mark_for_teardown(store, &current, &d.uid).await?;
-    info!(snapshot = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "snapshot",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
 }
 
@@ -1476,8 +1479,11 @@ async fn handle_destroy_volume(store: &EtcdStore, d: proto::DestroyVolume) -> an
     if current.is_deleting() {
         return Ok(());
     }
-    mark_for_teardown(store, &current, &d.uid).await?;
-    info!(volume = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "volume",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
 }
 
@@ -1555,23 +1561,35 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
     if current.is_deleting() {
         return Ok(());
     }
-    mark_for_teardown(store, &current, &d.uid).await?;
-    info!(vm = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "vm",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
+}
+
+/// What a cloud destroy found to mark.
+#[derive(Debug, PartialEq, Eq)]
+enum Teardown {
+    /// The judged object is marked for teardown, by this destroy or one before it.
+    Marked,
+    /// The judged object went or became another's in between: nothing of this cloud object is
+    /// left here to mark.
+    NothingLeft,
 }
 
 /// Mark the object a cloud destroy was judged against for teardown — a VM, a volume, a
 /// snapshot — under the uid it was judged at, never whatever its name names by the time of the
 /// write (NL3-3, IKR-B81).
 ///
-/// An object that went, became another cloud object's or was marked by someone else in between
-/// leaves the destroy nothing to do. One that is still the cloud's and unmarked is an error the
-/// cloud retries.
+/// An object that went or became another cloud object's in between leaves the destroy nothing
+/// to do. One that is still the cloud's and unmarked is an error the cloud retries.
 async fn mark_for_teardown<T: controller_api::Resource>(
     store: &EtcdStore,
     checked: &T,
     cloud_uid: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Teardown> {
     let the_clouds = |v: &T| v.metadata().cloud_uid() == Some(cloud_uid);
     let meta = checked.metadata();
     let mut marked = false;
@@ -1584,12 +1602,42 @@ async fn mark_for_teardown<T: controller_api::Resource>(
         })
         .await;
     match written {
-        Ok(_) if marked => Ok(()),
+        Ok(_) if marked => Ok(Teardown::Marked),
         Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
-            let done = |v: &T| !the_clouds(v) || v.metadata().deletion_timestamp.is_some();
-            answer_unwritten(store, &meta.name, done, "marked for teardown").await
+            teardown_unwritten::<T>(store, &meta.name, cloud_uid).await
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// What the name holds after a mark that did not land: gone or another cloud object's is nothing
+/// left; this cloud object, marked by somebody else, is marked; unmarked it is an error the cloud
+/// retries.
+async fn teardown_unwritten<T: controller_api::Resource>(
+    store: &EtcdStore,
+    name: &str,
+    cloud_uid: &str,
+) -> anyhow::Result<Teardown> {
+    match store.get::<T>(name).await {
+        Err(StoreError::NotFound(_)) => Ok(Teardown::NothingLeft),
+        Ok(current) if current.metadata().cloud_uid() != Some(cloud_uid) => {
+            Ok(Teardown::NothingLeft)
+        }
+        Ok(current) if current.metadata().deletion_timestamp.is_some() => Ok(Teardown::Marked),
+        Ok(_) => bail!(
+            "{}/{name} changed while it was marked for teardown; not marked for teardown yet",
+            T::RESOURCE
+        ),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Say what a destroy did: `marked` on a mark, and quietly that nothing of the cloud object was
+/// left otherwise.
+fn note_teardown(kind: &str, name: &str, outcome: Teardown) {
+    match outcome {
+        Teardown::Marked => info!(kind, name, "marked for teardown by the cloud"),
+        Teardown::NothingLeft => debug!(kind, name, "nothing of this cloud object left to mark"),
     }
 }
 
@@ -3542,10 +3590,15 @@ mod tests {
             .await
             .expect("another cloud volume of that name");
 
-        mark_for_teardown(&store, &checked, "u-1")
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
             .await
             .expect("nothing of u-1 is left here, which is a destroy done");
 
+        assert_eq!(
+            outcome,
+            Teardown::NothingLeft,
+            "and it is not said to be marked"
+        );
         let still: Volume = store.get("data").await.expect("the new volume");
         assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
         assert!(!still.is_deleting());
@@ -3598,10 +3651,15 @@ mod tests {
         store.delete::<Vm>("t").await.expect("it goes");
         stored_vm(&store, "u-2").await;
 
-        mark_for_teardown(&store, &checked, "u-1")
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
             .await
             .expect("nothing of u-1 is left here, which is a destroy done");
 
+        assert_eq!(
+            outcome,
+            Teardown::NothingLeft,
+            "and it is not said to be marked"
+        );
         let still: Vm = store.get("t").await.expect("the new vm");
         assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
         assert!(!still.is_deleting());
@@ -3624,6 +3682,22 @@ mod tests {
         let still: Vm = store.get("t").await.expect("the new vm");
         assert_eq!(still.metadata.uid, fresh.metadata.uid);
         assert!(!still.is_deleting());
+    }
+
+    /// The judged VM is marked, and says so. (IKR-B81)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_mark_on_the_judged_vm_is_said_to_be_marked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("marked");
+
+        assert_eq!(outcome, Teardown::Marked);
+        let marked: Vm = store.get("t").await.expect("the vm, until its teardown");
+        assert!(marked.is_deleting());
     }
 
     /// The VM the destroy names is marked for teardown: the guard is not a wall. (NL3-3)
