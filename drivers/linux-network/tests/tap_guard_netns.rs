@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Change the address guard of a tap a guest is using, and check what passes (NL4-1, NL5).
+//! Change the address guard of a tap a guest is using, and check what passes (NL4-1, NL5-2).
 //!
 //! Requires `ip`, `nft`, `ping`, and isolated network and mount namespaces:
 //!
@@ -31,7 +31,7 @@ struct Site {
     guest: &'static str,
     /// The subnet a test takes from the guest.
     taken: Subnet,
-    /// A second subnet the guest has an address in, kept throughout.
+    /// A second subnet the guest has an address in and keeps sending from.
     other: Subnet,
     /// A third the guest has an address in and is never allowed to send from.
     never: Subnet,
@@ -64,9 +64,9 @@ const ONE_OF_TWO_TAKEN: Site = Site {
         guest: "10.7.5.9",
     },
 };
-/// A tenant guest addressed out of its network's prefix (`other`), with a routed subnet
-/// (`taken`) beside it.
-const ROUTER_GONE: Site = Site {
+/// A guest with one routed subnet (`taken`) and an address of its own outside every pool
+/// (`other`), on a node whose floating pool holds `never`.
+const NO_PREFIX_LEFT: Site = Site {
     nic: NicId::from_u128(0x4c40_0003 << 96),
     bridge: "msguard1",
     guest: "ms-guarded1",
@@ -76,16 +76,18 @@ const ROUTER_GONE: Site = Site {
         guest: "10.7.4.9",
     },
     other: Subnet {
-        cidr: "10.7.3.0/24",
-        host: "10.7.3.1",
-        guest: "10.7.3.9",
+        cidr: "10.30.3.0/24",
+        host: "10.30.3.1",
+        guest: "10.30.3.9",
     },
     never: Subnet {
-        cidr: "10.7.6.0/24",
-        host: "10.7.6.1",
-        guest: "10.7.6.9",
+        cidr: "10.255.6.0/24",
+        host: "10.255.6.1",
+        guest: "10.255.6.9",
     },
 };
+/// The floating pool of the node `NO_PREFIX_LEFT` is on.
+const FLOATING_POOL: &str = "10.255.0.0/16";
 const GUEST_MAC: &str = "52:54:00:00:4c:01";
 
 fn run(program: &str, args: &[&str]) -> (bool, String) {
@@ -131,14 +133,23 @@ fn reaches(site: &Site, subnet: &Subnet) -> bool {
     .0
 }
 
-/// The packets the tap's source-address rules dropped so far, IPv4 and ARP together.
-fn source_drops(tap: &str) -> u64 {
+/// The comments of the allowlist's rules, IPv4 and ARP.
+const SOURCE_RULES: [&str; 2] = ["src-ip", "src-arp"];
+/// And of the pool ban's.
+const POOL_RULES: [&str; 2] = ["pool-ip", "pool-arp"];
+
+/// The packets the tap's rules commented as one of `rules` dropped so far, together.
+fn drops(tap: &str, rules: [&str; 2]) -> u64 {
     let chain = format!("meister-{tap}");
-    let (ok, rules) = run("nft", &["list", "chain", "netdev", "meister", &chain]);
-    assert!(ok, "no chain {chain}: {rules}");
-    rules
+    let (ok, listed) = run("nft", &["list", "chain", "netdev", "meister", &chain]);
+    assert!(ok, "no chain {chain}: {listed}");
+    listed
         .lines()
-        .filter(|l| l.contains("comment \"src-ip\"") || l.contains("comment \"src-arp\""))
+        .filter(|l| {
+            rules
+                .iter()
+                .any(|r| l.contains(&format!("comment \"{r}\"")))
+        })
         .map(|l| {
             l.split_once("packets ")
                 .and_then(|(_, after)| after.split_whitespace().next())
@@ -149,11 +160,17 @@ fn source_drops(tap: &str) -> u64 {
 }
 
 fn driver() -> LinuxNetworkDriver {
+    driver_guarding(&[])
+}
+
+/// A driver on a node whose guarded ranges are `ranges`.
+fn driver_guarding(ranges: &[&str]) -> LinuxNetworkDriver {
+    let ranges: Vec<String> = ranges.iter().map(|r| r.to_string()).collect();
     LinuxNetworkDriver::build(
         None,
         NftConfig {
             binary: "nft".into(),
-            guarded: common::net::Ipv4Ranges::default(),
+            guarded: common::net::Ipv4Ranges::parse(&ranges).expect("guarded ranges"),
         },
         None,
     )
@@ -217,7 +234,8 @@ async fn take_down(site: &Site, d: &LinuxNetworkDriver, nic: &NicId) {
 }
 
 /// A subnet taken from a running guest is dropped at its tap from the moment the guard is
-/// updated, the subnet it keeps goes on passing, and a subnet given back passes again.
+/// updated, the subnet it keeps goes on passing, and a subnet given back passes again; a source
+/// it was never given is dropped throughout.
 #[tokio::test]
 #[ignore = "needs its own network and mount namespace; see the module note"]
 async fn a_subnet_taken_from_a_running_tap_is_dropped_and_one_given_back_passes() {
@@ -234,22 +252,30 @@ async fn a_subnet_taken_from_a_running_tap_is_dropped_and_one_given_back_passes(
         "the kept subnet passes at first"
     );
     assert!(reaches(&site, &site.taken), "and so does the other");
+    assert!(
+        !reaches(&site, &site.never),
+        "a source it was never given does not"
+    );
 
     d.update_guard(&nic, &allowing(&site, &[site.other.cidr]))
         .await
         .expect("the guard takes the subnet away");
-    let before = source_drops(&tap);
+    let before = drops(&tap, SOURCE_RULES);
     assert!(
         !reaches(&site, &site.taken),
         "a source in the subnet taken away is dropped at the tap"
     );
     assert!(
-        source_drops(&tap) > before,
+        drops(&tap, SOURCE_RULES) > before,
         "by the source-address rule, which counted it"
     );
     assert!(
         reaches(&site, &site.other),
         "the kept subnet goes on passing"
+    );
+    assert!(
+        !reaches(&site, &site.never),
+        "and a source it was never given stays dropped"
     );
 
     d.update_guard(&nic, &allowing(&site, &[site.other.cidr, site.taken.cidr]))
@@ -263,49 +289,42 @@ async fn a_subnet_taken_from_a_running_tap_is_dropped_and_one_given_back_passes(
     take_down(&site, &d, &nic).await;
 }
 
-/// A tenant guest whose router and routed subnet go keeps sending from its network's prefix,
-/// which the document goes on naming because the tenant declares it (NL5-1); the routed subnet
-/// is dropped at its tap from the moment the guard is updated, and a source the guest was never
-/// given stays dropped: the guard follows the document and does not open. (NL5)
+/// A re-send that leaves a guest's document no prefix at all puts its tap on the pool ban: a
+/// source in the node's floating pool that is not the guest's own is dropped and counted, and a
+/// source of its own outside every pool goes on passing, since the document says nothing of its
+/// address space. (NL5-2)
 #[tokio::test]
 #[ignore = "needs its own network and mount namespace; see the module note"]
-async fn a_guest_keeps_its_network_prefix_when_its_router_and_routed_subnet_go() {
-    let site = ROUTER_GONE;
-    let d = driver();
+async fn a_guest_left_no_prefix_is_kept_off_the_pool_and_keeps_its_own_sources() {
+    let site = NO_PREFIX_LEFT;
+    let d = driver_guarding(&[FLOATING_POOL]);
     let nic = site.nic;
     let tap = LinuxNetworkDriver::tap_name(&nic);
     host_and_guest(&site, &tap);
-    // With the router there, its inside prefix and the tenant's declared one are one entry.
-    d.create(&nic, &allowing(&site, &[site.other.cidr, site.taken.cidr]))
+    d.create(&nic, &allowing(&site, &[site.taken.cidr]))
         .await
         .expect("the guest's link is on the bridge and guarded");
-    assert!(reaches(&site, &site.other), "its network's prefix passes");
-    assert!(reaches(&site, &site.taken), "and so does its routed subnet");
     assert!(
-        !reaches(&site, &site.never),
-        "a source it was never given does not"
+        reaches(&site, &site.taken),
+        "its routed subnet passes at first"
     );
 
-    // The re-send after the router and the routed subnet went names the declared prefix alone.
-    d.update_guard(&nic, &allowing(&site, &[site.other.cidr]))
+    // The re-send after its last routed subnet went names no prefix.
+    d.update_guard(&nic, &allowing(&site, &[]))
         .await
         .expect("the guard follows the document");
-    let before = source_drops(&tap);
+    let before = drops(&tap, POOL_RULES);
     assert!(
-        !reaches(&site, &site.taken),
-        "a source in the routed subnet taken away is dropped at the tap"
+        !reaches(&site, &site.never),
+        "a pool address that is not the guest's is dropped at the tap"
     );
     assert!(
-        source_drops(&tap) > before,
-        "by the source-address rule, which counted it"
+        drops(&tap, POOL_RULES) > before,
+        "by the pool rule, which counted it"
     );
     assert!(
         reaches(&site, &site.other),
-        "the guest goes on sending from its network's prefix, east-west and out"
-    );
-    assert!(
-        !reaches(&site, &site.never),
-        "and a source it was never given stays dropped"
+        "an address of its own outside every pool goes on passing"
     );
 
     take_down(&site, &d, &nic).await;
