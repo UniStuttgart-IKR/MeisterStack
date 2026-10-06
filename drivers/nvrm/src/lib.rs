@@ -45,6 +45,10 @@ const NOFILE_LIMIT: u64 = 65536;
 /// Extra backend variables may not override these prefixes.
 const PROTECTED_ENV: [&str; 4] = ["LD_", "PATH", "HOME", "NVIDIA_"];
 
+/// What the backend reserves from `vram_profile_mib` when no
+/// `vram_reserve_mib` is set (Leandro vram.rs `DEFAULT_RESERVATION_MIB`).
+const BACKEND_DEFAULT_RESERVE_MIB: u64 = 256;
+
 /// `vgpuprofile`'s host reserve, written from `vgpu_host_reserve_mib`.
 const HOST_RESERVE_ENV: &str = "LEA_VGPU_HOST_RESERVE_MIB";
 
@@ -133,7 +137,42 @@ impl NvrmParams {
 
     fn validate(&self) -> device::Result<()> {
         self.refuse_two_vram_policies()?;
+        self.refuse_unusable_reserve()?;
         self.refuse_reserved_env()
+    }
+
+    /// The backend reserves from a profile size only (Leandro vram.rs
+    /// `decide`). Beside a vGPU type it ignores the reserve without a word,
+    /// so the node would run something other than what it was told; and a
+    /// reserve as large as the profile leaves the guest no memory, which the
+    /// backend refuses at start. Both are refused here instead.
+    fn refuse_unusable_reserve(&self) -> device::Result<()> {
+        if self.vgpu_type.is_some() && self.vram_reserve_mib.is_some() {
+            return Err(DeviceError::InvalidSpec(
+                "vgpu_type and vram_reserve_mib are both set: a vGPU type carries its own \
+                 reservation and the backend ignores this one; drop vram_reserve_mib"
+                    .into(),
+            ));
+        }
+        // 0 is the backend's "unset", for both.
+        let Some(profile) = self.vram_profile_mib.filter(|&mib| mib > 0) else {
+            return Ok(());
+        };
+        let set = self.vram_reserve_mib.filter(|&mib| mib > 0);
+        let reserve = set.unwrap_or(BACKEND_DEFAULT_RESERVE_MIB);
+        if reserve >= profile {
+            let which = if set.is_some() {
+                "vram_reserve_mib"
+            } else {
+                "the backend's default reserve"
+            };
+            return Err(DeviceError::InvalidSpec(format!(
+                "{which} of {reserve} MiB leaves nothing of vram_profile_mib {profile}: the \
+                 guest would be told its card has no memory and the backend refuses to start; \
+                 raise the profile or lower the reserve"
+            )));
+        }
+        Ok(())
     }
 
     /// Checked with the rest of the configuration so a node config naming a
@@ -864,6 +903,36 @@ mod tests {
         let both = p(serde_json::json!({ "vgpu_type": "4Q", "vram_profile_mib": 2048 }));
         let said = both.validate().expect_err("two policies").to_string();
         assert!(said.contains("vram_profile_mib and vgpu_type"), "{said}");
+    }
+
+    /// IKR-B45: a reserve as large as its profile leaves the guest nothing,
+    /// and the backend's own default reserve counts when none is set.
+    #[test]
+    fn a_reserve_that_leaves_the_profile_nothing_is_refused() {
+        let at = |profile: u64, reserve: Option<u64>| {
+            let mut params = p(serde_json::json!({ "vram_profile_mib": profile }));
+            params.vram_reserve_mib = reserve;
+            params.validate()
+        };
+        let said = at(2048, Some(2048)).expect_err("nothing left").to_string();
+        assert!(said.contains("leaves nothing"), "{said}");
+        at(2048, Some(512)).expect("1536 MiB for the guest");
+        let said = at(256, None)
+            .expect_err("the default takes it all")
+            .to_string();
+        assert!(said.contains("default reserve"), "{said}");
+    }
+
+    /// IKR-B45: a reserve beside a vGPU type would be ignored by the backend,
+    /// so it is refused rather than accepted and dropped.
+    #[test]
+    fn a_reserve_beside_a_vgpu_type_is_refused() {
+        let both = p(serde_json::json!({ "vgpu_type": "4Q", "vram_reserve_mib": 256 }));
+        let said = both
+            .validate()
+            .expect_err("ignored by the backend")
+            .to_string();
+        assert!(said.contains("drop vram_reserve_mib"), "{said}");
     }
 
     /// A node configuration whose defaults and profiles the tests choose.
