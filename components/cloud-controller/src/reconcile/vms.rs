@@ -278,17 +278,30 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
 
 /// How long a cluster that acked a VM's intent is left to act on it before the
 /// same intent is sent again. A lifecycle drift stands for a whole stop grace
-/// or boot; sent every pass, each ack's `observed_at` write was the watch
-/// event that started the next pass, and one stopping guest cost tens of
-/// commands a second. (IKR-B74)
+/// or boot; sent every pass, each ack's write was the watch event that started
+/// the next pass, and one stopping guest cost tens of commands a second.
+/// (IKR-B74)
 const RETELL_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
 
-/// Whether the cluster was told about this VM since `intent` and within
-/// [`RETELL_AFTER`]: then telling it the same again is noise.
-pub(super) fn told_lately(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+/// Whether the cluster acked a hand-down of this VM within [`RETELL_AFTER`]:
+/// then telling it the same again is noise. Only the ack's own record counts,
+/// never a reported phase.
+pub(super) fn handed_down_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
     vm.status
-        .observed_at
-        .is_some_and(|at| at >= intent && now.signed_duration_since(at) < RETELL_AFTER)
+        .handed_down
+        .as_ref()
+        .is_some_and(|h| now.signed_duration_since(h.at) < RETELL_AFTER)
+}
+
+/// [`handed_down_lately`], and no earlier than `intent`: a hand-down from
+/// before an intent says nothing about it.
+pub(super) fn handed_down_since(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    handed_down_lately(vm, now)
+        && vm
+            .status
+            .handed_down
+            .as_ref()
+            .is_some_and(|h| h.at >= intent)
 }
 
 /// Whether the VM has to go down to its cluster now: the cluster lacks it, or
@@ -299,7 +312,7 @@ pub(super) fn told_lately(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) ->
 pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool {
     let stale = vm.metadata.generation > vm.status.observed_generation;
     let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some()
-        && !told_lately(vm, DateTime::<Utc>::MIN_UTC, now);
+        && !handed_down_lately(vm, now);
     missing || stale || drifted
 }
 
@@ -667,7 +680,7 @@ pub(super) async fn evacuate(
                 // idempotent at the cluster because what changes down there
                 // is one object's desired state. Once per `RETELL_AFTER`
                 // after the mark, not once per pass. (IKR-B74)
-                if told_lately(vm, mark.since, Utc::now()) {
+                if handed_down_since(vm, mark.since, Utc::now()) {
                     return Ok(());
                 }
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
@@ -754,6 +767,7 @@ pub(super) async fn dispatch_create(
                     // it, a status built before the create landed could pass
                     // for proof that the VM was never there.
                     v.status.observed_at = Some(Utc::now());
+                    v.status.handed_down = Some(controller_api::HandedDown { at: Utc::now() });
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has

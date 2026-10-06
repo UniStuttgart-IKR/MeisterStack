@@ -536,6 +536,19 @@ pub struct VmStatus {
     /// restarting it on the source after a pass or controller restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evacuating: Option<Evacuating>,
+    /// The last intent the cloud handed down to this VM's cluster and the
+    /// cluster acked. Cloud tier only, and written on that ack and nowhere
+    /// else: `observedAt` also moves with every reported phase, so it cannot
+    /// say when the cluster was last told. (IKR-B74)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_down: Option<HandedDown>,
+}
+
+/// A hand-down the cluster acked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HandedDown {
+    pub at: DateTime<Utc>,
 }
 
 /// A restart-move in flight: which machine it is leaving, and which half of

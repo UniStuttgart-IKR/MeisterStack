@@ -780,12 +780,13 @@ fn stopping(told: i64) -> Vm {
     v.settle(at(0));
     v.status.observed_generation = v.metadata.generation;
     v.status.observed_at = Some(at(told));
+    v.status.handed_down = Some(controller_api::HandedDown { at: at(told) });
     v
 }
 
-/// The lab's loop: every ack wrote `observed_at`, the write started the next
-/// pass, and the pass dispatched the same create again. Now the cluster that
-/// acked the intent is left to act on it for `RETELL_AFTER`.
+/// The lab's loop: every ack was a write, the write started the next pass,
+/// and the pass dispatched the same create again. Now the cluster that acked
+/// the intent is left to act on it for `RETELL_AFTER`.
 #[test]
 fn a_drift_the_cluster_acked_lately_is_not_dispatched_again() {
     let v = stopping(10);
@@ -813,8 +814,17 @@ fn a_missing_vm_or_a_new_generation_is_dispatched_at_once() {
 #[test]
 fn only_a_dispatch_after_the_intent_counts_as_told() {
     let v = stopping(10);
-    assert!(told_lately(&v, at(5), at(11)));
-    assert!(!told_lately(&v, at(12), at(13)));
+    assert!(handed_down_since(&v, at(5), at(11)));
+    assert!(!handed_down_since(&v, at(12), at(13)));
+}
+
+/// A phase the cluster reported a moment ago is not a hand-down: the drift
+/// it shows goes down unless the cluster itself acked the intent lately.
+#[test]
+fn a_fresh_report_does_not_stand_in_for_a_hand_down() {
+    let mut v = stopping(10);
+    v.status.observed_at = Some(at(100));
+    assert!(must_hand_down(&v, false, at(101)));
 }
 
 // --- IKR-B78: a cluster is offered only where one node can take the VM -----

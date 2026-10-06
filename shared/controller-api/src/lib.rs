@@ -67,7 +67,7 @@ pub use resources::{
     DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC, DEFAULT_QUOTA_STORAGE_GIB,
     DEFAULT_ROUTED_PREFIX_LEN, Draining, Evacuating, Evacuation, EvacuationStep, Event, EventSpec,
     EventType, FloatingIp, FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec,
-    FloatingPoolStatus, Image, ImageFormat, ImageNodeState, ImagePhase, ImagePhaseKind,
+    FloatingPoolStatus, HandedDown, Image, ImageFormat, ImageNodeState, ImagePhase, ImagePhaseKind,
     ImageReason, ImageSpec, ImageStatus, IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY,
     Locality, MANAGED_BY_CLOUD, MachineProfile, NatKind, NatRule, Node, NodeCapacity,
     NodeCondition, NodeConditionType, NodeSpec, NodeStatus, NodeSummary, PoolAtCluster,
