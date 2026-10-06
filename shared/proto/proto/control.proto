@@ -468,7 +468,10 @@ message PrepareMigration {
 }
 
 // Start sending the source guest to the prepared destination. Ack confirms
-// acceptance only. Errors and lost replies do not prove an abort; retain
+// acceptance only. An error with reason CannotSend is the source's final,
+// attempt-bound refusal before any stream opened: the guest stays on the
+// source and the destination may be torn down. Any other error, an empty
+// legacy reason included, or a lost reply does not prove an abort; retain
 // attempt protection until matching durable evidence resolves ownership.
 message MigrateOut {
   string id = 1;
