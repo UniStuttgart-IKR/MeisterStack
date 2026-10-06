@@ -269,8 +269,9 @@ default_bridge = "meister_br0"
 # vgpu_type, vram_profile_mib and vram_limit_mib. env may not set a variable a
 # typed field writes.
 # vram_reserve_mib goes with vram_profile_mib only and must stay below it
-# (unset, the backend reserves 256 MiB); beside a vgpu_type it is refused,
-# because a type carries its own reservation.
+# (unset, the backend reserves 256 MiB); without vram_profile_mib (beside a
+# cap, a vgpu_type, which carries its own reservation, or alone) the backend
+# would ignore it, so it is refused.
 #[device.nvrm.defaults]
 #vgpu_type        = "RTX2070-4Q"
 #managed_compat   = true

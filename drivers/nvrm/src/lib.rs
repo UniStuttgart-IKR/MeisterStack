@@ -161,21 +161,15 @@ impl NvrmParams {
     }
 
     /// The backend reserves from a profile size only (Leandro vram.rs
-    /// `decide`). Beside a vGPU type it ignores the reserve without a word,
-    /// so the node would run something other than what it was told; and a
-    /// reserve as large as the profile leaves the guest no memory, which the
-    /// backend refuses at start. Both are refused here instead.
+    /// `decide`). Beside a cap, a vGPU type or no policy at all it ignores
+    /// the reserve without a word, so the node would run something other
+    /// than what it was told; and a reserve as large as the profile leaves
+    /// the guest no memory, which the backend refuses at start. Both are
+    /// refused here instead.
     fn refuse_unusable_reserve(&self) -> device::Result<()> {
-        if self.vgpu_type.is_some() && self.vram_reserve_mib.is_some() {
-            return Err(DeviceError::InvalidSpec(
-                "vgpu_type and vram_reserve_mib are both set: a vGPU type carries its own \
-                 reservation and the backend ignores this one; drop vram_reserve_mib"
-                    .into(),
-            ));
-        }
         // 0 is the backend's "unset", for both.
         let Some(profile) = self.vram_profile_mib.filter(|&mib| mib > 0) else {
-            return Ok(());
+            return self.refuse_reserve_without_a_profile();
         };
         let set = self.vram_reserve_mib.filter(|&mib| mib > 0);
         let reserve = set.unwrap_or(BACKEND_DEFAULT_RESERVE_MIB);
@@ -202,6 +196,24 @@ impl NvrmParams {
         ]
         .into_iter()
         .try_for_each(|(name, mib)| refuse_beyond_byte_range(name, mib))
+    }
+
+    fn refuse_reserve_without_a_profile(&self) -> device::Result<()> {
+        let Some(reserve) = self.vram_reserve_mib else {
+            return Ok(());
+        };
+        let beside = if self.vgpu_type.is_some() {
+            "a vgpu_type, which carries its own reservation"
+        } else if self.vram_limit_mib.is_some() {
+            "a cap (vram_limit_mib)"
+        } else {
+            "no VRAM policy at all"
+        };
+        Err(DeviceError::InvalidSpec(format!(
+            "vram_reserve_mib = {reserve} is set beside {beside}: the backend reserves from \
+             vram_profile_mib only and ignores it there; drop vram_reserve_mib or set \
+             vram_profile_mib"
+        )))
     }
 
     /// Checked with the rest of the configuration so a node config naming a
@@ -977,6 +989,28 @@ mod tests {
             .expect_err("ignored by the backend")
             .to_string();
         assert!(said.contains("drop vram_reserve_mib"), "{said}");
+    }
+
+    /// Beside a cap the backend ignores a reserve just the same.
+    #[test]
+    fn a_reserve_beside_a_cap_is_refused() {
+        let both = p(serde_json::json!({ "vram_limit_mib": 2048, "vram_reserve_mib": 256 }));
+        let said = both
+            .validate()
+            .expect_err("ignored by the backend")
+            .to_string();
+        assert!(said.contains("a cap"), "{said}");
+    }
+
+    /// And a reserve with no VRAM policy at all reserves from nothing.
+    #[test]
+    fn a_reserve_alone_is_refused() {
+        let alone = p(serde_json::json!({ "vram_reserve_mib": 256 }));
+        let said = alone
+            .validate()
+            .expect_err("ignored by the backend")
+            .to_string();
+        assert!(said.contains("no VRAM policy"), "{said}");
     }
 
     /// A node configuration whose defaults and profiles the tests choose.
