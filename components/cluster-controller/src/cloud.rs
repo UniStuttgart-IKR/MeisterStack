@@ -819,12 +819,42 @@ async fn handle_create(
     // both are the owner's INTENT, both are mutable at the cloud's edge, and
     // this session is the only way either reaches the tier that acts on it.
     let evacuation_moved = current.spec.evacuation != spec.evacuation;
-    if !shape_moved && !evacuation_moved && current.spec.run_strategy == spec.run_strategy {
+    let placement_moved = placement_moved(&current, &spec, &c);
+    if !shape_moved
+        && !evacuation_moved
+        && !placement_moved
+        && current.spec.run_strategy == spec.run_strategy
+    {
         return Ok(());
     }
-    write_drift(store, &c.name, &spec).await?;
-    note_drift(&c.name, &spec, shape_moved, evacuation_moved);
+    write_drift(store, &c, &spec).await?;
+    note_drift(&c.name, &spec, shape_moved, evacuation_moved, placement_moved);
     Ok(())
+}
+
+/// The cloud VM's own labels under this tier's ownership marks: what the
+/// cluster's copy carries, so another cloud VM's `antiAffinity` term finds it
+/// on its node. The marks are written last, over anything the cloud sent
+/// under their keys. (IKR-B71)
+fn label_for_cloud(metadata: &mut controller_api::Metadata, c: &proto::CreateVm) {
+    metadata.labels = c
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    metadata.mark_managed_by_cloud(&c.uid);
+}
+
+/// Whether the owner's words about where on this cluster the VM may run moved:
+/// class, node selector, anti-affinity, or the labels other VMs' terms match.
+/// They decide the next placement here, and the cloud is their owner.
+fn placement_moved(current: &Vm, spec: &VmSpec, c: &proto::CreateVm) -> bool {
+    let mut labelled = current.metadata.clone();
+    label_for_cloud(&mut labelled, c);
+    current.spec.class != spec.class
+        || current.spec.node_selector != spec.node_selector
+        || current.spec.anti_affinity != spec.anti_affinity
+        || current.metadata.labels != labelled.labels
 }
 
 /// The cloud's create, as this tier's own object.
@@ -842,7 +872,7 @@ fn declared_for_cloud(c: &proto::CreateVm, spec: &VmSpec, traceparent: &str) -> 
             ..spec.clone()
         },
     );
-    vm.metadata.mark_managed_by_cloud(&c.uid);
+    label_for_cloud(&mut vm.metadata, c);
     if !traceparent.is_empty() {
         vm.metadata.set_traceparent(traceparent);
     }
@@ -887,12 +917,16 @@ fn shape_moved(current: &Vm, spec: &VmSpec, name: &str) -> anyhow::Result<bool> 
     Ok(moved)
 }
 
-/// The three fields that may drift, onto the stored object.
-async fn write_drift(store: &EtcdStore, name: &str, spec: &VmSpec) -> anyhow::Result<()> {
+/// The fields that may drift, onto the stored object.
+async fn write_drift(store: &EtcdStore, c: &proto::CreateVm, spec: &VmSpec) -> anyhow::Result<()> {
     store
-        .mutate::<Vm, _>(name, |v| {
+        .mutate::<Vm, _>(&c.name, |v| {
             v.spec.run_strategy = spec.run_strategy;
             v.spec.evacuation = spec.evacuation;
+            v.spec.class = spec.class.clone();
+            v.spec.node_selector = spec.node_selector.clone();
+            v.spec.anti_affinity = spec.anti_affinity.clone();
+            label_for_cloud(&mut v.metadata, c);
             if v.spec.vm != spec.vm {
                 v.spec.vm = spec.vm.clone();
                 // What `carry_generation` does at a REST edge, done by hand
@@ -906,14 +940,22 @@ async fn write_drift(store: &EtcdStore, name: &str, spec: &VmSpec) -> anyhow::Re
     Ok(())
 }
 
-/// Which of the three it was, for the log. The order is the order the caller
+/// Which of them it was, for the log. The order is the order the caller
 /// decided in.
-fn note_drift(name: &str, spec: &VmSpec, shape_moved: bool, evacuation_moved: bool) {
+fn note_drift(
+    name: &str,
+    spec: &VmSpec,
+    shape_moved: bool,
+    evacuation_moved: bool,
+    placement_moved: bool,
+) {
     if shape_moved {
         info!(vm = %name, "spec.vm volumes updated from the cloud");
     } else if evacuation_moved {
         info!(vm = %name, evacuation = spec.evacuation.as_str(),
               "evacuation policy updated from the cloud");
+    } else if placement_moved {
+        info!(vm = %name, "placement constraints updated from the cloud");
     } else {
         info!(vm = %name, strategy = ?spec.run_strategy, "run strategy updated from the cloud");
     }
@@ -2398,6 +2440,7 @@ mod tests {
             vni,
             floating_ips: floating.iter().map(|s| s.to_string()).collect(),
             routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
+            labels: Default::default(),
         }
     }
 
@@ -3130,6 +3173,71 @@ mod tests {
             store.get::<Router>("out").await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// IKR-B71 at this tier: the node selector, anti-affinity, class and labels the cloud was
+    /// given arrive on the stored object, move with a later create, and are what this tier's
+    /// scheduler places by.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_is_placed_here_by_the_constraints_the_cloud_was_given() {
+        let store = crate::test_etcd::fresh_store("cloud-placement-test").await;
+        let asking = |zone: &str| proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "class": "gpu",
+                "nodeSelector": { "network-node": zone },
+                "antiAffinity": [{ "selector": { "app": "web" } }],
+                "vm": { "vcpus": 1, "memory_mib": 512 },
+            })
+            .to_string(),
+            labels: [("app".to_string(), "web".to_string())].into(),
+            ..create(None, &[], &[])
+        };
+        handle_create(&store, asking("cobra3"), "")
+            .await
+            .expect("created");
+        let stored: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(stored.metadata.labels["app"], "web");
+        assert_eq!(stored.metadata.cloud_uid(), Some("uid-1"));
+
+        let node = |name: &str, zone: &str, hosted: &[&str]| controller_api::Candidate {
+            name: name.into(),
+            connected: true,
+            alive: true,
+            schedulable: true,
+            unhealthy: Vec::new(),
+            free: controller_api::Capacity {
+                vcpus: 8,
+                mem_mib: 8192,
+            },
+            catalogue: vec!["hypervisor/cloud-hypervisor".to_string()],
+            kind: controller_api::CandidateKind::Node,
+            labels: [("network-node".to_string(), zone.to_string())].into(),
+            accepts: vec!["gpu".to_string()],
+            hosted: hosted
+                .iter()
+                .map(|app| [("app".to_string(), app.to_string())].into())
+                .collect(),
+            machine: None,
+        };
+        let fleet = [
+            node("cobra2", "cobra2", &[]),
+            node("cobra3b", "cobra3", &["web"]),
+            node("cobra3", "cobra3", &[]),
+        ];
+        assert_eq!(
+            controller_api::Scheduler::assign(&controller_api::FirstFit, &stored, &fleet),
+            Some("cobra3".to_string()),
+            "the labelled node, and not the one already holding a web"
+        );
+
+        handle_create(&store, asking("cobra2"), "")
+            .await
+            .expect("the cloud moved the selector");
+        let moved: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(moved.spec.node_selector["network-node"], "cobra2");
+        assert_eq!(moved.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
     }
 
     /// The running VM `t`, stored as the cloud's object `cloud_uid`.

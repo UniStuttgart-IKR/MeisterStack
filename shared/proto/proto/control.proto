@@ -1055,6 +1055,10 @@ message CreateVm {
   // Cloud-resolved tenant routed prefixes used by NIC source filtering.
   // Empty means no routed-prefix claim.
   repeated string routed_subnets = 6;
+  // The cloud VM's metadata.labels. The cluster stores them on its copy, so a
+  // spec.antiAffinity term of another cloud VM finds this one on its node; the
+  // cloud ownership labels are set by the cluster over whatever arrives here.
+  map<string, string> labels = 7;
 }
 
 // Set deletionTimestamp on the cluster VM. Its finalizer uses DestroyInstance

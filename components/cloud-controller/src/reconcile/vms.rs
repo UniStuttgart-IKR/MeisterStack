@@ -703,6 +703,7 @@ pub(super) async fn dispatch_create(
         vni: tenant_vni(store, vm.spec.tenant.as_deref()).await?,
         floating_ips: addresses.floating_ips,
         routed_subnets: addresses.routed_subnets,
+        labels: vm.metadata.labels.clone().into_iter().collect(),
     });
 
     let dispatched = vm.metadata.generation;
@@ -893,6 +894,13 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
         // cannot set it through the cluster API.
         "evacuation": vm.spec.evacuation.as_str(),
         "tenant": vm.spec.tenant,
+        // The node half of placement is the cluster's to answer, so the owner's
+        // words about it have to reach the cluster's scheduler. The cluster
+        // selector stays here: it was answered when this cluster was chosen.
+        // (IKR-B71)
+        "class": vm.spec.class,
+        "nodeSelector": vm.spec.node_selector,
+        "antiAffinity": vm.spec.anti_affinity,
         "vm": vm.spec.vm,
     }))?)
 }

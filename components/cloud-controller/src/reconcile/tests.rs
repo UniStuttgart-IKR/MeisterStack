@@ -434,6 +434,26 @@ fn the_cluster_tier_parses_what_the_cloud_sends() {
     assert!(spec.node_name.is_none() && spec.cluster_name.is_none());
 }
 
+/// IKR-B71: a node selector, an anti-affinity term and a class set at the
+/// cloud reach the cluster's scheduler; the cluster selector, answered here,
+/// does not travel.
+#[test]
+fn the_node_half_of_placement_travels_to_the_cluster() {
+    let mut v = vm();
+    v.spec.class = "gpu".into();
+    v.spec.node_selector = [("network-node".to_string(), "cobra3".to_string())].into();
+    v.spec.cluster_selector = [("region".to_string(), "stuttgart".to_string())].into();
+    v.spec.anti_affinity = vec![controller_api::resources::AntiAffinity {
+        selector: [("app".to_string(), "web".to_string())].into(),
+        required: true,
+    }];
+    let spec: VmSpec = serde_json::from_str(&build_spec_json(&v).unwrap()).unwrap();
+    assert_eq!(spec.class, "gpu");
+    assert_eq!(spec.node_selector, v.spec.node_selector);
+    assert_eq!(spec.anti_affinity, v.spec.anti_affinity);
+    assert!(spec.cluster_selector.is_empty());
+}
+
 // --- the address book ----------------------------------------------------
 
 fn owned(name: &str, tenant: Option<&str>) -> Vm {
