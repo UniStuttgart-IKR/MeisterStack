@@ -235,10 +235,13 @@ async fn reconcile_router(
         .routed_subnets
         .iter()
         .filter_map(|named| {
+            // The tenant as well as the name: admission checks both, and a
+            // subnet released and cut again for somebody else under the same
+            // name must not be announced by this router.
             estate
                 .subnets
                 .iter()
-                .find(|s| &s.metadata.name == named)
+                .find(|s| &s.metadata.name == named && s.spec.tenant == router.spec.tenant)
                 .map(|s| s.spec.cidr.clone())
         })
         .filter(|cidr| !cidr.is_empty())
@@ -528,6 +531,7 @@ mod tests {
             "lab-out",
             controller_api::RouterSpec {
                 tenant: "lab".into(),
+                internal_addr: "10.30.0.1/24".into(),
                 ..Default::default()
             },
         );

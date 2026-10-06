@@ -72,6 +72,7 @@ pub(super) async fn create_floating_ip(
     if let Some(vm) = body.spec.vm.as_deref().filter(|v| !v.is_empty()) {
         check_vm_of_tenant(&st, vm, &owner).await?;
     }
+    check_router_binding(&st, &body.spec, &owner).await?;
 
     let pools = floating::all_pools(&st.store).await?;
     let pool = floating::pick_pool(&pools, Some(body.spec.pool.as_str()))?;
@@ -91,6 +92,45 @@ pub(super) async fn create_floating_ip(
     info!(address = %created.spec.address, tenant = %owner, pool = %pool.metadata.name,
           vm = ?created.spec.vm, "floating address reserved");
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Refuse a router binding that is not the tenant's own way out.
+///
+/// The router has to exist and be this tenant's, or the address would be
+/// translated in somebody else's namespace; a missing and a foreign router
+/// get the same answer, so the refusal names nobody else's router. The
+/// inside end has to be a guest on that router's overlay
+/// (`network::inside_address_refusal`). `nat_rules` checks both again when
+/// it renders, for what was stored before this edge did.
+async fn check_router_binding(
+    st: &ApiState,
+    spec: &controller_api::FloatingIpSpec,
+    tenant: &str,
+) -> Result<(), ApiError> {
+    if spec.router.is_empty() {
+        return Ok(());
+    }
+    let unknown = || {
+        invalid_field(
+            "spec.router",
+            format!("no router {:?} in this tenant", spec.router),
+        )
+    };
+    let router: controller_api::Router = match st.store.get(&spec.router).await {
+        Ok(router) => router,
+        Err(StoreError::NotFound(_)) => return Err(unknown()),
+        Err(e) => return Err(e.into()),
+    };
+    if router.spec.tenant != tenant {
+        return Err(unknown());
+    }
+    if spec.internal_address.is_empty() {
+        return Ok(());
+    }
+    match controller_api::network::inside_address_refusal(&router, &spec.internal_address) {
+        Some(why) => Err(invalid_field("spec.internalAddress", why)),
+        None => Ok(()),
+    }
 }
 
 pub(super) async fn get_floating_ip(
@@ -143,6 +183,7 @@ pub(super) async fn update_floating_ip(
     if let Some(vm) = body.spec.vm.as_deref().filter(|v| !v.is_empty()) {
         check_vm_of_tenant(&st, vm, &current.spec.tenant).await?;
     }
+    check_router_binding(&st, &body.spec, &current.spec.tenant).await?;
     keep_server_owned(&mut body.metadata, &current.metadata);
     check_owned(&current, &body, FLOATING_IP_OWNED)?;
     body.spec.vm = body.spec.vm.filter(|v| !v.is_empty());

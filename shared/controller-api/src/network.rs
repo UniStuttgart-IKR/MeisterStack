@@ -233,8 +233,7 @@ pub fn nat_rules(router: &Router, floating: &[FloatingIp], announced: &[String])
     }
     let mut ours: Vec<&FloatingIp> = floating
         .iter()
-        .filter(|f| f.spec.router == router.metadata.name)
-        .filter(|f| !f.spec.internal_address.is_empty() && !f.spec.address.is_empty())
+        .filter(|f| translates_through(router, f))
         .collect();
     ours.sort_by(|a, b| a.spec.address.cmp(&b.spec.address));
     rules.extend(ours.into_iter().map(|f| NatRule {
@@ -251,6 +250,52 @@ pub fn nat_rules(router: &Router, floating: &[FloatingIp], announced: &[String])
         logical_ip: prefix.clone(),
     }));
     rules
+}
+
+/// Whether `ip` is a one-to-one translation this router renders.
+///
+/// The router's name alone is not enough: the name may be another tenant's
+/// router by now, and a reservation written before admission checked the
+/// inside end may point anywhere. Both are checked again here, where the
+/// rule is made, so a stored object never becomes a DNAT into somebody
+/// else's namespace.
+fn translates_through(router: &Router, ip: &FloatingIp) -> bool {
+    ip.spec.router == router.metadata.name
+        && ip.spec.tenant == router.spec.tenant
+        && !ip.spec.address.is_empty()
+        && !ip.spec.internal_address.is_empty()
+        && inside_address_refusal(router, &ip.spec.internal_address).is_none()
+}
+
+/// Why `internal` cannot be the inside end of a floating address behind
+/// `router`, if it cannot.
+///
+/// The translation runs in the router's namespace, so its inside end has to
+/// be a guest on the router's own overlay: a host address of the prefix
+/// `spec.internalAddr` names, other than the router's own. Anything else is a
+/// public address DNATed to wherever the router's routing table leads. A
+/// router with no readable inside prefix cannot be checked and is refused.
+pub fn inside_address_refusal(router: &Router, internal: &str) -> Option<String> {
+    let name = &router.metadata.name;
+    let Ok(address) = internal.parse::<Ipv4Addr>() else {
+        return Some(format!("{internal:?} is not an ipv4 address"));
+    };
+    let inside = &router.spec.internal_addr;
+    let own = inside.split('/').next().and_then(|a| a.parse::<Ipv4Addr>().ok());
+    let (Some(own), Ok(prefix)) = (own, inside.parse::<common::net::Ipv4Range>()) else {
+        return Some(format!(
+            "router {name} has no inside prefix ({inside:?}) to place {internal} in"
+        ));
+    };
+    if address == own {
+        return Some(format!("{internal} is router {name}'s own inside address"));
+    }
+    if !prefix.is_allocatable(address) {
+        return Some(format!(
+            "{internal} is not a guest address on router {name}'s inside prefix {inside}"
+        ));
+    }
+    None
 }
 
 /// Resolved router configuration for a backend to apply without store lookups.
@@ -690,6 +735,57 @@ mod tests {
                 .iter()
                 .all(|r| r.kind != NatKind::Snat)
         );
+    }
+
+    /// IKR-B68: a reservation naming this router is rendered only when it is
+    /// the router's own tenant's and points at a guest on its inside prefix,
+    /// whatever admission let through before it checked.
+    #[test]
+    fn a_floating_address_is_translated_only_for_its_tenant_into_the_inside_prefix() {
+        let r = router("acme-out");
+        let reservation = |tenant: &str, inside: &str| {
+            FloatingIp::declare(
+                "198.51.100.9",
+                FloatingIpSpec {
+                    tenant: tenant.into(),
+                    address: "198.51.100.9".into(),
+                    router: "acme-out".into(),
+                    internal_address: inside.into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let dnats = |ip: FloatingIp| {
+            nat_rules(&r, &[ip], &[])
+                .into_iter()
+                .filter(|n| n.kind == NatKind::DnatAndSnat)
+                .count()
+        };
+        assert_eq!(dnats(reservation("acme", "10.42.0.9")), 1);
+        for (tenant, inside) in [
+            ("mallory", "10.42.0.9"),
+            ("acme", "10.128.1.103"),
+            ("acme", "10.42.0.1"),
+            ("acme", "10.42.0.255"),
+            ("acme", "not-an-address"),
+        ] {
+            assert_eq!(dnats(reservation(tenant, inside)), 0, "{tenant} {inside}");
+        }
+    }
+
+    /// The inside end is refused with a sentence saying which rule it broke,
+    /// and a router with no inside prefix cannot vouch for any address.
+    #[test]
+    fn an_inside_address_must_be_a_guest_on_the_routers_own_prefix() {
+        let mut r = router("acme-out");
+        assert_eq!(inside_address_refusal(&r, "10.42.0.9"), None);
+        let own = inside_address_refusal(&r, "10.42.0.1").expect("the router itself");
+        assert!(own.contains("own inside address"), "{own}");
+        let away = inside_address_refusal(&r, "1.1.1.1").expect("outside the prefix");
+        assert!(away.contains("10.42.0.1/24"), "{away}");
+        r.spec.internal_addr.clear();
+        let unknown = inside_address_refusal(&r, "10.42.0.9").expect("nothing to check against");
+        assert!(unknown.contains("no inside prefix"), "{unknown}");
     }
 
     /// A router keeps its address for life, so the cut is asked once — and

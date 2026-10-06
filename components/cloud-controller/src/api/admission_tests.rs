@@ -724,3 +724,110 @@ async fn a_cloud_init_naming_neither_or_both_a_literal_and_a_reference_is_refuse
         both.message()
     );
 }
+
+// --- IKR-B68: a floating address goes through its tenant's own router ------
+
+/// A private pool for the reservations below, and a router for each tenant.
+async fn cloud_with_routers(what: &str) -> ApiState {
+    let st = cloud(what).await;
+    st.store
+        .create(&FloatingPool::declare(
+            "lab",
+            controller_api::FloatingPoolSpec {
+                cidrs: vec!["198.51.100.0/24".into()],
+                default: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a pool");
+    for (tenant, inside) in [("a", "10.42.0.1/24"), ("b", "10.77.0.1/24")] {
+        st.store
+            .create(&controller_api::Router::declare(
+                &format!("{tenant}-out"),
+                controller_api::RouterSpec {
+                    tenant: tenant.into(),
+                    provider_network: "ext".into(),
+                    internal_addr: inside.into(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("a router");
+    }
+    st
+}
+
+async fn reserve_as(
+    st: &ApiState,
+    who: (Caller, CallerRole, CallerTenant),
+    router: &str,
+    inside: &str,
+) -> Result<FloatingIp, ApiError> {
+    let (caller, role, tenant) = who;
+    let body = FloatingIp::declare(
+        "",
+        controller_api::FloatingIpSpec {
+            router: router.into(),
+            internal_address: inside.into(),
+            ..Default::default()
+        },
+    );
+    create_floating_ip(
+        State(st.clone()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .map(|(_, Json(ip))| ip)
+}
+
+/// The lab's repro: a router that does not exist, another tenant's router,
+/// and an inside end off the router's prefix were all reserved.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_floating_address_is_bound_only_to_its_tenants_router_and_inside_prefix() {
+    let st = cloud_with_routers("b68").await;
+    for (router, inside, field) in [
+        ("no-such-router", "10.42.0.9", "spec.router"),
+        ("b-out", "10.77.0.10", "spec.router"),
+        ("a-out", "10.128.1.103", "spec.internalAddress"),
+        ("a-out", "10.42.0.1", "spec.internalAddress"),
+    ] {
+        let err = reserve_as(&st, member("a"), router, inside)
+            .await
+            .expect_err("not a's own way in");
+        assert_eq!(err.field(), Some(field), "{router} {inside}: {}", err.message());
+    }
+    // The missing router and b's router read the same: nothing of b's is named.
+    let foreign = reserve_as(&st, member("a"), "b-out", "10.77.0.10")
+        .await
+        .expect_err("b's router");
+    assert!(!foreign.message().contains("tenant b"), "{}", foreign.message());
+
+    let ok = reserve_as(&st, member("a"), "a-out", "10.42.0.9")
+        .await
+        .expect("a guest behind a's own router");
+    assert_eq!(ok.spec.router, "a-out");
+
+    // And an update is held to the same rule.
+    let (caller, role, tenant) = member("a");
+    let mut moved = ok.clone();
+    moved.spec.router = "b-out".into();
+    let err = update_floating_ip(
+        State(st.clone()),
+        Path(ok.metadata.name.clone()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(moved),
+    )
+    .await
+    .map(|Json(ip)| ip)
+    .expect_err("re-pointed at b's router");
+    assert_eq!(err.field(), Some("spec.router"));
+}
