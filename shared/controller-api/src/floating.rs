@@ -69,10 +69,13 @@ fn addresses(ips: &[FloatingIp]) -> BTreeSet<Ipv4Addr> {
 }
 
 /// Read reservations and reject a list/count mismatch rather than allocate
-/// from known partial inventory. List and count are separate reads.
+/// from known partial inventory. List and count come from one response, so a
+/// write landing between two reads cannot pass for an object that did not
+/// decode: a range claim's question after its write runs exactly while the
+/// other claim writes or takes itself back.
 pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
-    let ips = store.list::<FloatingIp>().await?;
-    if ips.len() != store.count::<FloatingIp>().await? {
+    let (ips, keys) = store.list_counted::<FloatingIp>().await?;
+    if ips.len() != keys {
         return Err(StoreError::Invalid(
             "some floatingip objects did not decode, so which addresses are taken cannot be \
              established; refusing rather than handing out one twice"
@@ -338,8 +341,8 @@ pub fn cut_subnet(
 /// and same reason as `all_reservations`, with the overlap check at stake
 /// instead of the address.
 pub async fn all_subnets(store: &EtcdStore) -> Result<Vec<RoutedSubnet>> {
-    let subnets = store.list::<RoutedSubnet>().await?;
-    if subnets.len() != store.count::<RoutedSubnet>().await? {
+    let (subnets, keys) = store.list_counted::<RoutedSubnet>().await?;
+    if subnets.len() != keys {
         return Err(StoreError::Invalid(
             "some routedsubnet objects did not decode, so an overlap check cannot be made; \
              refusing rather than cutting a subnet on top of another one"
@@ -351,8 +354,8 @@ pub async fn all_subnets(store: &EtcdStore) -> Result<Vec<RoutedSubnet>> {
 
 /// Every floating pool, with the same guard.
 pub async fn all_pools(store: &EtcdStore) -> Result<Vec<FloatingPool>> {
-    let pools = store.list::<FloatingPool>().await?;
-    if pools.len() != store.count::<FloatingPool>().await? {
+    let (pools, keys) = store.list_counted::<FloatingPool>().await?;
+    if pools.len() != keys {
         return Err(StoreError::Invalid(
             "some floatingpool objects did not decode; refusing rather than allocating out of \
              a list that is not all of them"
