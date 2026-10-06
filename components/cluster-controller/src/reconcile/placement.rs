@@ -42,11 +42,6 @@ pub(super) fn hosted_on(
         .collect()
 }
 
-/// Condition types used by candidate health checks and diagnostics.
-pub(crate) fn condition_types(conditions: &[controller_api::NodeCondition]) -> Vec<String> {
-    conditions.iter().map(|c| c.type_.clone()).collect()
-}
-
 /// Build candidates without changing readiness or reserving capacity.
 /// Readiness comes from shared status and heartbeat age, independent of which
 /// replica owns a session. Unlike live placement, this path uses `schedulable`
@@ -78,7 +73,7 @@ pub(crate) async fn candidates_for_preview(
             // machines are up.
             alive: ready,
             schedulable: node.spec.schedulable,
-            unhealthy: condition_types(&node.status.conditions),
+            unhealthy: controller_api::NodeCondition::vetoing(&node.status.conditions),
             free: free_on(&name, &node.status.capacity, &vms, overcommit),
             catalogue: node.status.capacity.capabilities,
             kind: CandidateKind::Node,
@@ -200,7 +195,7 @@ pub(super) async fn expire_and_collect_nodes(
             // usable and the one neither of the two above can carry: the node
             // that wedged in the mini-chaos run was connected and
             // schedulable for three hours and could not execute a command.
-            unhealthy: condition_types(&node.status.conditions),
+            unhealthy: controller_api::NodeCondition::vetoing(&node.status.conditions),
             free: free_on(&name, &node.status.capacity, vms, overcommit),
             catalogue: node.status.capacity.capabilities,
             kind: CandidateKind::Node,

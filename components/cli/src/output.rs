@@ -295,11 +295,15 @@ pub fn readiness(ready: bool, schedulable: bool, draining: bool, conditions: &[&
 }
 
 /// Shorten known conditions; preserve unfamiliar ones for newer agents.
+/// The word list is this column's own: the controller's condition types
+/// live in a crate the CLI does not link, and a type it has not heard of
+/// still reaches the operator in full.
 fn short_condition(condition: &str) -> String {
     match condition {
         "DiskPressure" => "pressure".to_string(),
         "StoreUnhealthy" => "store".to_string(),
         "CgroupUnusable" => "cgroup".to_string(),
+        "DriverUnavailable" => "driver".to_string(),
         other => other.replace(' ', "-"),
     }
 }
@@ -461,6 +465,11 @@ mod tests {
             "pressure,store"
         );
         assert_eq!(readiness(true, true, false, &["CgroupUnusable"]), "cgroup");
+        // It still takes vms, but the operator sees that a driver is missing.
+        assert_eq!(
+            readiness(true, true, false, &["DriverUnavailable"]),
+            "driver"
+        );
         // A word this CLI has never heard of still takes the node out of
         // `yes` and reaches the operator unswallowed.
         assert_eq!(readiness(true, true, false, &["FanFailure"]), "FanFailure");

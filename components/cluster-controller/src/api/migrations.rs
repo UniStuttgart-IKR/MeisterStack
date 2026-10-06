@@ -215,18 +215,8 @@ pub(crate) fn migration_refusal(
             vm.status.phase().kind().as_str()
         ));
     }
-    let devices = vm
-        .spec
-        .vm
-        .get("devices")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|d| !d.is_empty());
-    if devices {
-        return Some(format!(
-            "a vm with a passthrough or paravirtual device does not migrate live; set \
-             spec.evacuation = restart on {} to move it by reboot",
-            vm.metadata.name
-        ));
+    if let Some(why) = crate::migration::device_refusal(vm) {
+        return Some(why);
     }
     if let Some(disk) = inline_disk(&vm.spec.vm) {
         return Some(format!(

@@ -7,6 +7,12 @@
 //! Drivers choose commands and attachment formats. This crate handles process
 //! setup, socket-file readiness, logging, identity checks and termination.
 //! Reusing an owned backend requires both a live child and an existing socket.
+//!
+//! A backend that runs as the vmm user is handed its socket's directory, and
+//! that user may put anything there: a link to a file of the agent's, a FIFO
+//! nobody writes. Its log is therefore kept elsewhere, in a directory only
+//! the agent can enter ([`create_log_dir`]), and the backend writes it only
+//! through the descriptors it inherits.
 
 use std::path::Path;
 use std::time::Duration;
@@ -29,6 +35,9 @@ const COMM_LEN: usize = 15;
 
 /// How much of a dead backend's log to hang on the error that reports it.
 const TAIL_CHARS: usize = 800;
+
+/// The most of a log read to find those characters: four bytes each at most.
+const TAIL_BYTES: u64 = TAIL_CHARS as u64 * 4;
 
 /// Backend process failure or surrounding I/O failure.
 #[derive(Debug, thiserror::Error)]
@@ -130,24 +139,26 @@ impl BackendKind {
             span,
         } = io;
 
+        self.refuse_log_in_backend_dir(socket, log)?;
+
         // Remove stale sockets before readiness polling.
         let _ = tokio::fs::remove_file(socket).await;
 
-        let log_file = std::fs::File::create(log).map_err(|e| BackendError::Failed(e.into()))?;
-        // Transfer the socket directory and log before dropping backend identity.
-        // The log path remains readable when failure reporting reopens it.
-        if let Some(user) = &self.vmm_user {
-            if let Some(dir) = socket.parent() {
-                user.take(dir)
-                    .map_err(|e| BackendError::Failed(anyhow::anyhow!("{}: {e}", dir.display())))?;
-            }
-            user.take(log)
-                .map_err(|e| BackendError::Failed(anyhow::anyhow!("{}: {e}", log.display())))?;
+        let log_file = create_log(log).map_err(|e| {
+            BackendError::Failed(anyhow::anyhow!("creating {}: {e}", log.display()))
+        })?;
+        // The socket directory goes to the backend identity, so the backend
+        // can bind there. The log stays the agent's: the backend writes it
+        // through the descriptors below and never opens it by name.
+        if let Some(user) = &self.vmm_user
+            && let Some(dir) = socket.parent()
+        {
+            user.take(dir)
+                .map_err(|e| BackendError::Failed(anyhow::anyhow!("{}: {e}", dir.display())))?;
         }
-        let log_dup = log_file
-            .try_clone()
-            .map_err(|e| BackendError::Failed(e.into()))?;
-        cmd.stdout(log_file).stderr(log_dup);
+        let (stdout, stderr) = (log_file.try_clone(), log_file.try_clone());
+        cmd.stdout(stdout.map_err(|e| BackendError::Failed(e.into()))?)
+            .stderr(stderr.map_err(|e| BackendError::Failed(e.into()))?);
         if self.stdin_null {
             cmd.stdin(std::process::Stdio::null());
         }
@@ -189,10 +200,16 @@ impl BackendKind {
             None => BackendError::Failed(e.into()),
         })?;
         // Every early return after spawn must kill and reap the child through
-        // `abandon`; dropping a Tokio Child alone does not stop it.
-        let Some(pid) = child.id() else {
+        // `abandon`; dropping a Tokio Child alone does not stop it. A caller
+        // that drops this future mid-spawn returns early too, and the guard
+        // kills the child then.
+        let unready = KillUnlessReady {
+            kind: self,
+            child: &mut child,
+        };
+        let Some(pid) = unready.child.id() else {
             // Run cleanup for the exited child to ensure it is reaped.
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(BackendError::Died(format!(
                 "{} exited before pid could be read",
                 self.label
@@ -207,7 +224,7 @@ impl BackendKind {
         if let Some(cg) = cgroup
             && let Err(e) = cg.attach_pid(pid)
         {
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(BackendError::Failed(anyhow::anyhow!("cgroup attach: {e}")));
         }
 
@@ -219,16 +236,16 @@ impl BackendKind {
                 if socket.exists() {
                     break;
                 }
-                if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(Some(status)) = unready.child.try_wait() {
                     return Err(BackendError::Died(format!(
                         "{label} exited with {status} before its socket appeared; log tail:\n{}",
-                        tail_log(log)
+                        tail(&log_file)
                     )));
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(BackendError::Died(format!(
                         "{label} socket did not appear within {timeout:?}; log tail:\n{}",
-                        tail_log(log)
+                        tail(&log_file)
                     )));
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -240,11 +257,31 @@ impl BackendKind {
         // Kill and reap failed startups, including socket timeouts. An already
         // collected child makes cleanup a no-op.
         if let Err(e) = waited {
-            self.abandon(&mut child).await;
+            self.abandon(unready.child).await;
             return Err(e);
         }
 
+        unready.ready();
         Ok((pid, Backend { child }))
+    }
+
+    /// A log inside the directory handed to the backend user could be
+    /// replaced by that user between any two calls; it belongs in one only
+    /// the agent can write.
+    fn refuse_log_in_backend_dir(&self, socket: &Path, log: &Path) -> Result<()> {
+        let (Some(user), Some(dir)) = (&self.vmm_user, socket.parent()) else {
+            return Ok(());
+        };
+        if log.starts_with(dir) {
+            return Err(BackendError::Failed(anyhow::anyhow!(
+                "the {} log {} lies in {}, which is handed to {user}; a backend's log \
+                 belongs in a directory only the agent can write",
+                self.label,
+                log.display(),
+                dir.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Kill and reap a child after failed startup. Cleanup is explicit because
@@ -300,21 +337,36 @@ impl BackendKind {
     /// line. Both checks are needed because PIDs can be reused by another backend
     /// of the same kind. An unreadable or absent process fails the check.
     pub fn is_ours(&self, pid: u32, socket: &Path) -> bool {
-        if self.comm.is_empty() {
-            return false;
+        self.has_our_name(pid) && names_socket(pid, socket).unwrap_or(false)
+    }
+
+    /// The backend of this kind serving `socket`, found by scanning `/proc`,
+    /// for a socket nobody recorded a pid for. A process of this name whose
+    /// command line cannot be read is an error and not a "no": it may be the
+    /// one.
+    pub fn find_serving(&self, socket: &Path) -> std::io::Result<Option<u32>> {
+        for entry in std::fs::read_dir("/proc")? {
+            let Some(pid) = entry?.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            if !self.has_our_name(pid) {
+                continue;
+            }
+            match names_socket(pid, socket) {
+                Ok(true) => return Ok(Some(pid)),
+                Ok(false) => {}
+                // Exited between the listing and the read.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-        let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|comm| comm.trim() == self.comm)
-            .unwrap_or(false);
-        if !comm_matches {
-            return false;
-        }
-        // Match NUL-delimited arguments directly so spaces cannot merge argument boundaries.
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            return false;
-        };
-        let needle = socket.as_os_str().as_encoded_bytes();
-        !needle.is_empty() && cmdline.windows(needle.len()).any(|w| w == needle)
+        Ok(None)
+    }
+
+    fn has_our_name(&self, pid: u32) -> bool {
+        !self.comm.is_empty()
+            && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == self.comm)
     }
 
     fn signal(&self, pid: u32, sig: Signal) {
@@ -328,6 +380,47 @@ impl BackendKind {
             nix::sys::signal::kill(pid, sig)
         };
     }
+}
+
+/// A spawned backend nobody has been handed yet. Dropped before [`ready`],
+/// as when the future spawning it is cancelled, it kills the backend: nothing
+/// else knows of it, so nothing else would ever stop it.
+///
+/// [`ready`]: KillUnlessReady::ready
+struct KillUnlessReady<'a> {
+    kind: &'a BackendKind,
+    child: &'a mut tokio::process::Child,
+}
+
+impl KillUnlessReady<'_> {
+    /// The backend is up and goes to the caller.
+    fn ready(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for KillUnlessReady<'_> {
+    fn drop(&mut self) {
+        // `None` once `abandon` or `try_wait` reaped it: then its pid may
+        // belong to someone else already and is not signalled.
+        if let Some(pid) = self.child.id() {
+            warn!(
+                pid,
+                backend = self.kind.label,
+                "the start of this backend was abandoned; killing it"
+            );
+            self.kind.signal(pid, Signal::SIGKILL);
+        }
+    }
+}
+
+/// Whether `pid`'s command line holds `socket`. Matches NUL-delimited
+/// arguments directly so spaces cannot merge argument boundaries; a zombie's
+/// empty command line names nothing.
+fn names_socket(pid: u32, socket: &Path) -> std::io::Result<bool> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let needle = socket.as_os_str().as_encoded_bytes();
+    Ok(!needle.is_empty() && cmdline.windows(needle.len()).any(|w| w == needle))
 }
 
 /// Where one backend's files live and how long it gets to come up.
@@ -371,19 +464,87 @@ pub fn pid_is_alive(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
-/// The tail of a backend's log, for the error that reports its death.
-pub fn tail_log(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .map(|s| {
-            s.chars()
-                .rev()
-                .take(TAIL_CHARS)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect()
-        })
-        .unwrap_or_else(|_| "<no log>".into())
+/// Create `dir` for backend logs: a directory of the agent's, mode 0700,
+/// that no backend is handed. One that is a link, or that belongs to someone
+/// else, is refused: whoever controls it controls what the agent opens there.
+pub fn create_log_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let at = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(at)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(at(e)),
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(dir).map_err(at)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory; backend logs need one of the agent's own",
+            dir.display()
+        )));
+    }
+    let me = nix::unistd::Uid::effective().as_raw();
+    if meta.uid() != me {
+        return Err(std::io::Error::other(format!(
+            "{} belongs to uid {}, not to this agent (uid {me}); backend logs need a \
+             directory only the agent can write",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(at)?;
+    }
+    Ok(())
+}
+
+/// A new, empty log for one start. Whatever is at the path goes first, and
+/// the file is then created anew (`O_EXCL`, which neither follows a link nor
+/// opens a FIFO that won the race; `O_NOFOLLOW` says so twice). Readable,
+/// so the agent can quote it through this same descriptor.
+fn create_log(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("the new log is not a regular file"));
+    }
+    Ok(file)
+}
+
+/// The tail of a backend's log, for the error that reports its death. Read
+/// through the agent's own descriptor and never by name again, so nothing
+/// put at the path since can be quoted in its place; at most [`TAIL_BYTES`]
+/// are read, however much the backend wrote.
+fn tail(log: &std::fs::File) -> String {
+    use std::os::unix::fs::FileExt;
+    let read = || -> std::io::Result<Vec<u8>> {
+        let len = log.metadata()?.len();
+        let start = len.saturating_sub(TAIL_BYTES);
+        let mut bytes = vec![0; (len - start) as usize];
+        let n = log.read_at(&mut bytes, start)?;
+        bytes.truncate(n);
+        Ok(bytes)
+    };
+    match read() {
+        Ok(bytes) => last_chars(&String::from_utf8_lossy(&bytes), TAIL_CHARS),
+        Err(e) => format!("<the log could not be read: {e}>"),
+    }
+}
+
+fn last_chars(s: &str, n: usize) -> String {
+    let skip = s.chars().count().saturating_sub(n);
+    s.chars().skip(skip).collect()
 }
 
 /// Teardown is idempotent: a file that is already gone is a file removed.
@@ -471,17 +632,26 @@ mod tests {
         assert!(!kind.is_ours(pid, std::path::Path::new("")));
     }
 
+    /// A socket with no recorded pid is traced to the process that names it.
+    #[test]
+    fn the_backend_serving_a_socket_is_found_without_its_pid() {
+        let me =
+            std::fs::read_to_string(format!("/proc/{}/comm", std::process::id())).expect("linux");
+        let kind = BackendKind::detached("test", me.trim(), 1);
+        let found = kind
+            .find_serving(&own_cmdline_argument())
+            .expect("/proc reads");
+        assert!(found.is_some(), "this test process names its own argv[0]");
+        let nobody = std::path::Path::new("/run/meisterstack/nvrm/nobody-serves-this.sock");
+        assert_eq!(kind.find_serving(nobody).expect("/proc reads"), None);
+    }
+
     #[test]
     fn liveness_of_a_pid_that_cannot_exist() {
         assert!(pid_is_alive(std::process::id()));
         // Use an impossible positive PID. u32::MAX becomes -1 for kill(2),
         // which addresses every permitted process instead of an absent one.
         assert!(!pid_is_alive(i32::MAX as u32));
-    }
-
-    #[test]
-    fn a_missing_log_reads_as_no_log_rather_than_an_empty_tail() {
-        assert_eq!(tail_log(Path::new("/nonexistent/backend.log")), "<no log>");
     }
 
     /// A failed cgroup attachment must kill and reap the spawned process.
@@ -549,16 +719,136 @@ mod tests {
     /// must not put a megabyte into an API error.
     #[test]
     fn the_log_tail_is_the_last_of_it() {
+        use std::io::Write;
         let temp = tempfile::tempdir().expect("a temp dir");
-        let path = temp.path().join("backend.log");
+        let mut log = create_log(&temp.path().join("backend.log")).expect("a log");
         let body: String = std::iter::repeat_n('x', TAIL_CHARS)
             .chain("THE END".chars())
             .collect();
-        std::fs::write(&path, format!("THE BEGINNING{body}")).unwrap();
+        write!(log, "THE BEGINNING{body}").expect("written");
 
-        let tail = tail_log(&path);
+        let tail = tail(&log);
         assert_eq!(tail.chars().count(), TAIL_CHARS);
         assert!(tail.ends_with("THE END"), "{tail}");
         assert!(!tail.contains("THE BEGINNING"));
+    }
+
+    /// The tail comes from the agent's own descriptor: a file put at the
+    /// log's path afterwards, here a link to something else, is not quoted.
+    #[test]
+    fn the_tail_is_read_from_the_log_that_was_opened_not_from_its_path() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let path = temp.path().join("backend.log");
+        let mut log = create_log(&path).expect("a log");
+        write!(log, "the backend's own words").expect("written");
+        let secret = temp.path().join("secret");
+        std::fs::write(&secret, "not for an api error").expect("a file to aim at");
+        std::fs::remove_file(&path).expect("unlinked");
+        std::os::unix::fs::symlink(&secret, &path).expect("a link in its place");
+
+        assert_eq!(tail(&log), "the backend's own words");
+    }
+
+    /// `f` on a thread, given at most ten seconds: an open that waits on a
+    /// FIFO fails the test instead of hanging it.
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("finished without waiting on anything")
+    }
+
+    /// Whatever sits at a log's path, a link or a FIFO, is replaced by a new
+    /// file of the agent's: the link's target is not written, and the FIFO
+    /// is not waited on.
+    #[test]
+    fn a_link_or_a_fifo_at_the_log_path_is_replaced_not_followed() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "untouched").expect("a file to aim at");
+        let linked = temp.path().join("linked.log");
+        std::os::unix::fs::symlink(&victim, &linked).expect("a link");
+        let fifo = temp.path().join("fifo.log");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("a fifo");
+
+        for path in [linked, fifo] {
+            let at = path.clone();
+            within_ten_seconds(move || create_log(&at)).expect("a new log");
+            let meta = std::fs::symlink_metadata(&path).expect("there");
+            assert!(meta.is_file(), "{} is a plain file now", path.display());
+        }
+        assert_eq!(std::fs::read(&victim).expect("still there"), b"untouched");
+    }
+
+    /// The agent itself, as a `VmmUser`: a spawn refused before it switches
+    /// identity needs no second account.
+    fn me() -> agent_api::VmmUser {
+        let gid = nix::unistd::Gid::effective().as_raw();
+        agent_api::VmmUser {
+            name: "me".into(),
+            uid: nix::unistd::Uid::effective().as_raw(),
+            gid,
+            groups: vec![gid],
+        }
+    }
+
+    /// A backend that runs as the vmm user does not get its log in the
+    /// directory handed to that user, not even in a subdirectory of it.
+    #[tokio::test]
+    async fn a_log_in_the_directory_handed_to_the_backend_user_is_refused() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let socket = temp.path().join("backend.sock");
+        let kind = BackendKind::child("sleep", "sleep").as_user(Some(me()));
+        for log in [
+            temp.path().join("backend.log"),
+            temp.path().join("logs").join("backend.log"),
+        ] {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("600");
+            let io = BackendIo {
+                socket: &socket,
+                log: &log,
+                timeout: Duration::from_secs(30),
+                cgroup: None,
+                span: tracing::Span::none(),
+            };
+            let said = kind
+                .spawn(cmd, io)
+                .await
+                .map(|(pid, _)| pid)
+                .expect_err("the backend user could swap it")
+                .to_string();
+            assert!(said.contains("only the agent can write"), "{said}");
+            assert!(!log.exists(), "nothing was created: {}", log.display());
+        }
+    }
+
+    /// A log directory is the agent's alone, whatever mode it was left in.
+    #[test]
+    fn a_log_directory_is_made_the_agents_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dir = temp.path().join("logs").join("nvrm");
+        create_log_dir(&dir).expect("created");
+        let mode = |d: &Path| std::fs::metadata(d).expect("there").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("opened");
+        create_log_dir(&dir).expect("taken back");
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    /// A link where the log directory should be is refused, not followed.
+    #[test]
+    fn a_link_in_place_of_the_log_directory_is_refused() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("a directory");
+        let dir = temp.path().join("logs");
+        std::os::unix::fs::symlink(&elsewhere, &dir).expect("a link");
+        let said = create_log_dir(&dir).expect_err("a link").to_string();
+        assert!(said.contains("not a directory"), "{said}");
     }
 }

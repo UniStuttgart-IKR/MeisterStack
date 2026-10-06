@@ -562,8 +562,9 @@ fn nics_with_ids(nics: Vec<NewNic>, default_bridge: &str) -> anyhow::Result<Vec<
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-/// Reject NVRM operator-only params before creating a record. The driver also
-/// checks them at use time; backend privilege and environment belong to node config.
+/// Reject operator-only params of the GPU drivers before creating a record.
+/// The drivers also check them at use time; backend choice, sandboxing,
+/// privilege and environment belong to node config.
 fn refuse_operator_only_device_params(
     driver: &str,
     params: Option<&serde_json::Value>,
@@ -571,11 +572,12 @@ fn refuse_operator_only_device_params(
     let Some(params) = params else {
         return Ok(());
     };
-    if driver == crate::drivers::DRIVER_NVRM {
-        nvrm_driver::refuse_operator_only_params(params)
-            .map_err(|said| anyhow::anyhow!("{said}"))?;
-    }
-    Ok(())
+    let refused = match driver {
+        crate::drivers::DRIVER_NVRM => nvrm_driver::refuse_operator_only_params(params),
+        crate::drivers::DRIVER_CROSVM_GPU => crosvm_gpu_driver::refuse_operator_only_params(params),
+        _ => Ok(()),
+    };
+    refused.map_err(|said| anyhow::anyhow!("{said}"))
 }
 
 /// Allocate device IDs and parse each partitioning mode.
@@ -615,6 +617,41 @@ fn non_empty(s: String) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// IKR-B21: a crosvm-gpu spec chooses a profile and sets no backend
+    /// parameter, neither as tenant default nor through a controller request.
+    #[test]
+    fn a_vm_document_may_not_configure_the_crosvm_gpu_backend() {
+        let device = |driver: Option<&str>, params: serde_json::Value| NewDevice {
+            driver: driver.map(str::to_string),
+            partition: "mediated".into(),
+            profile: Some("venus".into()),
+            params: Some(params),
+        };
+        devices_with_ids(vec![device(Some("crosvm-gpu"), serde_json::json!({}))])
+            .expect("a profile and nothing else");
+
+        // The default driver is crosvm-gpu, so leaving the name out changes nothing.
+        for driver in [Some("crosvm-gpu"), None] {
+            let err = devices_with_ids(vec![device(
+                driver,
+                serde_json::json!({ "implicit_render_server": false }),
+            )])
+            .expect_err("the sandbox is the node's");
+            let said = format!("{err:#}");
+            assert!(said.contains("implicit_render_server"), "{said}");
+            assert!(said.contains("device.crosvm-gpu"), "{said}");
+        }
+
+        let err = DeviceWithId::try_from(proto::DeviceSpec {
+            id: Uuid::new_v4().to_string(),
+            partition: "mediated".into(),
+            driver_name: "crosvm-gpu".into(),
+            params_json: r#"{"backend": "gfxstream"}"#.into(),
+        })
+        .expect_err("typed requests are held to the same rule");
+        assert!(format!("{err:#}").contains("backend"), "{err:#}");
+    }
+
     /// NVRM specs may select a vGPU type but cannot set backend privilege or environment.
     #[test]
     fn a_vm_document_may_not_configure_the_nvrm_backend() {
@@ -645,13 +682,13 @@ mod tests {
             );
         }
 
-        // Other drivers retain their own parameter validation.
+        // Drivers without an allowlist retain their own parameter validation.
         assert!(
             devices_with_ids(vec![NewDevice {
-                driver: Some("crosvm-gpu".into()),
+                driver: Some("input".into()),
                 partition: "mediated".into(),
                 profile: None,
-                params: Some(serde_json::json!({ "anything": "at all" })),
+                params: Some(serde_json::json!({ "evdev": "/dev/input/event0" })),
             }])
             .is_ok()
         );

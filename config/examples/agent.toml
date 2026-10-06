@@ -248,15 +248,32 @@ default_bridge = "meister_br0"
 # Deadline for the backend's Unix socket to appear.
 #socket_timeout_ms = 5000
 
-# Optional hard VRAM admission budget. Per-type max_instance is enforced
-# independently; without a budget, VRAM overcommit is warned about.
+# Optional hard VRAM admission budget. Once a vGPU type is on the card, the
+# card itself is a hard limit too: per-type max_instance, all admitted
+# sizes together within vgpu_available_mib, and no backend without a
+# vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
+# Under a budget every nvrm device needs a VRAM limit (a cap, a profile
+# size or a vgpu_type); one without could exceed it alone and is refused.
+# Without either, nothing caps the sum; the agent notes it at debug level
+# only. Admission counts the devices of every vm this node has a record of,
+# running or stopped: a stopped vm keeps its share.
 #vram_budget_mib = 8192
 
-# Merge defaults < profile < VM parameters. Avoid combining vgpu_type with
-# vram_limit_mib. Backend-specific env overrides typed fields.
+# The host's share of the card in MiB that vgpuprofile subtracts before it
+# derives vGPU types. Required once a vgpu_type is configured or requested:
+# measured instead, the running guests would count as the host's share after
+# an agent restart and the same type would resolve to a smaller card.
+#vgpu_host_reserve_mib = 1024
+
+# Merge defaults < profile < VM parameters. The merged result may name one of
+# vgpu_type, vram_profile_mib and vram_limit_mib. env may not set a variable a
+# typed field writes.
+# vram_reserve_mib goes with vram_profile_mib only and must stay below it
+# (unset, the backend reserves 256 MiB); without vram_profile_mib (beside a
+# cap, a vgpu_type, which carries its own reservation, or alone) the backend
+# would ignore it, so it is refused.
 #[device.nvrm.defaults]
 #vgpu_type        = "RTX2070-4Q"
-#vram_reserve_mib = 256
 #managed_compat   = true
 #admin_priv       = false
 
@@ -278,6 +295,10 @@ default_bridge = "meister_br0"
 
 # Deadline for the backend's Unix socket to appear.
 #socket_timeout_ms = 5000
+
+# The host input nodes a vm may take, exactly as a spec's params.evdev names
+# them. A node not listed is never given to a guest; unset offers none.
+#evdev = ["/dev/input/by-id/usb-Example_Keyboard-event-kbd"]
 
 # Allowlist complete PCI devices for the vfio driver. Only these addresses
 # may be assigned; keep management devices out of this list.

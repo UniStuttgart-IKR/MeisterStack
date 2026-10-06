@@ -620,8 +620,13 @@ async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
     let driver = input_driver::InputDriver::new(input_driver::InputDriverConfig {
         binary: PathBuf::from(&backend),
         run_dir: dir.path().join("input"),
+        log_dir: dir.path().join("backend-logs").join("input"),
         socket_timeout: Duration::from_secs(10),
         vmm_user: user.clone(),
+        evdev: std::env::var_os("MEISTER_INPUT_DEVICE")
+            .map(PathBuf::from)
+            .into_iter()
+            .collect(),
     })
     .expect("a driver over the upstream backend");
 

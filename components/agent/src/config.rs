@@ -447,6 +447,9 @@ pub struct NvrmConfig {
     #[serde(default = "default_nvrm_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
     pub vram_budget_mib: Option<u64>,
+    /// The host's share of the card in MiB that `vgpuprofile` subtracts before
+    /// deriving vGPU types. Required once a vGPU type is configured or requested.
+    pub vgpu_host_reserve_mib: Option<u64>,
     #[serde(default)]
     pub defaults: NvrmParams,
     #[serde(default)]
@@ -461,6 +464,10 @@ pub struct InputConfig {
     /// Backend socket timeout; defaults to `input_driver::DEFAULT_SOCKET_TIMEOUT_MS`.
     #[serde(default = "default_input_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
+    /// The host input nodes vms may take, as a spec must name them; see
+    /// `input_driver::InputDriverConfig::evdev`. Unset offers none.
+    #[serde(default)]
+    pub evdev: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

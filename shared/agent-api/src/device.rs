@@ -45,6 +45,39 @@ pub fn default_device_driver() -> String {
     "crosvm-gpu".to_string()
 }
 
+/// Refuse device parameters a vm spec may not set. `allowed` names the keys a
+/// tenant may choose; every other backend setting belongs to the node's
+/// `[device.<driver>]` configuration, reached from a spec through a profile.
+/// The refusal names the key and where it belongs.
+pub fn refuse_params_outside(
+    driver: &str,
+    allowed: &[&str],
+    params: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let serde_json::Value::Object(fields) = params else {
+        return Err(format!("{driver} params must be an object, not {params}"));
+    };
+    match fields.keys().find(|key| !allowed.contains(&key.as_str())) {
+        Some(key) => Err(format!(
+            "{driver} params.{key} is the node's to set and not a spec's; {}, and everything \
+             else comes from [device.{driver}] on the node",
+            what_a_spec_may_name(allowed)
+        )),
+        None => Ok(()),
+    }
+}
+
+fn what_a_spec_may_name(allowed: &[&str]) -> String {
+    if allowed.is_empty() {
+        "a vm spec chooses one of the node's profiles (spec.profile)".to_string()
+    } else {
+        format!(
+            "a vm spec may name [{}] and a profile (spec.profile)",
+            allowed.join(", ")
+        )
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DeviceAttachment {
     VfioPci {
@@ -99,17 +132,62 @@ pub trait DeviceDriver: Send + Sync {
     }
 
     /// Check declared device claims before creating resources. `claimed`
-    /// contains this driver's specs from every other VM in the persistent
-    /// store, so conflicts remain visible after agent restart.
+    /// holds this driver's devices from every other VM record in the
+    /// persistent store, running or not, so a conflict is visible after an
+    /// agent restart and a stopped VM keeps what it was admitted to.
     ///
-    /// Drivers may separately enforce live-backend limits in `create`, such
-    /// as NVRM VRAM and instance budgets.
-    fn admit(
+    /// The agent admits before every `create` of a VM's devices (provision,
+    /// restart) and writes the VM's record under the same operations lock, so
+    /// a driver that shares a resource between VMs accounts for it here,
+    /// against the store, and not in `create`. Reception of a migrating VM
+    /// refuses devices outright and never gets this far.
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        claimed: &[(crate::VmId, DeviceSpec)],
+        claimed: &[ClaimedDevice],
     ) -> Result<()> {
         let _ = (requested, claimed);
         Ok(())
+    }
+}
+
+/// A device another VM's persisted record names, as `admit` sees it.
+#[derive(Clone, Debug)]
+pub struct ClaimedDevice {
+    pub vm: crate::VmId,
+    pub id: DeviceId,
+    pub spec: DeviceSpec,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key outside the allowlist is refused by name, with where it belongs.
+    #[test]
+    fn a_spec_may_set_only_the_keys_its_driver_allows() {
+        let allowed = ["vgpu_type"];
+        refuse_params_outside("nvrm", &allowed, &serde_json::json!({ "vgpu_type": "4Q" }))
+            .expect("allowed");
+        let said = refuse_params_outside("nvrm", &allowed, &serde_json::json!({ "env": {} }))
+            .expect_err("not allowed");
+        assert!(said.contains("params.env"), "{said}");
+        assert!(said.contains("[device.nvrm]"), "{said}");
+    }
+
+    /// With nothing allowed, the refusal points at profiles instead of an empty list.
+    #[test]
+    fn a_driver_that_allows_nothing_points_at_its_profiles() {
+        refuse_params_outside("crosvm-gpu", &[], &serde_json::json!({})).expect("no keys");
+        let said = refuse_params_outside("crosvm-gpu", &[], &serde_json::json!({ "vulkan": true }))
+            .expect_err("not a spec's");
+        assert!(said.contains("spec.profile"), "{said}");
+        assert!(!said.contains("[]"), "{said}");
+    }
+
+    #[test]
+    fn params_that_are_not_an_object_are_refused() {
+        refuse_params_outside("crosvm-gpu", &[], &serde_json::json!("venus"))
+            .expect_err("a string is not a parameter set");
     }
 }

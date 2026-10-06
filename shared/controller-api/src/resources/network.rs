@@ -142,7 +142,14 @@ pub fn accepts_class(accepts: &[String], class: &str) -> bool {
 pub fn cluster_accepts(nodes: &[crate::NodeSummary]) -> Vec<String> {
     let usable: Vec<&crate::NodeSummary> = nodes
         .iter()
-        .filter(|n| n.ready && n.schedulable && n.conditions.is_empty())
+        .filter(|n| {
+            n.ready
+                && n.schedulable
+                && !n
+                    .conditions
+                    .iter()
+                    .any(crate::NodeCondition::vetoes_placement)
+        })
         .collect();
     if usable.is_empty() || usable.iter().any(|n| n.accepts.is_empty()) {
         return Vec::new();

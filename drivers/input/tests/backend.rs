@@ -20,12 +20,16 @@ trap 'rm -f "$socket"; exit 0' TERM
 while :; do sleep 0.05; done
 "#;
 
+/// The nodes these tests' operator offers: two stand-ins for evdev, and the
+/// alias `<root>/event` a test may link to one of them.
 fn driver(root: &Path, binary: PathBuf, timeout: Duration) -> InputDriver {
     InputDriver::new(InputDriverConfig {
         binary,
         run_dir: root.join("run"),
+        log_dir: root.join("logs"),
         socket_timeout: timeout,
         vmm_user: None,
+        evdev: vec!["/dev/null".into(), "/dev/zero".into(), root.join("event")],
     })
     .unwrap()
 }
@@ -173,8 +177,52 @@ async fn rejects_legacy_and_invalid_sources() {
     assert!(driver.create(&id, &s, None).await.is_err());
 }
 
-#[test]
-fn admission_excludes_aliases_and_duplicates() {
+/// Another VM's record holding `spec`, as the agent hands it to `admit`.
+fn held(spec: DeviceSpec) -> agent_api::device::ClaimedDevice {
+    agent_api::device::ClaimedDevice {
+        vm: agent_api::VmId::new_v4(),
+        id: DeviceId::new_v4(),
+        spec,
+    }
+}
+
+/// IKR-B42: a spec may name only a node the operator listed, however real
+/// the device it names; the host's other character devices are not a
+/// tenant's to take.
+#[tokio::test]
+async fn a_node_the_operator_did_not_list_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(temp.path(), LISTENS);
+    let unlisted = spec(Path::new("/dev/full"));
+    let said = driver
+        .admit(&[(DeviceId::new_v4(), unlisted.clone())], &[])
+        .await
+        .expect_err("not offered")
+        .to_string();
+    assert!(said.contains("[device.input].evdev"), "{said}");
+    let created = driver.create(&DeviceId::new_v4(), &unlisted, None).await;
+    assert!(created.is_err(), "nor started past admission");
+}
+
+/// An empty list offers nothing at all.
+#[tokio::test]
+async fn a_node_with_no_listed_inputs_offers_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = InputDriver::new(InputDriverConfig {
+        binary: std::env::current_exe().unwrap(),
+        run_dir: temp.path().join("run"),
+        log_dir: temp.path().join("logs"),
+        socket_timeout: Duration::from_millis(1),
+        vmm_user: None,
+        evdev: Vec::new(),
+    })
+    .unwrap();
+    let null = (DeviceId::new_v4(), spec(Path::new("/dev/null")));
+    assert!(driver.admit(&[null], &[]).await.is_err());
+}
+
+#[tokio::test]
+async fn admission_excludes_aliases_and_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let driver = fake(temp.path(), LISTENS);
     let alias = temp.path().join("event");
@@ -183,19 +231,18 @@ fn admission_excludes_aliases_and_duplicates() {
     let b = (DeviceId::new_v4(), spec(&alias));
     assert!(
         driver
-            .admit(
-                std::slice::from_ref(&b),
-                &[(agent_api::VmId::new_v4(), a.1.clone())]
-            )
+            .admit(std::slice::from_ref(&b), &[held(a.1.clone())])
+            .await
             .is_err()
     );
-    assert!(driver.admit(&[a, b], &[]).is_err());
+    assert!(driver.admit(&[a, b], &[]).await.is_err());
     assert!(
         driver
             .admit(
                 &[(DeviceId::new_v4(), spec(Path::new("/dev/zero")))],
-                &[(agent_api::VmId::new_v4(), spec(Path::new("/dev/null")))]
+                &[held(spec(Path::new("/dev/null")))]
             )
+            .await
             .is_ok()
     );
     assert_eq!(driver.profiles(), ["evdev"]);

@@ -6,6 +6,7 @@
 //! driver decides which requests conflict.
 
 use super::*;
+use agent_api::device::ClaimedDevice;
 
 /// Resolve the creating driver from the persisted device spec. Missing entries
 /// use the spec default rather than a separately maintained driver name.
@@ -20,9 +21,12 @@ pub(crate) fn device_driver_name(record: &VmRecord, id: &DeviceId) -> String {
 }
 
 impl Provisioner {
-    /// Ask configured drivers to admit this request alongside other persisted VM
-    /// specifications. Missing drivers are reported when the chain creates devices.
-    pub(super) fn check_device_admission(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
+    /// Ask configured drivers to admit this request alongside the devices
+    /// every other persisted VM record names, running or not. Called before
+    /// each creation of a VM's devices and under the operations lock, so no
+    /// second admission runs before this VM's record is written. Missing
+    /// drivers are reported when the chain creates devices.
+    pub(super) async fn check_device_admission(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
         if spec.devices.is_empty() {
             return Ok(());
         }
@@ -34,7 +38,7 @@ impl Provisioner {
                 .push((d.id, d.spec.clone()));
         }
 
-        let mut claimed: HashMap<String, Vec<(VmId, DeviceSpec)>> = HashMap::new();
+        let mut claimed: HashMap<String, Vec<ClaimedDevice>> = HashMap::new();
         for (other_id, record) in self.store.list()? {
             if &other_id == id {
                 continue;
@@ -43,7 +47,11 @@ impl Provisioner {
                 claimed
                     .entry(d.spec.driver.clone())
                     .or_default()
-                    .push((other_id, d.spec.clone()));
+                    .push(ClaimedDevice {
+                        vm: other_id,
+                        id: d.id,
+                        spec: d.spec.clone(),
+                    });
             }
         }
 
@@ -54,6 +62,7 @@ impl Provisioner {
             let held = claimed.get(name).map(Vec::as_slice).unwrap_or(&[]);
             driver
                 .admit(&requested, held)
+                .await
                 .with_context(|| format!("device admission refused by driver {name:?}"))?;
         }
         Ok(())

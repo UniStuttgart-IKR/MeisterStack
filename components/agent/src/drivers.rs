@@ -142,6 +142,9 @@ static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
     build: build_linux_network,
 }];
 
+/// Constructed drivers by registry name.
+type Registry<T> = HashMap<String, Arc<T>>;
+
 /// Build configured, permitted drivers and reject unknown section names.
 fn register<T: ?Sized>(
     entries: &[DriverEntry<T>],
@@ -150,6 +153,34 @@ fn register<T: ?Sized>(
     what: &str,
     skip: &HashSet<&'static str>,
 ) -> anyhow::Result<HashMap<String, Arc<T>>> {
+    refuse_unknown_sections(entries, sections, what)?;
+    build_each(entries, sections, cfg, skip, |_, e| Err(e))
+}
+
+/// Like [`register`], except that a driver whose constructor fails is left
+/// out and named, with its reason, in the second list. Unknown sections still
+/// fail: they are a configuration this agent cannot read at all.
+fn register_or_report<T: ?Sized>(
+    entries: &[DriverEntry<T>],
+    sections: &Sections,
+    cfg: &AgentConfig,
+    what: &str,
+    skip: &HashSet<&'static str>,
+) -> anyhow::Result<(Registry<T>, Vec<String>)> {
+    refuse_unknown_sections(entries, sections, what)?;
+    let mut unavailable = Vec::new();
+    let built = build_each(entries, sections, cfg, skip, |name, e| {
+        unavailable.push(format!("{what} driver {name:?} could not be built: {e:#}"));
+        Ok(())
+    })?;
+    Ok((built, unavailable))
+}
+
+fn refuse_unknown_sections<T: ?Sized>(
+    entries: &[DriverEntry<T>],
+    sections: &Sections,
+    what: &str,
+) -> anyhow::Result<()> {
     // Sort unknown sections so configuration errors are deterministic.
     let mut unknown: Vec<&str> = sections
         .keys()
@@ -168,15 +199,30 @@ fn register<T: ?Sized>(
             known.join(", ")
         );
     }
+    Ok(())
+}
 
-    let mut built: HashMap<String, Arc<T>> = HashMap::new();
+/// Construct every configured, permitted driver. `failed` decides what a
+/// constructor error means: returning it ends registration.
+fn build_each<T: ?Sized>(
+    entries: &[DriverEntry<T>],
+    sections: &Sections,
+    cfg: &AgentConfig,
+    skip: &HashSet<&'static str>,
+    mut failed: impl FnMut(&'static str, anyhow::Error) -> anyhow::Result<()>,
+) -> anyhow::Result<Registry<T>> {
+    let mut built: Registry<T> = HashMap::new();
     for entry in entries {
         // Skip drivers with unmet host prerequisites; unknown sections still fail.
         if skip.contains(entry.name) {
             continue;
         }
-        if let Some(driver) = (entry.build)(sections, cfg)? {
-            built.insert(entry.name.to_string(), driver);
+        match (entry.build)(sections, cfg) {
+            Ok(Some(driver)) => {
+                built.insert(entry.name.to_string(), driver);
+            }
+            Ok(None) => {}
+            Err(e) => failed(entry.name, e)?,
         }
     }
     Ok(built)
@@ -416,6 +462,7 @@ fn build_crosvm_gpu(
     let driver = CrosvmGpuDriver::new(crosvm_gpu_driver::CrosvmGpuDriverConfig {
         crosvm_bin: g.binary.clone(),
         run_dir: cfg.paths.run_dir.join("gpu"),
+        log_dir: backend_log_dir(cfg, DRIVER_CROSVM_GPU),
         defaults: g.defaults.clone(),
         profiles: g.profiles.clone(),
         socket_timeout: Duration::from_millis(g.socket_timeout_ms),
@@ -435,8 +482,10 @@ fn build_nvrm(
         binary: n.binary.clone(),
         vgpuprofile_bin: n.vgpuprofile.clone(),
         run_dir: cfg.paths.run_dir.join("nvrm"),
+        log_dir: backend_log_dir(cfg, DRIVER_NVRM),
         socket_timeout: Duration::from_millis(n.socket_timeout_ms),
         vram_budget_mib: n.vram_budget_mib,
+        vgpu_host_reserve_mib: n.vgpu_host_reserve_mib,
         defaults: n.defaults.clone(),
         profiles: n.profiles.clone(),
         // A vhost-user backend maps the guest's memory, so it drops with the
@@ -457,8 +506,10 @@ fn build_input(
     let driver = InputDriver::new(input_driver::InputDriverConfig {
         binary: i.binary.clone(),
         run_dir: cfg.paths.run_dir.join(DRIVER_INPUT),
+        log_dir: backend_log_dir(cfg, DRIVER_INPUT),
         socket_timeout: Duration::from_millis(i.socket_timeout_ms),
         vmm_user: vmm_user(cfg)?,
+        evdev: i.evdev.clone(),
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -474,6 +525,13 @@ fn build_vfio(
         return Ok(None);
     }
     Ok(Some(Arc::new(VfioPciDriver::new(inventory)?)))
+}
+
+/// Where a device driver's backends log: beside the run directories and not
+/// in one, because a run directory goes to the vmm user and this one stays
+/// the agent's (the drivers make it 0700 and refuse a link in its place).
+fn backend_log_dir(cfg: &AgentConfig, driver: &str) -> std::path::PathBuf {
+    cfg.paths.run_dir.join("backend-logs").join(driver)
 }
 
 /// Resolve the configured backend user during driver construction.
@@ -681,8 +739,36 @@ pub struct Drivers {
     pub devices: HashMap<String, Arc<dyn DeviceDriver>>,
 }
 
+/// What startup made of the configured drivers.
+pub struct Startup {
+    pub drivers: Drivers,
+    /// Configured device drivers whose constructor failed, with the reason.
+    /// They stay unregistered until a restart builds them; see [`report_unavailable`].
+    pub unavailable: Vec<String>,
+}
+
+/// Raise [`crate::conditions::DRIVER_UNAVAILABLE`] for device drivers that
+/// could not be built. Only a restart retries them, so nothing clears it.
+pub fn report_unavailable(unavailable: &[String], conditions: &crate::conditions::Conditions) {
+    if !unavailable.is_empty() {
+        conditions.raise(
+            crate::conditions::DRIVER_UNAVAILABLE,
+            unavailable.join(" | "),
+        );
+    }
+}
+
 impl Drivers {
+    /// Build the drivers, leaving out device drivers that could not be built.
     pub async fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
+        Ok(Self::start(cfg).await?.drivers)
+    }
+
+    /// Build the drivers. A device driver whose constructor fails is left out
+    /// and reported, not fatal: a wrong backend setting must not keep the agent
+    /// from managing the guests it already runs. Its capability is then simply
+    /// not advertised.
+    pub async fn start(cfg: &AgentConfig) -> anyhow::Result<Startup> {
         // Require explicit compute or storage configuration. The implicit filesystem
         // fallback alone is not a declaration of a storage-only node.
         if cfg.hypervisor.is_empty() && cfg.volume.is_empty() {
@@ -735,7 +821,11 @@ impl Drivers {
         let (hypervisor_name, hypervisor) =
             register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor", skip)?.unzip();
         let storage = register(VOLUME_DRIVERS, &cfg.volume, cfg, "volume", skip)?;
-        let devices = register(DEVICE_DRIVERS, &cfg.device, cfg, "device", skip)?;
+        let (devices, unavailable) =
+            register_or_report(DEVICE_DRIVERS, &cfg.device, cfg, "device", skip)?;
+        for detail in &unavailable {
+            tracing::error!(%detail, "a configured device driver is not registered on this node");
+        }
         // `[network]` is not a table of sections, so there is none to check
         // against; the row's own builder reads `cfg.network`. See
         // `NETWORK_DRIVERS`.
@@ -751,15 +841,18 @@ impl Drivers {
             None => None,
         };
 
-        Ok(Self {
-            confiner,
-            hypervisor,
-            hypervisor_name,
-            storage,
-            networking,
-            bridge,
-            announcer,
-            devices,
+        Ok(Startup {
+            drivers: Self {
+                confiner,
+                hypervisor,
+                hypervisor_name,
+                storage,
+                networking,
+                bridge,
+                announcer,
+                devices,
+            },
+            unavailable,
         })
     }
 
@@ -1891,5 +1984,53 @@ mod tests {
         assert!(!said.contains(DRIVER_LVM_THIN), "{said}");
         assert!(!said.contains(DRIVER_NVMEOF), "{said}");
         assert!(!said.contains(DRIVER_VFIO), "{said}");
+    }
+
+    /// IKR-B15: a device driver whose configuration cannot be built is left
+    /// out and named, and the agent still registers every other driver. The
+    /// nvrm section fails on its missing host reserve before it asks the card
+    /// anything.
+    #[test]
+    fn a_device_driver_that_cannot_be_built_is_reported_and_the_rest_registers() {
+        let binary = std::env::current_exe().expect("this test binary");
+        let (_temp, cfg) = config(&format!(
+            r#"[device.input]
+               binary = {binary:?}
+               [device.nvrm]
+               binary = {binary:?}
+               vgpuprofile = "/nonexistent/vgpuprofile"
+               [device.nvrm.profiles.4q]
+               vgpu_type = "4Q""#
+        ));
+        let (devices, unavailable) = register_or_report(
+            DEVICE_DRIVERS,
+            &cfg.device,
+            &cfg,
+            "device",
+            &nothing_skipped(),
+        )
+        .expect("a driver that cannot be built does not stop the agent");
+        assert!(devices.contains_key(DRIVER_INPUT));
+        assert!(!devices.contains_key(DRIVER_NVRM));
+        let said = unavailable.join(" | ");
+        assert!(said.contains("\"nvrm\""), "{said}");
+        assert!(said.contains("vgpu_host_reserve_mib"), "{said}");
+    }
+
+    /// The reason a driver is missing is part of the node's status.
+    #[test]
+    fn an_unavailable_driver_is_reported_as_a_node_condition() {
+        let conditions = crate::conditions::Conditions::default();
+        report_unavailable(&[], &conditions);
+        assert!(
+            conditions.report().is_empty(),
+            "nothing failed, nothing said"
+        );
+
+        report_unavailable(&["device driver \"nvrm\": why".to_string()], &conditions);
+        let said = conditions
+            .message(crate::conditions::DRIVER_UNAVAILABLE)
+            .expect("raised");
+        assert!(said.contains("nvrm"), "{said}");
     }
 }

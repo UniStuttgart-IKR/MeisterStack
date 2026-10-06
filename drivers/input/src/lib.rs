@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_api::CgroupHandle;
@@ -35,9 +35,18 @@ pub struct InputParams {
 
 pub struct InputDriverConfig {
     pub binary: PathBuf,
+    /// The backends' sockets. Handed to `vmm_user` when one is set.
     pub run_dir: PathBuf,
+    /// The backends' logs: the agent's alone, outside `run_dir`; see
+    /// [`backend::create_log_dir`].
+    pub log_dir: PathBuf,
     pub socket_timeout: Duration,
     pub vmm_user: Option<agent_api::VmmUser>,
+    /// The host input nodes an operator lets vms take, as a spec must name
+    /// them. Like the vfio inventory: a node not listed here is never given
+    /// to a guest, so a tenant cannot reach the host's own keyboard, or any
+    /// other character device, by naming its path. Empty offers none.
+    pub evdev: Vec<PathBuf>,
 }
 
 pub struct InputDriver {
@@ -49,6 +58,7 @@ pub struct InputDriver {
 impl InputDriver {
     pub fn new(config: InputDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
+        backend::create_log_dir(&config.log_dir).map_err(|e| DeviceError::Backend(e.into()))?;
         if !config.binary.exists() {
             return Err(DeviceError::Backend(anyhow::anyhow!(
                 "vhost-device-input binary not found at {}",
@@ -77,10 +87,26 @@ impl InputDriver {
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        self.config.run_dir.join(format!("{id}.log"))
+        self.config.log_dir.join(format!("{id}.log"))
     }
 
-    fn source(spec: &DeviceSpec) -> device::Result<PathBuf> {
+    /// The host node a spec asks for, if the operator listed it. The path is
+    /// compared as written before anything is looked up on the host, so a
+    /// spec cannot probe which other paths exist.
+    fn source(&self, spec: &DeviceSpec) -> device::Result<PathBuf> {
+        let named = Self::named(spec)?;
+        if !self.config.evdev.contains(&named) {
+            return Err(DeviceError::InvalidSpec(format!(
+                "host input device {} is not one this node offers; an operator lists the \
+                 input nodes a vm may take in [device.input].evdev",
+                named.display()
+            )));
+        }
+        Self::character_device(&named)
+    }
+
+    /// `params.evdev` as the spec wrote it.
+    fn named(spec: &DeviceSpec) -> device::Result<PathBuf> {
         if spec.profile.as_deref().unwrap_or(PROFILE_EVDEV) != PROFILE_EVDEV {
             return Err(DeviceError::InvalidSpec(
                 "input supports only the evdev profile".into(),
@@ -89,12 +115,16 @@ impl InputDriver {
         let params: InputParams =
             serde_json::from_value(spec.params.clone().unwrap_or_else(|| serde_json::json!({})))
                 .map_err(|e| DeviceError::InvalidSpec(format!("invalid input params: {e}")))?;
-        let path = params.evdev.ok_or_else(|| {
+        params.evdev.ok_or_else(|| {
             DeviceError::InvalidSpec(
                 "params.evdev must name a host /dev/input/eventN device".into(),
             )
-        })?;
-        let path = std::fs::canonicalize(&path).map_err(|e| {
+        })
+    }
+
+    /// The character device behind `path`, resolved through any links.
+    fn character_device(path: &Path) -> device::Result<PathBuf> {
+        let path = std::fs::canonicalize(path).map_err(|e| {
             DeviceError::InvalidSpec(format!("input device {}: {e}", path.display()))
         })?;
         // Upstream parses event-list as comma-separated UTF-8 paths.
@@ -113,8 +143,10 @@ impl InputDriver {
         Ok(path)
     }
 
+    /// The device number a spec names, listed or not: another vm's record
+    /// holds what it holds whatever this node offers today.
     fn claimed_node(spec: &DeviceSpec) -> Option<u64> {
-        let path = Self::source(spec).ok()?;
+        let path = Self::character_device(&Self::named(spec).ok()?).ok()?;
         // Device numbers also identify aliases created with mknod.
         Some(std::fs::metadata(path).ok()?.rdev())
     }
@@ -146,7 +178,7 @@ impl DeviceDriver for InputDriver {
         }
 
         let socket = self.socket_path(id);
-        let source = Self::source(spec)?;
+        let source = self.source(spec)?;
         let mut active = self.active.lock().await;
         {
             if let Some(running) = active.get_mut(id) {
@@ -237,22 +269,23 @@ impl DeviceDriver for InputDriver {
         vec![PROFILE_EVDEV.to_string()]
     }
 
-    fn admit(
+    async fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
-        claimed: &[(agent_api::VmId, DeviceSpec)],
+        claimed: &[device::ClaimedDevice],
     ) -> device::Result<()> {
         for (index, (id, spec)) in requested.iter().enumerate() {
             // Detect ownership by device number, including mknod aliases; report
             // both that number and the requested path.
-            let path = Self::source(spec)?;
+            let path = self.source(spec)?;
             let Some(node) = Self::claimed_node(spec) else {
                 continue;
             };
 
-            if let Some((holder, _)) = claimed
+            if let Some(holder) = claimed
                 .iter()
-                .find(|(_, held)| Self::claimed_node(held) == Some(node))
+                .find(|held| Self::claimed_node(&held.spec) == Some(node))
+                .map(|held| held.vm)
             {
                 return Err(DeviceError::InvalidSpec(format!(
                     "host input device {} (device number {node}) is already claimed by vm \

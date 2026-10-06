@@ -304,7 +304,9 @@ in
     description = ''
       Path to upstream vhost-device-input; null disables the input driver.
       Each device uses profile "evdev" and params.evdev to select a host
-      /dev/input/eventN node. The backend user needs read access to that node.
+      /dev/input/eventN node, which must be listed exactly as named in
+      settings.device.input.evdev; an unlisted node is never given to a
+      guest. The backend user needs read access to that node.
       Set settings.device.input.socket_timeout_ms to override the 5000 ms
       startup timeout. The package is supplied separately.
     '';

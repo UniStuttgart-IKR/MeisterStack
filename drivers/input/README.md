@@ -2,6 +2,7 @@
 
 - Runs upstream rust-vmm `vhost-device-input`, one process per device.
 - Configure `[device.input].binary` with the upstream executable path.
+- List the host nodes vms may take in `[device.input].evdev`; a spec must name one exactly.
 - Device spec: `{"driver":"input","partition":"mediated","profile":"evdev","params":{"evdev":"/dev/input/eventN"}}`.
 - The backend user needs read access to that node. Admission rejects duplicate device numbers, including aliases.
 - Backend arguments: `--socket-path PREFIX --event-list NODE`. The attachment uses `PREFIX0`, device type 18 and two 256-entry queues.

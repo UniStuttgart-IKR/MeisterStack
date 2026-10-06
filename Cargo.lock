@@ -1235,6 +1235,7 @@ dependencies = [
  "meister-backend",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1386,8 +1387,11 @@ dependencies = [
  "async-trait",
  "meister-agent-api",
  "meister-backend",
+ "nix 0.31.3",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -1472,6 +1476,7 @@ dependencies = [
  "meister-agent-api",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]

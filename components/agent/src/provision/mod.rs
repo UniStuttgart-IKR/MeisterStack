@@ -215,7 +215,7 @@ impl Provisioner {
             return self.sync_volumes(&id, &spec).await;
         }
 
-        self.check_device_admission(&id, &spec)?;
+        self.check_device_admission(&id, &spec).await?;
 
         let mut record = VmRecord {
             spec,
@@ -370,6 +370,10 @@ impl Provisioner {
 
     #[instrument(skip(self, record), fields(vm_id = %id))]
     pub(crate) async fn resume(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
+        // Admitted again on every start: a node whose configuration changed
+        // since this vm was first admitted (a smaller budget, a larger
+        // profile) must not start it past what it can hold now.
+        self.check_device_admission(id, &record.spec).await?;
         record.phase = Phase::Provisioning;
         record.volumes.clear();
         record.nics.clear();
