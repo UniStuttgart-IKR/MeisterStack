@@ -788,6 +788,10 @@ async fn handle_create(
     if !spec.vm.is_object() {
         bail!("spec.vm must be the agent's NewVmSpec object");
     }
+    // Every vm the cloud sends is a tenant's. The cloud refuses these fields
+    // at its own edge; a cloud from before that rule must not get a tenant's
+    // tap onto a provider network or a host bridge through this one.
+    controller_api::vni::check_tenant_nics(&spec.vm).map_err(|e| anyhow!("{}", e.message()))?;
 
     // The truth is made at the edge. The cloud resolved the tenant's VNI and
     // sent it alongside; this is where it becomes part of the spec, before
@@ -2440,6 +2444,29 @@ mod tests {
         assert_eq!(spec["nics"][0]["floating_ips"][0], "192.0.2.9");
         // ... and the field it said nothing about is still filled in.
         assert_eq!(spec["nics"][0]["routed_subnets"][0], "10.7.1.0/24");
+    }
+
+    /// IKR-B67 one tier down: a cloud from before the rule does not get a
+    /// tenant's tap onto the provider segment through this session.
+    #[tokio::test]
+    async fn a_cloud_vm_whose_nic_picks_its_own_wire_is_refused_before_it_is_stored() {
+        // Refused before any read, so the lazy client never dials.
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/b67-test")
+            .await
+            .expect("the etcd client is built lazily");
+        let c = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "vm": { "vcpus": 1, "nics": [{ "physnet": "ext" }] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        };
+        let why = format!(
+            "{:#}",
+            handle_create(&store, c, "").await.expect_err("a tap on ext")
+        );
+        assert!(why.contains("nics[0].physnet"), "{why}");
     }
 
     #[test]

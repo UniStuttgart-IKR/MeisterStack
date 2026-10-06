@@ -29,6 +29,11 @@ pub(super) fn validate_vm_spec(spec: &VmSpec) -> Result<(), ApiError> {
             "user_data and user_data_from are two starting points; name one",
         ));
     }
+    // A vm that names a tenant is held to the tenant's rule whoever writes
+    // it here; one without a tenant is the operator's own.
+    if spec.tenant.as_deref().is_some_and(|t| !t.is_empty()) {
+        controller_api::vni::check_tenant_nics(&spec.vm)?;
+    }
     Ok(())
 }
 

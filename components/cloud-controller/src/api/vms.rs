@@ -168,6 +168,9 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
     controller_api::vm_spec::check(&spec.vm)?;
     check_vm_shape(&spec.vm)?;
     check_owned_nic_fields(&spec.vm)?;
+    // Unconditionally: every vm at this tier is a tenant's, `create_vm_traced`
+    // insists on one.
+    controller_api::vni::check_tenant_nics(&spec.vm)?;
     check_owned_volume_fields(&spec.vm, &catalogue_sources(store, &spec.vm).await)?;
     if spec.user_data_said_twice() {
         return Err(controller_api::invalid_field(
@@ -1964,6 +1967,32 @@ mod tests {
             json!({ "nics": [{ "vxlan_id": null, "floating_ips": null }] }),
         ] {
             check_owned_nic_fields(&spec).expect("nothing control-plane-owned here");
+        }
+    }
+
+    /// IKR-B67: `physnet: ext` from a tenant member was taken while
+    /// `vxlan_id` was refused. Every vm at this tier is a tenant's.
+    #[tokio::test]
+    async fn a_vm_whose_nic_picks_its_own_wire_is_refused_at_the_cloud() {
+        // No base image, so nothing below reads the store.
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/b67-test")
+            .await
+            .expect("the etcd client is built lazily");
+        for field in ["physnet", "bridge"] {
+            let spec: VmSpec = serde_json::from_value(json!({ "vm": {
+                "vcpus": 1, "memory_mib": 512,
+                "boot": { "kind": "firmware", "firmware": "fw" },
+                "volumes": [{ "size_bytes": 1 }],
+                "nics": [{ field: "ext" }],
+            }}))
+            .expect("a vm spec");
+            let err = validate_vm_spec(&store, &spec)
+                .await
+                .expect_err("a tenant's tap on a wire it chose");
+            assert_eq!(
+                err.field(),
+                Some(format!("spec.vm.nics[0].{field}").as_str())
+            );
         }
     }
 

@@ -1009,3 +1009,24 @@ fn said_to_be(vm: &mut Vm, phase: controller_api::VmPhaseKind) {
     ));
     vm.settle(chrono::Utc::now());
 }
+
+/// IKR-B67 at this edge: a vm that names a tenant is held to the tenant's rule
+/// whoever writes it here, and an unscoped one is the operator's own wire.
+#[test]
+fn a_tenant_vm_may_not_pick_its_own_wire_here_and_an_operator_vm_may() {
+    let spec = |tenant: Option<&str>| -> VmSpec {
+        serde_json::from_value(json!({
+            "tenant": tenant,
+            "vm": {
+                "vcpus": 1, "memory_mib": 512,
+                "boot": { "kind": "firmware", "firmware": "fw" },
+                "volumes": [{ "size_bytes": 1 }],
+                "nics": [{ "physnet": "ext" }],
+            },
+        }))
+        .expect("a vm spec")
+    };
+    let err = validate_vm_spec(&spec(Some("acme"))).expect_err("a tenant's tap on ext");
+    assert_eq!(err.field(), Some("spec.vm.nics[0].physnet"));
+    validate_vm_spec(&spec(None)).expect("the operator's own vm");
+}
