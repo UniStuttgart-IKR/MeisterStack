@@ -327,9 +327,10 @@ pub struct RouterOutcome {
 /// tests can supply a recorder without depending on controller internals.
 #[async_trait::async_trait]
 pub trait RouterSink: Send + Sync {
-    /// Idempotently ensure a router on one node. A `Refusal` saying `CANNOT_SERVE`
-    /// anywhere in the error's chain denotes structural incompatibility; other
-    /// errors do not establish that refusal.
+    /// Idempotently ensure a router on one node. When the outermost `Refusal` in
+    /// the error's chain (see `Refusal::in_chain`) says `CANNOT_SERVE`, the node
+    /// is structurally incompatible; a `CANNOT_SERVE` under a refusal with
+    /// another word, and any other error, does not establish that.
     async fn ensure(&self, node: &str, router: proto::EnsureRouter) -> anyhow::Result<()>;
     /// Let go of one router on one node, by uid.
     async fn destroy(&self, node: &str, id: &str) -> anyhow::Result<()>;
