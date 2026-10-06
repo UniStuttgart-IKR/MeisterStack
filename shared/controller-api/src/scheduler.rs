@@ -583,7 +583,7 @@ impl NodeDemand<'_> {
             n.ready
                 && n.schedulable
                 // Apply the node-health veto before cloud placement, matching node scheduling.
-                && n.conditions.is_empty()
+                && !n.conditions.iter().any(crate::NodeCondition::vetoes_placement)
                 && selects(self.selector, &n.labels)
                 && self
                     .allowed
@@ -2887,6 +2887,33 @@ mod tests {
         assert_eq!(why, PendingReason::NodeUnhealthy);
         assert!(sentence.contains("agent-1a"), "{sentence}");
         assert!(sentence.contains("DiskPressure"), "{sentence}");
+    }
+
+    /// IKR-B43: a node whose device driver could not be built still takes
+    /// vms that need no device. Only the missing capability keeps a vm away,
+    /// through the catalogue the node no longer lists it in.
+    #[test]
+    fn a_node_with_an_unavailable_driver_still_takes_vms_without_devices() {
+        let reported = [crate::NodeCondition {
+            type_: crate::NodeConditionType::DriverUnavailable.as_str().into(),
+            message: "device driver \"nvrm\" could not be built".into(),
+        }];
+        let degraded = Candidate {
+            unhealthy: crate::NodeCondition::vetoing(&reported),
+            ..gpu_candidate("agent-1a", &[])
+        };
+        let only = std::slice::from_ref(&degraded);
+        assert_eq!(FirstFit.assign(&vm(), only).as_deref(), Some("agent-1a"));
+        assert_eq!(FirstFit.assign(&vm_asking(nvrm_4q()), only), None);
+
+        // The cloud's question about the cluster agrees.
+        let mut node = summary("agent-1a", true, true, &[]);
+        node.conditions = reported.to_vec();
+        let anywhere = NodeDemand {
+            selector: &BTreeMap::new(),
+            allowed: None,
+        };
+        assert!(anywhere.met_by_a_node(&[node]));
     }
 
     /// Unknown reported health conditions still veto placement and remain visible

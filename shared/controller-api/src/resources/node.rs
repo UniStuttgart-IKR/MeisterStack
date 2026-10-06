@@ -246,6 +246,27 @@ pub struct NodeCondition {
     pub message: String,
 }
 
+impl NodeCondition {
+    /// Whether this condition takes the whole node out of placement. A word
+    /// this build does not know vetoes, as every condition used to; one that
+    /// only withdraws a capability does not, because the capability is
+    /// already missing from the node's catalogue and that alone keeps the vms
+    /// needing it away, while the node still serves every other vm.
+    pub fn vetoes_placement(&self) -> bool {
+        NodeConditionType::parse(&self.type_).is_none_or(NodeConditionType::vetoes_placement)
+    }
+
+    /// The types among `conditions` that veto placement: what a scheduling
+    /// candidate is unhealthy with, and what its diagnostics name.
+    pub fn vetoing(conditions: &[NodeCondition]) -> Vec<String> {
+        conditions
+            .iter()
+            .filter(|c| c.vetoes_placement())
+            .map(|c| c.type_.clone())
+            .collect()
+    }
+}
+
 /// Known agent condition categories. Preserve the protocol spelling when ingesting reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeConditionType {
@@ -255,13 +276,17 @@ pub enum NodeConditionType {
     StoreUnhealthy,
     /// `cgroup_root` is not a cgroup2 filesystem, so no teardown finishes.
     CgroupUnusable,
+    /// A configured device driver could not be built, so the node does not
+    /// offer its capability. Everything else on the node works.
+    DriverUnavailable,
 }
 
 impl NodeConditionType {
-    pub const ALL: [NodeConditionType; 3] = [
+    pub const ALL: [NodeConditionType; 4] = [
         NodeConditionType::DiskPressure,
         NodeConditionType::StoreUnhealthy,
         NodeConditionType::CgroupUnusable,
+        NodeConditionType::DriverUnavailable,
     ];
 
     /// The spelling on the wire and in the object. `parse` is its inverse.
@@ -270,7 +295,13 @@ impl NodeConditionType {
             NodeConditionType::DiskPressure => "DiskPressure",
             NodeConditionType::StoreUnhealthy => "StoreUnhealthy",
             NodeConditionType::CgroupUnusable => "CgroupUnusable",
+            NodeConditionType::DriverUnavailable => "DriverUnavailable",
         }
+    }
+
+    /// See [`NodeCondition::vetoes_placement`].
+    pub fn vetoes_placement(self) -> bool {
+        !matches!(self, NodeConditionType::DriverUnavailable)
     }
 
     /// The one word a `node ls` READY column has room for.
@@ -282,6 +313,7 @@ impl NodeConditionType {
             NodeConditionType::DiskPressure => "pressure",
             NodeConditionType::StoreUnhealthy => "store",
             NodeConditionType::CgroupUnusable => "cgroup",
+            NodeConditionType::DriverUnavailable => "driver",
         }
     }
 

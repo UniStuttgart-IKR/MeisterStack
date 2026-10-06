@@ -1189,7 +1189,12 @@ fn a_node_condition_is_spelled_type_and_message_and_vanishes_when_empty() {
     // agent's contract and of every dashboard that greps for one.
     assert_eq!(
         NodeConditionType::ALL.map(NodeConditionType::as_str),
-        ["DiskPressure", "StoreUnhealthy", "CgroupUnusable"]
+        [
+            "DiskPressure",
+            "StoreUnhealthy",
+            "CgroupUnusable",
+            "DriverUnavailable"
+        ]
     );
     assert_eq!(
         NodeConditionType::parse("DiskPressure"),
@@ -1199,6 +1204,24 @@ fn a_node_condition_is_spelled_type_and_message_and_vanishes_when_empty() {
     // the running by the list being non-empty; parsing is only for the
     // short spelling in a table.
     assert_eq!(NodeConditionType::parse("FanFailure"), None);
+}
+
+/// A condition that only withdraws a capability leaves the node in
+/// placement; every other one, and every word this build does not know,
+/// takes it out.
+#[test]
+fn only_a_capability_condition_leaves_the_node_in_placement() {
+    let said = |type_: &str| NodeCondition {
+        type_: type_.into(),
+        message: String::new(),
+    };
+    assert!(!said("DriverUnavailable").vetoes_placement());
+    assert!(said("StoreUnhealthy").vetoes_placement());
+    assert!(said("FanFailure").vetoes_placement());
+    assert_eq!(
+        NodeCondition::vetoing(&[said("DriverUnavailable"), said("DiskPressure")]),
+        ["DiskPressure"]
+    );
 }
 /// Check migration compatibility before opening a transfer, including machine properties beyond
 /// the hypervisor's CPUID check.
