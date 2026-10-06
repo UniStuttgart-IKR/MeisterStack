@@ -78,6 +78,9 @@ let
       c.meisterstack.cluster.effective.metrics_listen == "[fd00::10]:9101"
       && builtins.elem "network-online.target" c.systemd.services.meister-cluster-controller.wants;
 
+    "nix run of the package starts the CLI" =
+      self.packages.${system}.meisterstack.meta.mainProgram == "meister";
+
     "an agent holds no address on the default guest bridge unless asked" =
       !((agent { }).meisterstack.agent.effective.network ? bridge_addr);
     "an agent keeps guests from opening connections to the host" =

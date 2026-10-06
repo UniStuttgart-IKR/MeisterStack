@@ -62,7 +62,8 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "The MeisterStack control plane: agent, both controllers, the cli and meister-deploy";
     license = lib.licenses.mit;
-    mainProgram = "meister-agent";
+    # `nix run` is for a person at a shell; the daemons are started by units by path.
+    mainProgram = "meister";
     platforms = [ "x86_64-linux" ];
   };
 }
