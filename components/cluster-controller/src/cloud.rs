@@ -1028,7 +1028,7 @@ async fn delete_cloud_record<T: controller_api::Resource>(
         Err(StoreError::NotFound(_)) => Ok(()),
         Ok(current) if !the_clouds(&current) => Ok(()),
         Ok(_) => bail!(
-            "{} {name} changed while it was deleted; not deleted yet",
+            "{}/{name} changed while it was deleted; not deleted yet",
             T::RESOURCE
         ),
         Err(e) => Err(e.into()),
