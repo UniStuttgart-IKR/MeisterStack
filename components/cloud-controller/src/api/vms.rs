@@ -80,7 +80,7 @@ pub(super) fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiEr
 /// key returns 422; a volume that is not Ready yet is accepted.
 ///
 /// Volume readiness and cluster reachability constrain placement in
-/// `servable_clusters`; this tier does not select a node.
+/// `reconcile::placement::wanted`; this tier does not select a node.
 pub(super) async fn check_volume_refs(
     st: &ApiState,
     tenant: Option<&str>,
