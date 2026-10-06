@@ -56,6 +56,13 @@ const MAX_MIB: u64 = u64::MAX >> 20;
 /// `vram_reserve_mib` is set (Leandro vram.rs `DEFAULT_RESERVATION_MIB`).
 const BACKEND_DEFAULT_RESERVE_MIB: u64 = 256;
 
+/// A size as the backend reads it: 0 is "unset" (Leandro vram.rs `decide`).
+/// A reserve of 0 asks for nothing, so it is no reserve to refuse beside a
+/// policy that would ignore it.
+fn backend_set(mib: Option<u64>) -> Option<u64> {
+    mib.filter(|&mib| mib > 0)
+}
+
 /// How long `vgpuprofile` gets to answer. It asks the GPU driver a handful of
 /// questions and is done in well under a second; one still running after
 /// this is stuck in a driver that will not answer the backend either.
@@ -167,11 +174,10 @@ impl NvrmParams {
     /// the guest no memory, which the backend refuses at start. Both are
     /// refused here instead.
     fn refuse_unusable_reserve(&self) -> device::Result<()> {
-        // 0 is the backend's "unset", for both.
-        let Some(profile) = self.vram_profile_mib.filter(|&mib| mib > 0) else {
+        let Some(profile) = backend_set(self.vram_profile_mib) else {
             return self.refuse_reserve_without_a_profile();
         };
-        let set = self.vram_reserve_mib.filter(|&mib| mib > 0);
+        let set = backend_set(self.vram_reserve_mib);
         let reserve = set.unwrap_or(BACKEND_DEFAULT_RESERVE_MIB);
         if reserve >= profile {
             let which = if set.is_some() {
@@ -199,7 +205,7 @@ impl NvrmParams {
     }
 
     fn refuse_reserve_without_a_profile(&self) -> device::Result<()> {
-        let Some(reserve) = self.vram_reserve_mib else {
+        let Some(reserve) = backend_set(self.vram_reserve_mib) else {
             return Ok(());
         };
         let beside = if self.vgpu_type.is_some() {
@@ -1011,6 +1017,21 @@ mod tests {
             .expect_err("ignored by the backend")
             .to_string();
         assert!(said.contains("no VRAM policy"), "{said}");
+    }
+
+    /// The backend reads 0 as "unset" (Leandro vram.rs `decide`): a reserve
+    /// of 0 asks for nothing, so nothing is ignored and nothing is refused.
+    #[test]
+    fn a_reserve_of_zero_is_unset_as_the_backend_reads_it() {
+        for policy in [
+            serde_json::json!({ "vgpu_type": "4Q" }),
+            serde_json::json!({ "vram_limit_mib": 2048 }),
+            serde_json::json!({}),
+        ] {
+            let mut params = p(policy);
+            params.vram_reserve_mib = Some(0);
+            params.validate().expect("0 is no reserve at all");
+        }
     }
 
     /// A node configuration whose defaults and profiles the tests choose.
