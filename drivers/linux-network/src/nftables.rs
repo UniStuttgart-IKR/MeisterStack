@@ -4,7 +4,8 @@
 
 //! Render and apply tap source guards and router NAT rules.
 //! Each tap has a netdev ingress chain: MAC pinning, then an IPv4/ARP allowlist
-//! or guarded-pool rules. Provider NICs receive only MAC pinning. IPv6 source
+//! or guarded-pool rules, as [`GuardMode`] reads them off the NIC's document
+//! and the node's pool. Provider NICs receive only MAC pinning. IPv6 source
 //! addresses and inbound guest traffic have no address policy here.
 //! Router NAT uses a separate ip-family table inside each router namespace.
 
@@ -37,6 +38,45 @@ pub struct NftConfig {
     pub guarded: Ipv4Ranges,
 }
 
+/// How a tap's IPv4 sources are guarded beyond its MAC pin: read off the NIC's document and the
+/// node's floating pool alone, so every node with the same pool guards the same document the
+/// same. [`ruleset`] builds the chain by it and [`Nft::guard`] logs it, so the log says what
+/// the chain does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardMode {
+    /// No address rule: a provider NIC, whose address space is the operator's, or a NIC whose
+    /// document names no prefix, on a node without a floating pool.
+    MacOnly,
+    /// No source out of the floating pool but the NIC's own floating addresses; every other
+    /// source passes. A NIC whose document names no prefix: its address space is unknown,
+    /// which is a known limit until the stack hands out overlay addresses itself (IPAM).
+    PoolBan,
+    /// No source but the document's prefixes, its floating addresses and the unspecified
+    /// address.
+    Allowlist,
+}
+
+impl GuardMode {
+    pub fn of(spec: &NicSpec, guarded: &Ipv4Ranges) -> Self {
+        if spec.sources_allowlisted() {
+            Self::Allowlist
+        } else if spec.physnet.is_some() || guarded.is_empty() {
+            Self::MacOnly
+        } else {
+            Self::PoolBan
+        }
+    }
+
+    /// The word the log says it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MacOnly => "mac-only",
+            Self::PoolBan => "pool-ban",
+            Self::Allowlist => "allowlist",
+        }
+    }
+}
+
 /// Render one complete tap chain for an nft batch.
 pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String, RangeError> {
     let chain = chain_name(tap);
@@ -60,52 +100,70 @@ pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String
         spec.mac
     )));
 
-    // Provider NICs use operator-managed address space; apply MAC pinning only.
+    // Provider NICs use operator-managed address space; their lists are not this tier's to read.
     if spec.physnet.is_some() {
         return Ok(s);
     }
 
     let floating = Ipv4Ranges::parse(&spec.floating_ips)?;
     let subnets = Ipv4Ranges::parse(&spec.routed_subnets)?;
-
-    if spec.sources_allowlisted() {
-        // 3. The tenant's address space is known, so say exactly what it is.
-        let allowed = [&subnets, &floating]
-            .into_iter()
-            .filter(|ranges| !ranges.is_empty())
-            .map(Ipv4Ranges::to_nft)
-            .chain([UNSPECIFIED.to_string()])
-            .collect::<Vec<_>>()
-            .join(", ");
-        s.push_str(&rule(&format!(
-            "meta protocol ip ip saddr != {{ {allowed} }} counter drop comment \"src-ip\""
-        )));
-        s.push_str(&rule(&format!(
-            "meta protocol arp arp saddr ip != {{ {allowed} }} counter drop comment \"src-arp\""
-        )));
-        return Ok(s);
-    }
-
-    if !guarded.is_empty() {
-        // Accept this VM's reservations before rejecting other guarded-pool sources.
-        if !floating.is_empty() {
-            let mine = floating.to_nft();
-            s.push_str(&rule(&format!(
-                "meta protocol ip ip saddr {{ {mine} }} accept"
-            )));
-            s.push_str(&rule(&format!(
-                "meta protocol arp arp saddr ip {{ {mine} }} accept"
-            )));
-        }
-        let pool = guarded.to_nft();
-        s.push_str(&rule(&format!(
-            "meta protocol ip ip saddr {{ {pool} }} counter drop comment \"pool-ip\""
-        )));
-        s.push_str(&rule(&format!(
-            "meta protocol arp arp saddr ip {{ {pool} }} counter drop comment \"pool-arp\""
-        )));
+    match GuardMode::of(spec, guarded) {
+        GuardMode::Allowlist => s.push_str(&allowlist_rules(&rule, &subnets, &floating)),
+        GuardMode::PoolBan => s.push_str(&pool_ban_rules(&rule, &floating, guarded)),
+        GuardMode::MacOnly => {}
     }
     Ok(s)
+}
+
+/// The tenant's address space is known, so say exactly what it is.
+fn allowlist_rules(
+    rule: &dyn Fn(&str) -> String,
+    subnets: &Ipv4Ranges,
+    floating: &Ipv4Ranges,
+) -> String {
+    let allowed = [subnets, floating]
+        .into_iter()
+        .filter(|ranges| !ranges.is_empty())
+        .map(Ipv4Ranges::to_nft)
+        .chain([UNSPECIFIED.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    [
+        rule(&format!(
+            "meta protocol ip ip saddr != {{ {allowed} }} counter drop comment \"src-ip\""
+        )),
+        rule(&format!(
+            "meta protocol arp arp saddr ip != {{ {allowed} }} counter drop comment \"src-arp\""
+        )),
+    ]
+    .concat()
+}
+
+/// The pool is banned, and this VM's reservations are accepted before the ban, or the ban
+/// would win.
+fn pool_ban_rules(
+    rule: &dyn Fn(&str) -> String,
+    floating: &Ipv4Ranges,
+    guarded: &Ipv4Ranges,
+) -> String {
+    let mut s = String::new();
+    if !floating.is_empty() {
+        let mine = floating.to_nft();
+        s.push_str(&rule(&format!(
+            "meta protocol ip ip saddr {{ {mine} }} accept"
+        )));
+        s.push_str(&rule(&format!(
+            "meta protocol arp arp saddr ip {{ {mine} }} accept"
+        )));
+    }
+    let pool = guarded.to_nft();
+    s.push_str(&rule(&format!(
+        "meta protocol ip ip saddr {{ {pool} }} counter drop comment \"pool-ip\""
+    )));
+    s.push_str(&rule(&format!(
+        "meta protocol arp arp saddr ip {{ {pool} }} counter drop comment \"pool-arp\""
+    )));
+    s
 }
 
 /// Take one tap's chain away. Flush first: nftables refuses to delete a chain
@@ -316,12 +374,8 @@ impl Nft {
             .map_err(|e| NetworkError::Backend(anyhow::anyhow!(e)))?;
         info!(
             floating = spec.floating_ips.len(),
-            subnets = spec.routed_subnets.len(),
-            mode = if spec.routed_subnets.is_empty() {
-                "pool-guard"
-            } else {
-                "allowlist"
-            },
+            prefixes = spec.routed_subnets.len(),
+            mode = GuardMode::of(spec, guarded).as_str(),
             "tap guarded"
         );
         Ok(())
@@ -537,8 +591,58 @@ mod tests {
         assert!(listed[2].contains("arp saddr ip != {"), "{}", listed[2]);
         // The pool ban is gone, and it is not missing: an allowlist that does
         // not contain a pool address already forbids it, and the cloud refuses
-        // a subnet that overlaps a pool.
+        // a routed subnet or a tenant's network prefix that overlaps a pool.
         assert!(!script.contains("pool-ip"), "{script}");
+    }
+
+    /// The mode the log names is the mode the chain is built in, for every kind of NIC: one
+    /// predicate decides both. (NL5-3)
+    #[test]
+    fn the_mode_the_log_names_is_the_mode_the_chain_is_built_in() {
+        let mut provider = spec(&["203.0.113.7"], &["10.31.0.0/24"]);
+        provider.physnet = Some("ext".into());
+        let none = Ipv4Ranges::default();
+        let lab = pool(&["10.255.0.0/16"]);
+        for (nic, guarded, mode) in [
+            (provider, &lab, GuardMode::MacOnly),
+            (spec(&[], &[]), &none, GuardMode::MacOnly),
+            (spec(&["10.255.0.7"], &[]), &lab, GuardMode::PoolBan),
+            (spec(&[], &["10.30.0.0/24"]), &none, GuardMode::Allowlist),
+            (
+                spec(&["10.255.0.7"], &["10.30.0.0/24"]),
+                &lab,
+                GuardMode::Allowlist,
+            ),
+        ] {
+            assert_eq!(GuardMode::of(&nic, guarded), mode, "{nic:?}");
+            let script = ruleset("msk0", &nic, guarded).unwrap();
+            let built = match (
+                script.contains("\"src-ip\""),
+                script.contains("\"pool-ip\""),
+            ) {
+                (true, false) => GuardMode::Allowlist,
+                (false, true) => GuardMode::PoolBan,
+                (false, false) => GuardMode::MacOnly,
+                (true, true) => panic!("both modes in one chain: {script}"),
+            };
+            assert_eq!(built, mode, "{}: {script}", mode.as_str());
+        }
+    }
+
+    /// One document is one chain, whichever node reads it and whether it comes off the wire or
+    /// out of a record: nothing a node keeps of its own goes into a guard. (NL5-2)
+    #[test]
+    fn the_same_document_is_the_same_chain_on_every_node() {
+        let document = r#"{"bridge":"meister_br0","mac":"52:54:00:11:22:33","vxlan_id":10007,
+                           "floating_ips":["10.255.0.7"],"routed_subnets":["10.30.0.0/24"]}"#;
+        let guarded = pool(&["10.255.0.0/16"]);
+        let on_one: NicSpec = serde_json::from_str(document).unwrap();
+        let on_another: NicSpec = serde_json::from_str(document).unwrap();
+        let from_a_record: NicSpec =
+            serde_json::from_value(serde_json::to_value(&on_one).unwrap()).unwrap();
+        let chain = ruleset("msk0", &on_one, &guarded).unwrap();
+        assert_eq!(chain, ruleset("msk0", &on_another, &guarded).unwrap());
+        assert_eq!(chain, ruleset("msk0", &from_a_record, &guarded).unwrap());
     }
 
     /// Allow initial DHCP and ARP probes before a guest has an address.
