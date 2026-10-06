@@ -966,8 +966,10 @@ pub enum PendingReason {
     /// Only where a node of it reports room for the VM before those are
     /// counted: then nothing says the room is gone, so not `NoCapacity`, and
     /// none of the VM's asks is what is missing, so not a node-level ask. A VM
-    /// no node's reported room holds is `NoCapacity` whatever the list left
-    /// out (NL4-2).
+    /// no node's reported room holds is not `RoomUnknown`, whatever the list
+    /// left out: that cluster is not weighed for it, and its reason is the one
+    /// the other clusters give or, with none left, the one its node-level asks
+    /// give (NL4-2).
     RoomUnknown,
 }
 
