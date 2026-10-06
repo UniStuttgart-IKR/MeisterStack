@@ -35,6 +35,7 @@ etcd_prefix = "/cloud"
 
 # Super-pools for automatic routed-subnet allocation. Explicit CIDRs remain
 # possible without pools. Upstream routing is configured outside MeisterStack.
+# Every agent lists these in its guarded_ranges too, beside the floating pools.
 #routed_pools = ["10.7.0.0/16"]
 
 # Placement strategy; currently first-fit. Unknown names fail startup.

@@ -35,6 +35,7 @@ identity and, with auto-approval disabled, explicit approval. The cloud example
 includes a signing CA key; deployments that keep signing offline should remove
 that runtime responsibility when adapting the configuration.
 
-Floating-pool ranges must remain synchronized with agent `guarded_ranges`.
+Floating-pool ranges and `routed_pools` must remain synchronized with agent
+`guarded_ranges`.
 Overlay discovery mode and upstream routing also require site configuration;
 see [Networking](../../../docs/NETWORKING.md).

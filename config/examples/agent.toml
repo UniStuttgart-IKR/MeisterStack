@@ -57,11 +57,13 @@ controller_addrs = ["http://10.128.1.104:50051", "http://10.128.1.110:50051"]
 #cgroup_cpuset    = "0-15,32-47"
 # cgroup_cpuset = "16-31,48-63", and its own [paths].
 
-# Floating-pool ranges blocked as guest source addresses, except reservations
-# in that VM's spec. Keep this union aligned with cloud pools. MAC pinning is
-# always applied; routed subnets add a source allowlist. Reachability still
-# needs upstream routing or a guest/router appliance.
-#guarded_ranges = ["10.255.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
+# Ranges blocked as guest source addresses, except reservations in that VM's
+# spec: the cloud's floating pools AND its routed_pools (plus any routed subnet
+# CIDR named outside them), so a subnet taken from a NIC that is left no prefix
+# stays dropped. Keep this union aligned with the cloud. MAC pinning is always
+# applied; a NIC whose spec names prefixes is held to an allowlist of them
+# instead. Reachability still needs upstream routing or a guest/router appliance.
+#guarded_ranges = ["10.255.0.0/16", "10.7.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
 
 # nftables executable; defaults to PATH. Rule programming is required.
 #nft = "/run/current-system/sw/bin/nft"

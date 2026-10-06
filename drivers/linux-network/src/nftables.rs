@@ -5,7 +5,7 @@
 //! Render and apply tap source guards and router NAT rules.
 //! Each tap has a netdev ingress chain: MAC pinning, then an IPv4/ARP allowlist
 //! or guarded-pool rules, as [`GuardMode`] reads them off the NIC's document
-//! and the node's pool. Provider NICs receive only MAC pinning. IPv6 source
+//! and the node's guarded ranges. Provider NICs receive only MAC pinning. IPv6 source
 //! addresses and inbound guest traffic have no address policy here.
 //! Router NAT uses a separate ip-family table inside each router namespace.
 
@@ -33,23 +33,26 @@ pub struct NftConfig {
     /// The binary. `nft` = whatever PATH says, which is right on a NixOS node
     /// and wrong nowhere in particular.
     pub binary: String,
-    /// Locally configured floating-pool ranges. Keep them aligned with cloud allocation;
-    /// the controller session does not synchronize this catalogue.
+    /// Locally configured ranges the cloud hands addresses out of: its floating pools and
+    /// its routed pools. Keep them aligned with the cloud's; the controller session does not
+    /// synchronize this catalogue.
     pub guarded: Ipv4Ranges,
 }
 
 /// How a tap's IPv4 sources are guarded beyond its MAC pin: read off the NIC's document and the
-/// node's floating pool alone, so every node with the same pool guards the same document the
+/// node's guarded ranges alone, so every node with the same ranges guards the same document the
 /// same. [`ruleset`] builds the chain by it and [`Nft::guard`] logs it, so the log says what
 /// the chain does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuardMode {
     /// No address rule: a provider NIC, whose address space is the operator's, or a NIC whose
-    /// document names no prefix, on a node without a floating pool.
+    /// document names no prefix, on a node without guarded ranges.
     MacOnly,
-    /// No source out of the floating pool but the NIC's own floating addresses; every other
-    /// source passes. A NIC whose document names no prefix: its address space is unknown,
-    /// which is a known limit until the stack hands out overlay addresses itself (IPAM).
+    /// No source out of the guarded ranges, the cloud's floating and routed pools, but the
+    /// NIC's own floating addresses; every other source passes. A NIC whose document names no
+    /// prefix: its address space is unknown, which is a known limit until the stack hands out
+    /// overlay addresses itself (IPAM). What the cloud handed out stays closed to it, so a
+    /// routed subnet taken from it is dropped like any pool address. (RR5-1)
     PoolBan,
     /// No source but the document's prefixes, its floating addresses and the unspecified
     /// address.

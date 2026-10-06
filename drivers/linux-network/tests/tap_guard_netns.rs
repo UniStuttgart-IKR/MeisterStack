@@ -64,8 +64,8 @@ const ONE_OF_TWO_TAKEN: Site = Site {
         guest: "10.7.5.9",
     },
 };
-/// A guest with one routed subnet (`taken`) and an address of its own outside every pool
-/// (`other`), on a node whose floating pool holds `never`.
+/// A guest with one routed subnet (`taken`, cut from `ROUTED_POOL`) and an address of its own
+/// outside every pool (`other`), on a node whose floating pool holds `never`.
 const NO_PREFIX_LEFT: Site = Site {
     nic: NicId::from_u128(0x4c40_0003 << 96),
     bridge: "msguard1",
@@ -88,6 +88,9 @@ const NO_PREFIX_LEFT: Site = Site {
 };
 /// The floating pool of the node `NO_PREFIX_LEFT` is on.
 const FLOATING_POOL: &str = "10.255.0.0/16";
+/// The cloud's routed pool `NO_PREFIX_LEFT`'s routed subnet was cut from, which the node guards
+/// beside its floating pool.
+const ROUTED_POOL: &str = "10.7.0.0/16";
 const GUEST_MAC: &str = "52:54:00:00:4c:01";
 
 fn run(program: &str, args: &[&str]) -> (bool, String) {
@@ -289,15 +292,16 @@ async fn a_subnet_taken_from_a_running_tap_is_dropped_and_one_given_back_passes(
     take_down(&site, &d, &nic).await;
 }
 
-/// A re-send that leaves a guest's document no prefix at all puts its tap on the pool ban: a
-/// source in the node's floating pool that is not the guest's own is dropped and counted, and a
-/// source of its own outside every pool goes on passing, since the document says nothing of its
-/// address space. (NL5-2)
+/// A re-send that leaves a guest's document no prefix at all puts its tap on the pool ban over
+/// the node's guarded ranges, its floating pool and the routed pool: the routed subnet just
+/// taken is dropped and counted, as is a pool address that is not the guest's, and a source of
+/// its own outside every pool goes on passing, since the document says nothing of its address
+/// space. (NL5-2, RR5-1)
 #[tokio::test]
 #[ignore = "needs its own network and mount namespace; see the module note"]
-async fn a_guest_left_no_prefix_is_kept_off_the_pool_and_keeps_its_own_sources() {
+async fn a_guest_left_no_prefix_is_kept_off_every_pool_and_keeps_its_own_sources() {
     let site = NO_PREFIX_LEFT;
-    let d = driver_guarding(&[FLOATING_POOL]);
+    let d = driver_guarding(&[FLOATING_POOL, ROUTED_POOL]);
     let nic = site.nic;
     let tap = LinuxNetworkDriver::tap_name(&nic);
     host_and_guest(&site, &tap);
@@ -313,6 +317,15 @@ async fn a_guest_left_no_prefix_is_kept_off_the_pool_and_keeps_its_own_sources()
     d.update_guard(&nic, &allowing(&site, &[]))
         .await
         .expect("the guard follows the document");
+    let before = drops(&tap, POOL_RULES);
+    assert!(
+        !reaches(&site, &site.taken),
+        "a source in the routed subnet taken away is dropped at the tap"
+    );
+    assert!(
+        drops(&tap, POOL_RULES) > before,
+        "by the pool rule, since the subnet was cut from a pool the node guards"
+    );
     let before = drops(&tap, POOL_RULES);
     assert!(
         !reaches(&site, &site.never),

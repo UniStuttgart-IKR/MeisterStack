@@ -24,10 +24,13 @@ controller_ca = "pki/ca.crt"
 controller_cert = "pki/system-node-manacor.crt"
 controller_key = "pki/system-node-manacor.key"
 
-# Floating-pool ranges blocked as guest source addresses, except reservations
-# in that VM's spec. Keep this union aligned with cloud pools. MAC pinning is
-# always applied; routed subnets add a source allowlist. Reachability still
-# needs upstream routing or a guest/router appliance.
+# Ranges blocked as guest source addresses, except reservations in that VM's
+# spec: the cloud's floating pools AND its routed_pools (plus any routed subnet
+# CIDR named outside them), so a subnet taken from a NIC that is left no prefix
+# stays dropped. Keep this union aligned with the cloud; add the routed pool
+# here when cloud.toml sets routed_pools. MAC pinning is always applied; a NIC
+# whose spec names prefixes is held to an allowlist of them instead.
+# Reachability still needs upstream routing or a guest/router appliance.
 guarded_ranges = ["10.255.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
 
 # nftables executable; defaults to PATH. Rule programming is required.

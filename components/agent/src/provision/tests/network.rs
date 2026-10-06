@@ -525,8 +525,10 @@ async fn a_nic_without_a_tap_takes_the_new_addresses_into_the_record_alone() {
 
 /// The last prefix a re-send takes from a running VM leaves its tap guarded as the re-sent
 /// document says, on the pool ban, and the record with it: no node keeps an allowlist of its
-/// own for a NIC whose document names no prefix. That a tenant's guests keep their network's
-/// prefix is the controller's to send (NL5-1); this tier holds no word about it. (NL5-2)
+/// own for a NIC whose document names no prefix. The ban covers the node's guarded ranges, the
+/// routed pools the subnet was cut from among them, so the subnet taken stays dropped
+/// (tap_guard_netns, RR5-1). That a tenant's guests keep their network's prefix is the
+/// controller's to send (NL5-1); this tier holds no word about it. (NL5-2)
 #[tokio::test]
 async fn the_last_prefix_taken_from_a_running_vm_leaves_its_tap_as_the_document_says() {
     let temp = tempfile::tempdir().expect("a temp dir");

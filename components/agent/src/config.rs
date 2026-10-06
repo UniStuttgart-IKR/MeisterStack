@@ -98,9 +98,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub cgroup_cpuset: Option<String>,
 
-    // Guarded IPv4 ranges shared with the cloud floating pools. Tap rules permit
-    // only the addresses assigned to that NIC within these ranges. Empty ranges
-    // leave MAC pinning active. This duplicated configuration must be kept in sync.
+    // Guarded IPv4 ranges: every range the cloud hands addresses out of, its floating
+    // pools AND its routed_pools, and any CIDR a routed subnet was named with outside
+    // them. A tap whose document names no prefix may send from none of them but its own
+    // floating addresses, which is what keeps a routed subnet taken from it dropped
+    // (RR5-1); a tap on an allowlist is held to its document alone. Empty ranges leave
+    // MAC pinning only. This duplicated configuration must be kept in sync.
     #[serde(default)]
     pub guarded_ranges: Vec<String>,
     /// Path to `nft`; defaults to PATH.
@@ -1025,10 +1028,14 @@ mod tests {
         let guarded = cfg.nft_config().expect("the example's ranges parse");
         assert_eq!(
             guarded.guarded.ranges().len(),
-            3,
-            "a cidr, an address and a range"
+            4,
+            "a floating pool, the routed pool, an address and a range"
         );
         assert!(guarded.guarded.contains("10.255.0.7".parse().unwrap()));
+        assert!(
+            guarded.guarded.contains("10.7.1.9".parse().unwrap()),
+            "the routed pool is guarded beside the floating ones (RR5-1)"
+        );
         assert!(guarded.binary.ends_with("nft"));
 
         assert!(
