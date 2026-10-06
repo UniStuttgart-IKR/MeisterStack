@@ -632,20 +632,22 @@ mod tests {
         }
     }
 
-    /// One document is one chain, whichever node reads it and whether it comes off the wire or
-    /// out of a record: nothing a node keeps of its own goes into a guard. (NL5-2)
+    /// A NIC spec written into a record and read back renders the chain its document does: the
+    /// record keeps every field the guard reads. That one spec renders one chain on any node
+    /// is not this test's claim; the agent's provisioner tests and the cloud's reconcile tests
+    /// hold that the same document reaches every node. (NL5-2, RR5-5)
     #[test]
-    fn the_same_document_is_the_same_chain_on_every_node() {
+    fn a_nic_spec_read_back_from_its_record_renders_the_same_chain() {
         let document = r#"{"bridge":"meister_br0","mac":"52:54:00:11:22:33","vxlan_id":10007,
                            "floating_ips":["10.255.0.7"],"routed_subnets":["10.30.0.0/24"]}"#;
         let guarded = pool(&["10.255.0.0/16"]);
-        let on_one: NicSpec = serde_json::from_str(document).unwrap();
-        let on_another: NicSpec = serde_json::from_str(document).unwrap();
-        let from_a_record: NicSpec =
-            serde_json::from_value(serde_json::to_value(&on_one).unwrap()).unwrap();
-        let chain = ruleset("msk0", &on_one, &guarded).unwrap();
-        assert_eq!(chain, ruleset("msk0", &on_another, &guarded).unwrap());
-        assert_eq!(chain, ruleset("msk0", &from_a_record, &guarded).unwrap());
+        let sent: NicSpec = serde_json::from_str(document).unwrap();
+        let recorded = serde_json::to_vec(&sent).unwrap();
+        let read_back: NicSpec = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(
+            ruleset("msk0", &sent, &guarded).unwrap(),
+            ruleset("msk0", &read_back, &guarded).unwrap()
+        );
     }
 
     /// Allow initial DHCP and ARP probes before a guest has an address.
