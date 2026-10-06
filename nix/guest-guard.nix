@@ -28,7 +28,11 @@ let
       ${lib.concatMapStringsSep "\n  " (l: ''iifname "${l}" jump from_guest'') guestLinks}
     }
     chain from_guest {
-      ct state established,related accept
+      # Replies to what the host opened, and nothing a guest opened. While the
+      # table is missing (a NixOS firewall's stop removes it until its
+      # ExecStopPost loads it again) a guest's connection passes, and
+      # accepting every established flow would let it live on afterwards.
+      ct state { established, related } ct direction reply accept
       # Address resolution for connections the host opens to a guest.
       icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept
       ${allowed "tcp" cfg.allowedTCPPorts}
@@ -84,6 +88,8 @@ in
         on its own; elsewhere `meister-guest-guard.service` loads it. The
         table stays when its loader stops, so guest isolation fails closed;
         `nft delete table inet meister-guest-guard` removes it by hand.
+        A connection a guest opened while the table was missing ends when it
+        is back: only replies to the host's own connections are let through.
       '';
     };
 

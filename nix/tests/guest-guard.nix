@@ -17,6 +17,39 @@ let
   # shows whether systemd stopped or restarted the unit.
   agentStandIn = pkgs.writeShellScriptBin "meister-agent" "exec sleep infinity";
   loader = if hostRunsNftables then "nftables.service" else "meister-guest-guard.service";
+
+  # Answers every line it is sent, over IPv4 and IPv6, on the port the guard keeps closed.
+  echoServer = pkgs.writeText "echo-server.py" ''
+    import socket, socketserver
+
+    class Echo(socketserver.StreamRequestHandler):
+        def handle(self):
+            for line in self.rfile:
+                self.wfile.write(line)
+
+    class DualStack(socketserver.ThreadingTCPServer):
+        address_family = socket.AF_INET6
+        allow_reuse_address = True
+
+    DualStack(("::", 8082), Echo).serve_forever()
+  '';
+
+  # A guest's connection to the host that is open while the guard returns:
+  # the guard is missing for the first line and back for the second.
+  openAcrossReload = pkgs.writeText "open-across-reload.py" ''
+    import socket, subprocess, sys
+
+    conn = socket.create_connection(("10.42.0.1", 8082), timeout=3)
+    conn.sendall(b"one\n")
+    assert conn.recv(16) == b"one\n", "the connection did not open while the guard was missing"
+    subprocess.run(["systemctl", "restart", sys.argv[1]], check=True)
+    conn.sendall(b"two\n")
+    try:
+        answer = conn.recv(16)
+    except socket.timeout:
+        sys.exit(0)
+    sys.exit(f"the guard let a connection it never allowed carry on: {answer!r}")
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "meister-guest-guard${lib.optionalString hostRunsNftables "-nftables"}";
@@ -142,6 +175,22 @@ pkgs.testers.runNixOSTest {
         host.succeed("systemctl stop meister-guest-guard.service")
         guests_shut_out_and_agent_untouched()
   '') + ''
+
+    with subtest("a connection a guest opened while the guard was missing ends when it is back"):
+        # Connection tracking runs only while some table uses it. A host with a
+        # NAT or another firewall has it running in the gap too, and only then
+        # does the connection become an established one the guard could accept.
+        host.succeed(
+            "nft add table inet tracker",
+            "nft add chain inet tracker pre '{ type filter hook prerouting priority -300; }'",
+            "nft add rule inet tracker pre ct state new counter",
+        )
+        host.succeed("nft delete table inet meister-guest-guard")
+        host.succeed("(python3 ${echoServer} >/dev/null 2>&1 &)")
+        host.wait_for_open_port(8082)
+        host.succeed("ip netns exec guest python3 ${openAcrossReload} ${loader}")
+        host.succeed("nft list table inet meister-guest-guard")
+        host.execute("nft delete table inet tracker")
 
     with subtest("without the table the same connection goes through"):
         # Its loader is up and has nothing left to do, so only the table is missing.
