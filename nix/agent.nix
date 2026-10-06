@@ -452,6 +452,7 @@ in
 
       systemd.services.meister-agent = {
         description = "MeisterStack agent";
+        wantedBy = lib.mkIf cfg.autostart [ "multi-user.target" ];
         # Order the agent after its volume mount. Require the mount only when
         # volumes.required is set; optional mounts permit root-filesystem fallback.
         after = [

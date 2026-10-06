@@ -183,14 +183,8 @@ in
     # role daemons named by service units.
     environment.systemPackages = [ ms.package ];
 
-    # Enable selected role units at boot; credentials can still gate their startup.
-    systemd.services = lib.mkMerge (map
-      (role:
-        lib.mkIf (builtins.elem role ms.unitsFor) {
-          ${if role == "agent" then "meister-agent" else "meister-${role}-controller"}
-            .wantedBy = [ "multi-user.target" ];
-        })
-      [ "cloud" "cluster" "agent" ]);
+    # Start the role units at boot; credentials can still gate their startup.
+    meisterstack.autostart = lib.mkDefault true;
 
     # Signed closure transport and local deployment support.
     nix.enable = true;

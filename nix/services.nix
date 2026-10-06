@@ -90,6 +90,24 @@ in
       '';
     };
 
+    autostart = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = lib.literalExpression "config.my.host.holdsItsCertificates";
+      description = ''
+        Whether the role units of this host (`meister-agent`,
+        `meister-cloud-controller`, `meister-cluster-controller`) start at
+        boot, i.e. are wanted by `multi-user.target`.
+
+        Off by default: importing `nixosModules.services` into an existing
+        configuration defines the units and starts none of them, so a host
+        decides when it is ready — typically once its certificates are in
+        place. `nix/managed.nix` turns it on, because there the deployed
+        closure is the decision. Either way a unit still waits for its key
+        material (`ConditionPathExists`), and the agent for its guest guard.
+      '';
+    };
+
     binariesInStore = lib.mkOption {
       type = lib.types.bool;
       internal = true;

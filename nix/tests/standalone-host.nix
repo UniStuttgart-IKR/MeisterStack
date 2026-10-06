@@ -58,6 +58,14 @@ let
       accepted c && c.services.alloy.enable
       && c.services.alloy.configPath == "${c.meisterstack.configDir}/alloy.alloy";
 
+    "a host starts no role unit at boot unless asked" =
+      let c = cluster { }; in
+      c.systemd.services.meister-cluster-controller.wantedBy == [ ]
+      && (agent { }).systemd.services.meister-agent.wantedBy == [ ];
+    "asked to, a host starts its role units at boot" =
+      let c = cluster { meisterstack.autostart = true; }; in
+      builtins.elem "multi-user.target" c.systemd.services.meister-cluster-controller.wantedBy;
+
     "an agent holds no address on the default guest bridge unless asked" =
       !((agent { }).meisterstack.agent.effective.network ? bridge_addr);
     "an agent keeps guests from opening connections to the host" =

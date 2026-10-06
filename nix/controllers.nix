@@ -59,6 +59,7 @@ let
 
   controller = name: {
     description = "MeisterStack ${name}-controller";
+    wantedBy = lib.mkIf cfg.autostart [ "multi-user.target" ];
     # Order after the context renderer only when that renderer is enabled.
     after = [ "etcd.service" "meister-context.service" ];
     wants = [ "etcd.service" ];
