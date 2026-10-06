@@ -549,6 +549,12 @@ pub struct VmStatus {
 #[serde(rename_all = "camelCase")]
 pub struct HandedDown {
     pub at: DateTime<Utc>,
+    /// `metadata.labels` as that hand-down carried them. Labels are no part
+    /// of the spec and move no generation, so this is how the cloud knows the
+    /// cluster's copy, which the anti-affinity of the VM's neighbours reads,
+    /// still wears them. (IKR-B71)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A restart-move in flight: which machine it is leaving, and which half of

@@ -3364,6 +3364,35 @@ mod tests {
         assert_eq!(moved.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
     }
 
+    /// IKR-B71: a create that differs only in its labels is drift, and the
+    /// cluster's copy takes the new labels under its own marks.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_label_only_resend_relabels_the_cloud_vm_here() {
+        let store = crate::test_etcd::fresh_store("cloud-placement-test").await;
+        let labelled = |app: &str| proto::CreateVm {
+            spec_json: serde_json::json!({ "vm": { "vcpus": 1, "memory_mib": 512 } }).to_string(),
+            labels: [("app".to_string(), app.to_string())].into(),
+            ..create(None, &[], &[])
+        };
+        handle_create(&store, labelled("web"), "")
+            .await
+            .expect("created");
+        let before: Vm = store.get("web-1").await.expect("the cloud's vm");
+
+        handle_create(&store, labelled("db"), "")
+            .await
+            .expect("relabelled");
+
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(after.metadata.labels["app"], "db");
+        assert_eq!(after.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
+        assert_eq!(
+            after.metadata.generation, before.metadata.generation,
+            "labels are no new spec"
+        );
+    }
+
     /// IKR-B81: a volume destroy judged on a record that was replaced under the same name
     /// leaves the new record unmarked, as a VM destroy does (NL3-3).
     #[tokio::test]

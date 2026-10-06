@@ -780,7 +780,10 @@ fn stopping(told: i64) -> Vm {
     v.settle(at(0));
     v.status.observed_generation = v.metadata.generation;
     v.status.observed_at = Some(at(told));
-    v.status.handed_down = Some(controller_api::HandedDown { at: at(told) });
+    v.status.handed_down = Some(controller_api::HandedDown {
+        at: at(told),
+        labels: v.metadata.labels.clone(),
+    });
     v
 }
 
@@ -816,6 +819,27 @@ fn only_a_dispatch_after_the_intent_counts_as_told() {
     let v = stopping(10);
     assert!(handed_down_since(&v, at(5), at(11)));
     assert!(!handed_down_since(&v, at(12), at(13)));
+}
+
+/// A label-only edit of a bound, acked VM goes down at once: labels move no
+/// generation, and the neighbours' anti-affinity at the cluster reads them.
+#[test]
+fn a_label_edit_of_an_acked_vm_is_handed_down() {
+    let mut v = stopping(10);
+    v.spec.run_strategy = RunStrategy::Running;
+    assert!(!must_hand_down(&v, false, at(11)), "nothing new");
+    v.metadata.labels.insert("app".into(), "web".into());
+    assert!(must_hand_down(&v, false, at(11)));
+}
+
+/// A VM handed down before the record existed goes down once more, so the
+/// cluster's copy gets the labels it never carried.
+#[test]
+fn a_vm_handed_down_before_labels_travelled_goes_down_once_more() {
+    let mut v = stopping(10);
+    v.spec.run_strategy = RunStrategy::Running;
+    v.status.handed_down = None;
+    assert!(must_hand_down(&v, false, at(11)));
 }
 
 /// A phase the cluster reported a moment ago is not a hand-down: the drift

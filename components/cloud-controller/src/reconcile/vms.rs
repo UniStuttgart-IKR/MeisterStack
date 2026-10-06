@@ -304,16 +304,27 @@ pub(super) fn handed_down_since(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Ut
             .is_some_and(|h| h.at >= intent)
 }
 
+/// Whether the cluster's copy may wear other labels than the VM: edited since
+/// the last acked hand-down, or never handed down under this record, which
+/// is every VM dispatched before labels travelled. (IKR-B71)
+pub(super) fn labels_unsent(vm: &Vm) -> bool {
+    vm.status
+        .handed_down
+        .as_ref()
+        .is_none_or(|h| h.labels != vm.metadata.labels)
+}
+
 /// Whether the VM has to go down to its cluster now: the cluster lacks it, or
-/// has not been sent the current spec generation, or its phase still disagrees
-/// with the intent it acked longer than [`RETELL_AFTER`] ago. Generation
-/// changes include disk hot-plug and runStrategy edits; the drift arm is the
-/// repair for a cluster that lost what it acked, not the way intent travels.
+/// has not been sent the current spec generation or labels, or its phase
+/// still disagrees with the intent it acked longer than [`RETELL_AFTER`] ago.
+/// Generation changes include disk hot-plug and runStrategy edits; the drift
+/// arm is the repair for a cluster that lost what it acked, not the way
+/// intent travels.
 pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool {
     let stale = vm.metadata.generation > vm.status.observed_generation;
     let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some()
         && !handed_down_lately(vm, now);
-    missing || stale || drifted
+    missing || stale || labels_unsent(vm) || drifted
 }
 
 /// Dispatch what [`must_hand_down`] says has to go down.
@@ -767,7 +778,12 @@ pub(super) async fn dispatch_create(
                     // it, a status built before the create landed could pass
                     // for proof that the VM was never there.
                     v.status.observed_at = Some(Utc::now());
-                    v.status.handed_down = Some(controller_api::HandedDown { at: Utc::now() });
+                    // The labels this command carried, not the object's
+                    // by now: an edit since is still to go down.
+                    v.status.handed_down = Some(controller_api::HandedDown {
+                        at: Utc::now(),
+                        labels: vm.metadata.labels.clone(),
+                    });
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has
