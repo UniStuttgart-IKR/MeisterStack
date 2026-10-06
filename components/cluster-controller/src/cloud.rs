@@ -3320,7 +3320,8 @@ mod tests {
         assert_eq!(stored.metadata.labels["app"], "web");
         assert_eq!(stored.metadata.cloud_uid(), Some("uid-1"));
 
-        let node = |name: &str, zone: &str, hosted: &[&str]| controller_api::Candidate {
+        // What each node holds: (tenant, app) of every VM on it.
+        let node = |name: &str, zone: &str, hosted: &[(&str, &str)]| controller_api::Candidate {
             name: name.into(),
             connected: true,
             alive: true,
@@ -3336,19 +3337,23 @@ mod tests {
             accepts: vec!["gpu".to_string()],
             hosted: hosted
                 .iter()
-                .map(|app| [("app".to_string(), app.to_string())].into())
+                .map(|(tenant, app)| controller_api::Hosted {
+                    tenant: Some(tenant.to_string()),
+                    labels: [("app".to_string(), app.to_string())].into(),
+                })
                 .collect(),
             machine: None,
         };
         let fleet = [
             node("cobra2", "cobra2", &[]),
-            node("cobra3b", "cobra3", &["web"]),
-            node("cobra3", "cobra3", &[]),
+            node("cobra3b", "cobra3", &[("acme", "web")]),
+            node("cobra3", "cobra3", &[("umbrella", "web")]),
         ];
         assert_eq!(
             controller_api::Scheduler::assign(&controller_api::FirstFit, &stored, &fleet),
             Some("cobra3".to_string()),
-            "the labelled node, and not the one already holding a web"
+            "the labelled node, and not the one already holding a web of its own tenant; \
+             another tenant's web is not one it can mean"
         );
 
         handle_create(&store, asking("cobra2"), "")

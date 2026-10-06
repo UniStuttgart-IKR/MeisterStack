@@ -442,7 +442,7 @@ async fn expire_and_collect_clusters(
             free: free_on(&name, &cluster.status.capacity, vms, overcommit),
             catalogue: cluster.status.capacity.capabilities,
             kind: CandidateKind::Cluster,
-            hosted: hosted_on(&name, vms, |v| v.spec.cluster_name.as_deref()),
+            hosted: controller_api::hosted_on(&name, vms, |v| v.spec.cluster_name.as_deref()),
             labels: cluster.spec.labels,
             name,
             // A candidate here is a CLUSTER and not a machine, so there is no

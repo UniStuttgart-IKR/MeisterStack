@@ -30,19 +30,6 @@ pub(super) fn free_on(
         .minus(bound)
 }
 
-/// The label sets of the VMs already bound to `on` — what anti-affinity is
-/// measured against. Every phase counts, exactly as `free_on` counts them.
-pub(super) fn hosted_on(
-    on: &str,
-    vms: &[Vm],
-    bound: fn(&Vm) -> Option<&str>,
-) -> Vec<BTreeMap<String, String>> {
-    vms.iter()
-        .filter(|v| bound(v) == Some(on))
-        .map(|v| v.metadata.labels.clone())
-        .collect()
-}
-
 /// Preview cluster placement using the same volume and selector constraints
 /// as reconciliation, without mutating objects or reserving capacity.
 /// Read shared connection and heartbeat state so the answer does not depend on
@@ -87,7 +74,7 @@ pub(crate) async fn would_place(
             free: free_on(&name, &cluster.status.capacity, &vms, overcommit),
             catalogue: cluster.status.capacity.capabilities,
             kind: CandidateKind::Cluster,
-            hosted: hosted_on(&name, &vms, |v| v.spec.cluster_name.as_deref()),
+            hosted: controller_api::hosted_on(&name, &vms, |v| v.spec.cluster_name.as_deref()),
             labels: cluster.spec.labels,
             name,
             // A candidate here is a CLUSTER and not a machine, so there is no

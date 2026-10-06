@@ -6,19 +6,6 @@
 
 use super::*;
 
-/// Labels of all VMs bound to this candidate, including VMs that have not started.
-/// Anti-affinity must account for reservations made earlier in the same pass.
-pub(super) fn hosted_on(
-    on: &str,
-    vms: &[Vm],
-    bound: fn(&Vm) -> Option<&str>,
-) -> Vec<BTreeMap<String, String>> {
-    vms.iter()
-        .filter(|v| bound(v) == Some(on))
-        .map(|v| v.metadata.labels.clone())
-        .collect()
-}
-
 /// Build candidates without changing readiness or reserving capacity.
 /// Readiness comes from shared status and heartbeat age, independent of which
 /// replica owns a session. Unlike live placement, this path uses `schedulable`
@@ -54,7 +41,7 @@ pub(crate) async fn candidates_for_preview(
             free: free_on(&name, &node.status.capacity, &vms, overcommit),
             catalogue: node.status.capacity.capabilities,
             kind: CandidateKind::Node,
-            hosted: hosted_on(&name, &vms, |v| v.spec.node_name.as_deref()),
+            hosted: controller_api::hosted_on(&name, &vms, |v| v.spec.node_name.as_deref()),
             labels: node.spec.labels,
             accepts: node.spec.accepts,
             // Not a scheduling input; see `Candidate::machine`. It is here
@@ -176,7 +163,7 @@ pub(super) async fn expire_and_collect_nodes(
             free: free_on(&name, &node.status.capacity, vms, overcommit),
             catalogue: node.status.capacity.capabilities,
             kind: CandidateKind::Node,
-            hosted: hosted_on(&name, vms, |v| v.spec.node_name.as_deref()),
+            hosted: controller_api::hosted_on(&name, vms, |v| v.spec.node_name.as_deref()),
             labels: node.spec.labels,
             // What this MACHINE takes — the mirror image of a selector, and
             // the tier that has it: `NodeSpec.accepts` is an operator's word

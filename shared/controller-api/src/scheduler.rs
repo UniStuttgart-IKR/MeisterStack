@@ -168,13 +168,44 @@ pub struct Candidate {
     /// currently have no node acceptance list on the wire, so the cluster
     /// performs the final class check.
     pub accepts: Vec<String>,
-    /// Labels of bound VMs for anti-affinity checks, derived with capacity usage
-    /// from each pass's VM inventory.
-    pub hosted: Vec<BTreeMap<String, String>>,
+    /// The VMs bound here as anti-affinity sees them, derived with capacity
+    /// usage from each pass's VM inventory.
+    pub hosted: Vec<Hosted>,
     /// Machine profile for live-migration compatibility, not ordinary VM
     /// placement. None at the cloud tier or for older nodes means unavailable
     /// evidence, not compatibility.
     pub machine: Option<crate::MachineProfile>,
+}
+
+/// One VM a candidate already holds, as anti-affinity measures it: whose it
+/// is and what it is labelled.
+///
+/// The tenant travels with the labels because a term only ever means the
+/// owner's own VMs. Labels are the tenant's to choose, so measured across
+/// tenants one tenant's labels would push another's VMs off a machine, and a
+/// term's refusals would tell its owner what somebody else runs where.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hosted {
+    pub tenant: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl Hosted {
+    pub fn of(vm: &Vm) -> Self {
+        Self {
+            tenant: vm.spec.tenant.clone(),
+            labels: vm.metadata.labels.clone(),
+        }
+    }
+}
+
+/// The VMs bound to `on` by `bound`, every phase counted, exactly as
+/// [`free_on`] counts them: what anti-affinity is measured against.
+pub fn hosted_on(on: &str, vms: &[Vm], bound: fn(&Vm) -> Option<&str>) -> Vec<Hosted> {
+    vms.iter()
+        .filter(|v| bound(v) == Some(on))
+        .map(Hosted::of)
+        .collect()
 }
 
 /// Require every selector pair to match; an empty selector matches all labels.
@@ -191,12 +222,15 @@ pub fn selector_for(vm: &Vm, kind: CandidateKind) -> &BTreeMap<String, String> {
     }
 }
 
-/// Does this candidate already hold a VM that `term` says to stay away from?
-fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
+/// Does this candidate already hold a VM of `vm`'s own tenant that `term`
+/// says to stay away from? Another tenant's VMs are never meant; see
+/// [`Hosted`].
+fn collides(term: &AntiAffinity, vm: &Vm, candidate: &Candidate) -> bool {
     candidate
         .hosted
         .iter()
-        .any(|labels| selects(&term.selector, labels))
+        .filter(|h| h.tenant == vm.spec.tenant)
+        .any(|h| selects(&term.selector, &h.labels))
 }
 
 /// Apply hard VM constraints while preserving inventory order: health,
@@ -215,7 +249,7 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
                 .anti_affinity
                 .iter()
                 .filter(|t| t.required)
-                .any(|t| collides(t, c))
+                .any(|t| collides(t, vm, c))
         })
         .collect()
 }
@@ -646,7 +680,7 @@ pub fn preferred<'a>(vm: &Vm, feasible: Vec<&'a Candidate>) -> Vec<&'a Candidate
     let clean: Vec<&Candidate> = feasible
         .iter()
         .copied()
-        .filter(|c| !soft.iter().any(|t| collides(t, c)))
+        .filter(|c| !soft.iter().any(|t| collides(t, vm, c)))
         .collect();
     if clean.is_empty() { feasible } else { clean }
 }
@@ -1053,7 +1087,7 @@ const CUTS: [Cut; 6] = [
                 .anti_affinity
                 .iter()
                 .filter(|t| t.required)
-                .any(|t| collides(t, c))
+                .any(|t| collides(t, vm, c))
         },
         verdict: |_, _, _, _| {
             (
@@ -1115,7 +1149,7 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
 pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
         c.free = c.free.minus(Capacity::wanted_by(vm));
-        c.hosted.push(vm.metadata.labels.clone());
+        c.hosted.push(Hosted::of(vm));
     }
 }
 
@@ -1296,7 +1330,13 @@ mod tests {
         Candidate {
             machine: None,
             labels: labels(on),
-            hosted: holding.iter().map(|h| labels(h)).collect(),
+            hosted: holding
+                .iter()
+                .map(|h| Hosted {
+                    tenant: None,
+                    labels: labels(h),
+                })
+                .collect(),
             ..candidate(name, true, true)
         }
     }
@@ -2276,6 +2316,70 @@ mod tests {
         // A term whose selector matches nothing there is not a constraint.
         assert_eq!(
             FirstFit.assign(&avoiding(&[("app", "db")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// A candidate holding one VM labelled `app=web` of `tenant`.
+    fn holding_web_of(name: &str, tenant: Option<&str>) -> Candidate {
+        Candidate {
+            hosted: vec![Hosted {
+                tenant: tenant.map(str::to_string),
+                labels: labels(&[("app", "web")]),
+            }],
+            ..candidate(name, true, true)
+        }
+    }
+
+    /// `avoiding`, asked by a VM of `tenant`.
+    fn avoiding_as(tenant: &str, pairs: &[(&str, &str)], required: bool) -> Vm {
+        let mut v = avoiding(pairs, required);
+        v.spec.tenant = Some(tenant.into());
+        v
+    }
+
+    /// A term means its owner's own VMs: another tenant's VM wearing the
+    /// label does not push this one off the machine. (IKR-B71)
+    #[test]
+    fn a_term_does_not_see_another_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("umbrella"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("acme", &[("app", "web")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// The same machine, holding the tenant's own `web`, is avoided.
+    #[test]
+    fn a_term_still_sees_its_own_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("acme"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("acme", &[("app", "web")], true), &only),
+            None
+        );
+    }
+
+    /// An unscoped VM's term means unscoped VMs only, and no tenant's VM.
+    #[test]
+    fn an_unscoped_term_does_not_see_a_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("acme"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// What a pass spends carries the tenant, so the next VM of the same
+    /// tenant in that pass sees it and one of another tenant does not.
+    #[test]
+    fn a_spent_placement_is_hosted_under_its_tenant() {
+        let mut room = vec![candidate("agent-1a", true, true)];
+        let mut first = avoiding_as("acme", &[("app", "web")], true);
+        first.metadata.labels = labels(&[("app", "web")]);
+        spend(&mut room, "agent-1a", &first);
+        assert_eq!(FirstFit.assign(&first, &room), None);
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("umbrella", &[("app", "web")], true), &room),
             Some("agent-1a".into())
         );
     }
