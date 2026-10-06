@@ -217,7 +217,7 @@ async fn pass(
     for vm in vms {
         let name = vm.metadata.name.clone();
         if let Err(e) = reconcile_vm(
-            store, registry, scheduler, &sessions, &clusters, &book, &pending, vm,
+            store, registry, scheduler, &sessions, &clusters, &book, &pending, overcommit, vm,
         )
         .await
         {

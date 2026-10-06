@@ -108,6 +108,13 @@ pub struct NodeSummary {
     pub vcpus: u32,
     #[serde(default)]
     pub mem_mib: u64,
+    /// What the VMs bound to this node ask for, as its cluster counts them
+    /// (cluster-local VMs included). Zero from a cluster that predates the
+    /// field, which leaves the whole capacity as the room. (IKR-B78)
+    #[serde(default)]
+    pub bound_vcpus: u32,
+    #[serde(default)]
+    pub bound_mem_mib: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     #[serde(default)]

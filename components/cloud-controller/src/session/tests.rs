@@ -24,6 +24,8 @@ fn a_reported_node_reaches_the_cluster_object_unchanged() {
             .collect(),
         vcpus: 32,
         mem_mib: 65_536,
+        bound_vcpus: 4,
+        bound_mem_mib: 8192,
         capabilities: vec!["nvrm/4q".into()],
         accepts: vec!["router".into()],
         vms: 3,
@@ -40,6 +42,7 @@ fn a_reported_node_reaches_the_cluster_object_unchanged() {
     assert!(!kept.schedulable, "the drain travels up with the rest");
     assert_eq!(kept.labels["zone"], "a");
     assert_eq!((kept.vcpus, kept.mem_mib, kept.vms), (32, 65_536, 3));
+    assert_eq!((kept.bound_vcpus, kept.bound_mem_mib), (4, 8192));
     assert_eq!(kept.capabilities, vec!["nvrm/4q".to_string()]);
     // And the node's own word about itself, which is what tells a wedged
     // machine from a healthy one at the tier that places on clusters.

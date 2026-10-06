@@ -812,3 +812,57 @@ fn only_a_dispatch_after_the_intent_counts_as_told() {
     assert!(told_lately(&v, at(5), at(11)));
     assert!(!told_lately(&v, at(12), at(13)));
 }
+
+// --- IKR-B78: a cluster is offered only where one node can take the VM -----
+
+/// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
+/// cluster had room, the cloud bound, and the VM sat Pending a tier down.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into());
+    let store = EtcdStore::connect(
+        &[endpoint],
+        &format!("/placement-test/{}", uuid::Uuid::new_v4()),
+    )
+    .await
+    .expect("an etcd to talk to");
+    let node = |name: &str| controller_api::NodeSummary {
+        name: name.into(),
+        ready: true,
+        schedulable: true,
+        vcpus: 4,
+        mem_mib: 2048,
+        ..Default::default()
+    };
+    let mut cluster = Cluster::declare("ikr-netlab", Default::default());
+    cluster.status.nodes = vec![node("cobra0"), node("cobra1")];
+    store.create(&cluster).await.expect("the cluster");
+
+    let asking = |mem_mib: u64| {
+        let mut v = vm();
+        v.spec.vm = serde_json::json!({ "vcpus": 1, "memory_mib": mem_mib });
+        v
+    };
+    let offered = |servable| match servable {
+        Servable::Clusters(names) => names,
+        Sentence(why) => panic!("no storage asked, yet: {why}"),
+    };
+    let none = offered(
+        servable_clusters(&store, &asking(4096), Overcommit::default())
+            .await
+            .expect("an answer"),
+    );
+    assert!(none.is_empty(), "{none:?}");
+    let one = offered(
+        servable_clusters(&store, &asking(1024), Overcommit::default())
+            .await
+            .expect("an answer"),
+    );
+    assert_eq!(one, vec!["ikr-netlab".to_string()]);
+
+    let (category, sentence) = node_level_reason(&asking(4096), 1);
+    assert_eq!(category, controller_api::PendingReason::NoCapacity);
+    assert!(sentence.contains("4096 MiB"), "{sentence}");
+}

@@ -277,6 +277,8 @@ pub(super) fn node_summary(n: &proto::NodeReport) -> controller_api::NodeSummary
         labels: n.labels.clone().into_iter().collect(),
         vcpus: n.vcpus,
         mem_mib: n.mem_mib,
+        bound_vcpus: n.bound_vcpus,
+        bound_mem_mib: n.bound_mem_mib,
         capabilities: n.capabilities.clone(),
         vms: n.vms,
         conditions: n

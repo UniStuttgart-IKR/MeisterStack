@@ -772,7 +772,12 @@ message NodeReport {
   // False means unavailable or incomplete; absence then proves nothing. See
   // StatusReport.images_complete for the corresponding agent-hop contract.
   bool images_complete = 13;
-
+  // What the VMs bound to this node ask for, as this cluster counts them,
+  // cluster-local VMs included. The cloud measures one node's room with it, so
+  // it binds a VM only to a cluster with a node that can take it. Zero from an
+  // older cluster leaves the whole capacity as the room.
+  uint32 bound_vcpus = 14;
+  uint64 bound_mem_mib = 15;
 }
 
 // The evidence a drain leaves, relayed one tier up. See

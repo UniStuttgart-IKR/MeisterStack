@@ -102,10 +102,10 @@ pub use rest::{
 };
 pub use scheduler::{
     Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, NodeDemand, Overcommit,
-    PendingReason, PendingTally, Scheduler, SchedulerConfig, Spread, VolumeBinding, feasible,
-    feasible_for_volumes, free_on, hold, narrow_allowed, pending_reason, pending_reason_of,
-    preferred, preferred_for_volumes, reservation_holds, reserved_on, selector_for, selects, spend,
-    volume_nodes_unusable, volume_pending_reason,
+    PendingReason, PendingTally, Scheduler, SchedulerConfig, Spread, VolumeBinding, bound_on,
+    feasible, feasible_for_volumes, free_on, hold, narrow_allowed, pending_reason,
+    pending_reason_of, preferred, preferred_for_volumes, reservation_holds, reserved_on,
+    selector_for, selects, spend, volume_nodes_unusable, volume_pending_reason,
 };
 pub use store::{EtcdStore, Fence, PassTrigger, StoreError};
 pub use stuck::{

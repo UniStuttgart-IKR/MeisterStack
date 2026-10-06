@@ -53,7 +53,7 @@ pub(crate) async fn would_place(
     overcommit: Overcommit,
     vm: &Vm,
 ) -> anyhow::Result<String> {
-    let names = match servable_clusters(store, vm).await? {
+    let names = match servable_clusters(store, vm, overcommit).await? {
         Servable::Clusters(names) => names,
         Sentence(reason) => return Ok(reason),
     };
@@ -106,7 +106,9 @@ pub(crate) async fn would_place(
         // The same two sentences the pass gives, and in the same order: a
         // cluster cut away for having no suitable node is not a cluster that
         // "had no room".
-        None if allowed.is_empty() && !clusters.is_empty() => node_level_reason(vm, clusters.len()),
+        None if allowed.is_empty() && !clusters.is_empty() => {
+            node_level_reason(vm, clusters.len()).1
+        }
         None => controller_api::pending_reason_of(vm, &allowed).1,
     })
 }
@@ -164,21 +166,17 @@ pub(super) enum Servable {
 
 pub(super) use Servable::Sentence;
 
-/// Narrow cluster candidates using node selectors and referenced-volume locality.
-/// These constraints require node-level facts that aggregate cluster capacity
-/// cannot express. With neither constraint, all connected clusters are eligible.
-pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Result<Servable> {
+/// Narrow cluster candidates to those with ONE node that takes this VM: its
+/// selector, the locality of its referenced volumes, its class and its size.
+/// These need node-level facts that a cluster's sum cannot express: a cluster
+/// of two half-full nodes has room in total for a VM neither node can take,
+/// and binding it there leaves it Pending a tier down (IKR-B78).
+pub(super) async fn servable_clusters(
+    store: &EtcdStore,
+    vm: &Vm,
+    overcommit: Overcommit,
+) -> anyhow::Result<Servable> {
     let names = vm.spec.referenced_volumes();
-    if names.is_empty() && vm.spec.node_selector.is_empty() {
-        return Ok(Servable::Clusters(
-            store
-                .list::<Cluster>()
-                .await?
-                .into_iter()
-                .map(|c| c.metadata.name)
-                .collect(),
-        ));
-    }
 
     // Intersect the clusters serving every referenced volume, then apply node
     // locality. Multiple pools must share at least one reachable placement.
@@ -209,6 +207,9 @@ pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Res
     let demand = controller_api::NodeDemand {
         selector: &vm.spec.node_selector,
         allowed,
+        size: Capacity::wanted_by(vm),
+        class: vm.spec.class(),
+        overcommit,
     };
     let servable = store
         .list::<Cluster>()
@@ -349,9 +350,11 @@ pub(super) fn reachable_nodes(
     }
 }
 
-/// Why no cluster has a node for this VM. Names the two things that can cut
-/// one away, because which of them it was is what an operator has to change.
-pub(super) fn node_level_reason(vm: &Vm, known: usize) -> String {
+/// Why no cluster has a node for this VM, and under which category. Names
+/// every node-level ask the VM makes, because which of them cut the clusters
+/// away is what an operator has to change; the category is the most specific
+/// one the VM asked for.
+pub(super) fn node_level_reason(vm: &Vm, known: usize) -> (controller_api::PendingReason, String) {
     let selector: Vec<String> = vm
         .spec
         .node_selector
@@ -359,20 +362,32 @@ pub(super) fn node_level_reason(vm: &Vm, known: usize) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     let volumes = vm.spec.referenced_volumes();
-    match (selector.is_empty(), volumes.is_empty()) {
-        (true, false) => format!(
-            "none of the {known} known clusters has a node that can reach [{}]",
-            volumes.join(", ")
-        ),
-        (false, true) => format!(
-            "none of the {known} known clusters has a schedulable node labelled [{}]",
-            selector.join(", ")
-        ),
-        _ => format!(
-            "none of the {known} known clusters has a schedulable node that is labelled [{}] \
-             and can reach [{}]",
-            selector.join(", "),
-            volumes.join(", ")
-        ),
+    let size = Capacity::wanted_by(vm);
+    let mut asks = Vec::new();
+    if !selector.is_empty() {
+        asks.push(format!("is labelled [{}]", selector.join(", ")));
     }
+    if !volumes.is_empty() {
+        asks.push(format!("can reach [{}]", volumes.join(", ")));
+    }
+    asks.push(format!(
+        "takes class {} with room for {} vcpu and {} MiB",
+        vm.spec.class(),
+        size.vcpus,
+        size.mem_mib
+    ));
+    let category = if !volumes.is_empty() {
+        controller_api::PendingReason::NoNodeForVolume
+    } else if !selector.is_empty() {
+        controller_api::PendingReason::SelectorUnmatched
+    } else {
+        controller_api::PendingReason::NoCapacity
+    };
+    (
+        category,
+        format!(
+            "none of the {known} known clusters has a schedulable node that {}",
+            asks.join(" and ")
+        ),
+    )
 }

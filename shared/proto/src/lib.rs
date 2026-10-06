@@ -269,6 +269,8 @@ mod tests {
                 .collect(),
             vcpus: 32,
             mem_mib: 64 * 1024,
+            bound_vcpus: 4,
+            bound_mem_mib: 8 * 1024,
             capabilities: vec!["nvrm/4q".into(), "network/vxlan".into()],
             accepts: vec!["router".into()],
             vms: 3,

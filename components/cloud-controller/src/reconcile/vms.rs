@@ -22,6 +22,7 @@ pub(super) async fn reconcile_vm(
     clusters: &std::sync::Mutex<Vec<Candidate>>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
+    overcommit: Overcommit,
     vm: Vm,
 ) -> anyhow::Result<()> {
     let context = birth_trace(&vm).unwrap_or_else(telemetry::TraceParent::root);
@@ -35,7 +36,7 @@ pub(super) async fn reconcile_vm(
         span,
         &context,
         reconcile_vm_traced(
-            store, registry, scheduler, sessions, clusters, book, pending, vm, context,
+            store, registry, scheduler, sessions, clusters, book, pending, overcommit, vm, context,
         ),
     )
     .await
@@ -63,6 +64,7 @@ pub(super) async fn reconcile_vm_traced(
     clusters: &std::sync::Mutex<Vec<Candidate>>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
+    overcommit: Overcommit,
     vm: Vm,
     context: telemetry::TraceParent,
 ) -> anyhow::Result<()> {
@@ -84,7 +86,10 @@ pub(super) async fn reconcile_vm_traced(
     }
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        return place(store, registry, scheduler, clusters, pending, vm, &outgoing).await;
+        return place(
+            store, registry, scheduler, clusters, pending, overcommit, vm, &outgoing,
+        )
+        .await;
     };
 
     let Some(report) = current_report(registry, &vm, &cluster) else {
@@ -137,12 +142,14 @@ fn current_report(
 /// that already has something of ours: an old binding that has to be given up
 /// first, a storage answer that no cluster satisfies, and otherwise the
 /// scheduler's pick.
+#[allow(clippy::too_many_arguments)]
 async fn place(
     store: &EtcdStore,
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     clusters: &std::sync::Mutex<Vec<Candidate>>,
     pending: &PendingTally,
+    overcommit: Overcommit,
     vm: Vm,
     outgoing: &str,
 ) -> anyhow::Result<()> {
@@ -159,7 +166,7 @@ async fn place(
     // a sum and its catalogue a union, so a cluster can look able to
     // serve a VM that no single node of it can — and until this the
     // answer was found one tier down, after the VM had been sent there.
-    let node_level = match servable_clusters(store, &vm).await? {
+    let node_level = match servable_clusters(store, &vm, overcommit).await? {
         Servable::Clusters(names) => names,
         Sentence(reason) => {
             pending.note(controller_api::PendingReason::VolumeNotReady);
@@ -217,13 +224,9 @@ fn pick_cluster(
         // offered. A cluster cut away for having no suitable node is
         // not a cluster that "had no room", and saying so would send
         // an operator to look at the wrong thing.
-        None if allowed.is_empty() && !clusters.is_empty() => Err((
-            clusters.len(),
-            (
-                controller_api::PendingReason::NoNodeForVolume,
-                node_level_reason(vm, clusters.len()),
-            ),
-        )),
+        None if allowed.is_empty() && !clusters.is_empty() => {
+            Err((clusters.len(), node_level_reason(vm, clusters.len())))
+        }
         None => Err((
             allowed.len(),
             controller_api::pending_reason_of(vm, &allowed),

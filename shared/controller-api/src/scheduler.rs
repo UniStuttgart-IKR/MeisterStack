@@ -573,11 +573,19 @@ pub struct NodeDemand<'a> {
     /// Intersection of nodes permitted by all referenced volumes.
     /// None means unrestricted; an empty set means no common placement exists.
     pub allowed: Option<Vec<String>>,
+    /// What the VM asks of ONE machine. A cluster's capacity is a sum, and
+    /// a sum can hold a VM no node of it can (IKR-B78).
+    pub size: Capacity,
+    /// The workload class one node must accept, as `VmSpec::class` reads it.
+    pub class: &'a str,
+    /// The allowance a node's capacity gives, as the cloud applies it to a
+    /// cluster's sum.
+    pub overcommit: Overcommit,
 }
 
 impl NodeDemand<'_> {
-    /// Require a usable node satisfying the selector and volume constraints before
-    /// binding a VM to this cluster.
+    /// Require ONE usable node satisfying the selector, the volume constraints,
+    /// the class and the room before binding a VM to this cluster.
     pub fn met_by_a_node(&self, nodes: &[NodeSummary]) -> bool {
         nodes.iter().any(|n| {
             n.ready
@@ -589,7 +597,22 @@ impl NodeDemand<'_> {
                     .allowed
                     .as_ref()
                     .is_none_or(|allowed| allowed.iter().any(|a| a == &n.name))
+                && crate::resources::accepts_class(&n.accepts, self.class)
+                && self.size.fits_in(self.room_on(n))
         })
+    }
+
+    /// What one node has left, as its cluster reported the VMs bound to it.
+    fn room_on(&self, node: &NodeSummary) -> Capacity {
+        let capacity = Capacity {
+            vcpus: node.vcpus,
+            mem_mib: node.mem_mib,
+        };
+        let bound = Capacity {
+            vcpus: node.bound_vcpus,
+            mem_mib: node.bound_mem_mib,
+        };
+        self.overcommit.allowance(capacity).minus(bound)
     }
 }
 
@@ -1105,18 +1128,23 @@ pub fn free_on(
     vms: &[Vm],
     overcommit: Overcommit,
 ) -> Capacity {
-    let bound = vms
-        .iter()
-        .filter(|v| v.spec.node_name.as_deref() == Some(node))
-        .fold(Capacity::default(), |sum, vm| {
-            sum.plus(Capacity::wanted_by(vm))
-        });
     overcommit
         .allowance(Capacity {
             vcpus: capacity.vcpus,
             mem_mib: capacity.mem_mib,
         })
-        .minus(bound)
+        .minus(bound_on(node, vms))
+}
+
+/// What the VMs bound to `node` ask for, Pending included. The used half of
+/// [`free_on`], and what a cluster reports up per node so the cloud measures
+/// one node's room the same way.
+pub fn bound_on(node: &str, vms: &[Vm]) -> Capacity {
+    vms.iter()
+        .filter(|v| v.spec.node_name.as_deref() == Some(node))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        })
 }
 
 /// Sum reservations independently of bound VM usage: migrating guests stay bound to their
@@ -2936,6 +2964,9 @@ mod tests {
         let anywhere = NodeDemand {
             selector: &BTreeMap::new(),
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
+            overcommit: Overcommit::default(),
         };
         assert!(anywhere.met_by_a_node(&[node]));
     }
@@ -3104,6 +3135,8 @@ mod tests {
                 .collect(),
             vcpus: 8,
             mem_mib: 8192,
+            bound_vcpus: 0,
+            bound_mem_mib: 0,
             capabilities: Vec::new(),
             accepts: Vec::new(),
             vms: 0,
@@ -3132,6 +3165,9 @@ mod tests {
         let demand = NodeDemand {
             selector: &want,
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
+            overcommit: Overcommit::default(),
         };
         assert!(demand.met_by_a_node(&[summary("a", true, true, &[("disk", "nvme")])]));
         assert!(!demand.met_by_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
@@ -3158,6 +3194,9 @@ mod tests {
         let demand = NodeDemand {
             selector: &none,
             allowed: Some(vec!["manacor".to_string()]),
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
+            overcommit: Overcommit::default(),
         };
         assert!(demand.met_by_a_node(&[
             summary("soller", true, true, &[]),
@@ -3176,6 +3215,9 @@ mod tests {
         let demand = NodeDemand {
             selector: &want,
             allowed: Some(vec!["manacor".to_string()]),
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
+            overcommit: Overcommit::default(),
         };
         assert!(demand.met_by_a_node(&[summary("manacor", true, true, &[("zone", "a")])]));
         assert!(
@@ -3214,12 +3256,48 @@ mod tests {
         let demand = NodeDemand {
             selector: &none,
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
+            overcommit: Overcommit::default(),
         };
         assert!(demand.met_by_a_node(&[summary("a", true, true, &[])]));
         assert!(
             !demand.met_by_a_node(&[]),
             "but a cluster with no nodes serves nothing"
         );
+    }
+
+    /// IKR-B78: a cluster of two 8 GiB nodes holds 16 GiB, and a 12 GiB VM fits
+    /// that sum and neither node. One node has to have the room, after what is
+    /// bound to it, and take the class.
+    #[test]
+    fn one_node_has_to_have_the_room_and_not_the_sum_of_them() {
+        let none = BTreeMap::new();
+        let asking = |mem_mib: u64, class: &'static str| NodeDemand {
+            selector: &none,
+            allowed: None,
+            size: Capacity { vcpus: 1, mem_mib },
+            class,
+            overcommit: Overcommit::default(),
+        };
+        let two = [summary("a", true, true, &[]), summary("b", true, true, &[])];
+        assert!(asking(4096, crate::resources::CLASS_VM).met_by_a_node(&two));
+        assert!(!asking(12_288, crate::resources::CLASS_VM).met_by_a_node(&two));
+
+        let mut busy = two.clone();
+        for node in &mut busy {
+            node.bound_mem_mib = 6144;
+        }
+        assert!(
+            !asking(4096, crate::resources::CLASS_VM).met_by_a_node(&busy),
+            "4 GiB free in all and 2 GiB on each"
+        );
+
+        let mut routers_only = two.clone();
+        for node in &mut routers_only {
+            node.accepts = vec!["router".to_string()];
+        }
+        assert!(!asking(1024, crate::resources::CLASS_VM).met_by_a_node(&routers_only));
     }
 
     /// A storage-only node can provision disks but cannot host VMs.

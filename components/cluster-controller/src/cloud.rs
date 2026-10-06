@@ -1582,15 +1582,22 @@ async fn build_status(
         mem_mib = mem_mib.saturating_add(node.status.capacity.mem_mib);
         profiles.extend(node.status.capacity.capabilities.iter().cloned());
     }
+    let vms = store.list::<Vm>().await?;
     // Every node, ready or not: a node that is down is exactly the one an
     // operator is looking for one tier up, and leaving it out of the report
     // would be the cloud saying it does not exist.
     let reported_nodes: Vec<proto::NodeReport> = nodes
         .iter()
-        .map(|node| node_report(node, registry.images.is_complete(&node.metadata.name)))
+        .map(|node| {
+            let name = &node.metadata.name;
+            node_report(
+                node,
+                registry.images.is_complete(name),
+                controller_api::bound_on(name, &vms),
+            )
+        })
         .collect();
 
-    let vms = store.list::<Vm>().await?;
     // Absence from this list is what the cloud accepts as proof that a VM was
     // torn down, and `list` drops what it cannot decode. A short list would
     // read up there as a deletion, so the completeness travels with it and the
@@ -1808,7 +1815,11 @@ fn update_node_patch(u: &proto::UpdateNode) -> Option<serde_json::Value> {
 /// `images_complete` is the one field that comes from neither half: it is off
 /// the session's own `ImageView`, because the claim is about the last REPORT
 /// and not about the object. See `NodeReport.images_complete`.
-fn node_report(node: &Node, images_complete: bool) -> proto::NodeReport {
+fn node_report(
+    node: &Node,
+    images_complete: bool,
+    bound: controller_api::Capacity,
+) -> proto::NodeReport {
     proto::NodeReport {
         name: node.metadata.name.clone(),
         ready: node.status.ready,
@@ -1817,6 +1828,10 @@ fn node_report(node: &Node, images_complete: bool) -> proto::NodeReport {
         labels: node.spec.labels.clone().into_iter().collect(),
         vcpus: node.status.capacity.vcpus,
         mem_mib: node.status.capacity.mem_mib,
+        // What its VMs ask for, so the cloud binds only where one node has
+        // room and not where the sum of them does. (IKR-B78)
+        bound_vcpus: bound.vcpus,
+        bound_mem_mib: bound.mem_mib,
         capabilities: node.status.capacity.capabilities.clone(),
         vms: node.status.vms,
         images_complete,
@@ -2249,7 +2264,7 @@ mod tests {
     /// not exist.
     #[test]
     fn a_node_report_carries_what_an_operator_decided_and_what_the_agent_said() {
-        let up = node_report(&node("manacor", true, false), false);
+        let up = node_report(&node("manacor", true, false), false, Default::default());
         assert_eq!(up.name, "manacor");
         assert!(up.ready, "the agent is talking");
         assert!(!up.schedulable, "and an operator drained it");
@@ -2257,7 +2272,7 @@ mod tests {
         assert_eq!((up.vcpus, up.mem_mib, up.vms), (32, 65_536, 2));
         assert_eq!(up.capabilities, vec!["nvrm/4q".to_string()]);
 
-        let down = node_report(&node("felanitx", false, true), false);
+        let down = node_report(&node("felanitx", false, true), false, Default::default());
         assert!(!down.ready);
         assert!(down.schedulable);
         // A healthy machine says nothing, and that is what travels: an empty
@@ -2273,9 +2288,21 @@ mod tests {
     /// machine nobody is emptying, and that absence is the whole reason it is
     /// a submessage: a block of zeroes would give every node in the fleet a
     /// drain column reading `0 moved, 0 leaving, 0 staying`.
+    /// IKR-B78: what a node's VMs ask for travels up beside its capacity, so
+    /// the cloud can tell one node's room from the cluster's sum.
+    #[test]
+    fn what_a_nodes_vms_ask_for_travels_up_beside_its_capacity() {
+        let bound = controller_api::Capacity {
+            vcpus: 3,
+            mem_mib: 3072,
+        };
+        let up = node_report(&node("manacor", true, true), false, bound);
+        assert_eq!((up.bound_vcpus, up.bound_mem_mib), (3, 3072));
+    }
+
     #[test]
     fn the_numbers_of_a_drain_travel_up_beside_the_ask() {
-        let quiet = node_report(&node("manacor", true, false), false);
+        let quiet = node_report(&node("manacor", true, false), false, Default::default());
         assert!(
             quiet.draining.is_none(),
             "nobody is emptying this one, so there is nothing to say"
@@ -2295,7 +2322,7 @@ mod tests {
                 message: "its owner said evacuation: never".into(),
             }],
         });
-        let up = node_report(&emptying, false);
+        let up = node_report(&emptying, false, Default::default());
         assert!(up.drain, "the ask");
         let evidence = up.draining.expect("and the evidence beside it");
         assert_eq!(
@@ -2344,7 +2371,7 @@ mod tests {
                 message: "/var/lib/meisterstack has 0 bytes free".into(),
             },
         ];
-        let up = node_report(&wedged, false);
+        let up = node_report(&wedged, false, Default::default());
         assert_eq!(
             up.conditions
                 .iter()
