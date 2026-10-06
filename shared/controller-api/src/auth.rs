@@ -6,8 +6,9 @@
 //!
 //! An authenticator returns `Ok(None)` to defer, an identity to accept, or an
 //! error to reject the request without consulting later authenticators. An empty
-//! chain enables anonymous access. Identities name callers; roles, resource
-//! classes and tenant scope determine their permissions.
+//! chain is anonymous access, which exists only where `[auth] anonymous = true`
+//! asks for it. Identities name callers; roles, resource classes and tenant scope
+//! determine their permissions.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -231,8 +232,9 @@ pub trait Authenticator: Send + Sync {
 /// What the chain concluded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authenticated {
-    /// No chain is configured. Every request is anonymous and may do
-    /// anything — the behaviour of M1 through M4, and the default.
+    /// No authenticator is configured: every request is anonymous and may
+    /// do anything. A controller builds this only when `[auth] anonymous =
+    /// true` asks for it; it is never a default.
     Anonymous,
     As(Identity),
 }

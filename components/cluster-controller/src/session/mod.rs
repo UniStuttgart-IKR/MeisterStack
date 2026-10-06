@@ -450,8 +450,8 @@ pub fn service(
 pub struct ControlPlaneService {
     registry: Arc<SessionRegistry>,
     store: Arc<EtcdStore>,
-    /// The same chain the REST API runs. Empty = anonymous, which is how
-    /// every agent session up to M4 was opened and still is by default.
+    /// The same chain the REST API runs. Empty = anonymous, which happens
+    /// only where `[auth] anonymous = true` asks for it, never by default.
     chain: controller_api::grpc::SessionAuth,
     vms: Arc<VmIndex>,
     /// This replica's own REST address, where it has one to give.
