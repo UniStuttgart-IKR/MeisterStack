@@ -594,8 +594,39 @@ async fn a_vm_with_a_device_is_not_received() {
     assert!(store.get(&id).expect("a lookup").is_none(), "no record");
 }
 
-/// IKR-B17: a source refuses to send a guest with a device before it claims
-/// the attempt or opens a stream.
+/// What a send this node will never carry out leaves behind (NL-A1): the answer is
+/// `CannotSend`, no stream was opened, no barrier blocks repair, and the claimed attempt
+/// reports StillHere with the refusal, for a controller that missed the answer.
+fn assert_refused_for_good(
+    store: &crate::store::Store,
+    hv: &MigratingVmm,
+    id: &VmId,
+    refused: &anyhow::Error,
+) {
+    assert!(
+        refused.downcast_ref::<crate::CannotSend>().is_some(),
+        "the answer carries the word a controller tears the destination down on: {refused:#}"
+    );
+    assert!(
+        !hv.said().iter().any(|line| line.starts_with("migrate_out")),
+        "{:?}",
+        hv.said()
+    );
+    let record = store.get(id).expect("a lookup").expect("still a record");
+    assert_eq!(record.phase, Phase::Provisioned, "the guest is still ours");
+    assert!(record.operation.is_none(), "no send was begun");
+    let line = crate::reconcile::departure(&record).expect("the attempt has its evidence");
+    assert_eq!(line.migration_id, "attempt-1");
+    assert_eq!(line.peer, "tcp:10.0.0.9:49000");
+    assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::StillHere);
+    assert_eq!(
+        line.message.as_deref(),
+        Some(format!("{refused:#}").as_str()),
+        "and the evidence says what the answer said"
+    );
+}
+
+/// IKR-B17: a source refuses to send a guest with a device before it opens a stream.
 #[tokio::test]
 async fn a_vm_with_a_device_is_not_sent() {
     let (_temp, root) = migration_root("mig-device-out");
@@ -621,14 +652,7 @@ async fn a_vm_with_a_device_is_not_sent() {
         .await
         .expect_err("a device does not migrate");
     assert!(format!("{refused:#}").contains("crosvm-gpu"), "{refused:#}");
-    let record = store.get(&id).expect("a lookup").expect("still a record");
-    assert!(record.operation.is_none(), "no send was begun");
-    assert!(record.migration.is_none(), "no attempt was claimed");
-    assert!(
-        !hv.said().iter().any(|line| line.starts_with("migrate_out")),
-        "{:?}",
-        hv.said()
-    );
+    assert_refused_for_good(&store, &hv, &id, &refused);
 }
 
 /// The NICs the conversion of a create document naming two NICs gives the VM `id`.
@@ -664,8 +688,21 @@ async fn running_with_nics(
     store.put(&id, &record).expect("stored");
 }
 
+/// A guest whose NIC ids an older agent rolled at random, running here.
+async fn running_with_a_rolled_nic(
+    p: &Provisioner,
+    store: &crate::store::Store,
+    id: VmId,
+) -> agent_api::networking::NicId {
+    let mut legacy = derived_nics(id);
+    legacy[1].id = agent_api::networking::NicId::new_v4();
+    let rolled = legacy[1].id;
+    running_with_nics(p, store, id, legacy).await;
+    rolled
+}
+
 /// IKR-B66: a guest whose NIC ids an older agent rolled at random is not sent, since the
-/// destination would name its taps after ids it derives; nothing is claimed or opened.
+/// destination would name its taps after ids it derives; no stream is opened.
 #[tokio::test]
 async fn a_vm_whose_nic_ids_were_rolled_at_random_is_not_sent() {
     let (_temp, root) = migration_root("mig-rolled-nic");
@@ -673,10 +710,7 @@ async fn a_vm_whose_nic_ids_were_rolled_at_random_is_not_sent() {
     let hv = Arc::new(MigratingVmm::new(true));
     let p = migrating_provisioner(&root, store.clone(), hv.clone());
     let id = VmId::new_v4();
-    let mut legacy = derived_nics(id);
-    legacy[1].id = agent_api::networking::NicId::new_v4();
-    let rolled = legacy[1].id;
-    running_with_nics(&p, &store, id, legacy).await;
+    let rolled = running_with_a_rolled_nic(&p, &store, id).await;
 
     let refused = p
         .begin_migrate_out(
@@ -690,9 +724,32 @@ async fn a_vm_whose_nic_ids_were_rolled_at_random_is_not_sent() {
     let said = format!("{refused:#}");
     assert!(said.contains(&rolled.to_string()), "{said}");
     assert!(said.contains("by reboot"), "{said}");
-    let record = store.get(&id).expect("a lookup").expect("still a record");
-    assert!(record.operation.is_none(), "no send was begun");
-    assert!(record.migration.is_none(), "no attempt was claimed");
+    assert_refused_for_good(&store, &hv, &id, &refused);
+}
+
+/// NL-A1: the refused attempt is claimed, so the same attempt asked again opens no stream
+/// either.
+#[tokio::test]
+async fn a_refused_attempt_asked_again_is_not_sent() {
+    let (_temp, root) = migration_root("mig-refused-twice");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+    let id = VmId::new_v4();
+    running_with_a_rolled_nic(&p, &store, id).await;
+    let ops = tokio::sync::Mutex::new(());
+    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
+        .await
+        .expect_err("refused");
+
+    let again = p
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
+        .await
+        .expect_err("the attempt was handled");
+    assert!(
+        format!("{again:#}").contains("already handled"),
+        "{again:#}"
+    );
     assert!(
         !hv.said().iter().any(|line| line.starts_with("migrate_out")),
         "{:?}",

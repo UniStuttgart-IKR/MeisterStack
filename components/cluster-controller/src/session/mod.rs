@@ -319,6 +319,40 @@ impl SessionRegistry {
         self.pending.resolve(request_id, Ok(payload));
     }
 
+    /// The refusal a real agent's `CommandResult` would carry, for the same tests.
+    #[cfg(test)]
+    pub(crate) fn refuse(&self, request_id: &str, refusal: controller_api::Refusal) {
+        self.pending.resolve(request_id, Err(refusal));
+    }
+
+    /// A node dialled into this registry whose agent answers the first command sent
+    /// down its session with `answer`, and hands back what it was told. The agent's
+    /// half and nothing more: it resolves the request id, as `on_result` does.
+    #[cfg(test)]
+    pub(crate) fn agent_answering(
+        self: &Arc<Self>,
+        node: &str,
+        answer: Result<Vec<u8>, controller_api::Refusal>,
+    ) -> tokio::task::JoinHandle<Option<proto::command::Op>> {
+        let (tx, mut rx) = mpsc::channel(4);
+        self.attach(node, &tx);
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let msg = rx.recv().await?;
+            let Ok(ControllerMessage {
+                kind: Some(proto::controller_message::Kind::Command(cmd)),
+            }) = msg
+            else {
+                return None;
+            };
+            match answer {
+                Ok(payload) => registry.answer(&cmd.request_id, payload),
+                Err(refusal) => registry.refuse(&cmd.request_id, refusal),
+            }
+            cmd.op
+        })
+    }
+
     /// Send an unacknowledged message on the node session.
     /// Console frames have no request ID. Return false if no session can receive it,
     /// allowing the caller to close the console.

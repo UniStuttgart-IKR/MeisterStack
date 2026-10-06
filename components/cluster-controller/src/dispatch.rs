@@ -279,10 +279,17 @@ impl Dispatch {
                     // rejection back as the node said it — so collapsing this
                     // into "the forward failed" would lose the only thing
                     // worth reading.
+                    let refusal = refusal_in(&answer.body);
+                    if TYPED_REFUSALS.contains(&refusal.reason.as_str()) {
+                        return Err(anyhow::Error::new(refusal).context(format!(
+                            "the replica at {endpoint} answered {}",
+                            answer.status
+                        )));
+                    }
                     bail!(
                         "the replica at {endpoint} answered {}: {}",
                         answer.status,
-                        said(&answer.body)
+                        refusal.message
                     );
                 }
                 Ok(answer.body.to_vec())
@@ -298,17 +305,34 @@ impl Dispatch {
     }
 }
 
-/// The `message` of this API's refusal, or the body as it stands when it is
-/// not one. The read half of the same forward has this; a write needs it for
-/// exactly the same reason.
-fn said(body: &bytes::Bytes) -> String {
+/// The node words a forward carries back as words, so that the replica that
+/// asked acts on a node's typed refusal as it would on its own session's:
+/// `CannotServe` places elsewhere, `CannotSend` tears a migration's
+/// destination down. Every other refusal travels as a sentence.
+const TYPED_REFUSALS: [&str; 2] = [controller_api::CANNOT_SERVE, controller_api::CANNOT_SEND];
+
+/// The node's typed refusal under `e`, with its word as this tier spells it.
+fn typed_refusal(e: &anyhow::Error) -> Option<(&'static str, &controller_api::Refusal)> {
+    let refusal = e.downcast_ref::<controller_api::Refusal>()?;
+    let word = TYPED_REFUSALS
+        .into_iter()
+        .find(|word| *word == refusal.reason)?;
+    Some((word, refusal))
+}
+
+/// The `message` and `reason` of this API's refusal, or the body as it stands
+/// and no reason when it is not one. The read half of the same forward has
+/// this; a write needs it for exactly the same reason.
+fn refusal_in(body: &bytes::Bytes) -> controller_api::Refusal {
     #[derive(serde::Deserialize)]
-    struct Refusal {
+    struct Status {
         message: String,
+        #[serde(default)]
+        reason: String,
     }
-    match serde_json::from_slice::<Refusal>(body) {
-        Ok(r) => r.message,
-        Err(_) => String::from_utf8_lossy(body).trim().to_string(),
+    match serde_json::from_slice::<Status>(body) {
+        Ok(status) => controller_api::Refusal::new(status.message, status.reason),
+        Err(_) => controller_api::Refusal::plain(String::from_utf8_lossy(body).trim()),
     }
 }
 
@@ -336,16 +360,23 @@ pub async fn serve_forwarded(
         Holder::Here => registry
             .send_command(node, "", cmd.into_op())
             .await
-            .map_err(|e| {
-                // The agent's own refusal, or a session that went away
+            .map_err(|e| match typed_refusal(&e) {
+                // The node's typed answer keeps its word across the hop; see
+                // `TYPED_REFUSALS`.
+                Some((word, refusal)) => controller_api::ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    word,
+                    refusal.message.clone(),
+                ),
+                // The agent's untyped refusal, or a session that went away
                 // between the forward and the send. Both are "the party that
                 // can act did not act", which is a 503 the sender turns back
                 // into a sentence on the migration.
-                controller_api::ApiError::new(
+                None => controller_api::ApiError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "Unavailable",
                     format!("{e:#}"),
-                )
+                ),
             }),
         // Forwarded here and the session is not here either: the node moved
         // between the write and the read. Never a second hop.
@@ -364,33 +395,24 @@ pub async fn serve_forwarded(
 mod tests {
     use super::*;
 
-    use tokio::sync::mpsc;
-
     /// A registry with one node dialled into it, and a task that answers
-    /// whatever is sent down that session with `payload`.
-    ///
-    /// This is the agent's half and nothing more: it reads the request id off
-    /// the envelope and resolves it, which is what `on_result` does when a
-    /// real agent answers.
+    /// whatever is sent down that session with `payload`; see
+    /// `SessionRegistry::agent_answering`.
     fn agent_on(
         registry: &Arc<SessionRegistry>,
         node: &str,
         payload: Vec<u8>,
     ) -> tokio::task::JoinHandle<Option<command::Op>> {
-        let (tx, mut rx) = mpsc::channel(4);
-        registry.attach(node, &tx);
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let msg = rx.recv().await?;
-            let Ok(proto::ControllerMessage {
-                kind: Some(proto::controller_message::Kind::Command(cmd)),
-            }) = msg
-            else {
-                return None;
-            };
-            registry.answer(&cmd.request_id, payload);
-            cmd.op
-        })
+        registry.agent_answering(node, Ok(payload))
+    }
+
+    /// `holder`'s REST edge on a free local port: the route a sibling forwards to.
+    async fn serve_edge(holder: Arc<SessionRegistry>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let router = crate::api::test_router(holder).await;
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        endpoint
     }
 
     /// A dispatcher whose store is never asked anything: every test below
@@ -430,10 +452,7 @@ mod tests {
             "agent-1a",
             br#"{"peer":"10.0.0.7:49000"}"#.to_vec(),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap().to_string();
-        let router = crate::api::test_router(holder.clone()).await;
-        tokio::spawn(async move { axum::serve(listener, router).await });
+        let endpoint = serve_edge(holder.clone()).await;
 
         // And the replica that holds the migration, which holds no session
         // for this node at all.
@@ -467,6 +486,83 @@ mod tests {
         assert_eq!(prepare.id, "uid-1");
         assert_eq!(prepare.migration_id, "attempt");
         assert_eq!(prepare.listen, "", "the destination picks its own address");
+    }
+
+    /// NL-A1: a source's `CannotSend` reaches the replica that holds the migration as the
+    /// same typed refusal its own session would have handed it, so that replica tears the
+    /// destination down instead of waiting on an unknown outcome.
+    #[tokio::test]
+    async fn a_forwarded_refusal_to_send_keeps_its_word() {
+        let holder = Arc::new(SessionRegistry::new());
+        let agent = holder.agent_answering(
+            "agent-1a",
+            Err(controller_api::Refusal::new(
+                "vm uid-1 has 1 device(s) (crosvm-gpu)",
+                controller_api::CANNOT_SEND,
+            )),
+        );
+        let endpoint = serve_edge(holder.clone()).await;
+
+        let refused = dispatch(Arc::new(SessionRegistry::new()))
+            .await
+            .deliver(
+                "agent-1a",
+                NodeCommand::MigrateOut {
+                    migration_id: "attempt".into(),
+                    id: "uid-1".into(),
+                    peer: "tcp:10.0.0.9:49000".into(),
+                },
+                false,
+                Some(&endpoint),
+            )
+            .await
+            .expect_err("the source refused");
+
+        let refusal = refused
+            .downcast_ref::<controller_api::Refusal>()
+            .expect("a typed refusal, not a sentence");
+        assert_eq!(refusal.reason, controller_api::CANNOT_SEND);
+        assert_eq!(refusal.message, "vm uid-1 has 1 device(s) (crosvm-gpu)");
+        assert!(
+            matches!(agent.await.unwrap(), Some(command::Op::MigrateOut(_))),
+            "the source was asked"
+        );
+    }
+
+    /// An untyped refusal stays a sentence across the hop: nothing the replica that asked
+    /// could act on is invented for it.
+    #[tokio::test]
+    async fn a_forwarded_untyped_refusal_stays_a_sentence() {
+        let holder = Arc::new(SessionRegistry::new());
+        let _agent = holder.agent_answering(
+            "agent-1a",
+            Err(controller_api::Refusal::plain("sending vm uid-1: refused")),
+        );
+        let endpoint = serve_edge(holder.clone()).await;
+
+        let refused = dispatch(Arc::new(SessionRegistry::new()))
+            .await
+            .deliver(
+                "agent-1a",
+                NodeCommand::MigrateOut {
+                    migration_id: "attempt".into(),
+                    id: "uid-1".into(),
+                    peer: "tcp:10.0.0.9:49000".into(),
+                },
+                false,
+                Some(&endpoint),
+            )
+            .await
+            .expect_err("the source refused");
+
+        assert!(
+            refused.downcast_ref::<controller_api::Refusal>().is_none(),
+            "{refused:#}"
+        );
+        assert!(
+            format!("{refused:#}").contains("sending vm uid-1: refused"),
+            "{refused:#}"
+        );
     }
 
     /// The other end of the same hop: a replica that was forwarded a command

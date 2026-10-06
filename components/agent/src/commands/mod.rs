@@ -80,12 +80,7 @@ impl Agent {
                 } else {
                     error!(error = %message, "command failed");
                 }
-                // Only structural `CannotServe` failures request rescheduling. Other
-                // errors retain the empty reason used for retries on this node.
-                let reason = match e.downcast_ref::<CannotServe>().is_some() {
-                    true => proto::CANNOT_SERVE.to_string(),
-                    false => String::new(),
-                };
+                let reason = wire_reason(&e).to_string();
                 command_result::Outcome::Error(proto::ErrorMsg { message, reason })
             }
         };
@@ -93,5 +88,37 @@ impl Agent {
             request_id,
             outcome: Some(outcome),
         }
+    }
+}
+
+/// The typed word a failed command answers with. Only refusals the controller
+/// acts on carry one: `CannotServe` requests rescheduling, `CannotSend` lets it
+/// tear a migration's destination down. Every other error keeps the empty
+/// reason, which the controller reads as "retry here" or "outcome unknown".
+fn wire_reason(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<CannotServe>().is_some() {
+        proto::CANNOT_SERVE
+    } else if e.downcast_ref::<CannotSend>().is_some() {
+        proto::CANNOT_SEND
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NL-A1: a source's final refusal of a send answers with its own word, through any
+    /// context a call site adds, and an ordinary failure still answers with none.
+    #[test]
+    fn a_refused_send_answers_with_cannot_send() {
+        let refused = anyhow::Error::new(CannotSend("vm has a device".into()))
+            .context("handling migrate-out");
+        assert_eq!(wire_reason(&refused), proto::CANNOT_SEND);
+        assert_eq!(
+            wire_reason(&anyhow!("sending vm to tcp:10.0.0.9:49000: refused")),
+            ""
+        );
     }
 }

@@ -549,7 +549,8 @@ pub enum DepartureOutcome {
     Arrived,
     /// The VMM exited, which is how cloud-hypervisor states that a send took.
     Gone,
-    /// v53 gave the guest back and is serving it here.
+    /// v53 gave the guest back and is serving it here, or this node refused the
+    /// send before any stream opened.
     StillHere,
 }
 

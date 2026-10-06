@@ -22,6 +22,12 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 /// empty legacy reason retains the conservative same-node failure path.
 pub const CANNOT_SERVE: &str = "CannotServe";
 
+/// Wire reason for a source's refusal of `MigrateOut` before it opened a
+/// stream: the attempt is claimed and stays refused, and the guest stays on
+/// the source. Controllers may tear the prepared destination down and end the
+/// attempt. An empty legacy reason leaves the send's outcome unknown.
+pub const CANNOT_SEND: &str = "CannotSend";
+
 /// Node router readiness vocabulary, distinct from the controller's
 /// Active/Standby/Unknown placement phases. Controllers combine readiness
 /// with their active-node decision.

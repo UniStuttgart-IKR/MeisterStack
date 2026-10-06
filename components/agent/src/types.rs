@@ -112,8 +112,9 @@ pub struct VmRecord {
     /// Expiry does not prove that a receive ended and never authorizes teardown.
     #[serde(default)]
     pub receive_deadline: Option<std::time::SystemTime>,
-    /// Explicit terminal evidence that the acknowledged send returned ownership
-    /// to this source. Deadlines and ambiguous errors never populate this field.
+    /// Explicit terminal evidence that this source kept the guest: the acknowledged
+    /// send returned ownership, or the send was refused before any stream opened.
+    /// Deadlines and ambiguous errors never populate this field.
     /// It belongs to `migration.id` and is cleared before the next attempt.
     #[serde(default)]
     pub send_failed: Option<String>,

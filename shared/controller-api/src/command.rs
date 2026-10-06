@@ -81,6 +81,9 @@ pub struct Refused {
 /// It lives in proto so the agent need not depend on controller-api.
 pub use proto::CANNOT_SERVE;
 
+/// Agent-defined reason for a source that refused a send before opening a stream.
+pub use proto::CANNOT_SEND;
+
 impl Refused {
     /// "The party that holds the answer is out of reach right now." A caller
     /// that retries is right, and the tier above should say 503 rather than

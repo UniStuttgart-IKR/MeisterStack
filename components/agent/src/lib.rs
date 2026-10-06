@@ -82,6 +82,20 @@ fn cannot_serve<T>(r: anyhow::Result<T>) -> anyhow::Result<T> {
     r.map_err(|e| anyhow::Error::new(CannotServe(format!("{e:#}"))))
 }
 
+/// A source's final refusal of a send, carried as CANNOT_SEND on the command
+/// result: nothing left this node for the attempt and nothing will, so the
+/// controller may tear the destination down.
+#[derive(Debug)]
+struct CannotSend(String);
+
+impl std::fmt::Display for CannotSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CannotSend {}
+
 fn heals_without_an_operator(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause.is::<NoSuchVm>()

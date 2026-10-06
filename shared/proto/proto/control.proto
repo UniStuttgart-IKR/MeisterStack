@@ -178,8 +178,10 @@ message StatusReport {
 
 // Durable evidence from either endpoint, bound to a VM and migration attempt.
 // Sending: accepted transfer; Unknown: ownership unresolved; Gone: source process
-// absent; StillHere: acknowledged transfer explicitly aborted; Receiving: prepared
-// target; Arrived: target received the guest. Success requires Gone AND Arrived.
+// absent; StillHere: the source keeps the guest, because an acknowledged transfer
+// was explicitly aborted or the send was refused (CannotSend) before any stream
+// opened; Receiving: prepared target; Arrived: target received the guest.
+// Success requires Gone AND Arrived.
 message MigrationReport {
   // The VM's uid, the same one CreateInstance and MigrateOut carry.
   string vm_id = 1;

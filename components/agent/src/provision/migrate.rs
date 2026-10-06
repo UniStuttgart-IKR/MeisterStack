@@ -57,6 +57,25 @@ fn refuse_nics_with_rolled_ids(id: &VmId, nics: &[crate::types::NicWithId]) -> R
     )
 }
 
+/// This node's way to send the guest, or why no attempt will ever send it: a hypervisor
+/// that cannot, a device, NIC ids an older agent rolled. Each is a fact of the guest or the
+/// node rather than of the moment, which is what makes a refusal for it final.
+fn sender<'a>(
+    id: &VmId,
+    spec: &AgentVmSpec,
+    hypervisor: &'a dyn agent_api::hypervisor::Hypervisor,
+) -> Result<&'a dyn agent_api::Migratable> {
+    let migratable = hypervisor.as_migratable().ok_or_else(|| {
+        anyhow!(
+            "this node's hypervisor cannot send a live migration; \
+             the vm has to move by reboot instead"
+        )
+    })?;
+    refuse_devices(id, &spec.devices)?;
+    refuse_nics_with_rolled_ids(id, &spec.nics)?;
+    Ok(migratable)
+}
+
 impl Provisioner {
     /// Prepare a receiving VMM with a durable attempt identity. Any existing VM
     /// row, including an unreadable row, refuses reception. Inline disks are
@@ -167,6 +186,11 @@ impl Provisioner {
     /// An acknowledgement means accepted, not transferred. Errors after submission
     /// leave acceptance unknown and retain the barrier.
     ///
+    /// A guest this node can never send (see [`sender`]) is refused after the attempt
+    /// is claimed and before any stream opens, as [`crate::CannotSend`] and as the
+    /// attempt's durable StillHere evidence, so that the controller tears the prepared
+    /// destination down instead of waiting on an unknown outcome (IKR-B66).
+    ///
     /// The operations lock covers submission and record writes, while the watcher
     /// releases it between observations. The controller learns terminal evidence
     /// through status reports.
@@ -183,12 +207,6 @@ impl Provisioner {
             "migration requires an operation identity"
         );
         let hypervisor = self.drivers.hypervisor()?;
-        let migratable = hypervisor.as_migratable().ok_or_else(|| {
-            anyhow!(
-                "this node's hypervisor cannot send a live migration; \
-                 the vm has to move by reboot instead"
-            )
-        })?;
 
         let _guard = ops.lock().await;
         let mut record = self
@@ -201,8 +219,6 @@ impl Provisioner {
                 record.phase
             );
         }
-        refuse_devices(id, &record.spec.devices)?;
-        refuse_nics_with_rolled_ids(id, &record.spec.nics)?;
         // An existing operation owns this VM. Do not replace its identity or peer
         // with a second send request.
         if let Some(op) = &record.operation {
@@ -223,14 +239,18 @@ impl Provisioner {
             accepted: false,
             unknown: None,
         });
+        // Clear the previous attempt's verdict before reporting the new attempt.
+        record.send_failed = None;
+        let migratable = match sender(id, &record.spec, hypervisor.as_ref()) {
+            Ok(migratable) => migratable,
+            Err(why) => return Err(self.keep_refused_send(id, &mut record, why)),
+        };
         // Hands off for the length of the transfer. The guest is paused
         // near the end of it, and a pass that saw a paused guest under a
         // Running record would resume it — into a copy of itself.
         record.operation = Some(Operation::MigratingOut {
             peer: peer.to_string(),
         });
-        // Clear the previous attempt's verdict before reporting the new attempt.
-        record.send_failed = None;
         self.store.put(id, &record)?;
 
         if let Err(e) =
@@ -245,6 +265,25 @@ impl Provisioner {
         self.store.put(id, &record)?;
         info!("the stream is open; the guest is on its way");
         Ok(())
+    }
+
+    /// Keep the refusal of a claimed attempt on the record as its StillHere evidence and
+    /// return it as [`crate::CannotSend`]. The record carries no operation, so nothing
+    /// blocks repair. The evidence is what a controller that missed the answer reads
+    /// on the next heartbeat; failing to write it does not change the answer, since
+    /// the claim already keeps the attempt from ever sending.
+    fn keep_refused_send(
+        &self,
+        id: &VmId,
+        record: &mut VmRecord,
+        why: anyhow::Error,
+    ) -> anyhow::Error {
+        let why = format!("{why:#}");
+        record.send_failed = Some(why.clone());
+        if let Err(e) = self.store.put(id, record) {
+            warn!(error = %format!("{e:#}"), "the refused send could not be kept as evidence");
+        }
+        anyhow::Error::new(crate::CannotSend(why))
     }
 
     /// Watch a single durable attempt. A deadline ends this task, not ownership.

@@ -985,14 +985,14 @@ async fn send(
         Some(format!("sending to {target} at {peer}")),
         Utc::now(),
     ));
-    match store.update(&claimed).await {
-        Ok(_) => {}
+    let running = match store.update(&claimed).await {
+        Ok(running) => running,
         Err(StoreError::Conflict(_)) => {
             debug!(migration = %name, "lost the send race");
             return Ok(());
         }
         Err(e) => return Err(e.into()),
-    }
+    };
 
     info!(migration = %name, vm = %vm.metadata.name, from = %source, to = %target,
           "telling the source to send");
@@ -1007,6 +1007,14 @@ async fn send(
         )
         .await
     {
+        if let Some(refusal) = refused_to_send(&e) {
+            let why = format!(
+                "{source} refused to send the guest and still runs it: {}. {target} holds no \
+                 guest and has been torn down",
+                refusal.message
+            );
+            return abandon(store, dispatch, &running, vm, &target, why).await;
+        }
         // An error string cannot prove that an accepted transfer was aborted.
         // Keep ownership and wait for attempt-bound reports from both endpoints.
         let e = format!("{e:#}");
@@ -1016,6 +1024,16 @@ async fn send(
         unresolved(store, migration, why).await?;
     }
     Ok(())
+}
+
+/// The source's own word that it sent nothing for this attempt and never will
+/// (`CannotSend`): it refused before opening a stream, claimed the attempt so it
+/// stays refused, and still runs the guest. That is the source abort `abandon`
+/// waits for. Any other failure, an empty legacy reason included, leaves the
+/// send's acceptance unknown.
+fn refused_to_send(e: &anyhow::Error) -> Option<&controller_api::Refusal> {
+    e.downcast_ref::<controller_api::Refusal>()
+        .filter(|refusal| refusal.reason == controller_api::CANNOT_SEND)
 }
 
 /// Interpret matching source-abort evidence together with destination evidence.
@@ -2485,5 +2503,127 @@ mod tests {
         reap_reservations(&store, &left, &migrations, &vms).await;
         let after: Vec<CapacityReservation> = store.list().await.expect("the listing");
         assert_eq!(after.len(), 1);
+    }
+
+    /// A migration of `guest` from `source` to `target` that is ready to send: Preparing,
+    /// with its attempt identity, the destination's address and the room held there.
+    async fn ready_to_send(store: &EtcdStore, guest: &Vm) -> VmMigration {
+        let mut ready = migration(&guest.metadata.name, VmMigrationPhaseKind::Preparing);
+        ready.status.migration_id = Some(ready.metadata.uid.clone());
+        ready.status.vm_uid = Some(guest.metadata.uid.clone());
+        ready.status.source_node = Some("source".into());
+        ready.status.target_node = Some("target".into());
+        ready.status.peer = Some("tcp:target:49000".into());
+        ready.status.started_at = Some(Utc::now());
+        let ready = store.create(&ready).await.expect("the record");
+        store
+            .create(&CapacityReservation::of(&ready, guest, "target"))
+            .await
+            .expect("its room");
+        ready
+    }
+
+    /// A dispatcher over `registry`, for nodes this replica holds the sessions of.
+    fn dispatch_over(
+        registry: std::sync::Arc<crate::session::SessionRegistry>,
+        store: std::sync::Arc<EtcdStore>,
+    ) -> Dispatch {
+        Dispatch::new(
+            registry,
+            store,
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        )
+    }
+
+    /// NL-A1: a source that refuses the send with `CannotSend` (NIC ids an older agent
+    /// rolled, a device) ends the migration as a clean no: the destination is told to
+    /// clean this attempt up, the room is given back, and the record is Failed instead of
+    /// waiting on recovery with a prepared destination and its room held.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_source_that_refuses_to_send_ends_the_migration_and_clears_the_destination() {
+        let store = std::sync::Arc::new(crate::test_etcd::fresh_store("migration-refusal").await);
+        let guest = store.create(&vm("web-1")).await.expect("the guest");
+        let ready = ready_to_send(&store, &guest).await;
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let source = registry.agent_answering(
+            "source",
+            Err(controller_api::Refusal::new(
+                "vm predates NIC ids derived from the vm's own; move the vm by reboot",
+                controller_api::CANNOT_SEND,
+            )),
+        );
+        let target = registry.agent_answering("target", Ok(Vec::new()));
+
+        send(
+            &store,
+            &dispatch_over(registry, store.clone()),
+            Timeouts::default(),
+            &ready,
+            &guest,
+        )
+        .await
+        .expect("the step");
+
+        let ended: VmMigration = store.get(&ready.metadata.name).await.expect("the record");
+        assert_eq!(ended.status.phase().kind(), VmMigrationPhaseKind::Failed);
+        assert!(!ended.status.recovery_required);
+        let phase = ended.status.phase();
+        let said = phase.message().unwrap_or_default();
+        assert!(said.contains("move the vm by reboot"), "{said}");
+        let held: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert!(held.is_empty(), "the room went back with the attempt");
+        assert!(matches!(
+            source.await.expect("the source"),
+            Some(proto::command::Op::MigrateOut(_))
+        ));
+        let Some(proto::command::Op::CleanupMigration(cleanup)) = target.await.expect("the target")
+        else {
+            panic!("the destination was told to clean up");
+        };
+        assert_eq!(cleanup.migration_id, ready.metadata.uid, "this attempt's");
+        assert!(!cleanup.source, "as the receiving end");
+    }
+
+    /// A refusal without the word proves nothing about an accepted transfer: the migration
+    /// keeps its destination and room and asks for recovery, as before NL-A1.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_source_refusal_without_its_word_leaves_the_outcome_unknown() {
+        let store = std::sync::Arc::new(crate::test_etcd::fresh_store("migration-refusal").await);
+        let guest = store.create(&vm("web-1")).await.expect("the guest");
+        let ready = ready_to_send(&store, &guest).await;
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let _source = registry.agent_answering(
+            "source",
+            Err(controller_api::Refusal::plain(
+                "sending vm: connection reset",
+            )),
+        );
+        let (tx, mut target) = tokio::sync::mpsc::channel(4);
+        registry.attach("target", &tx);
+
+        send(
+            &store,
+            &dispatch_over(registry, store.clone()),
+            Timeouts::default(),
+            &ready,
+            &guest,
+        )
+        .await
+        .expect("the step");
+
+        let open: VmMigration = store.get(&ready.metadata.name).await.expect("the record");
+        assert_eq!(open.status.phase().kind(), VmMigrationPhaseKind::Running);
+        assert!(open.status.recovery_required);
+        let held: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert_eq!(held.len(), 1, "the room stays held");
+        assert!(target.try_recv().is_err(), "the destination was left alone");
     }
 }

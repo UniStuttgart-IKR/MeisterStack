@@ -42,7 +42,7 @@ pub use auth::{
     GROUP_OPERATORS, GROUP_VIEWERS, Identity, MtlsAuthenticator, OwnPeer, Rejected, Role, Scope,
     Verb, class_of, classify, least_role, permits, permits_object,
 };
-pub use command::{Ack, CANNOT_SERVE, Peer, Pending, Refusal, Refused};
+pub use command::{Ack, CANNOT_SEND, CANNOT_SERVE, Peer, Pending, Refusal, Refused};
 pub use heartbeat::{HEARTBEAT_TIMEOUT_SECS, expired as heartbeat_expired};
 pub use lifecycle::{
     Holder, Lifecycle, lifecycle_command, not_stopped_enough, released_while_unknown,
