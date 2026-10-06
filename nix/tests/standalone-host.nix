@@ -27,6 +27,7 @@ let
 
   cloud = extra: probe [{ meisterstack.roles = [ "cloud" ]; } extra];
   cluster = extra: probe [{ meisterstack.roles = [ "cluster" ]; } extra];
+  agent = extra: probe [{ meisterstack.roles = [ "agent" ]; } extra];
 
   expectations = {
     "a cloud that names no authenticator is refused" =
@@ -56,6 +57,13 @@ let
       let c = cluster { meisterstack.observability.enable = true; }; in
       accepted c && c.services.alloy.enable
       && c.services.alloy.configPath == "${c.meisterstack.configDir}/alloy.alloy";
+
+    "an agent holds no address on the default guest bridge unless asked" =
+      !((agent { }).meisterstack.agent.effective.network ? bridge_addr);
+    "an agent keeps guests from opening connections to the host" =
+      let c = agent { }; in
+      c.meisterstack.agent.guestGuard.enable
+      && builtins.elem "meister-agent.service" c.systemd.services.meister-guest-guard.requiredBy;
   };
 
   broken = lib.attrNames (lib.filterAttrs (_: holds: !holds) expectations);

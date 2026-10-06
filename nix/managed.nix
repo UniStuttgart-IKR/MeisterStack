@@ -157,6 +157,8 @@ in
 
     # Keep guest image assets in managed persistent storage.
     meisterstack.agent.imageDir = lib.mkDefault "/var/lib/meisterstack/images";
+    # The fleet's host-local gateway on the default guest bridge, as before.
+    meisterstack.agent.bridgeAddress = lib.mkDefault "10.42.0.1/24";
     # Render role TOML from module defaults and inventory settings.
     meisterstack.cloud.generated = rendered.cloud;
     meisterstack.cluster.generated = rendered.cluster;

@@ -193,6 +193,11 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # Keep guests from opening connections to their host.
+          vm-guest-guard = import ./nix/tests/guest-guard.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # Exercise standalone socket access and a nested guest.
           vm-single-node = import ./nix/tests/single-node.nix {
             inherit nixpkgs lib pkgs system self;

@@ -15,6 +15,7 @@ in
     ./etcd.nix
     ./controllers.nix
     ./agent.nix
+    ./guest-guard.nix
     ./single-node.nix
     # Import optional RDMA tools.
     ./rdma.nix
