@@ -148,14 +148,15 @@ impl KeyRotation {
 
     /// The pair in use and the status each successor ends with. Taken back
     /// before it moved a file, a switch is still the rotation it was:
-    /// `keys revert` has nothing to put back, and the prepared pair waits.
+    /// `keys revert` refuses with nothing to put back, the old pair stays in
+    /// use and the prepared one waits, so the status is `overlap` and never
+    /// `reverted`.
     fn ends(&self, by: KeySuccessor, moved: bool) -> &'static [(Pair, KeysState)] {
         match (self.verb, by) {
             (KeyVerb::Switch, KeySuccessor::RunAgain) => &[(Pair::New, KeysState::Switched)],
-            (KeyVerb::Switch, KeySuccessor::TakeBack) if !moved => &[
-                (Pair::Old, KeysState::Reverted),
-                (Pair::Old, KeysState::Overlap),
-            ],
+            (KeyVerb::Switch, KeySuccessor::TakeBack) if !moved => {
+                &[(Pair::Old, KeysState::Overlap)]
+            }
             (KeyVerb::Switch, KeySuccessor::TakeBack) | (KeyVerb::Revert, _) => {
                 &[(Pair::Old, KeysState::Reverted)]
             }
