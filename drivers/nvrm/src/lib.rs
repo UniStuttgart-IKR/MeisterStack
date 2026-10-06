@@ -1368,16 +1368,34 @@ mod tests {
     /// FIFO, so the write waits for the test to read it), and then never
     /// binds its socket.
     fn never_ready_backend(dir: &Path, started: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let binary = dir.join("vhost-user-nvrm");
         let script = format!(
             "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
             started.display()
         );
-        std::fs::write(&binary, script).expect("a fake backend");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
+        executable(&binary, &script);
         binary
+    }
+
+    /// An executable script at `path`, written by a child process. A file
+    /// this process held open for writing could be inherited by another
+    /// test's fork in that moment, and exec of it would then fail with
+    /// "Text file busy".
+    fn executable(path: &Path, script: &str) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("a shell");
+        writer
+            .stdin
+            .take()
+            .expect("its stdin")
+            .write_all(script.as_bytes())
+            .expect("the script");
+        assert!(writer.wait().expect("waited").success(), "written");
     }
 
     /// R2-3: a create whose future is dropped while its backend is being
@@ -1452,11 +1470,8 @@ mod tests {
     /// `vhost-user-nvrm`, with the socket on its command line, and waiting
     /// on its stdin until the test kills it.
     fn a_backend_nobody_started(dir: &Path, socket: &Path) -> std::process::Child {
-        use std::os::unix::fs::PermissionsExt;
         let binary = dir.join("vhost-user-nvrm");
-        std::fs::write(&binary, "#!/bin/sh\nread never\n").expect("a fake backend");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
+        executable(&binary, "#!/bin/sh\nread never\n");
         std::fs::write(socket, b"").expect("a socket stand-in");
         std::process::Command::new(&binary)
             .arg("--nvrm")
@@ -1530,11 +1545,8 @@ mod tests {
     /// A driver over a fake backend that runs `body` as `/bin/sh` with
     /// `--nvrm <socket>` as its arguments, so `$2` is the socket.
     fn driver_over(dir: &Path, body: &str) -> NvrmDriver {
-        use std::os::unix::fs::PermissionsExt;
         let binary = dir.join("vhost-user-nvrm");
-        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).expect("a fake backend");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
+        executable(&binary, &format!("#!/bin/sh\n{body}\n"));
         let mut config = node_in(&dir.join("run"));
         config.binary = binary;
         config.socket_timeout = Duration::from_secs(30);
