@@ -27,7 +27,8 @@ pub(super) async fn list_tenants(
 }
 
 /// Allocate a server-owned VNI before storing the tenant. The counter CAS gives
-/// concurrent creates distinct networks; failed creates may consume a VNI.
+/// concurrent creates distinct networks; a create that fails after it, at the
+/// store, may consume a VNI, while one refused for its own input does not.
 /// Dry-run reads the next candidate without advancing the counter.
 pub(super) async fn create_tenant(
     State(st): State<ApiState>,
@@ -43,15 +44,17 @@ pub(super) async fn create_tenant(
             "spec.vni is server-owned; the cloud allocates one per tenant and never twice",
         ));
     }
+    // The client's input is judged before the counter turns, so a create refused
+    // for its prefixes spends no VNI. (RR5-7)
+    let prefixes =
+        checked_network_prefixes(&st, &body.metadata.name, &body.spec.network_prefixes, &[])
+            .await?;
     // A preview READS the counter instead of turning it: see `vni::peek`.
     // Showing somebody a tenant must not spend a number.
     let vni = match dry.requested() {
         true => vni::peek(&st.store, st.vni_base).await?,
         false => vni::allocate(&st.store, st.vni_base).await?,
     };
-    let prefixes =
-        checked_network_prefixes(&st, &body.metadata.name, &body.spec.network_prefixes, &[])
-            .await?;
     let mut tenant = Tenant::declare(&body.metadata.name, body.spec);
     tenant.spec.vni = Some(vni);
     tenant.spec.network_prefixes = prefixes;

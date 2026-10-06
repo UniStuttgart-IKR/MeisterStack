@@ -965,6 +965,40 @@ async fn cloud_with_a_tenant_network(what: &str) -> ApiState {
     st
 }
 
+/// A tenant refused for its network prefixes spends no VNI: its input is judged before the
+/// counter turns, so the next tenant gets the number it would have had. (RR5-7)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenant_refused_for_its_network_prefixes_spends_no_vni() {
+    let st = cloud_with_routers("rr5-7").await;
+    let next = vni::peek(&st.store, st.vni_base)
+        .await
+        .expect("the next vni");
+    for (prefix, status) in [
+        ("198.51.100.0/25", StatusCode::CONFLICT),
+        ("10.30.0", StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let refused = create_tenant(
+            State(st.clone()),
+            DryRun::default(),
+            Json(tenant_with_network("c", &[prefix])),
+        )
+        .await
+        .err()
+        .expect("a prefix that is no prefix or on a pool");
+        assert_eq!(refused.status(), status, "{prefix}: {}", refused.message());
+    }
+
+    let (_, Json(created)) = create_tenant(
+        State(st.clone()),
+        DryRun::default(),
+        Json(tenant_with_network("c", &[])),
+    )
+    .await
+    .expect("a tenant without prefixes");
+    assert_eq!(created.spec.vni, Some(next));
+}
+
 /// A tenant's network prefixes are stored as the CIDRs of their networks, whatever host
 /// address the administrator wrote them with.
 #[tokio::test]
