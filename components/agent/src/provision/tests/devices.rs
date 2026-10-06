@@ -42,6 +42,11 @@ async fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built(
     let root = temp.path().to_path_buf();
     let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
 
+    // Use distinct, universally available character devices as evdev stand-ins.
+    // Admission checks device numbers without requiring host input hardware.
+    const NODE_A: &str = "/dev/null";
+    const NODE_B: &str = "/dev/zero";
+
     // Any binary that really exists: the driver refuses to build without
     // one, and admission never runs it.
     let mut devices: HashMap<String, Arc<dyn agent_api::device::DeviceDriver>> = HashMap::new();
@@ -53,6 +58,7 @@ async fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built(
                 run_dir: root.join("run").join("input"),
                 socket_timeout: std::time::Duration::from_millis(1),
                 vmm_user: None,
+                evdev: vec![NODE_A.into(), NODE_B.into()],
             })
             .expect("a driver over a binary that exists"),
         ),
@@ -87,11 +93,6 @@ async fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built(
             params: Some(serde_json::json!({ "evdev": node })),
         },
     };
-
-    // Use distinct, universally available character devices as evdev stand-ins.
-    // Admission checks device numbers without requiring host input hardware.
-    const NODE_A: &str = "/dev/null";
-    const NODE_B: &str = "/dev/zero";
 
     // The guest that has the node, as a record in the store — which is the
     // only place a claim lives, and why a teardown gives the node back.

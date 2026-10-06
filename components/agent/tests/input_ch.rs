@@ -72,6 +72,7 @@ fn node(
             run_dir: root.join("run").join("input"),
             socket_timeout: Duration::from_millis(input_driver::DEFAULT_SOCKET_TIMEOUT_MS),
             vmm_user: None,
+            evdev: vec![from_env("MEISTER_INPUT_DEVICE")],
         })
         .expect("a driver over the upstream backend"),
     );

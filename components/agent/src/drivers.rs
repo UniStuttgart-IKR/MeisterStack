@@ -506,6 +506,7 @@ fn build_input(
         run_dir: cfg.paths.run_dir.join(DRIVER_INPUT),
         socket_timeout: Duration::from_millis(i.socket_timeout_ms),
         vmm_user: vmm_user(cfg)?,
+        evdev: i.evdev.clone(),
     })?;
     Ok(Some(Arc::new(driver)))
 }

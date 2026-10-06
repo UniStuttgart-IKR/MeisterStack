@@ -293,6 +293,10 @@ default_bridge = "meister_br0"
 # Deadline for the backend's Unix socket to appear.
 #socket_timeout_ms = 5000
 
+# The host input nodes a vm may take, exactly as a spec's params.evdev names
+# them. A node not listed is never given to a guest; unset offers none.
+#evdev = ["/dev/input/by-id/usb-Example_Keyboard-event-kbd"]
+
 # Allowlist complete PCI devices for the vfio driver. Only these addresses
 # may be assigned; keep management devices out of this list.
 #[[device.managed]]

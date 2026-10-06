@@ -464,6 +464,10 @@ pub struct InputConfig {
     /// Backend socket timeout; defaults to `input_driver::DEFAULT_SOCKET_TIMEOUT_MS`.
     #[serde(default = "default_input_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
+    /// The host input nodes vms may take, as a spec must name them; see
+    /// `input_driver::InputDriverConfig::evdev`. Unset offers none.
+    #[serde(default)]
+    pub evdev: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
