@@ -751,10 +751,11 @@ pub(super) async fn dispatch_create(
     traceparent: &str,
 ) -> anyhow::Result<()> {
     let name = vm.metadata.name.clone();
-    // The first dispatch of the pass pays for the two listings; every other
-    // one reads the same book. See `AddressBook`.
+    // The first dispatch of the pass reads the address book, and the first one
+    // whose router prefix has to be judged the claimed address space; every
+    // other one reads the same. See `LazyBook`.
     let network = tenant_network(store, vm.spec.tenant.as_deref()).await?;
-    let addresses = book.get(store).await?.for_vm(vm, &network.prefixes);
+    let addresses = book.addresses(store, vm, &network.prefixes).await?;
     note_refused_prefixes(store, &addresses.refused).await;
     let op = cloud_command::Op::Create(proto::CreateVm {
         name: name.clone(),

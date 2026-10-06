@@ -108,6 +108,42 @@ pub fn cidr_of(range: &Ipv4Range) -> String {
     range.to_cidr().unwrap_or_else(|| range.to_string())
 }
 
+/// The prefix behind `router` where it reaches beyond what its tenant holds already, which only
+/// the address space claimed by everybody else can judge (`ClaimedSpace::refusal_of`). (NL6-1)
+///
+/// It opens nothing new (`Ok(None)`) when the router names no inside address, or when the
+/// prefix lies inside one of the tenant's own routed subnets (out of `subnets`) or, with a
+/// network `declared` (the tenant's `networkPrefixes`, which an administrator writes and which
+/// were judged against everybody else's addresses), inside one of its prefixes. With a network
+/// declared, any other prefix is refused, and so is an inside address that cannot be read,
+/// since what it would open is unknown. What is left is the prefix of a tenant that declares
+/// no network (`Ok(Some(prefix))`).
+pub fn prefix_beyond_own(
+    router: &Router,
+    subnets: &[RoutedSubnet],
+    declared: &[String],
+) -> std::result::Result<Option<Ipv4Range>, String> {
+    let Some(prefix) = inside_prefix(router)? else {
+        return Ok(None);
+    };
+    let tenant = router.spec.tenant.as_str();
+    let own_subnets = subnets
+        .iter()
+        .filter(|s| s.spec.tenant == tenant)
+        .map(|s| &s.spec.cidr);
+    if covered_by_any(own_subnets, &prefix) || covered_by_any(declared, &prefix) {
+        return Ok(None);
+    }
+    if !declared.is_empty() {
+        return Err(format!(
+            "{} is not inside tenant {tenant}'s network ({})",
+            cidr_of(&prefix),
+            declared.join(", ")
+        ));
+    }
+    Ok(Some(prefix))
+}
+
 /// The address space claimed in a cloud, read together so that one judgement is made from one
 /// picture of it: the floating pools, the routed subnets, the tenants' networks, the provider
 /// networks' wires, and the routed pools from the cloud config.
@@ -145,50 +181,38 @@ impl ClaimedSpace {
     /// beyond what is open there already, or why it may not open anything. (NL6-1)
     ///
     /// `spec.internalAddr` is the tenant's own to write, and the prefix it is on would let
-    /// every guest of the tenant send from it. It opens nothing new (`Ok(None)`) when the
-    /// router names no inside address, or when the prefix lies inside one of the tenant's own
-    /// routed subnets or, with a network `declared` (the tenant's `networkPrefixes`, which an
-    /// administrator writes and which were judged against everybody else's addresses), inside
-    /// one of its prefixes. With a network declared, any other prefix is refused. With none, it
-    /// is opened (`Ok(Some(prefix))`) unless it overlaps a floating pool, another tenant's
-    /// routed subnet or network, the routed pools or a provider network's wire. An inside
-    /// address that cannot be read is refused, since what it would open is unknown.
+    /// every guest of the tenant send from it. What the tenant holds already decides first
+    /// (`prefix_beyond_own`); a prefix of a tenant that declares no network that lies beyond
+    /// that is opened (`Ok(Some(prefix))`) unless it lies on somebody else's claim
+    /// (`refusal_of`).
     pub fn opened_by_router(
         &self,
         router: &Router,
         declared: &[String],
     ) -> std::result::Result<Option<Ipv4Range>, String> {
-        let Some(prefix) = inside_prefix(router)? else {
+        let Some(prefix) = prefix_beyond_own(router, &self.subnets, declared)? else {
             return Ok(None);
         };
-        let tenant = router.spec.tenant.as_str();
-        let own_subnets = self
-            .subnets
-            .iter()
-            .filter(|s| s.spec.tenant == tenant)
-            .map(|s| &s.spec.cidr);
-        if covered_by_any(own_subnets, &prefix) || covered_by_any(declared, &prefix) {
-            return Ok(None);
-        }
-        if !declared.is_empty() {
-            return Err(format!(
-                "{} is not inside tenant {tenant}'s network ({})",
-                cidr_of(&prefix),
-                declared.join(", ")
-            ));
-        }
-        match self
-            .off_limits_to_inside_prefix(tenant)
-            .into_iter()
-            .find(|(_, range)| range.overlaps(&prefix))
-        {
-            Some((what, _)) => Err(format!(
-                "{} overlaps {what}; tenant {tenant} declares no network its routers' prefixes \
-                 could lie in",
-                cidr_of(&prefix)
-            )),
+        match self.refusal_of(&router.spec.tenant, &prefix) {
+            Some(why) => Err(why),
             None => Ok(Some(prefix)),
         }
+    }
+
+    /// Why `prefix`, behind a router of `tenant`, which declares no network, may not be opened:
+    /// it overlaps a floating pool, another tenant's routed subnet or network, the routed pools
+    /// or a provider network's wire. `None` where it lies on none of them.
+    pub fn refusal_of(&self, tenant: &str, prefix: &Ipv4Range) -> Option<String> {
+        self.off_limits_to_inside_prefix(tenant)
+            .into_iter()
+            .find(|(_, range)| range.overlaps(prefix))
+            .map(|(what, _)| {
+                format!(
+                    "{} overlaps {what}; tenant {tenant} declares no network its routers' \
+                     prefixes could lie in",
+                    cidr_of(prefix)
+                )
+            })
     }
 
     /// What the prefix behind a router of `tenant`, which declares no network, may not

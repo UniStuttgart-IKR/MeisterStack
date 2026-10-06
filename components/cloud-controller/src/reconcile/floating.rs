@@ -8,6 +8,7 @@
 
 use super::*;
 
+use anyhow::Context as _;
 use common::net::Ipv4Ranges;
 use controller_api::address_space::{self, ClaimedSpace};
 
@@ -90,17 +91,21 @@ impl Carried {
 /// must observe allocation changes.
 pub(super) struct AddressBook {
     pub(super) reservations: Vec<controller_api::FloatingIp>,
+    /// The routed subnets: a tenant's guests send from its own, and the prefix behind its
+    /// router opens nothing new inside them.
+    pub(super) subnets: Vec<controller_api::RoutedSubnet>,
     /// The tenants' routers, for the prefix their inside leg is on.
     pub(super) routers: Vec<controller_api::Router>,
-    /// The address space claimed in the cloud: the routed subnets a tenant's guests send
-    /// from, and what the prefix behind a router may not lie on. (NL6-1)
-    pub(super) claimed: ClaimedSpace,
 }
 
 /// The pass's `AddressBook`, read by the first dispatch that asks for it: most passes
-/// dispatch nothing, and those must go on costing nothing.
+/// dispatch nothing, and those must go on costing nothing. The address space claimed in the
+/// cloud is read apart from it, by the first dispatch whose router prefix has to be judged
+/// against it: an object there that does not decode stops those dispatches and no others.
+/// (RR6-3)
 pub(super) struct LazyBook<'a> {
     book: OnceCell<AddressBook>,
+    claimed: OnceCell<ClaimedSpace>,
     /// The routed pools from the cloud config, which a router's prefix may not lie on.
     routed_pools: &'a Ipv4Ranges,
 }
@@ -109,15 +114,41 @@ impl<'a> LazyBook<'a> {
     pub(super) fn new(routed_pools: &'a Ipv4Ranges) -> Self {
         Self {
             book: OnceCell::new(),
+            claimed: OnceCell::new(),
             routed_pools,
         }
     }
 
-    /// The book, read on the first call of the pass.
-    pub(super) async fn get(&self, store: &EtcdStore) -> anyhow::Result<&AddressBook> {
-        self.book
-            .get_or_try_init(|| AddressBook::read(store, self.routed_pools))
-            .await
+    /// What `vm` may send from (`AddressBook::for_vm`), with the address space claimed in the
+    /// cloud read only where a router prefix of its tenant reaches beyond what the tenant holds.
+    /// Where that cannot be read, this dispatch fails, as one whose tenant or routers cannot be
+    /// read does: a list handed down without the prefix would cut a running guest off it on a
+    /// read that failed, not on a claim that was found.
+    pub(super) async fn addresses(
+        &self,
+        store: &EtcdStore,
+        vm: &Vm,
+        declared: &[String],
+    ) -> anyhow::Result<Addresses> {
+        let book = self
+            .book
+            .get_or_try_init(|| AddressBook::read(store))
+            .await?;
+        let claimed = match book.tenant_reaching_beyond_own(vm, declared) {
+            Some(tenant) => Some(self.claimed(store).await.with_context(|| {
+                format!("judging the prefix behind a router of tenant {tenant}")
+            })?),
+            None => None,
+        };
+        Ok(book.for_vm(vm, declared, claimed))
+    }
+
+    /// The address space claimed in the cloud, read on the first call of the pass.
+    async fn claimed(&self, store: &EtcdStore) -> anyhow::Result<&ClaimedSpace> {
+        Ok(self
+            .claimed
+            .get_or_try_init(|| ClaimedSpace::read(store, self.routed_pools.clone()))
+            .await?)
     }
 }
 
@@ -136,21 +167,40 @@ async fn all_routers(store: &EtcdStore) -> anyhow::Result<Vec<controller_api::Ro
 }
 
 impl AddressBook {
-    /// Through readers that refuse to answer from a partial list — an
-    /// undecodable object here is an address handed to the wrong VM, a prefix
-    /// taken off a tap that sends from it, or a claim a router's prefix is not
-    /// kept off.
-    pub(super) async fn read(store: &EtcdStore, routed_pools: &Ipv4Ranges) -> anyhow::Result<Self> {
+    /// Through the three readers that refuse to answer from a partial list —
+    /// an undecodable object here is an address handed to the wrong VM, or a
+    /// prefix taken off a tap that sends from it.
+    pub(super) async fn read(store: &EtcdStore) -> anyhow::Result<Self> {
         Ok(Self {
             reservations: controller_api::floating::all_reservations(store).await?,
+            subnets: controller_api::floating::all_subnets(store).await?,
             routers: all_routers(store).await?,
-            claimed: ClaimedSpace::read(store, routed_pools.clone()).await?,
         })
     }
 
+    /// The tenant of `vm`, where a router of it has a prefix beyond what the tenant holds
+    /// (`address_space::prefix_beyond_own`): only the address space claimed in the cloud can
+    /// judge that one. `declared` as for `for_vm`.
+    pub(super) fn tenant_reaching_beyond_own<'v>(
+        &self,
+        vm: &'v Vm,
+        declared: &[String],
+    ) -> Option<&'v str> {
+        let tenant = vm.spec.tenant.as_deref().filter(|t| !t.is_empty())?;
+        self.routers_of(tenant)
+            .any(|r| matches!(self.beyond_own(r, declared), Ok(Some(_))))
+            .then_some(tenant)
+    }
+
     /// What `vm` may send from. `declared` are the network prefixes of its tenant
-    /// (`TenantSpec::network_prefixes`), which the caller read with the tenant.
-    pub(super) fn for_vm(&self, vm: &Vm, declared: &[String]) -> Addresses {
+    /// (`TenantSpec::network_prefixes`), which the caller read with the tenant. `claimed` judges
+    /// a router prefix beyond what the tenant holds; without it, such a prefix is kept off.
+    pub(super) fn for_vm(
+        &self,
+        vm: &Vm,
+        declared: &[String],
+        claimed: Option<&ClaimedSpace>,
+    ) -> Addresses {
         let Some(tenant) = vm.spec.tenant.as_deref().filter(|t| !t.is_empty()) else {
             return Addresses::default();
         };
@@ -171,9 +221,8 @@ impl AddressBook {
             .collect();
         floating_ips.sort();
 
-        let (network, refused) = self.network_prefixes(tenant, declared);
+        let (network, refused) = self.network_prefixes(tenant, declared, claimed);
         let mut source_prefixes: Vec<String> = self
-            .claimed
             .subnets
             .iter()
             .filter(|s| s.spec.tenant == tenant)
@@ -189,8 +238,7 @@ impl AddressBook {
             .filter(mine)
             .map(|ip| Carried::of(ip, controller_api::FloatingIp::RESOURCE))
             .chain(
-                self.claimed
-                    .subnets
+                self.subnets
                     .iter()
                     .filter(|s| s.spec.tenant == tenant)
                     .map(|s| Carried::of(s, controller_api::RoutedSubnet::RESOURCE)),
@@ -214,24 +262,67 @@ impl AddressBook {
     /// they are on the allowlist whatever routed subnets the tenant has. (NL5-1)
     ///
     /// The network `declared` on the tenant holds whether a router is there or not. The prefix
-    /// behind each of its routers is added where `ClaimedSpace::opened_by_router` opens it,
-    /// and goes with the router; with a network declared, a router's prefix lies inside it and
-    /// adds nothing, or is refused. A prefix that lies on somebody else's claim is never
-    /// opened, whatever was admitted when the router was written. (NL6-1)
+    /// behind each of its routers is added where it opens something (`opened_by`), and goes
+    /// with the router; with a network declared, a router's prefix lies inside it and adds
+    /// nothing, or is refused. A prefix that lies on somebody else's claim is never opened,
+    /// whatever was admitted when the router was written. (NL6-1)
     fn network_prefixes(
         &self,
         tenant: &str,
         declared: &[String],
+        claimed: Option<&ClaimedSpace>,
     ) -> (Vec<String>, Vec<RefusedPrefix>) {
         let mut prefixes = declared.to_vec();
         let mut refused = Vec::new();
-        for router in self.routers.iter().filter(|r| r.spec.tenant == tenant) {
-            match self.claimed.opened_by_router(router, declared) {
+        for router in self.routers_of(tenant) {
+            match self.opened_by(router, declared, claimed) {
                 Ok(opened) => prefixes.extend(opened.map(|p| address_space::cidr_of(&p))),
                 Err(why) => refused.push(RefusedPrefix::of(router, why)),
             }
         }
         (prefixes, refused)
+    }
+
+    /// What the prefix behind `router` opens on its tenant's taps, as
+    /// `ClaimedSpace::opened_by_router` judges it, with the tenant's own subnets out of this
+    /// book. A prefix beyond what the tenant holds is judged by `claimed`, and kept off
+    /// without it: what it would lie on is unknown.
+    fn opened_by(
+        &self,
+        router: &controller_api::Router,
+        declared: &[String],
+        claimed: Option<&ClaimedSpace>,
+    ) -> Result<Option<common::net::Ipv4Range>, String> {
+        let Some(prefix) = self.beyond_own(router, declared)? else {
+            return Ok(None);
+        };
+        let claimed = claimed.ok_or_else(|| {
+            format!(
+                "{} could not be judged against the address space claimed in the cloud",
+                address_space::cidr_of(&prefix)
+            )
+        })?;
+        match claimed.refusal_of(&router.spec.tenant, &prefix) {
+            Some(why) => Err(why),
+            None => Ok(Some(prefix)),
+        }
+    }
+
+    /// `address_space::prefix_beyond_own` with the routed subnets of this book.
+    fn beyond_own(
+        &self,
+        router: &controller_api::Router,
+        declared: &[String],
+    ) -> Result<Option<common::net::Ipv4Range>, String> {
+        address_space::prefix_beyond_own(router, &self.subnets, declared)
+    }
+
+    /// The routers of `tenant`.
+    fn routers_of<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> impl Iterator<Item = &'a controller_api::Router> + 'a {
+        self.routers.iter().filter(move |r| r.spec.tenant == tenant)
     }
 }
 

@@ -522,17 +522,27 @@ fn book() -> AddressBook {
                 },
             )
         }],
-        claimed: controller_api::address_space::ClaimedSpace {
-            pools: Vec::new(),
-            subnets: vec![
-                net("acme-net", "acme", "10.7.1.0/24"),
-                net("other-net", "other", "10.7.2.0/24"),
-            ],
-            tenants: Vec::new(),
-            provider_networks: Vec::new(),
-            routed_pools: Default::default(),
-        },
+        subnets: vec![
+            net("acme-net", "acme", "10.7.1.0/24"),
+            net("other-net", "other", "10.7.2.0/24"),
+        ],
     }
+}
+
+/// The address space claimed in a cloud whose only claims are the routed subnets of `book`.
+fn claimed_by_subnets_of(book: &AddressBook) -> controller_api::address_space::ClaimedSpace {
+    controller_api::address_space::ClaimedSpace {
+        pools: Vec::new(),
+        subnets: book.subnets.clone(),
+        tenants: Vec::new(),
+        provider_networks: Vec::new(),
+        routed_pools: Default::default(),
+    }
+}
+
+/// What `vm` may send from out of `book`, in a cloud whose only claims are its routed subnets.
+fn addresses(book: &AddressBook, vm: &Vm, declared: &[String]) -> Addresses {
+    book.for_vm(vm, declared, Some(&claimed_by_subnets_of(book)))
 }
 
 /// The two listings that used to happen per dispatch happen once per pass,
@@ -545,7 +555,7 @@ fn book() -> AddressBook {
 fn one_address_book_answers_for_every_vm_of_the_pass() {
     let book = book();
 
-    let web = book.for_vm(&owned("web", Some("acme")), &[]);
+    let web = addresses(&book, &owned("web", Some("acme")), &[]);
     assert_eq!(web.floating_ips, ["10.255.0.7", "10.255.0.9"], "sorted");
     assert_eq!(
         web.source_prefixes,
@@ -554,17 +564,17 @@ fn one_address_book_answers_for_every_vm_of_the_pass() {
     );
 
     // The same book, a second VM, no second listing.
-    let db = book.for_vm(&owned("db", Some("acme")), &[]);
+    let db = addresses(&book, &owned("db", Some("acme")), &[]);
     assert_eq!(db.floating_ips, ["10.255.0.8"]);
     assert_eq!(db.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
 
     // A VM of the tenant that holds nothing assigned to it still gets the
     // tenant's subnets, and none of anybody's addresses.
-    let idle = book.for_vm(&owned("idle", Some("acme")), &[]);
+    let idle = addresses(&book, &owned("idle", Some("acme")), &[]);
     assert!(idle.floating_ips.is_empty());
     assert_eq!(idle.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
     // And the other tenant's router is not acme's business.
-    let theirs = book.for_vm(&owned("web", Some("other")), &[]);
+    let theirs = addresses(&book, &owned("web", Some("other")), &[]);
     assert_eq!(theirs.source_prefixes, ["10.7.2.0/24"]);
 }
 
@@ -575,7 +585,7 @@ fn one_address_book_answers_for_every_vm_of_the_pass() {
 fn a_tenants_declared_network_prefix_outlives_its_router() {
     let declared = ["10.42.0.0/24".to_string()];
     let mut book = book();
-    let with_router = book.for_vm(&owned("web", Some("acme")), &declared);
+    let with_router = addresses(&book, &owned("web", Some("acme")), &declared);
     assert_eq!(
         with_router.source_prefixes,
         ["10.42.0.0/24", "10.7.1.0/24"],
@@ -583,9 +593,9 @@ fn a_tenants_declared_network_prefix_outlives_its_router() {
     );
 
     book.routers.clear();
-    let without = book.for_vm(&owned("web", Some("acme")), &declared);
+    let without = addresses(&book, &owned("web", Some("acme")), &declared);
     assert_eq!(without.source_prefixes, ["10.42.0.0/24", "10.7.1.0/24"]);
-    let undeclared = book.for_vm(&owned("web", Some("acme")), &[]);
+    let undeclared = addresses(&book, &owned("web", Some("acme")), &[]);
     assert_eq!(
         undeclared.source_prefixes,
         ["10.7.1.0/24"],
@@ -598,18 +608,17 @@ fn a_tenants_declared_network_prefix_outlives_its_router() {
 /// router is named with why. (NL6-1)
 #[test]
 fn a_router_prefix_on_somebody_elses_claim_is_kept_off_the_taps() {
-    let mut book = book();
-    book.claimed
-        .pools
-        .push(controller_api::FloatingPool::declare(
-            "late",
-            controller_api::FloatingPoolSpec {
-                cidrs: vec!["10.42.0.0/25".into()],
-                ..Default::default()
-            },
-        ));
+    let book = book();
+    let mut claimed = claimed_by_subnets_of(&book);
+    claimed.pools.push(controller_api::FloatingPool::declare(
+        "late",
+        controller_api::FloatingPoolSpec {
+            cidrs: vec!["10.42.0.0/25".into()],
+            ..Default::default()
+        },
+    ));
 
-    let web = book.for_vm(&owned("web", Some("acme")), &[]);
+    let web = book.for_vm(&owned("web", Some("acme")), &[], Some(&claimed));
     assert_eq!(web.source_prefixes, ["10.7.1.0/24"]);
     let refused: Vec<(&str, &str)> = web
         .refused
@@ -631,7 +640,7 @@ fn a_router_prefix_off_the_declared_network_is_kept_off_the_taps() {
     let book = book();
     let declared = ["10.30.0.0/24".to_string()];
 
-    let web = book.for_vm(&owned("web", Some("acme")), &declared);
+    let web = addresses(&book, &owned("web", Some("acme")), &declared);
     assert_eq!(web.source_prefixes, ["10.30.0.0/24", "10.7.1.0/24"]);
     assert_eq!(web.refused.len(), 1);
     assert!(
@@ -643,21 +652,54 @@ fn a_router_prefix_off_the_declared_network_is_kept_off_the_taps() {
     );
 }
 
+/// A router prefix beyond what its tenant holds is kept off the taps where the address space
+/// claimed in the cloud is not there to judge it: what it would lie on is unknown. (RR6-3)
+#[test]
+fn a_router_prefix_beyond_its_tenant_is_kept_off_without_the_claimed_space() {
+    let book = book();
+
+    let web = book.for_vm(&owned("web", Some("acme")), &[], None);
+    assert_eq!(web.source_prefixes, ["10.7.1.0/24"]);
+    assert_eq!(web.refused.len(), 1);
+}
+
+/// Only a VM whose tenant has a router prefix beyond what the tenant holds needs the address
+/// space claimed in the cloud read. (RR6-3)
+#[test]
+fn only_a_router_prefix_beyond_its_tenant_asks_for_the_claimed_space() {
+    let book = book();
+    let inside = ["10.42.0.0/16".to_string()];
+
+    assert_eq!(
+        book.tenant_reaching_beyond_own(&owned("web", Some("acme")), &[]),
+        Some("acme")
+    );
+    assert_eq!(
+        book.tenant_reaching_beyond_own(&owned("web", Some("acme")), &inside),
+        None,
+        "inside the declared network"
+    );
+    assert_eq!(
+        book.tenant_reaching_beyond_own(&owned("web", Some("other")), &[]),
+        None,
+        "no router"
+    );
+}
+
 /// A tenant with no routed subnet and no router is known by its declared prefixes alone, and
 /// one with nothing declared either is known by nothing, as before the field existed.
 #[test]
 fn a_tenant_without_routers_or_subnets_is_known_by_its_declared_prefixes_alone() {
     let mut book = book();
     book.routers.clear();
-    book.claimed.subnets.clear();
+    book.subnets.clear();
     let declared = ["10.30.0.0/24".to_string(), "10.31.0.0/24".to_string()];
     assert_eq!(
-        book.for_vm(&owned("idle", Some("acme")), &declared)
-            .source_prefixes,
+        addresses(&book, &owned("idle", Some("acme")), &declared).source_prefixes,
         declared
     );
     assert!(
-        book.for_vm(&owned("idle", Some("acme")), &[])
+        addresses(&book, &owned("idle", Some("acme")), &[])
             .source_prefixes
             .is_empty()
     );
@@ -678,11 +720,11 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     for ip in &mut book.reservations {
         ip.metadata.generation = 3;
     }
-    for net in &mut book.claimed.subnets {
+    for net in &mut book.subnets {
         net.metadata.generation = 5;
     }
 
-    let carried = book.for_vm(&owned("web", Some("acme")), &[]).carried;
+    let carried = addresses(&book, &owned("web", Some("acme")), &[]).carried;
     let mut names: Vec<_> = carried
         .iter()
         .map(|c| (c.resource, c.name.as_str(), c.generation))
@@ -711,7 +753,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     // And a VM with nothing of its own still carries its tenant's subnet,
     // which is what a routed subnet IS — it reaches a node inside some
     // VM's create or it reaches none.
-    let idle = book.for_vm(&owned("idle", Some("acme")), &[]).carried;
+    let idle = addresses(&book, &owned("idle", Some("acme")), &[]).carried;
     let idle: Vec<_> = idle
         .iter()
         .map(|c| (c.resource, c.name.as_str(), c.generation))
@@ -731,7 +773,7 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
     for ip in &mut book.reservations {
         ip.metadata.generation = 2;
     }
-    let carried = book.for_vm(&owned("web", Some("acme")), &[]).carried;
+    let carried = addresses(&book, &owned("web", Some("acme")), &[]).carried;
 
     // The client changes an assignment while the command is in flight.
     for ip in &mut book.reservations {
@@ -753,7 +795,7 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
 fn a_vm_without_a_tenant_holds_nothing() {
     let book = book();
     for vm in [owned("web", None), owned("web", Some(""))] {
-        let none = book.for_vm(&vm, &[]);
+        let none = addresses(&book, &vm, &[]);
         assert!(none.floating_ips.is_empty() && none.source_prefixes.is_empty());
         assert!(none.carried.is_empty(), "and nothing to stamp");
     }
@@ -1427,11 +1469,67 @@ async fn an_address_book_is_not_read_past_a_router_that_does_not_decode() {
     let (store, prefix) = test_area("address-book").await;
     unparsable::<controller_api::Router>(&prefix, "broken").await;
 
-    let refused = AddressBook::read(&store, &common::net::Ipv4Ranges::default())
+    let refused = AddressBook::read(&store)
         .await
         .err()
         .expect("no book out of a partial list of routers");
     assert!(format!("{refused:#}").contains("router"), "{refused:#}");
+}
+
+/// A store under a fresh prefix with a router of `acme` on 10.42.0.1/24 and a floating pool
+/// that does not decode.
+async fn a_cloud_with_an_unreadable_claim(area: &str) -> EtcdStore {
+    let (store, prefix) = test_area(area).await;
+    store
+        .create(&controller_api::Router::declare(
+            "acme-out",
+            controller_api::RouterSpec {
+                tenant: "acme".into(),
+                provider_network: "ext".into(),
+                internal_addr: "10.42.0.1/24".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the router");
+    unparsable::<controller_api::FloatingPool>(&prefix, "broken").await;
+    store
+}
+
+/// A claim that does not decode does not stop a dispatch whose router prefix nothing has to
+/// judge: here one inside the tenant's declared network. (RR6-3)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_unreadable_claim_leaves_a_dispatch_that_judges_no_router_prefix_alone() {
+    let store = a_cloud_with_an_unreadable_claim("rr6-3-alone").await;
+    let routed_pools = common::net::Ipv4Ranges::default();
+    let declared = ["10.42.0.0/16".to_string()];
+
+    let addresses = LazyBook::new(&routed_pools)
+        .addresses(&store, &owned("web", Some("acme")), &declared)
+        .await
+        .expect("nothing to judge against the claims");
+    assert_eq!(addresses.source_prefixes, declared);
+}
+
+/// A claim that does not decode fails the dispatch whose router prefix it would judge, rather
+/// than handing down a list without the prefix. (RR6-3)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_unreadable_claim_fails_the_dispatch_whose_router_prefix_it_judges() {
+    let store = a_cloud_with_an_unreadable_claim("rr6-3-judged").await;
+    let routed_pools = common::net::Ipv4Ranges::default();
+
+    let failed = LazyBook::new(&routed_pools)
+        .addresses(&store, &owned("web", Some("acme")), &[])
+        .await
+        .err()
+        .expect("the claims cannot be told");
+    let said = format!("{failed:#}");
+    assert!(
+        said.contains("tenant acme") && said.contains("did not decode"),
+        "{said}"
+    );
 }
 
 /// A router prefix kept off its tenant's taps is a warning event on the router, which its
