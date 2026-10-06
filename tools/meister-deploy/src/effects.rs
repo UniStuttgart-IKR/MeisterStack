@@ -671,7 +671,7 @@ fn no_process_has(pid: u32) -> bool {
 /// `/proc/<pid>/stat` (proc_pid_stat(5)): the command name sits in
 /// parentheses and may hold anything, so the fields are counted from the
 /// last `)`. Field 3 is the state, field 22 the start time.
-pub fn proc_stat_state(stat: &str) -> Option<ProcessState> {
+fn proc_stat_state(stat: &str) -> Option<ProcessState> {
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
     let state = fields.next()?;
     let start = fields.nth(18)?.parse().ok()?;
