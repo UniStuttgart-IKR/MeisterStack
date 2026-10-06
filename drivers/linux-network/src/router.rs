@@ -27,6 +27,10 @@ pub const PROVIDER_PREFIX: &str = "meister-px-";
 /// The namespace one router gets.
 pub const NETNS_PREFIX: &str = "meister-rt-";
 
+/// Both legs of a router's namespace: the one on the provider network and the one on the
+/// tenant overlay.
+const ROUTER_LEGS: [&str; 2] = [LEG_EXTERNAL, LEG_INTERNAL];
+
 /// `ip`, when nobody names a path. PATH, which is right on a NixOS node — the
 /// same default `nft` takes.
 pub const DEFAULT_IP: &str = "ip";
@@ -406,7 +410,7 @@ impl crate::LinuxNetworkDriver {
         recorded_active: bool,
     ) -> networking::Result<()> {
         let was_silent = !recorded_active || self.some_leg_silent(netns).await;
-        self.set_arp_mode(netns, true).await?;
+        self.set_arp_mode(netns, &ROUTER_LEGS, true).await?;
         if was_silent {
             self.announce_garp(netns, spec).await;
         }
@@ -418,7 +422,7 @@ impl crate::LinuxNetworkDriver {
     /// read counts as silent: a shout too many from the active router is harmless, one too few
     /// leaves the neighbours pointing at the node that held the address before.
     async fn some_leg_silent(&self, netns: &str) -> bool {
-        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
+        for leg in ROUTER_LEGS {
             let mode = self.netns_sysctl_value(netns, &arp_ignore_key(leg)).await;
             if !mode.is_ok_and(|mode| mode == arp_ignore(true)) {
                 return true;
@@ -699,7 +703,7 @@ impl crate::LinuxNetworkDriver {
         // A standby's legs, old ones and any created above, are silent before they are given
         // an address.
         if !spec.active {
-            self.set_arp_mode(&netns, false).await?;
+            self.set_arp_mode(&netns, &ROUTER_LEGS, false).await?;
         }
 
         for (leg, addr) in [
@@ -1012,24 +1016,23 @@ impl crate::LinuxNetworkDriver {
     /// sysctl, or a namespace that cannot be looked into, is a failure: unknown is not silent.
     async fn silence_legs(&self, netns: &str) -> networking::Result<()> {
         let links = self.ip(&["-n", netns, "-o", "link", "show"]).await?;
-        let mut outcome = Ok(());
-        for leg in legs_present(&links) {
-            let set = self
-                .netns_sysctl(netns, &arp_ignore_key(leg), arp_ignore(false))
-                .await;
-            outcome = outcome.and(set);
-        }
-        outcome
+        self.set_arp_mode(netns, &legs_present(&links), false).await
     }
 
-    /// Set both legs' ARP mode: answering for an active router, `arp_ignore=8` for a standby.
+    /// Set the ARP mode of `legs`: answering for an active router, `arp_ignore=8` for a standby.
     ///
-    /// Both legs, because a standby must be silent towards the tenant as well as towards the
-    /// fabric: an ARP reply on the overlay would make it the tenant's default gateway. Both are
-    /// tried even when the first fails, so a silencing pass never leaves a leg it could reach.
-    async fn set_arp_mode(&self, netns: &str, active: bool) -> networking::Result<()> {
+    /// A pass names both [`ROUTER_LEGS`], because a standby must be silent towards the tenant
+    /// as well as towards the fabric: an ARP reply on the overlay would make it the tenant's
+    /// default gateway. The dead man names the legs the kernel lists. Every leg is tried even
+    /// when one fails, so a silencing pass never leaves a leg it could reach.
+    async fn set_arp_mode(
+        &self,
+        netns: &str,
+        legs: &[&str],
+        active: bool,
+    ) -> networking::Result<()> {
         let mut outcome = Ok(());
-        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
+        for leg in legs {
             let set = self
                 .netns_sysctl(netns, &arp_ignore_key(leg), arp_ignore(active))
                 .await;
@@ -1065,7 +1068,7 @@ fn silencing_targets(records: &[PathBuf], live: &[String]) -> (BTreeSet<RouterId
 
 /// The router legs an `ip -o link show` listing names.
 fn legs_present(links: &str) -> Vec<&'static str> {
-    [LEG_EXTERNAL, LEG_INTERNAL]
+    ROUTER_LEGS
         .into_iter()
         // `ip -o link show` prints `2: ext@if7: <...>`, so the name is
         // followed by `@` or `:` and never bare.
@@ -1097,7 +1100,7 @@ fn classify(
         }
     };
     let present = legs_present(&links);
-    let missing: Vec<&str> = [LEG_EXTERNAL, LEG_INTERNAL]
+    let missing: Vec<&str> = ROUTER_LEGS
         .into_iter()
         .filter(|leg| !present.contains(leg))
         .collect();
@@ -1517,9 +1520,6 @@ esac
         );
     }
 
-    /// Both of a router's legs, as a fully built namespace has them.
-    const BOTH_LEGS: [&str; 2] = [LEG_EXTERNAL, LEG_INTERNAL];
-
     /// The shell lines a fake `ip -n <netns> -o link show` answers with: `lo` and `legs`, each
     /// spelled as a veth end, which is how the real one prints them.
     fn link_listing(legs: &[&str]) -> String {
@@ -1557,7 +1557,7 @@ esac
     /// The legs the fake `ip` was told to silence (`arp_ignore=8`) inside `netns`.
     fn silenced_legs(log: &Path, netns: &str) -> Vec<&'static str> {
         let calls = std::fs::read_to_string(log).unwrap_or_default();
-        [LEG_EXTERNAL, LEG_INTERNAL]
+        ROUTER_LEGS
             .into_iter()
             .filter(|leg| {
                 let call =
@@ -1620,7 +1620,7 @@ exit 0
     /// spent.
     fn already_answering(dir: &Path) {
         let kernel = dir.join("kernel");
-        for leg in BOTH_LEGS {
+        for leg in ROUTER_LEGS {
             std::fs::write(kernel.join(arp_ignore_key(leg)), "0\n").expect("an answering leg");
         }
         std::fs::write(kernel.join("refused"), b"").expect("no refusal left");
@@ -1693,14 +1693,14 @@ exit 0
         let netns = router_netns(&spec(true).id);
         let d = fake_driver(
             dir,
-            &logging_ip(&log, std::slice::from_ref(&netns), &BOTH_LEGS, None),
+            &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
         );
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
 
         assert_eq!(outcome.silenced, [spec(true).id]);
         assert!(outcome.complete());
-        assert_eq!(silenced_legs(&log, &netns), [LEG_EXTERNAL, LEG_INTERNAL]);
+        assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
     }
 
     /// A record that says standby is no proof the kernel is silent: the namespace is silenced
@@ -1715,13 +1715,13 @@ exit 0
         write_record(dir, &standby);
         let d = fake_driver(
             dir,
-            &logging_ip(&log, std::slice::from_ref(&netns), &BOTH_LEGS, None),
+            &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
         );
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
 
         assert_eq!(outcome.silenced, [standby.id]);
-        assert_eq!(silenced_legs(&log, &netns), [LEG_EXTERNAL, LEG_INTERNAL]);
+        assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
     }
 
     /// A silenced router's record says standby afterwards, so it announces nothing and its
@@ -1732,7 +1732,10 @@ exit 0
         let dir = temp.path();
         let active = spec(true);
         let path = write_record(dir, &active);
-        let d = fake_driver(dir, &logging_ip(&dir.join("ip.log"), &[], &BOTH_LEGS, None));
+        let d = fake_driver(
+            dir,
+            &logging_ip(&dir.join("ip.log"), &[], &ROUTER_LEGS, None),
+        );
 
         d.fall_silent_impl().await.expect("a silencing pass");
 
@@ -1752,17 +1755,14 @@ exit 0
             "echo \"$*\" >> '{}'\ncase \"$*\" in\n\"netns list\") exit 1;;\n\
              \"-n \"*\" -o link show\") {}:;;\nesac\nexit 0\n",
             log.display(),
-            link_listing(&BOTH_LEGS),
+            link_listing(&ROUTER_LEGS),
         );
         let d = fake_driver(dir, &ip);
 
         let err = d.fall_silent_impl().await;
 
         assert!(err.is_err(), "an unlisted kernel is not a silent one");
-        assert_eq!(
-            silenced_legs(&log, &router_netns(&active.id)),
-            [LEG_EXTERNAL, LEG_INTERNAL]
-        );
+        assert_eq!(silenced_legs(&log, &router_netns(&active.id)), ROUTER_LEGS);
     }
 
     /// One router that cannot be silenced does not stop the others, and leaves the pass partial
@@ -1778,7 +1778,7 @@ exit 0
         write_record(dir, &ok);
         write_record(dir, &bad);
         let listed = [router_netns(&ok.id), router_netns(&bad.id)];
-        let ip = logging_ip(&dir.join("ip.log"), &listed, &BOTH_LEGS, Some(&listed[1]));
+        let ip = logging_ip(&dir.join("ip.log"), &listed, &ROUTER_LEGS, Some(&listed[1]));
         let d = fake_driver(dir, &ip);
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
@@ -1836,7 +1836,7 @@ exit 0
         let standby = spec(false);
         let netns = router_netns(&standby.id);
         let listed = std::slice::from_ref(&netns);
-        let d = fake_driver(dir, &logging_ip(&log, listed, &BOTH_LEGS, None));
+        let d = fake_driver(dir, &logging_ip(&log, listed, &ROUTER_LEGS, None));
 
         let err = d
             .ensure_router_impl(&standby)
@@ -1844,7 +1844,7 @@ exit 0
             .expect_err("this node has no [network.vxlan] section, so no overlay is built");
 
         assert!(matches!(err, NetworkError::InvalidSpec(_)), "{err:#}");
-        assert_eq!(silenced_legs(&log, &netns), BOTH_LEGS);
+        assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
     }
 
     /// A demotion that cannot silence the old namespace stops there and says why (N2).
@@ -1855,7 +1855,7 @@ exit 0
         let standby = spec(false);
         let netns = router_netns(&standby.id);
         let listed = std::slice::from_ref(&netns);
-        let ip = logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, Some(&netns));
+        let ip = logging_ip(&dir.join("ip.log"), listed, &ROUTER_LEGS, Some(&netns));
         let d = fake_driver(dir, &ip);
 
         let err = d
@@ -1878,7 +1878,7 @@ exit 0
         let listed = std::slice::from_ref(&netns);
         let d = fake_driver(
             dir,
-            &logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, None),
+            &logging_ip(&dir.join("ip.log"), listed, &ROUTER_LEGS, None),
         );
 
         d.ensure_router_impl(&spec(false))
@@ -1900,7 +1900,7 @@ exit 0
         let path = write_record(dir, &spec(true));
         let netns = router_netns(&spec(true).id);
         let listed = std::slice::from_ref(&netns);
-        let ip = logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, Some(&netns));
+        let ip = logging_ip(&dir.join("ip.log"), listed, &ROUTER_LEGS, Some(&netns));
         let d = fake_driver(dir, &ip);
 
         d.ensure_router_impl(&spec(false))
