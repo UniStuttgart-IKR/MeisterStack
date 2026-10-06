@@ -213,8 +213,9 @@ in
     # Controllers share the meister service account. The meister group also grants
     # access to the agent socket; membership permits local VM administration.
     # Keep supplementary device groups on the agent unit, not the shared account.
-    users.groups.meister = { };
-    users.users.meister = {
+    # A host without a role gets neither, so importing the module changes nothing.
+    users.groups.meister = lib.mkIf (cfg.unitsFor != [ ]) { };
+    users.users.meister = lib.mkIf (cfg.unitsFor != [ ]) {
       isSystemUser = true;
       group = "meister";
       description = "MeisterStack control plane";
