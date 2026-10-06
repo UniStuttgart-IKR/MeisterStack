@@ -1136,14 +1136,7 @@ impl crate::LinuxNetworkDriver {
     /// its next activation shouts again. A missing, standby or unreadable record claims nothing
     /// a rewrite could withdraw and is left as it is.
     async fn record_standby(dir: &Path, id: &RouterId) -> networking::Result<()> {
-        let Ok(mut record) = Self::read_record(&Self::record_path(dir, id)).await else {
-            return Ok(());
-        };
-        if !record.spec.active {
-            return Ok(());
-        }
-        record.spec.active = false;
-        Self::store_record(dir, &record.spec).await
+        Self::withdraw_claim(dir, id, |spec| &mut spec.active).await
     }
 
     /// Withdraw a record's sole-gateway claim once the spec no longer makes it, before anything
@@ -1155,13 +1148,25 @@ impl crate::LinuxNetworkDriver {
         if spec.sole_gateway {
             return Ok(());
         }
-        let Ok(mut record) = Self::read_record(&Self::record_path(dir, &spec.id)).await else {
+        Self::withdraw_claim(dir, &spec.id, |spec| &mut spec.sole_gateway).await
+    }
+
+    /// Clear one claim of router `id`'s record, the field `claim` names, and store the record
+    /// only while it still makes the claim. A missing or unreadable record claims nothing and is
+    /// left as it is.
+    async fn withdraw_claim(
+        dir: &Path,
+        id: &RouterId,
+        claim: fn(&mut RouterSpec) -> &mut bool,
+    ) -> networking::Result<()> {
+        let Ok(mut record) = Self::read_record(&Self::record_path(dir, id)).await else {
             return Ok(());
         };
-        if !record.spec.sole_gateway {
+        let made = claim(&mut record.spec);
+        if !*made {
             return Ok(());
         }
-        record.spec.sole_gateway = false;
+        *made = false;
         Self::store_record(dir, &record.spec).await
     }
 
@@ -2010,6 +2015,49 @@ exit 0
         assert!(outcome.kept.is_empty(), "{outcome:?}");
         assert_eq!(outcome.silenced, [active.id]);
         assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
+    }
+
+    /// NL-A3: withdrawing one claim clears that field of the record and leaves the other
+    /// claims as they were.
+    #[tokio::test]
+    async fn a_withdrawn_claim_clears_its_own_field_alone() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let sole = RouterSpec {
+            sole_gateway: true,
+            ..spec(true)
+        };
+        let path = write_record(dir, &sole);
+
+        crate::LinuxNetworkDriver::withdraw_claim(dir, &sole.id, |spec| &mut spec.sole_gateway)
+            .await
+            .expect("withdrawn");
+
+        let after = read_spec(&path);
+        assert!(!after.sole_gateway);
+        assert!(after.active, "the router still says active");
+    }
+
+    /// NL-A3: a record that no longer makes the claim is not rewritten, and a missing one is
+    /// not made.
+    #[tokio::test]
+    async fn a_claim_nobody_makes_rewrites_no_record() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let standby = spec(false);
+        let path = write_record(dir, &standby);
+        let before = std::fs::read(&path).expect("the record");
+
+        crate::LinuxNetworkDriver::withdraw_claim(dir, &standby.id, |spec| &mut spec.active)
+            .await
+            .expect("nothing to withdraw");
+        let missing = RouterId::from_u128(7);
+        crate::LinuxNetworkDriver::withdraw_claim(dir, &missing, |spec| &mut spec.active)
+            .await
+            .expect("nothing to withdraw");
+
+        assert_eq!(std::fs::read(&path).expect("the record"), before);
+        assert!(!crate::LinuxNetworkDriver::record_path(dir, &missing).exists());
     }
 
     /// A silenced router's record says standby afterwards, so it announces nothing and its
