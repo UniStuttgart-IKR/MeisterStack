@@ -25,10 +25,11 @@ use tracing::{debug, error, info, instrument, warn};
 mod admission;
 mod ledger;
 mod paths;
+mod strays;
 mod vgpu;
 
 use admission::{Claim, Wanted};
-use ledger::{Ledger, Reservation};
+use ledger::{Existing, Ledger, Reservation};
 pub use vgpu::VgpuType;
 
 /// VIRTIO_ID_NVRM, the device type Leandro's guest module binds to.
@@ -573,12 +574,17 @@ impl DeviceDriver for NvrmDriver {
         }
 
         let socket = self.socket_path(id);
-        let reusable = self.ledger().reusable(id, &socket)?;
-        if let Some(pid) = reusable {
-            return Ok(Device {
-                id: *id,
-                attachment: Self::attachment(socket, pid),
-            });
+        let existing = self.ledger().existing(id, &socket)?;
+        match existing {
+            Existing::Serving(pid) => {
+                return Ok(Device {
+                    id: *id,
+                    attachment: Self::attachment(socket, pid),
+                });
+            }
+            // Its replacement binds the same socket and must not run beside it.
+            Existing::Stale(child) => self.process.stop(child).await,
+            Existing::Nothing => self.refuse_backend_not_started_here(id, &socket)?,
         }
 
         let (params, vgpu) = self.sized(spec).await?;
@@ -703,12 +709,56 @@ impl DeviceDriver for NvrmDriver {
             .map(|d| d.id)
             .chain(requested.iter().map(|(id, _)| *id))
             .collect();
-        held.extend(self.ledger().unrecorded(&recorded));
+        let started = {
+            let mut ledger = self.ledger();
+            held.extend(ledger.unrecorded(&recorded));
+            ledger.devices()
+        };
+        self.refuse_beside_strays(&recorded.union(&started).copied().collect())?;
         admission::admit_all(held, &wanted, self.config.vram_budget_mib)
     }
 }
 
 impl NvrmDriver {
+    /// Refuse while a backend runs that neither a record nor this driver
+    /// accounts for: its share of the card is unknown. Sockets nothing
+    /// serves any more are cleared on the way; see [`strays`].
+    fn refuse_beside_strays(&self, accounted: &HashSet<DeviceId>) -> device::Result<()> {
+        let found =
+            strays::strays(&self.config.run_dir, accounted, &self.process).map_err(|e| {
+                DeviceError::Backend(
+                    anyhow::Error::new(e).context("telling which nvrm backends run on this node"),
+                )
+            })?;
+        if found.is_empty() {
+            return Ok(());
+        }
+        Err(DeviceError::InvalidSpec(
+            "an nvrm backend runs on this node for a device no vm record names, so its share of \
+             the card is unknown and no nvrm device is admitted beside it; the agent log names \
+             it for an operator"
+                .into(),
+        ))
+    }
+
+    /// A backend already serving this device's socket that this driver did
+    /// not start (one that outlived an agent restart) is not started twice:
+    /// the second would bind its socket while the first still holds its share.
+    fn refuse_backend_not_started_here(&self, id: &DeviceId, socket: &Path) -> device::Result<()> {
+        let serving = self.process.find_serving(socket).map_err(|e| {
+            DeviceError::Backend(
+                anyhow::Error::new(e).context(format!("looking for a backend of device {id}")),
+            )
+        })?;
+        match serving {
+            None => Ok(()),
+            Some(pid) => Err(DeviceError::Backend(anyhow::anyhow!(
+                "device {id} already has a backend running (pid {pid}) that this agent did not \
+                 start; it is not started a second time"
+            ))),
+        }
+    }
+
     /// A spec's effective parameters and the vGPU type they resolve to.
     async fn sized(&self, spec: &DeviceSpec) -> device::Result<(NvrmParams, Option<VgpuType>)> {
         let params = self.config.effective_params(spec)?;
@@ -1294,10 +1344,13 @@ mod tests {
             "the dropped start counts for nothing"
         );
         let socket = driver.socket_path(&id);
-        driver
-            .ledger()
-            .reusable(&id, &socket)
-            .expect("no start of this device is under way any more");
+        assert!(
+            matches!(
+                driver.ledger().existing(&id, &socket),
+                Ok(Existing::Nothing)
+            ),
+            "no start of this device is under way any more"
+        );
 
         let exited = tokio::task::spawn_blocking(move || {
             use nix::sys::wait::{Id, WaitPidFlag, waitid};
@@ -1324,5 +1377,84 @@ mod tests {
             ),
             "{exited:?}"
         );
+    }
+
+    /// A process that passes for this device's backend: named
+    /// `vhost-user-nvrm`, with the socket on its command line, and waiting
+    /// on its stdin until the test kills it.
+    fn a_backend_nobody_started(dir: &Path, socket: &Path) -> std::process::Child {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("vhost-user-nvrm");
+        std::fs::write(&binary, "#!/bin/sh\nread never\n").expect("a fake backend");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        std::fs::write(socket, b"").expect("a socket stand-in");
+        std::process::Command::new(&binary)
+            .arg("--nvrm")
+            .arg(socket)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("running")
+    }
+
+    fn stop(mut backend: std::process::Child) {
+        backend.kill().expect("killed");
+        backend.wait().expect("reaped");
+    }
+
+    /// R2-4: a socket no process serves, for a device nobody accounts for,
+    /// is what a backend left behind. It holds nothing, counts nothing and
+    /// is cleared away.
+    #[tokio::test]
+    async fn a_socket_nothing_serves_counts_nothing_and_is_removed() {
+        let dir = run_dir();
+        let driver = driver_in(dir.path());
+        let left_behind = driver.socket_path(&DeviceId::new_v4());
+        std::fs::write(&left_behind, b"").expect("a socket stand-in");
+
+        driver
+            .admit(&requested(profiled("8q")), &[])
+            .await
+            .expect("the card is free");
+        assert!(!left_behind.exists(), "the stale socket is gone");
+    }
+
+    /// R2-4: a backend still running for a device no vm record names holds a
+    /// share of the card nobody can say. Nothing is admitted beside it, and
+    /// it is left running for an operator to look at, not killed.
+    #[tokio::test]
+    async fn a_backend_no_record_names_blocks_admission_and_is_left_running() {
+        let dir = run_dir();
+        let driver = driver_in(dir.path());
+        let mut unnamed =
+            a_backend_nobody_started(dir.path(), &driver.socket_path(&DeviceId::new_v4()));
+
+        let said = driver
+            .admit(&requested(profiled("1q")), &[])
+            .await
+            .expect_err("its share is unknown")
+            .to_string();
+        let running = unnamed.try_wait().expect("a status");
+        stop(unnamed);
+        assert!(said.contains("no vm record names"), "{said}");
+        assert!(
+            running.is_none(),
+            "admission does not kill what it cannot place"
+        );
+    }
+
+    /// R2-4: the same backend, found when its own device is created, is not
+    /// started a second time on its socket.
+    #[tokio::test]
+    async fn a_device_whose_backend_outlived_the_agent_is_not_started_twice() {
+        let dir = run_dir();
+        let driver = driver_in(dir.path());
+        let id = DeviceId::new_v4();
+        let survivor = a_backend_nobody_started(dir.path(), &driver.socket_path(&id));
+
+        let created = driver.create(&id, &profiled("1q"), None).await;
+        stop(survivor);
+        let said = created.expect_err("one backend per device").to_string();
+        assert!(said.contains("not started a second time"), "{said}");
     }
 }

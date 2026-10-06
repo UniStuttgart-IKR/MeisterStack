@@ -25,3 +25,11 @@ pub(crate) fn socket_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
 pub(crate) fn log_file(run_dir: &Path, id: &DeviceId) -> PathBuf {
     device_file(run_dir, id, LOG)
 }
+
+/// The device a socket in the run directory belongs to, if it is one.
+pub(crate) fn socket_device(path: &Path) -> Option<DeviceId> {
+    if path.extension().and_then(|e| e.to_str()) != Some(SOCKET) {
+        return None;
+    }
+    path.file_stem()?.to_str()?.parse().ok()
+}

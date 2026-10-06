@@ -40,6 +40,15 @@ impl Entry {
     }
 }
 
+/// What the ledger has of a device about to be created.
+pub(crate) enum Existing {
+    Nothing,
+    /// A child of this driver that still serves the device's socket.
+    Serving(u32),
+    /// A child that cannot serve any more: exited, or its socket is gone.
+    Stale(Backend),
+}
+
 #[derive(Default)]
 pub(crate) struct Ledger {
     entries: HashMap<DeviceId, Entry>,
@@ -147,13 +156,14 @@ impl Ledger {
         }
     }
 
-    /// The pid of `id`'s backend if it can serve again. One that cannot is
-    /// forgotten, so its replacement is started afresh.
-    pub(crate) fn reusable(&mut self, id: &DeviceId, socket: &Path) -> device::Result<Option<u32>> {
+    /// What this driver already has of `id`'s backend. A child that cannot
+    /// serve again is forgotten and handed back, so the caller stops it
+    /// before its replacement starts.
+    pub(crate) fn existing(&mut self, id: &DeviceId, socket: &Path) -> device::Result<Existing> {
         let Some(entry) = self.entries.get_mut(id) else {
-            return Ok(None);
+            return Ok(Existing::Nothing);
         };
-        let pid = match &mut entry.process {
+        let serving = match &mut entry.process {
             Process::Starting { .. } => {
                 return Err(DeviceError::Backend(anyhow::anyhow!(
                     "device {id} is already being started"
@@ -161,10 +171,15 @@ impl Ledger {
             }
             Process::Child(child) => child.is_reusable(socket).then(|| child.pid().unwrap_or(0)),
         };
-        if pid.is_none() {
-            self.entries.remove(id);
-        }
-        Ok(pid)
+        Ok(match serving {
+            Some(pid) => Existing::Serving(pid),
+            None => self.forget(id).map_or(Existing::Nothing, Existing::Stale),
+        })
+    }
+
+    /// Every device this driver has a start or a child for.
+    pub(crate) fn devices(&self) -> HashSet<DeviceId> {
+        self.entries.keys().copied().collect()
     }
 
     /// What this driver started for devices no record in `recorded` names:

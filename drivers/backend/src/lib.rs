@@ -307,21 +307,36 @@ impl BackendKind {
     /// line. Both checks are needed because PIDs can be reused by another backend
     /// of the same kind. An unreadable or absent process fails the check.
     pub fn is_ours(&self, pid: u32, socket: &Path) -> bool {
-        if self.comm.is_empty() {
-            return false;
+        self.has_our_name(pid) && names_socket(pid, socket).unwrap_or(false)
+    }
+
+    /// The backend of this kind serving `socket`, found by scanning `/proc`,
+    /// for a socket nobody recorded a pid for. A process of this name whose
+    /// command line cannot be read is an error and not a "no": it may be the
+    /// one.
+    pub fn find_serving(&self, socket: &Path) -> std::io::Result<Option<u32>> {
+        for entry in std::fs::read_dir("/proc")? {
+            let Some(pid) = entry?.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            if !self.has_our_name(pid) {
+                continue;
+            }
+            match names_socket(pid, socket) {
+                Ok(true) => return Ok(Some(pid)),
+                Ok(false) => {}
+                // Exited between the listing and the read.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-        let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|comm| comm.trim() == self.comm)
-            .unwrap_or(false);
-        if !comm_matches {
-            return false;
-        }
-        // Match NUL-delimited arguments directly so spaces cannot merge argument boundaries.
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            return false;
-        };
-        let needle = socket.as_os_str().as_encoded_bytes();
-        !needle.is_empty() && cmdline.windows(needle.len()).any(|w| w == needle)
+        Ok(None)
+    }
+
+    fn has_our_name(&self, pid: u32) -> bool {
+        !self.comm.is_empty()
+            && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == self.comm)
     }
 
     fn signal(&self, pid: u32, sig: Signal) {
@@ -367,6 +382,15 @@ impl Drop for KillUnlessReady<'_> {
             self.kind.signal(pid, Signal::SIGKILL);
         }
     }
+}
+
+/// Whether `pid`'s command line holds `socket`. Matches NUL-delimited
+/// arguments directly so spaces cannot merge argument boundaries; a zombie's
+/// empty command line names nothing.
+fn names_socket(pid: u32, socket: &Path) -> std::io::Result<bool> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let needle = socket.as_os_str().as_encoded_bytes();
+    Ok(!needle.is_empty() && cmdline.windows(needle.len()).any(|w| w == needle))
 }
 
 /// Where one backend's files live and how long it gets to come up.
@@ -508,6 +532,20 @@ mod tests {
         // An empty marker matches everywhere in a byte search, so it is
         // refused outright rather than allowed to mean "any".
         assert!(!kind.is_ours(pid, std::path::Path::new("")));
+    }
+
+    /// A socket with no recorded pid is traced to the process that names it.
+    #[test]
+    fn the_backend_serving_a_socket_is_found_without_its_pid() {
+        let me =
+            std::fs::read_to_string(format!("/proc/{}/comm", std::process::id())).expect("linux");
+        let kind = BackendKind::detached("test", me.trim(), 1);
+        let found = kind
+            .find_serving(&own_cmdline_argument())
+            .expect("/proc reads");
+        assert!(found.is_some(), "this test process names its own argv[0]");
+        let nobody = std::path::Path::new("/run/meisterstack/nvrm/nobody-serves-this.sock");
+        assert_eq!(kind.find_serving(nobody).expect("/proc reads"), None);
     }
 
     #[test]
