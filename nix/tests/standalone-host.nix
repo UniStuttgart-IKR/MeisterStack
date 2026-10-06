@@ -97,7 +97,8 @@ let
       && unit.serviceConfig.ExecStartPre != [ ]
       && !(builtins.elem guard (unit.requires ++ unit.requisite ++ unit.bindsTo))
       && c.systemd.services.meister-guest-guard.requiredBy == [ ]
-      && c.systemd.services.meister-guest-guard.partOf == [ ];
+      && c.systemd.services.meister-guest-guard.partOf == [ ]
+      && c.systemd.services.meister-guest-guard.before == [ ];
     "where NixOS runs nftables, the host's firewall carries the guard" =
       let
         c = agent { networking.nftables.enable = true; };

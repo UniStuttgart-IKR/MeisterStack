@@ -129,7 +129,6 @@ in
       systemd.services.${table} = {
         description = "Keep MeisterStack guests from opening connections to this host";
         wantedBy = [ "multi-user.target" ];
-        before = [ "meister-agent.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -142,7 +141,8 @@ in
     # Requires= or Requisite= would stop and restart the agent whenever the
     # loader stops or restarts, and the host's firewall is restarted for
     # reasons of its own. The table outlives its loader, so the agent only
-    # orders after the loader and checks for the table itself.
+    # orders after the loader and checks for the table itself. The order is
+    # declared here and nowhere else, not also as `before` on the loader.
     (lib.mkIf agentRuns {
       systemd.services.meister-agent = {
         after = [ loader ];
