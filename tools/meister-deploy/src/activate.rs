@@ -2268,7 +2268,7 @@ mod key_fixtures;
 
 #[cfg(test)]
 mod tests {
-    use super::key_fixtures::{key_layout, rotating};
+    use super::key_fixtures::{key_layout, rotating, switched_layout};
     use super::*;
     use crate::effects::{FakeClock, MemFiles};
     use crate::run::{Matcher, Output, Policy, StrictFake};
@@ -3861,10 +3861,7 @@ mod tests {
             KeysState::None
         );
 
-        let prepared = MemFiles::new()
-            .given(format!("{PKI}/identity.key"), "old key\n")
-            .given(format!("{PKI}/identity.crt"), "old certificate\n")
-            .given(format!("{PKI}/identity.key.next"), "k\n");
+        let prepared = key_layout(&[("key", "old"), ("crt", "old"), ("key.next", "new")]);
         assert_eq!(
             helper(&runner, &prepared, &clock)
                 .keys_status(KeyKind::Identity)
@@ -3882,11 +3879,7 @@ mod tests {
             KeysState::Overlap
         );
 
-        let switched = MemFiles::new()
-            .given(format!("{PKI}/identity.key"), "new key\n")
-            .given(format!("{PKI}/identity.crt"), "new certificate\n")
-            .given(format!("{PKI}/identity.key.prev"), "old key\n")
-            .given(format!("{PKI}/identity.crt.prev"), "old certificate\n");
+        let switched = switched_layout();
         assert_eq!(
             helper(&runner, &switched, &clock)
                 .keys_status(KeyKind::Identity)
@@ -3897,7 +3890,7 @@ mod tests {
 
         // A certificate with no key beside it is a state this tool has no
         // rule for, and it says so rather than guessing.
-        let half = MemFiles::new().given(format!("{PKI}/identity.crt.next"), "c\n");
+        let half = key_layout(&[("crt.next", "new")]);
         let view = helper(&runner, &half, &clock)
             .keys_status(KeyKind::Identity)
             .unwrap();
@@ -3971,16 +3964,6 @@ mod tests {
                 ("crt.prev", "old"),
             ],
         ]
-    }
-
-    /// What a whole switch leaves: the new pair in use, the old one aside.
-    fn switched_layout() -> MemFiles {
-        key_layout(&[
-            ("key", "new"),
-            ("crt", "new"),
-            ("key.prev", "old"),
-            ("crt.prev", "old"),
-        ])
     }
 
     /// Wherever a switch stopped, running it again finishes it: the new

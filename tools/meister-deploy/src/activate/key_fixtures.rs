@@ -27,3 +27,13 @@ pub(super) fn rotating() -> MemFiles {
         ("crt.next", "new"),
     ])
 }
+
+/// What a whole switch leaves: the new pair in use, the old one aside.
+pub(super) fn switched_layout() -> MemFiles {
+    key_layout(&[
+        ("key", "new"),
+        ("crt", "new"),
+        ("key.prev", "old"),
+        ("crt.prev", "old"),
+    ])
+}
