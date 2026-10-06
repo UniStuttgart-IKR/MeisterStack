@@ -252,6 +252,8 @@ default_bridge = "meister_br0"
 # card itself is a hard limit too: per-type max_instance, all admitted
 # sizes together within vgpu_available_mib, and no backend without a
 # vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
+# Under a budget every nvrm device needs a VRAM limit (a cap, a profile
+# size or a vgpu_type); one without could exceed it alone and is refused.
 # Without either, overcommit is only warned about. Admission counts the
 # devices of every vm this node has a record of, running or stopped: a
 # stopped vm keeps its share.

@@ -142,13 +142,19 @@ fn card_size(live: &[&Claim], want: &Claim) -> Option<u64> {
         .min()
 }
 
-/// Refuse a backend that would take the live claims past the node's VRAM budget.
+/// Refuse a backend that would take the live claims past the node's VRAM
+/// budget. A backend without a VRAM limit could take any amount of it, so
+/// under a budget one is not admitted, and one already on record leaves
+/// room for nothing beside it.
 fn refuse_budget_overrun(
     live: &[&Claim],
     want: &Claim,
     budget: Option<u64>,
     id: &DeviceId,
 ) -> device::Result<()> {
+    if let Some(budget) = budget {
+        refuse_unbounded_under_budget(live, want, budget, id)?;
+    }
     let used: u64 = live.iter().map(|c| c.mib).sum();
     let wants = want.mib;
     match budget {
@@ -170,6 +176,30 @@ fn refuse_budget_overrun(
             Ok(())
         }
     }
+}
+
+fn refuse_unbounded_under_budget(
+    live: &[&Claim],
+    want: &Claim,
+    budget: u64,
+    id: &DeviceId,
+) -> device::Result<()> {
+    if want.is_unbounded() {
+        return Err(DeviceError::InvalidSpec(format!(
+            "device {id} sets no VRAM limit, and this node holds its nvrm devices to a \
+             budget of {budget} MiB that such a backend could exceed alone; give the \
+             node a default cap ([device.nvrm.defaults] vram_limit_mib) or the device a \
+             profile that sets a limit or a vgpu_type"
+        )));
+    }
+    if live.iter().any(|c| c.is_unbounded()) {
+        return Err(DeviceError::InvalidSpec(format!(
+            "an nvrm device on this node sets no VRAM limit, and under the budget of \
+             {budget} MiB it counts as all of it; device {id} fits once that device has a \
+             limit or is gone"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -278,6 +308,29 @@ pub(crate) mod tests {
         };
         admit_all(Vec::new(), &[want(&q8)], None).expect("one 8Q fits");
         admit_all(Vec::new(), &[want(&q8), want(&q8)], None).expect_err("two do not");
+    }
+
+    /// Under a budget a backend without a VRAM limit is refused: it could
+    /// take more than the whole budget alone. Without one it is admitted.
+    #[test]
+    fn under_a_budget_a_backend_without_a_limit_is_refused() {
+        let said = refuse_budget_overrun(&[&capped(1024)], &unlimited(), Some(8192), &device())
+            .expect_err("it could take the rest and more")
+            .to_string();
+        assert!(said.contains("sets no VRAM limit"), "{said}");
+        assert!(said.contains("vram_limit_mib"), "and says what to set: {said}");
+        refuse_budget_overrun(&[&capped(1024)], &unlimited(), None, &device())
+            .expect("no budget to exceed");
+    }
+
+    /// The other order: a backend without a limit already on record counts
+    /// as the whole budget, so a capped one does not fit beside it.
+    #[test]
+    fn under_a_budget_a_backend_without_a_limit_on_record_leaves_no_room() {
+        let said = refuse_budget_overrun(&[&unlimited()], &capped(1024), Some(8192), &device())
+            .expect_err("the budget is all taken")
+            .to_string();
+        assert!(said.contains("counts as all of it"), "{said}");
     }
 
     /// Without any vGPU type the card size is unknown; only the budget applies.
