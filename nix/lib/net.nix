@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Address helpers shared by the modules and the inventory.
+# Address helpers shared by the modules and a fleet inventory (meister-deploy's
+# reads them as `lib.net`).
 { lib }:
 rec {
   isIPv6 = address: lib.hasInfix ":" address;

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Install RDMA diagnostic and benchmark tools on enabled agents. Inventory
-# enables them for declared RDMA NICs. No daemon is started; operators can
+# Install RDMA diagnostic and benchmark tools on enabled agents. A fleet inventory
+# (meister-deploy's) enables them for declared RDMA NICs. No daemon is started; operators can
 # replace the package list with a compatible vendor toolchain.
 { lib, pkgs, config, ... }:
 let
@@ -15,7 +15,7 @@ in
     enable = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      defaultText = lib.literalExpression ''false, and the inventory turns it on for a host whose hardware.nics declares rdma'';
+      defaultText = lib.literalExpression ''false, and meister-deploy's inventory turns it on for a host whose hardware.nics declares rdma'';
       description = ''
         Whether this machine carries the user-space tools of an RDMA fabric:
         `rping` and `ibv_devinfo` out of rdma-core, `ib_send_lat` and
@@ -27,9 +27,9 @@ in
         `pass`, because a fabric nobody could measure is not a fabric that
         works.
 
-        Off by default and turned on by the inventory for a host whose
+        Off by default; meister-deploy's inventory turns it on for a host whose
         `hardware.nics[].rdma` is true: a card is a fact about a machine, and
-        the inventory is where the facts about machines are written down.
+        a fleet inventory is where the facts about machines are written down.
       '';
     };
 

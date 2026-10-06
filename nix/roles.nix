@@ -65,7 +65,7 @@ in
         Two modules run it, and never both on one host. On an appliance the
         boot renderer (nix/context.nix) runs it in the middle of rendering,
         because there the provider's values are an INPUT to the config
-        files. On a managed host there is no renderer — the config files
+        files. On a store-built host there is no renderer — the config files
         are part of the system generation — and
         `meister-provider-context.service` (nix/services.nix) runs the same
         script for the one thing that is still the provider's to say: the
@@ -103,7 +103,7 @@ in
   };
 
   config = {
-    # Derive the role variable separately from inventory context defaults.
+    # Derive the role variable from `roles`, apart from the other context defaults.
     meisterstack.context.defaults = lib.mkIf (cfg.roles != [ ]) {
       MEISTER_ROLE = lib.concatStringsSep "," cfg.roles;
     };

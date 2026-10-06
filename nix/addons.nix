@@ -19,7 +19,7 @@ let
   grafanaSecret = "${pki}/addons-grafana-secret";
   garageEnv = "${pki}/addons-garage.env";
 
-  # Kanidm exposes one issuer per OAuth2 client; inventory derives this same URL.
+  # Kanidm exposes one issuer per OAuth2 client; meister-deploy's inventory derives this same URL.
   origin = "https://${cfg.fqdn}:${toString ports.kanidm}";
 
   # Bind persistent state onto each service module's expected path. DynamicUser
@@ -44,8 +44,8 @@ let
     # Order after rendering; request the renderer only when its unit exists.
     after = [ "meister-context.service" ];
     wants = lib.mkIf config.meisterstack.context.enable [ "meister-context.service" ];
-    # Require a role marker only when a renderer creates one. Managed role selection
-    # is fixed by the evaluated system.
+    # Require a role marker only when a renderer creates one. On a store-built host
+    # the role selection is fixed by the evaluated system.
     unitConfig.ConditionPathExists =
       lib.optional config.meisterstack.context.enable
         "${config.meisterstack.configDir}/addons.enabled"

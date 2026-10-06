@@ -123,8 +123,8 @@ in
       `[network.bgp]` one idle daemon: the appliance image is generic and the
       section arrives at BOOT from the context (MEISTER_BGP_*), so a daemon
       that were conditional on build-time knowledge would be missing on
-      exactly the machines that turn out to need it. A managed node whose plan
-      names no BGP can turn it off.
+      exactly the machines that turn out to need it. A store-built node whose
+      baked config names no BGP can turn it off.
     '';
   };
 

@@ -12,7 +12,7 @@ let
   cfg = config.meisterstack.storeHost;
   ms = config.meisterstack;
 
-  # Render inventory context defaults with the roles selected for this host.
+  # Render the context defaults with the roles selected for this host.
   env = { MEISTER_NODE_ID = config.networking.hostName; } // ms.context.defaults;
 
   rendered = import ./lib/render.nix
