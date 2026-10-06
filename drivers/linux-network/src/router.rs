@@ -237,6 +237,11 @@ fn arp_ignore(active: bool) -> &'static str {
     }
 }
 
+/// The sysctl that holds one leg's ARP mode.
+fn arp_ignore_key(leg: &str) -> String {
+    format!("net.ipv4.conf.{leg}.arp_ignore")
+}
+
 impl crate::LinuxNetworkDriver {
     /// This node's gateway slot, or the sentence it owes whoever asked for a
     /// router.
@@ -847,7 +852,7 @@ impl crate::LinuxNetworkDriver {
     ///
     /// The kernel is the truth here: a namespace with no record, with one that says standby or
     /// with one that does not parse can still answer ARP. So every live `meister-rt-` namespace
-    /// gets `arp_ignore=8` on both legs directly, whatever its record says, and a record still
+    /// gets `arp_ignore=8` on every leg it has, whatever its record says, and a record still
     /// saying active is rewritten standby so the announcement pass withdraws it. Failures are
     /// named per router so the dead man retries; a pass that could not list the namespaces or
     /// the records is an error, after everything it could reach was silenced.
@@ -889,7 +894,7 @@ impl crate::LinuxNetworkDriver {
         let netns = router_netns(&id);
         let kernel = match live.is_some_and(|live| !live.contains(&netns)) {
             true => Ok(()),
-            false => self.set_arp_mode(&netns, false).await,
+            false => self.silence_legs(&netns).await,
         };
         let record = Self::record_standby(dir, &id).await;
         kernel.and(record)
@@ -914,7 +919,7 @@ impl crate::LinuxNetworkDriver {
     async fn silence_unnamed(&self, unnamed: &[String]) -> networking::Result<()> {
         let mut failed = Vec::new();
         for netns in unnamed {
-            if let Err(e) = self.set_arp_mode(netns, false).await {
+            if let Err(e) = self.silence_legs(netns).await {
                 warn!(netns = %netns, error = %format!("{e:#}"),
                       "this namespace carries the router prefix and could not be silenced");
                 failed.push(netns.as_str());
@@ -929,6 +934,23 @@ impl crate::LinuxNetworkDriver {
         }
     }
 
+    /// Silence the legs a namespace has, as the kernel lists them (N3).
+    ///
+    /// A leg that is not there cannot answer ARP and counts as silenced, so a namespace without
+    /// legs does not keep every pass from completing. A leg that is there and refuses the
+    /// sysctl, or a namespace that cannot be looked into, is a failure: unknown is not silent.
+    async fn silence_legs(&self, netns: &str) -> networking::Result<()> {
+        let links = self.ip(&["-n", netns, "-o", "link", "show"]).await?;
+        let mut outcome = Ok(());
+        for leg in legs_present(&links) {
+            let set = self
+                .netns_sysctl(netns, &arp_ignore_key(leg), arp_ignore(false))
+                .await;
+            outcome = outcome.and(set);
+        }
+        outcome
+    }
+
     /// Set both legs' ARP mode: answering for an active router, `arp_ignore=8` for a standby.
     ///
     /// Both legs, because a standby must be silent towards the tenant as well as towards the
@@ -937,8 +959,9 @@ impl crate::LinuxNetworkDriver {
     async fn set_arp_mode(&self, netns: &str, active: bool) -> networking::Result<()> {
         let mut outcome = Ok(());
         for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
-            let key = format!("net.ipv4.conf.{leg}.arp_ignore");
-            let set = self.netns_sysctl(netns, &key, arp_ignore(active)).await;
+            let set = self
+                .netns_sysctl(netns, &arp_ignore_key(leg), arp_ignore(active))
+                .await;
             outcome = outcome.and(set);
         }
         outcome
@@ -969,6 +992,16 @@ fn silencing_targets(records: &[PathBuf], live: &[String]) -> (BTreeSet<RouterId
     (routers, unnamed)
 }
 
+/// The router legs an `ip -o link show` listing names.
+fn legs_present(links: &str) -> Vec<&'static str> {
+    [LEG_EXTERNAL, LEG_INTERNAL]
+        .into_iter()
+        // `ip -o link show` prints `2: ext@if7: <...>`, so the name is
+        // followed by `@` or `:` and never bare.
+        .filter(|leg| links.contains(&format!(" {leg}@")) || links.contains(&format!(" {leg}:")))
+        .collect()
+}
+
 /// Classify namespace absence, inspection failure and missing named legs separately.
 /// Ready means both leg names exist; it does not verify routes, rules or packet flow.
 fn classify(
@@ -992,11 +1025,10 @@ fn classify(
             );
         }
     };
+    let present = legs_present(&links);
     let missing: Vec<&str> = [LEG_EXTERNAL, LEG_INTERNAL]
         .into_iter()
-        // `ip -o link show` prints `2: ext@if7: <...>`, so the name is
-        // followed by `@` or `:` and never bare.
-        .filter(|leg| !links.contains(&format!(" {leg}@")) && !links.contains(&format!(" {leg}:")))
+        .filter(|leg| !present.contains(leg))
         .collect();
     match missing.is_empty() {
         true => (RouterPhase::Ready, None, String::new()),
@@ -1414,9 +1446,26 @@ esac
         );
     }
 
-    /// A fake `ip` that appends every call to `log`, lists the namespaces `listed` and refuses
-    /// the sysctls inside the namespace `refuse`.
-    fn logging_ip(log: &Path, listed: &[String], refuse: Option<&str>) -> String {
+    /// Both of a router's legs, as a fully built namespace has them.
+    const BOTH_LEGS: [&str; 2] = [LEG_EXTERNAL, LEG_INTERNAL];
+
+    /// The shell lines a fake `ip -n <netns> -o link show` answers with: `lo` and `legs`, each
+    /// spelled as a veth end, which is how the real one prints them.
+    fn link_listing(legs: &[&str]) -> String {
+        let mut out = "echo '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536'; ".to_string();
+        for (n, leg) in legs.iter().enumerate() {
+            out += &format!(
+                "echo '{}: {leg}@if{}: <BROADCAST,UP> mtu 1500'; ",
+                n + 2,
+                n + 7
+            );
+        }
+        out
+    }
+
+    /// A fake `ip` that appends every call to `log`, lists the namespaces `listed` with the
+    /// legs `legs` in each, and refuses the sysctls inside the namespace `refuse`.
+    fn logging_ip(log: &Path, listed: &[String], legs: &[&str], refuse: Option<&str>) -> String {
         let listing = listed
             .iter()
             .map(|netns| format!("echo '{netns} (id: 0)'; "))
@@ -1427,8 +1476,10 @@ esac
             })
             .unwrap_or_default();
         format!(
-            "echo \"$*\" >> '{log}'\ncase \"$*\" in\n\"netns list\") {listing}:;;\n{refusal}esac\nexit 0\n",
-            log = log.display()
+            "echo \"$*\" >> '{log}'\ncase \"$*\" in\n\"netns list\") {listing}:;;\n\
+             \"-n \"*\" -o link show\") {links}:;;\n{refusal}esac\nexit 0\n",
+            log = log.display(),
+            links = link_listing(legs),
         )
     }
 
@@ -1467,7 +1518,10 @@ esac
         let dir = temp.path();
         let log = dir.join("ip.log");
         let netns = router_netns(&spec(true).id);
-        let d = fake_driver(dir, &logging_ip(&log, std::slice::from_ref(&netns), None));
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &BOTH_LEGS, None),
+        );
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
 
@@ -1486,7 +1540,10 @@ esac
         let standby = spec(false);
         let netns = router_netns(&standby.id);
         write_record(dir, &standby);
-        let d = fake_driver(dir, &logging_ip(&log, std::slice::from_ref(&netns), None));
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &BOTH_LEGS, None),
+        );
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
 
@@ -1502,7 +1559,7 @@ esac
         let dir = temp.path();
         let active = spec(true);
         let path = write_record(dir, &active);
-        let d = fake_driver(dir, &logging_ip(&dir.join("ip.log"), &[], None));
+        let d = fake_driver(dir, &logging_ip(&dir.join("ip.log"), &[], &BOTH_LEGS, None));
 
         d.fall_silent_impl().await.expect("a silencing pass");
 
@@ -1519,8 +1576,10 @@ esac
         let active = spec(true);
         write_record(dir, &active);
         let ip = format!(
-            "echo \"$*\" >> '{}'\ncase \"$*\" in\n\"netns list\") exit 1;;\nesac\nexit 0\n",
-            log.display()
+            "echo \"$*\" >> '{}'\ncase \"$*\" in\n\"netns list\") exit 1;;\n\
+             \"-n \"*\" -o link show\") {}:;;\nesac\nexit 0\n",
+            log.display(),
+            link_listing(&BOTH_LEGS),
         );
         let d = fake_driver(dir, &ip);
 
@@ -1546,13 +1605,51 @@ esac
         write_record(dir, &ok);
         write_record(dir, &bad);
         let listed = [router_netns(&ok.id), router_netns(&bad.id)];
-        let ip = logging_ip(&dir.join("ip.log"), &listed, Some(&listed[1]));
+        let ip = logging_ip(&dir.join("ip.log"), &listed, &BOTH_LEGS, Some(&listed[1]));
         let d = fake_driver(dir, &ip);
 
         let outcome = d.fall_silent_impl().await.expect("a silencing pass");
 
         assert_eq!(outcome.silenced, [ok.id]);
         assert_eq!(outcome.failed, [bad.id]);
+        assert!(!outcome.complete());
+    }
+
+    /// A namespace without legs cannot answer ARP: it counts as silenced and the pass completes,
+    /// with no sysctl tried on a leg that is not there (N3).
+    #[tokio::test]
+    async fn a_namespace_without_legs_counts_as_silenced() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let netns = router_netns(&spec(true).id);
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &[], None),
+        );
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.silenced, [spec(true).id]);
+        assert!(outcome.complete());
+        let calls = std::fs::read_to_string(&log).expect("the fake's log");
+        assert!(!calls.contains("sysctl"), "{calls}");
+    }
+
+    /// A leg that is there and refuses the sysctl is a failure, even when the other leg is gone
+    /// (N3).
+    #[tokio::test]
+    async fn a_leg_that_is_there_and_refuses_the_sysctl_is_a_failure() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let netns = router_netns(&spec(true).id);
+        let listed = std::slice::from_ref(&netns);
+        let ip = logging_ip(&dir.join("ip.log"), listed, &[LEG_EXTERNAL], Some(&netns));
+        let d = fake_driver(dir, &ip);
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.failed, [spec(true).id]);
         assert!(!outcome.complete());
     }
 
