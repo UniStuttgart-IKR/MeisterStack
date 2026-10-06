@@ -1741,8 +1741,9 @@ async fn handle_create_vm_migration(
     if m.vm.is_empty() {
         bail!("create_vm_migration without a vm to move");
     }
-    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, migration_target(&m), &m.tenant)
-        .await
+    // `m.tenant` is the cloud's say and not this tier's to record: whose a
+    // migration is follows the guest (`start_from_the_cloud`).
+    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, migration_target(&m)).await
 }
 
 /// Where the cloud asked the guest to go, or `None` for "the cluster
@@ -2957,6 +2958,51 @@ mod tests {
                 .expect_err("nothing to move")
         );
         assert!(why.contains("vm to move"), "{why}");
+    }
+
+    /// IKR-B72: a migrate asked for at the cloud meets the REST edge's whole refusal, with its
+    /// word (`Invalid`), and no record is written. An instance-store disk and a node-local
+    /// volume were refused only at the REST edge before.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_migration_asked_for_at_the_cloud_meets_the_rest_edges_refusal() {
+        let store = crate::test_etcd::fresh_store("cloud-migration-test").await;
+        let mut pool = controller_api::StoragePool::declare("fast", Default::default());
+        pool.status.locality = Some(controller_api::Locality::NodeLocal);
+        store.create(&pool).await.expect("the pool");
+        store
+            .create(&cloud_volume("data", None, VolumePhaseKind::Ready))
+            .await
+            .expect("the volume");
+
+        for (name, disks, why) in [
+            ("inline", serde_json::json!([{ "size_bytes": 1 }]), "instance-store"),
+            ("pinned", serde_json::json!([{ "volume": "data" }]), "node-local"),
+        ] {
+            let mut guest = vm(name, Some(name), VmPhaseKind::Running);
+            guest.spec.node_name = Some("manacor".into());
+            guest.spec.vm = serde_json::json!({ "volumes": disks });
+            store.create(&guest).await.expect("the guest");
+            let record = format!("{name}-move");
+            let ask = proto::CreateVmMigration {
+                name: record.clone(),
+                vm: name.into(),
+                target_node: String::new(),
+                tenant: "acme".into(),
+            };
+            let err = handle_create_vm_migration(&store, ask)
+                .await
+                .expect_err("the REST edge would refuse it");
+            assert_eq!(controller_api::Refused::reason_of(&err), "Invalid");
+            assert!(format!("{err:#}").contains(why), "{err:#}");
+            assert!(
+                store
+                    .get::<controller_api::VmMigration>(&record)
+                    .await
+                    .is_err(),
+                "and nothing was started"
+            );
+        }
     }
 
     /// Repeated cloud creation updates an existing volume to the larger size.

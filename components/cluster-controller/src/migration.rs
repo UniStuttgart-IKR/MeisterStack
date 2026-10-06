@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::dispatch::{Dispatch, NodeCommand};
 
+pub(crate) mod admission;
+
 /// Deadlines for destination preparation and transfer observation.
 /// Preparation may be cancelled before dispatch; an uncertain transfer outcome
 /// retains ownership and requires recovery. Only the transfer budget is configurable.
@@ -249,7 +251,6 @@ pub async fn start_from_the_cloud(
     name: &str,
     vm: &str,
     target_node: Option<&str>,
-    tenant: &str,
 ) -> anyhow::Result<()> {
     // The vm has to be one of ours, and saying so here is what makes the
     // cloud's answer a sentence instead of a migration that fails a pass
@@ -258,14 +259,18 @@ pub async fn start_from_the_cloud(
         .get(vm)
         .await
         .map_err(|e| anyhow::anyhow!("vm {vm} is not on this cluster: {e}"))?;
-    // A cloud's command does not pass the REST edge, so its refusal is said here.
-    if let Some(why) = device_refusal(&guest) {
-        anyhow::bail!("{why}");
+    // A cloud's command does not pass the REST edge, so the REST edge's whole
+    // refusal is asked here: instance-store disks, node-local volumes,
+    // devices, nowhere to go. (IKR-B72)
+    if let Some(why) = admission::refusal(store, &guest, target_node).await? {
+        return Err(controller_api::Refused::invalid(why).into());
     }
     let migration = VmMigration::declare(
         name,
         controller_api::VmMigrationSpec {
-            tenant: tenant.to_string(),
+            // Whose it is follows the guest, as at the REST edge: a record of
+            // what happened to somebody's VM belongs in their history.
+            tenant: guest.spec.tenant.clone().unwrap_or_default(),
             vm: vm.to_string(),
             target_node: target_node.map(str::to_string),
         },

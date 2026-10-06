@@ -92,6 +92,16 @@ impl Refused {
         }
     }
 
+    /// "The request cannot be carried out as written" — the same answer a REST
+    /// edge gives with 422, said by a handler the request reached through a
+    /// session instead.
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            reason: "Invalid",
+            message: message.into(),
+        }
+    }
+
     /// Structural node refusal before a VM record is created. Controllers
     /// may release the binding and place elsewhere; failures after creation
     /// retain ownership and retry on the current node.

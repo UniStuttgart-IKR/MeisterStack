@@ -6,6 +6,7 @@
 //! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::*;
+use crate::migration::admission::{MigrationFacts, migration_refusal};
 
 /// Inline disks are node-local even without a Volume object, so live migration
 /// must reject them explicitly.
