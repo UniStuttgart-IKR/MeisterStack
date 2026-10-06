@@ -30,10 +30,11 @@ pub(super) fn free_on(
         .minus(bound)
 }
 
-/// Preview cluster placement using the same volume and selector constraints
-/// as reconciliation, without mutating objects or reserving capacity.
-/// Read shared connection and heartbeat state so the answer does not depend on
-/// which replica handles the request; expired heartbeats are ignored, not written.
+/// Preview cluster placement: the pass's own decision and sentences
+/// (`pick_cluster`), on a ledger built the way the pass builds its own and
+/// spent by nobody. Read shared connection and heartbeat state so the answer
+/// does not depend on which replica handles the request; expired heartbeats
+/// are ignored, not written.
 pub(crate) async fn would_place(
     store: &EtcdStore,
     scheduler: &dyn controller_api::Scheduler,
@@ -49,63 +50,66 @@ pub(crate) async fn would_place(
     // One read for every cluster's liveness — the heartbeat has its own key
     // since D-C7.
     let beats = store.beats::<Cluster>().await?;
-    let mut clusters = Vec::new();
-    let mut names = Vec::new();
+    let mut ledger = Ledger::default();
     for cluster in store.list::<Cluster>().await? {
-        let unreported = unreported_on(store, &cluster.metadata.name, &vms).await?;
-        if wanted.served_by(
-            &cluster.metadata.name,
-            &rooms_of(&cluster, &unreported, overcommit),
-        ) {
-            names.push(cluster.metadata.name.clone());
-        }
-        let name = cluster.metadata.name;
+        let name = cluster.metadata.name.clone();
+        let rooms = rooms_of(
+            &cluster,
+            &unreported_on(store, &name, &vms).await?,
+            overcommit,
+        );
         let connected = cluster.status.connected
             && !controller_api::heartbeat_expired(beats.get(&name).copied(), now);
-        clusters.push(Candidate {
-            connected,
-            // One view at this tier: a cloud has one session per cluster
-            // group and no second opinion to reconcile against.
-            alive: connected,
-            schedulable: cluster.spec.schedulable,
-            // A cluster is not a machine: it has no disk to fill and no
-            // store to wedge, and the conditions its NODES raise are read one
-            // tier down, where the placement they veto is made. What reaches
-            // this tier of them is `NodeDemand::met_by_a_node`, which refuses
-            // a cluster whose only matching machine has said something is
-            // wrong with it.
-            unhealthy: Vec::new(),
-            // Derived and not read off a field: a cluster has no `accepts`
-            // of its own, and what it takes is what its usable machines take.
-            // See `controller_api::cluster_accepts`.
-            accepts: controller_api::cluster_accepts(&cluster.status.nodes),
-            free: free_on(&name, &cluster.status.capacity, &vms, overcommit),
-            catalogue: cluster.status.capacity.capabilities,
-            kind: CandidateKind::Cluster,
-            hosted: controller_api::hosted_on(&name, &vms, |v| v.spec.cluster_name.as_deref()),
-            labels: cluster.spec.labels,
-            name,
-            // A candidate here is a CLUSTER and not a machine, so there is no
-            // machine state to compare and never will be: there is no live
-            // migration across clusters.
-            machine: None,
-        });
+        ledger.offer(
+            cluster_candidate(cluster, &vms, overcommit, connected),
+            rooms,
+        );
     }
-    let allowed: Vec<Candidate> = clusters
-        .iter()
-        .filter(|c| names.iter().any(|n| n == &c.name))
-        .cloned()
-        .collect();
-    Ok(match scheduler.assign(vm, &allowed) {
-        Some(pick) => format!("would place on cluster {pick}"),
-        // The same two sentences the pass gives, and in the same order: a
-        // cluster cut away for having no suitable node is not a cluster that
-        // "had no room".
-        None if allowed.is_empty() && !clusters.is_empty() => {
-            node_level_reason(vm, clusters.len()).1
-        }
-        None => controller_api::pending_reason_of(vm, &allowed).1,
-    })
+    Ok(
+        match pick_cluster(scheduler, &std::sync::Mutex::new(ledger), vm, &wanted) {
+            Ok(pick) => format!("would place on cluster {pick}"),
+            Err((_, (_, sentence))) => sentence,
+        },
+    )
+}
+
+/// One cluster as the scheduler weighs it, `connected` as the caller knows
+/// it: a pass by its own sessions, a preview by the shared state.
+pub(super) fn cluster_candidate(
+    cluster: Cluster,
+    vms: &[Vm],
+    overcommit: Overcommit,
+    connected: bool,
+) -> Candidate {
+    let name = cluster.metadata.name;
+    Candidate {
+        connected,
+        // One view at this tier: a cloud has one session per cluster
+        // group and no second opinion to reconcile against.
+        alive: connected,
+        schedulable: cluster.spec.schedulable,
+        // A cluster is not a machine: it has no disk to fill and no
+        // store to wedge, and the conditions its NODES raise are read one
+        // tier down, where the placement they veto is made. What reaches
+        // this tier of them is `NodeDemand::met_by_a_node`, which refuses
+        // a cluster whose only matching machine has said something is
+        // wrong with it.
+        unhealthy: Vec::new(),
+        // Derived and not read off a field: a cluster has no `accepts`
+        // of its own, and what it takes is what its usable machines take.
+        // See `controller_api::cluster_accepts`.
+        accepts: controller_api::cluster_accepts(&cluster.status.nodes),
+        free: free_on(&name, &cluster.status.capacity, vms, overcommit),
+        catalogue: cluster.status.capacity.capabilities,
+        kind: CandidateKind::Cluster,
+        hosted: controller_api::hosted_on(&name, vms, |v| v.spec.cluster_name.as_deref()),
+        labels: cluster.spec.labels,
+        name,
+        // A candidate here is a CLUSTER and not a machine, so there is no
+        // machine state to compare and never will be: there is no live
+        // migration across clusters.
+        machine: None,
+    }
 }
 
 /// Say WHY on the object, and only when it changed.
@@ -162,6 +166,12 @@ pub(super) struct Ledger {
 }
 
 impl Ledger {
+    /// Offer `candidate` for this pass, beside the rooms of its nodes.
+    pub(super) fn offer(&mut self, candidate: Candidate, rooms: Vec<NodeRoom>) {
+        self.nodes.insert(candidate.name.clone(), rooms);
+        self.clusters.push(candidate);
+    }
+
     /// The rooms of `cluster`'s nodes this pass; none for a cluster this
     /// pass did not list.
     fn rooms(&self, cluster: &str) -> &[NodeRoom] {

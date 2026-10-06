@@ -418,41 +418,20 @@ async fn expire_and_collect_clusters(
     // key since D-C7.
     let beats = store.beats::<Cluster>().await?;
     for cluster in store.list::<Cluster>().await? {
-        let unreported = unreported_on(store, &cluster.metadata.name, vms).await?;
-        let rooms = rooms_of(&cluster, &unreported, overcommit);
-        let name = cluster.metadata.name;
+        let name = cluster.metadata.name.clone();
+        let rooms = rooms_of(
+            &cluster,
+            &unreported_on(store, &name, vms).await?,
+            overcommit,
+        );
         let heard = beats.get(&name).copied();
         publish_heartbeat_age(&name, heard, now);
-        let connected = still_connected(store, &name, &cluster.status, heard, now).await;
-        out.nodes.insert(name.clone(), rooms);
-        out.clusters.push(Candidate {
-            connected: connected && sessions.contains(&name),
-            // One view at this tier: a cloud has one session per cluster
-            // group and no second opinion to reconcile against.
-            alive: connected && sessions.contains(&name),
-            schedulable: cluster.spec.schedulable,
-            // A cluster is not a machine: it has no disk to fill and no
-            // store to wedge, and the conditions its NODES raise are read one
-            // tier down, where the placement they veto is made. What reaches
-            // this tier of them is `NodeDemand::met_by_a_node`, which refuses
-            // a cluster whose only matching machine has said something is
-            // wrong with it.
-            unhealthy: Vec::new(),
-            // Derived and not read off a field: a cluster has no `accepts`
-            // of its own, and what it takes is what its usable machines take.
-            // See `controller_api::cluster_accepts`.
-            accepts: controller_api::cluster_accepts(&cluster.status.nodes),
-            free: free_on(&name, &cluster.status.capacity, vms, overcommit),
-            catalogue: cluster.status.capacity.capabilities,
-            kind: CandidateKind::Cluster,
-            hosted: controller_api::hosted_on(&name, vms, |v| v.spec.cluster_name.as_deref()),
-            labels: cluster.spec.labels,
-            name,
-            // A candidate here is a CLUSTER and not a machine, so there is no
-            // machine state to compare and never will be: there is no live
-            // migration across clusters.
-            machine: None,
-        });
+        let connected = still_connected(store, &name, &cluster.status, heard, now).await
+            && sessions.contains(&name);
+        out.offer(
+            cluster_candidate(cluster, vms, overcommit, connected),
+            rooms,
+        );
     }
     Ok(out)
 }

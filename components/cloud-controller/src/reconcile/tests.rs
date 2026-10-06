@@ -1095,6 +1095,44 @@ async fn test_store(area: &str) -> EtcdStore {
         .expect("an etcd to talk to")
 }
 
+/// `netlab(mem_mib)`, connected and heard from now, in `store`.
+async fn connected_netlab(store: &EtcdStore, mem_mib: u64) {
+    let mut cluster = netlab(mem_mib);
+    cluster.status.connected = true;
+    cluster.status.capacity.capabilities = vec!["hypervisor/cloud-hypervisor".to_string()];
+    store.create(&cluster).await.expect("the cluster");
+    store
+        .beat::<Cluster>("ikr-netlab", Utc::now())
+        .await
+        .expect("its heartbeat");
+}
+
+/// A preview answers with the pass's own decision and sentence: bound where
+/// one node takes the VM, and the node-level sentence where none does.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_preview_says_what_the_pass_would_decide() {
+    let store = test_store("preview-test").await;
+    connected_netlab(&store, 2048).await;
+    let preview = |vm: Vm| {
+        let store = &store;
+        async move {
+            would_place(store, &controller_api::FirstFit, Overcommit::default(), &vm)
+                .await
+                .expect("a preview")
+        }
+    };
+
+    assert_eq!(
+        preview(asking(1024)).await,
+        "would place on cluster ikr-netlab"
+    );
+    assert_eq!(
+        preview(asking(4096)).await,
+        node_level_reason(&asking(4096), 1).1
+    );
+}
+
 /// What a dispatch carried is stamped onto the reservation it was read from,
 /// not onto one released and reserved again under the same address since.
 #[tokio::test]
