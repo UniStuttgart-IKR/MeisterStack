@@ -31,8 +31,8 @@
       };
       lib = nixpkgs.lib;
 
-      # A control plane and an agent of the service modules alone, store-built, for
-      # the checks that read what such a host is built from.
+      # A store-built host of the service modules alone with `roles`, for the
+      # checks that read what such a host is built from.
       storeHostOf = name: roles: (nixpkgs.lib.nixosSystem {
         modules = [
           self.nixosModules.services
@@ -50,6 +50,7 @@
           }
         ];
       }).config;
+      # A control plane and an agent.
       storeHosts = {
         cp = storeHostOf "cp" [ "cloud" "cluster" ];
         n1 = storeHostOf "n1" [ "agent" ];
@@ -185,6 +186,13 @@
           import ./nix/tests/provider-opennebula-reads-its-context.nix {
             inherit nixpkgs lib pkgs system self;
           };
+
+        # A store-built host's units start the runtime package of its own
+        # generation and wait for keys, never for a binary.
+        store-host-uses-the-package = import ./nix/tests/store-host-uses-the-package.nix {
+          inherit lib pkgs;
+          host = storeHostOf "probe" [ "cloud" "cluster" "agent" ];
+        };
 
         # The roles reach the legacy boot renderer as MEISTER_ROLE in context.env.
         roles-context-env = import ./nix/tests/roles-context-env.nix {
