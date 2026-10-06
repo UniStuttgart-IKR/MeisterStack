@@ -762,6 +762,7 @@ impl crate::LinuxNetworkDriver {
         } else {
             self.silence_router_impl(&spec.id).await?;
         }
+        Self::record_not_sole_gateway(&g.state_dir, spec).await?;
         if !g.physnets.contains_key(&spec.physnet) {
             let mut have: Vec<&str> = g.physnets.keys().map(String::as_str).collect();
             have.sort_unstable();
@@ -1135,6 +1136,25 @@ impl crate::LinuxNetworkDriver {
             return Ok(());
         }
         record.spec.active = false;
+        Self::store_record(dir, &record.spec).await
+    }
+
+    /// Withdraw a record's sole-gateway claim once the spec no longer makes it, before anything
+    /// else in the pass can fail. The dead man keeps a sole gateway's router answering
+    /// (IKR-B76), and another node now claims the provider network: a pass that stopped
+    /// halfway must not leave it reading the claim. The claim itself is recorded only by a
+    /// complete pass, as an active router is. A missing or unreadable record claims nothing.
+    async fn record_not_sole_gateway(dir: &Path, spec: &RouterSpec) -> networking::Result<()> {
+        if spec.sole_gateway {
+            return Ok(());
+        }
+        let Ok(mut record) = Self::read_record(&Self::record_path(dir, &spec.id)).await else {
+            return Ok(());
+        };
+        if !record.spec.sole_gateway {
+            return Ok(());
+        }
+        record.spec.sole_gateway = false;
         Self::store_record(dir, &record.spec).await
     }
 
@@ -1952,6 +1972,37 @@ exit 0
             assert_eq!(outcome.silenced, [kept_back.id]);
             assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
         }
+    }
+
+    /// A pass that says another node claims the provider network as well withdraws the
+    /// sole-gateway claim even when it fails early, so the dead man silences the router.
+    #[tokio::test]
+    async fn a_failed_pass_that_drops_the_sole_gateway_claim_lets_the_dead_man_silence() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let active = spec(true);
+        let netns = router_netns(&active.id);
+        write_record(
+            dir,
+            &RouterSpec {
+                sole_gateway: true,
+                ..active.clone()
+            },
+        );
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
+        );
+        d.ensure_router_impl(&active)
+            .await
+            .expect_err("this node has no [network.vxlan] section, so no overlay is built");
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert!(outcome.kept.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.silenced, [active.id]);
+        assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
     }
 
     /// A silenced router's record says standby afterwards, so it announces nothing and its
