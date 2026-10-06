@@ -304,24 +304,11 @@ impl NodeConditionType {
         !matches!(self, NodeConditionType::DriverUnavailable)
     }
 
-    /// The one word a `node ls` READY column has room for.
-    ///
-    /// Lower case and short, because it stands where `yes` stands and the
-    /// column is what an operator scans down.
-    pub fn short(self) -> &'static str {
-        match self {
-            NodeConditionType::DiskPressure => "pressure",
-            NodeConditionType::StoreUnhealthy => "store",
-            NodeConditionType::CgroupUnusable => "cgroup",
-            NodeConditionType::DriverUnavailable => "driver",
-        }
-    }
-
     /// `None` for a word this tier does not know — which is a real answer and
     /// not an error. An agent newer than its controller may raise a condition
     /// this build has never heard of; the node still stops being a candidate
-    /// (the list is non-empty), and the word travels through to the operator
-    /// unshortened. Rejecting it would be the one reading that turns a newer
+    /// (an unknown word vetoes, see [`NodeCondition::vetoes_placement`]), and
+    /// the word travels through to the operator unshortened. Rejecting it would be the one reading that turns a newer
     /// agent's honesty into a controller that ignores it.
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.as_str() == s)

@@ -147,9 +147,9 @@ pub struct Candidate {
     pub alive: bool,
     /// `spec.schedulable` — an operator draining it without stopping it.
     pub schedulable: bool,
-    /// Reported node conditions used as scheduling vetoes. Empty means no
-    /// condition was reported, including by legacy agents; it is not independent
-    /// proof of health.
+    /// The node's vetoing conditions (see `NodeCondition::vetoes_placement`).
+    /// Empty means none was reported, including by legacy agents; it is not
+    /// independent proof of health.
     pub unhealthy: Vec<String>,
     /// Per-pass capacity after bound VMs and incoming migration reservations.
     /// All strategies consume this same budget; it is derived, not persisted.
