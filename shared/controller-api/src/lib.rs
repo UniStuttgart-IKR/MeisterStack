@@ -97,9 +97,9 @@ pub use rest::{
     ApiConfig, ApiError, ApiResource, AuthState, Caller, CallerRole, CallerTenant, DISCOVERY_PATH,
     DryRun, ListQuery, Mutability, Owned, PeerCerts, Removal, Removed, SCHEMAS_PATH, Selector,
     SpecUpdate, apply_merge_patch, apply_spec_update, assert_tables_match_schemas,
-    carry_generation, check_envelope, check_owned, conflict, cors, discovery, discovery_document,
-    forbidden, guard, invalid, invalid_field, merge_patch, patch_with_retry, readiness, removed,
-    schema_document, schema_has_field, schema_of, serve, statuses,
+    carry_generation, check_envelope, check_owned, claim_not_taken_back, conflict, cors, discovery,
+    discovery_document, forbidden, guard, invalid, invalid_field, merge_patch, patch_with_retry,
+    readiness, removed, schema_document, schema_has_field, schema_of, serve, statuses,
 };
 pub use scheduler::{
     Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, Hosted, NodeDemand, NodeRoom,

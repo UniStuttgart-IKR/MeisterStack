@@ -582,6 +582,7 @@ macro_rules! patch_object {
 mod admission;
 #[cfg(test)]
 mod admission_tests;
+mod claims;
 mod clusters;
 mod csrs;
 #[path = "events.rs"]
@@ -603,6 +604,7 @@ mod users;
 mod vms;
 
 use admission::*;
+use claims::*;
 use clusters::*;
 use csrs::*;
 use events_route::*;

@@ -360,21 +360,29 @@ async fn growing_a_volume_is_held_to_the_ceiling_creating_it_would_be() {
 
 // --- F03: one slot is one admission, however the requests interleave ------
 
-/// Requests held between their checks and their writes, by the key the handler gates on (see
-/// `admission_gate`). Holding competing requests there makes them all read the store as it was
-/// before any of them wrote. A key names one test's own tenant or object, so parallel tests do not
-/// hold each other's requests; retries pass through once a gate is spent.
+/// Requests held at a gate, by the key the handler gates on (see `admission_gate` and
+/// `undo_gate`). Holding competing requests between their checks and their writes makes them
+/// all read the store as it was before any of them wrote. A key names one test's own tenant or
+/// object, so parallel tests do not hold each other's requests; retries pass through once a
+/// gate is spent.
 static GATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Gate>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// One key's gate: the barrier, and how many requests it still holds.
-type Gate = (Arc<tokio::sync::Barrier>, usize);
+/// One key's gate: the barriers a held request waits at, in order, and how many requests it
+/// still holds.
+struct Gate {
+    stops: Vec<Arc<tokio::sync::Barrier>>,
+    left: usize,
+}
 
 /// Hold the first `parties` requests under `key` until all of them have arrived.
 fn hold_admissions(key: &str, parties: usize) {
     GATES.lock().unwrap().insert(
         key.to_string(),
-        (Arc::new(tokio::sync::Barrier::new(parties)), parties),
+        Gate {
+            stops: vec![Arc::new(tokio::sync::Barrier::new(parties))],
+            left: parties,
+        },
     );
 }
 
@@ -385,26 +393,90 @@ fn hold_together(keys: &[&str]) {
     let barrier = Arc::new(tokio::sync::Barrier::new(keys.len()));
     let mut gates = GATES.lock().unwrap();
     for key in keys {
-        gates.insert(key.to_string(), (barrier.clone(), 1));
+        gates.insert(
+            key.to_string(),
+            Gate {
+                stops: vec![barrier.clone()],
+                left: 1,
+            },
+        );
     }
+}
+
+/// One request held at its gate until the test has done what it wants done at that point.
+struct Paused {
+    arrived: Arc<tokio::sync::Barrier>,
+    released: Arc<tokio::sync::Barrier>,
+}
+
+impl Paused {
+    /// Returns once the request stands at the gate.
+    async fn arrived(&self) {
+        self.arrived.wait().await;
+    }
+
+    /// Lets the request on.
+    async fn release(&self) {
+        self.released.wait().await;
+    }
+}
+
+/// Hold the next request under `key` at its gate until the test lets it on: what the test
+/// writes in between is written after the request's check and before its write, in that order
+/// and no other.
+fn pause(key: &str) -> Paused {
+    let paused = Paused {
+        arrived: Arc::new(tokio::sync::Barrier::new(2)),
+        released: Arc::new(tokio::sync::Barrier::new(2)),
+    };
+    GATES.lock().unwrap().insert(
+        key.to_string(),
+        Gate {
+            stops: vec![paused.arrived.clone(), paused.released.clone()],
+            left: 1,
+        },
+    );
+    paused
+}
+
+/// `pause`, at the gate before the undo of the write under `key` (see `undo_gate`).
+fn pause_undo(key: &str) -> Paused {
+    pause(&undo_key(key))
+}
+
+/// The gate key of the undo of the write under `key`. No object name holds a space, so it
+/// names no other gate.
+fn undo_key(key: &str) -> String {
+    format!("{key} undo")
 }
 
 /// Called by the handlers after their checks and before the write, under `key`: the tenant's
 /// name for a quota admission, the object's own name for a range claim (a floating pool, a
 /// tenant's network). A no-op for every key no test is holding.
 pub(super) async fn admission_gate(key: &str) {
-    let barrier = {
+    pass_gate(key).await;
+}
+
+/// Called by `settle_claim` before it undoes a write that lost its claim, under the name of the
+/// object written. A no-op for every key no test is holding.
+pub(super) async fn undo_gate(key: &str) {
+    pass_gate(&undo_key(key)).await;
+}
+
+/// Wait at every stop of the gate under `key`, if it still holds a request.
+async fn pass_gate(key: &str) {
+    let stops = {
         let mut gates = GATES.lock().unwrap();
         match gates.get_mut(key) {
-            Some((barrier, left)) if *left > 0 => {
-                *left -= 1;
-                Some(barrier.clone())
+            Some(gate) if gate.left > 0 => {
+                gate.left -= 1;
+                gate.stops.clone()
             }
-            _ => None,
+            _ => Vec::new(),
         }
     };
-    if let Some(barrier) = barrier {
-        barrier.wait().await;
+    for stop in stops {
+        stop.wait().await;
     }
 }
 
@@ -1397,4 +1469,64 @@ async fn a_tenants_network_and_a_pool_claimed_at_the_same_moment_do_not_both_sta
         "the store holds both: {:?} and pool {pool}",
         stored.spec.network_prefixes
     );
+}
+
+// --- NL6-3: a lost claim that stays is said to stay -------------------------
+
+/// `tenant`'s labels moved past every check: somebody else's write of the tenant.
+async fn relabel(st: &ApiState, tenant: &str) -> Tenant {
+    st.store
+        .mutate::<Tenant, _>(tenant, |t| {
+            t.metadata.labels.insert("owner".into(), "ops".into());
+        })
+        .await
+        .expect("the tenant written again")
+}
+
+/// A PATCH of a tenant's network that lost its claim to a pool written between its check and
+/// its write, and whose put back failed because the tenant was written again before it, is
+/// told so once: not a 409 that `patch_with_retry` runs again into a 200 over the claim that
+/// stayed. (NL6-3)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_patch_whose_lost_claim_was_not_put_back_says_so_and_is_not_run_again() {
+    let st = cloud_with_routers("nl6-3").await;
+    let tenant = unique("t");
+    st.store
+        .create(&tenant_with_network(&tenant, &[]))
+        .await
+        .expect("the tenant");
+    let checked = pause(&tenant);
+    let undoing = pause_undo(&tenant);
+    let patch = json!({ "spec": { "networkPrefixes": ["10.30.0.0/24"] } });
+
+    let (answer, theirs) = tokio::join!(
+        patch_tenant(
+            State(st.clone()),
+            Path(tenant.clone()),
+            DryRun::default(),
+            Json(patch),
+        ),
+        async {
+            checked.arrived().await;
+            st.store
+                .create(&pool_on_10_30(&unique("p")))
+                .await
+                .expect("a pool between the check and the write");
+            checked.release().await;
+            undoing.arrived().await;
+            let theirs = relabel(&st, &tenant).await;
+            undoing.release().await;
+            theirs
+        },
+    );
+
+    let told = answer.err().expect("the claim was lost");
+    assert_eq!(told.reason(), "ClaimNotTakenBack", "{}", told.message());
+    let stands: Tenant = st.store.get(&tenant).await.expect("the tenant");
+    assert_eq!(
+        stands.metadata.resource_version, theirs.metadata.resource_version,
+        "nothing was written over their write"
+    );
+    assert_eq!(stands.spec.network_prefixes, ["10.30.0.0/24"]);
 }

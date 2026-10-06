@@ -465,36 +465,6 @@ pub(super) async fn collisions(
     Ok(out)
 }
 
-/// What a claim already in the store is told once its question was asked again:
-/// nothing when it won, the refusal when it lost, and the error when the question
-/// could not be answered, since a claim not known to have won is taken back like
-/// one that lost. (RR5-6)
-pub(super) fn refusal_after_write(lost: Result<Option<String>, ApiError>) -> Option<ApiError> {
-    match lost {
-        Ok(None) => None,
-        Ok(Some(why)) => Some(conflict(why)),
-        Err(e) => Some(e),
-    }
-}
-
-/// Undo a create that turned out to have lost its race. The object is the only
-/// thing that was written, so deleting it is the whole rollback.
-///
-/// A failure here is an ERROR: what stays behind is a pool or a subnet lying
-/// on top of another one, and no pass, retry or reconnect ever clears it —
-/// only a person does.
-///
-/// The object this request created, by its uid and revision: a name taken
-/// back after somebody else took it would be their object. (IKR-B81)
-pub(super) async fn take_back<T: Resource>(st: &ApiState, created: &T, kind: &str) {
-    let name = created.metadata().name.as_str();
-    if let Err(e) = controller_api::deletion::take_back_created(&st.store, created).await {
-        error!(name, kind, error = %format!("{e:#}"),
-               "could not take back an object that lost its claim; it now overlaps another \
-                one and has to be deleted by hand");
-    }
-}
-
 /// How many lost races a subnet cut accepts before it says so. A liveness
 /// bound and not a correctness one, the same one `floating::allocate` sets for
 /// the same reason: every round is a block somebody else took first.
@@ -566,13 +536,16 @@ pub(super) async fn create_floating_pool(
         None => st.store.create(&pool).await?,
     };
 
-    // And now the same questions again, from inside the store. No retry: an
-    // administrator named these ranges and this default mark outright, so
-    // there is nothing for the server to pick differently on a second round.
-    if let Some(refusal) = refusal_after_write(pool_lost_claim(&st, &created).await) {
-        take_back::<FloatingPool>(&st, &created, "floating pool").await;
-        return Err(refusal);
-    }
+    // And now the same questions again, from inside the store. No second
+    // round: an administrator named these ranges and this default mark
+    // outright, so there is nothing for the server to pick differently.
+    settle_claim(
+        &created.metadata.name,
+        "floating pool",
+        pool_lost_claim(&st, &created).await,
+        take_back(&st, &created),
+    )
+    .await?;
 
     info!(pool = %created.metadata.name, cidrs = %created.spec.cidrs.join(","),
           public = created.spec.public, default = created.spec.default, "floating pool created");

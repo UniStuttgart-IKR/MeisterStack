@@ -116,15 +116,21 @@ pub(super) async fn update_tenant(
 
     // And the question again from inside the store, as a pool or a routed subnet
     // asks it after its write: one written at the same moment was not in the
-    // listing the check above read. No retry: the administrator named these
-    // prefixes outright. (RR5-6)
+    // listing the check above read. (RR5-6) This handler asks once; a PATCH
+    // without a resourceVersion runs it again on a 409 (`patch_with_retry`),
+    // and that round judges the tenant as it was put back. A put back that
+    // failed answers `claim_not_taken_back`, which is not run again. (NL6-3)
     if network_prefixes_judged(
         &updated.spec.network_prefixes,
         &current.spec.network_prefixes,
-    ) && let Some(refusal) = refusal_after_write(network_lost_claim(&st, &updated).await)
-    {
-        put_back(&st, &current, &updated).await;
-        return Err(refusal);
+    ) {
+        settle_claim(
+            &name,
+            "tenant",
+            network_lost_claim(&st, &updated).await,
+            put_back(&st, &current, &updated),
+        )
+        .await?;
     }
     Ok(Json(updated))
 }
@@ -178,29 +184,6 @@ pub(super) async fn network_lost_claim(
             )
         }),
     )
-}
-
-/// Undo an update of a tenant whose network lost its race: `before` written back over
-/// `written`, the revision this request wrote, and over nothing anybody wrote since. The whole
-/// request is undone, since it is refused whole.
-///
-/// A failure is an ERROR for the reason `take_back`'s is: the tenant's network now overlaps
-/// what won the claim, and no pass ever clears that; only a person does.
-async fn put_back(st: &ApiState, before: &Tenant, written: &Tenant) {
-    if let Err(e) = write_back(st, before, written).await {
-        error!(tenant = %written.metadata.name, error = %e.message(),
-               "could not put back a tenant whose network lost its claim; it now overlaps \
-                another claim and has to be fixed by hand");
-    }
-}
-
-/// `before`, written over the revision `written` holds.
-async fn write_back(st: &ApiState, before: &Tenant, written: &Tenant) -> Result<(), ApiError> {
-    let mut back = before.clone();
-    back.metadata.resource_version = written.metadata.resource_version.clone();
-    controller_api::carry_generation(written, &mut back)?;
-    st.store.update(&back).await?;
-    Ok(())
 }
 
 /// What a tenant's network prefixes may not overlap, each with its name for the refusal:

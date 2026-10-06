@@ -133,13 +133,21 @@ pub(super) async fn create_storage_pool(
     };
 
     // And the same question again, from inside the store — the create is what
-    // makes a race visible. No retry: an admin marked this pool default
+    // makes a race visible. No second round: an admin marked this pool default
     // outright, so there is nothing for the server to pick differently.
-    if created.spec.default
-        && let Err(why) = check_storage_pool(&st, &created, Some(&created.metadata.name)).await
-    {
-        take_back::<StoragePool>(&st, &created, "storage pool").await;
-        return Err(why);
+    if created.spec.default {
+        // The check says why it refuses, a default mark already taken or a
+        // store that did not answer, and either way the create is undone.
+        let lost = check_storage_pool(&st, &created, Some(&created.metadata.name))
+            .await
+            .map(|()| None);
+        settle_claim(
+            &created.metadata.name,
+            "storage pool",
+            lost,
+            take_back(&st, &created),
+        )
+        .await?;
     }
 
     info!(pool = %created.metadata.name, driver = %created.spec.driver,

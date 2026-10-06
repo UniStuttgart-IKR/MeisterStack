@@ -258,6 +258,18 @@ pub fn conflict(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, "Conflict", message)
 }
 
+/// 500 — a write this request made lost its claim and could not be taken back: it stands in
+/// the store on what won the claim until a person undoes it. Not a `Conflict`, which says that
+/// nothing was written and which `patch_with_retry` takes for a lost compare-and-swap and runs
+/// again. (NL6-3)
+pub fn claim_not_taken_back(message: impl Into<String>) -> ApiError {
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "ClaimNotTakenBack",
+        message,
+    )
+}
+
 /// 403 — the caller is known and may not.
 pub fn forbidden(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, "Forbidden", message)

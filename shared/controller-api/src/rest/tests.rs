@@ -666,6 +666,24 @@ async fn only_a_lost_compare_and_swap_is_tried_again() {
     }
 }
 
+/// A write that lost its claim and could not be taken back is not a race either: run again,
+/// the request would find its own write in the store, nothing left to judge, and answer 200
+/// over a claim that won against it. (NL6-3)
+#[tokio::test]
+async fn a_lost_claim_left_standing_is_not_tried_again() {
+    let passes = std::cell::Cell::new(0);
+    let told = patch_with_retry(&serde_json::json!({}), || {
+        passes.set(passes.get() + 1);
+        std::future::ready(Err::<(), _>(claim_not_taken_back(
+            "tenant c stands on floating pool p",
+        )))
+    })
+    .await
+    .expect_err("refused");
+    assert_eq!(told.reason(), "ClaimNotTakenBack");
+    assert_eq!(passes.get(), 1);
+}
+
 const DISCOVERY_ROWS: &[ApiResource] = &[
     ApiResource::new(
         "vms",

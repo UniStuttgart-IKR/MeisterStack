@@ -127,39 +127,45 @@ pub(super) async fn create_routed_subnet(
             None => st.store.create(&subnet).await?,
         };
 
-        let name = created.metadata.name.clone();
-        let claimant = Claimant::Subnet {
-            name: &name,
-            tenant: &created.spec.tenant,
-        };
-        // A question that cannot be answered is a claim not known to be won.
-        let hits = match collisions(&st, &[cidr], claimant).await {
-            Ok(hits) => hits,
-            Err(e) => {
-                take_back::<RoutedSubnet>(&st, &created, "routed subnet").await;
-                return Err(e);
+        let lost = subnet_lost_claim(&st, &created, cidr).await;
+        let cut_again = !named && matches!(lost, Ok(Some(_)));
+        let name = created.metadata.name.as_str();
+        match settle_claim(name, "routed subnet", lost, take_back(&st, &created)).await {
+            Ok(()) => {
+                info!(subnet = %name, tenant = %created.spec.tenant,
+                      cidr = %created.spec.cidr, "routed subnet created");
+                return Ok((StatusCode::CREATED, Json(created)));
             }
-        };
-        let Some(won) = lost_to(&created.metadata.resource_version, &hits) else {
-            info!(subnet = %name, tenant = %created.spec.tenant,
-                  cidr = %created.spec.cidr, "routed subnet created");
-            return Ok((StatusCode::CREATED, Json(created)));
-        };
-
-        // Degraded and self-healing on the cut road, so WARN: the object is
-        // gone again and the next round takes the next free block.
-        warn!(subnet = %name, cidr = %created.spec.cidr, lost_to = %won.what,
-              "lost the claim on this block, taking the subnet back");
-        let overlap = format!("{} overlaps {}", created.spec.cidr, won.what);
-        take_back::<RoutedSubnet>(&st, &created, "routed subnet").await;
-        if named {
-            return Err(conflict(overlap));
+            // Degraded and self-healing on the cut road, so WARN: the block was
+            // lost and the subnet is gone again (a take-back that failed answers
+            // 500, not 409), and the next round takes the next free block.
+            Err(lost) if cut_again && lost.status() == StatusCode::CONFLICT => {
+                warn!(subnet = %name, cidr = %created.spec.cidr, why = %lost.message(),
+                      "lost the claim on this block, took the subnet back");
+            }
+            Err(refused) => return Err(refused),
         }
     }
     Err(conflict(format!(
         "lost {MAX_CLAIM_ROUNDS} races for a free block in routed_pools ({}); retries exhausted",
         st.routed_pools.join(", ")
     )))
+}
+
+/// The claim a routed subnet that is already in the store on `cidr` turns out to have lost:
+/// the overlap question asked again now that a concurrent write is visible, naming what won.
+async fn subnet_lost_claim(
+    st: &ApiState,
+    subnet: &RoutedSubnet,
+    cidr: common::net::Ipv4Range,
+) -> Result<Option<String>, ApiError> {
+    let claimant = Claimant::Subnet {
+        name: &subnet.metadata.name,
+        tenant: &subnet.spec.tenant,
+    };
+    let hits = collisions(st, &[cidr], claimant).await?;
+    Ok(lost_to(&subnet.metadata.resource_version, &hits)
+        .map(|won| format!("{} overlaps {}", subnet.spec.cidr, won.what)))
 }
 
 /// Tenant and CIDR cannot change after allocation; prefixLen records the chosen block.
