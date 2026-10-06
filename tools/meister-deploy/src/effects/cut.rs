@@ -4,8 +4,8 @@
 
 //! Deterministic crash points behind the `Files` and `Runner` seams (test only).
 //!
-//! A [`CutPoint`] numbers the mutating effects a run attempts, from 0 at the
-//! last `arm_after`/`observe`. Armed at `k`, effects `0..k` land, effect `k` is
+//! A [`CutPoint`] numbers the mutating effects a run attempts, from 0 when it
+//! is made or armed. Armed at `k`, effects `0..k` land, effect `k` is
 //! where the process dies, and every later effect is refused: a dead process
 //! makes no more changes. Reads pass through, because reading changes nothing a
 //! successor could find. This is Floppy's cut (floppy-disk `dev.rs:126-139`)
@@ -81,18 +81,9 @@ impl CutPoint {
 
     /// Crash at the `k`-th mutating effect from now. Clears the trace.
     pub fn arm_after(&self, k: usize) {
-        self.reset(Some(k));
-    }
-
-    /// Count and trace effects from now without crashing.
-    pub fn observe(&self) {
-        self.reset(None);
-    }
-
-    fn reset(&self, at: Option<usize>) {
         let mut st = self.lock();
         st.ops = 0;
-        st.at = at;
+        st.at = Some(k);
         st.frozen = None;
         st.trace.clear();
     }
@@ -102,7 +93,7 @@ impl CutPoint {
         self.lock().frozen.clone()
     }
 
-    /// The effects that landed since the last arm or observe.
+    /// The effects that landed since it was made or armed.
     pub fn trace(&self) -> Vec<Op> {
         self.lock().trace.clone()
     }
