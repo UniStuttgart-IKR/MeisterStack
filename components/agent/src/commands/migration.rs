@@ -17,7 +17,7 @@ impl Agent {
         // Parse the source create document so destination resources match the incoming VM config.
         let new_spec: crate::types::NewVmSpec =
             serde_json::from_str(&c.spec_json).context("invalid spec_json")?;
-        let (_, spec, _desired) = new_spec.into_spec(&self.default_bridge)?;
+        let (spec, _desired) = new_spec.into_spec(id, &self.default_bridge)?;
 
         cannot_serve(
             self.hypervisor

@@ -14,8 +14,7 @@ impl Agent {
         let (spec, desired) = if !c.spec_json.is_empty() {
             let new_spec: crate::types::NewVmSpec =
                 serde_json::from_str(&c.spec_json).context("invalid spec_json")?;
-            let (_, spec, desired) = new_spec.into_spec(&self.default_bridge)?;
-            (spec, desired)
+            new_spec.into_spec(id, &self.default_bridge)?
         } else {
             let spec = c.spec.ok_or_else(|| anyhow!("create without spec"))?;
             let spec: AgentVmSpec = spec.try_into().context("invalid vm spec")?;

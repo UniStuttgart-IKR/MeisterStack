@@ -400,25 +400,24 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
     }
 }
 
-/// Convert the shared create document into this node's persisted specification.
+/// Convert the shared create document into this node's persisted specification for the VM
+/// `vm`.
 pub trait NewVmSpecExt {
-    fn into_spec(self, default_bridge: &str) -> anyhow::Result<(VmId, AgentVmSpec, Desired)>;
+    fn into_spec(self, vm: VmId, default_bridge: &str) -> anyhow::Result<(AgentVmSpec, Desired)>;
 }
 
 impl NewVmSpecExt for NewVmSpec {
-    fn into_spec(self, default_bridge: &str) -> anyhow::Result<(VmId, AgentVmSpec, Desired)> {
+    fn into_spec(self, vm: VmId, default_bridge: &str) -> anyhow::Result<(AgentVmSpec, Desired)> {
         refuse_what_cannot_be_a_vm(&self)?;
-        let vm_id = Uuid::new_v4();
         refuse_a_volume_entry_that_says_two_things(&self.volumes)?;
         let images = images_to_fetch(&self.volumes);
         Ok((
-            vm_id,
             AgentVmSpec {
                 vcpus: self.vcpus,
                 memory_mib: self.memory_mib,
                 boot: self.boot,
                 volumes: volumes_with_ids(self.volumes)?,
-                nics: nics_with_ids(self.nics, default_bridge)?,
+                nics: nics_with_ids(self.nics, &vm, default_bridge)?,
                 devices: devices_with_ids(self.devices)?,
                 cloud_init: self.cloud_init,
                 images,
@@ -531,11 +530,35 @@ fn volumes_with_ids(volumes: Vec<NewVolume>) -> anyhow::Result<Vec<VolumeWithId>
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-/// Allocate NIC IDs and default omitted MAC addresses and bridge names.
-fn nics_with_ids(nics: Vec<NewNic>, default_bridge: &str) -> anyhow::Result<Vec<NicWithId>> {
+/// The id of the VM's NIC at `position`, the same for every conversion of its create document.
+///
+/// A NIC's id names its tap and, without a MAC in the document, its MAC. A live migration
+/// converts the document again on the destination, and the arriving configuration names the
+/// source's tap and MAC: a fresh id there would leave the guest on a tap nobody bridged,
+/// behind a MAC guard that drops its frames. Derived from the VM's id, so two VMs never share
+/// one.
+fn nic_id(vm: &VmId, position: usize) -> NicId {
+    use sha2::Digest;
+    let digest = sha2::Sha256::new()
+        .chain_update(vm.as_bytes())
+        .chain_update(b"nic")
+        .chain_update(position.to_be_bytes())
+        .finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+/// Derive NIC IDs and default omitted MAC addresses and bridge names.
+fn nics_with_ids(
+    nics: Vec<NewNic>,
+    vm: &VmId,
+    default_bridge: &str,
+) -> anyhow::Result<Vec<NicWithId>> {
     nics.into_iter()
-        .map(|n| {
-            let id = Uuid::new_v4();
+        .enumerate()
+        .map(|(position, n)| {
+            let id = nic_id(vm, position);
             let mac = n.mac.unwrap_or_else(|| {
                 let b = id.as_bytes();
                 format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
@@ -741,7 +764,7 @@ mod tests {
                      "volumes":[{{"size_bytes":1}}]}}"#
             );
             let spec: NewVmSpec = serde_json::from_str(&doc).expect("spec parses");
-            let (_, _, desired) = spec.into_spec("br0").expect("spec is valid");
+            let (_, desired) = spec.into_spec(VmId::nil(), "br0").expect("spec is valid");
             assert_eq!(desired, expected);
         }
     }
@@ -753,7 +776,7 @@ mod tests {
                         "boot":{"kind":"firmware","firmware":"fw"},
                         "volumes":[{"size_bytes":1}]}"#;
         let spec: NewVmSpec = serde_json::from_str(plain).unwrap();
-        let (_, agent, _) = spec.into_spec("br0").unwrap();
+        let (agent, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         assert_eq!(agent.cloud_init, None, "no block, no seed, no second disk");
 
         // The `##` is not decoration: user_data starts with `#cloud-config`,
@@ -765,7 +788,7 @@ mod tests {
                                         "network_config":"version: 2\n",
                                         "local_hostname":"web-1"}}"##;
         let spec: NewVmSpec = serde_json::from_str(seeded).unwrap();
-        let (_, agent, _) = spec.into_spec("br0").unwrap();
+        let (agent, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         let config = agent.cloud_init.expect("the block travels");
         assert_eq!(config.user_data, "#cloud-config\n");
         assert_eq!(config.network_config.as_deref(), Some("version: 2\n"));
@@ -780,7 +803,10 @@ mod tests {
                       "boot":{"kind":"firmware","firmware":"fw"},
                       "volumes":[{"size_bytes":1}]}"#;
         let spec: NewVmSpec = serde_json::from_str(doc).unwrap();
-        assert_eq!(spec.into_spec("br0").unwrap().2, Desired::Running);
+        assert_eq!(
+            spec.into_spec(VmId::nil(), "br0").unwrap().1,
+            Desired::Running
+        );
     }
 
     /// Parse all shipped specs with unknown-field validation.
@@ -796,7 +822,7 @@ mod tests {
             let raw = std::fs::read_to_string(&path).unwrap();
             let spec: NewVmSpec = serde_json::from_str(&raw)
                 .unwrap_or_else(|e| panic!("{} no longer parses: {e}", path.display()));
-            spec.into_spec("br0")
+            spec.into_spec(VmId::nil(), "br0")
                 .unwrap_or_else(|e| panic!("{} is no longer valid: {e:#}", path.display()));
             seen += 1;
         }
@@ -810,7 +836,7 @@ mod tests {
                       "boot":{"kind":"firmware","firmware":"fw"},
                       "volumes":[{"base_image":"n.raw","size_bytes":10}]}"#;
         let spec: NewVmSpec = serde_json::from_str(doc).unwrap();
-        let (_, spec, _) = spec.into_spec("br0").unwrap();
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         assert_eq!(spec.volumes[0].spec.driver, None);
         assert_eq!(spec.volumes[0].spec.params, None);
     }
@@ -823,7 +849,7 @@ mod tests {
                       "volumes":[{"size_bytes":10,"driver":"lvm-thin",
                                   "params":{"pool":"vg0/thin","snapshot_of":"base"}}]}"#;
         let spec: NewVmSpec = serde_json::from_str(doc).unwrap();
-        let (_, spec, _) = spec.into_spec("br0").unwrap();
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         assert_eq!(spec.volumes[0].spec.driver.as_deref(), Some("lvm-thin"));
         assert_eq!(
             spec.volumes[0].spec.params.as_ref().unwrap()["pool"],
@@ -839,7 +865,7 @@ mod tests {
                       "volumes":[{"size_bytes":1}],
                       "nics":[{}]}"#;
         let spec: NewVmSpec = serde_json::from_str(doc).unwrap();
-        let (_, spec, _) = spec.into_spec("br0").unwrap();
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         assert_eq!(spec.nics[0].spec.bridge, "br0");
         assert_eq!(spec.nics[0].spec.vxlan_id, None);
         assert!(spec.nics[0].spec.floating_ips.is_empty());
@@ -861,7 +887,7 @@ mod tests {
                                "floating_ips":["10.255.0.7"],
                                "routed_subnets":["10.7.1.0/24"]}]}"#;
         let spec: NewVmSpec = serde_json::from_str(doc).unwrap();
-        let (_, spec, _) = spec.into_spec("br0").unwrap();
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").unwrap();
         assert_eq!(spec.nics[0].spec.vxlan_id, Some(10_007));
         assert_eq!(spec.nics[0].spec.floating_ips, ["10.255.0.7"]);
         assert_eq!(spec.nics[0].spec.routed_subnets, ["10.7.1.0/24"]);
@@ -877,7 +903,7 @@ mod tests {
                      "volumes":[{{"size_bytes":1}}]}}"#
             );
             let spec: NewVmSpec = serde_json::from_str(&doc).unwrap();
-            assert!(spec.into_spec("br0").is_err());
+            assert!(spec.into_spec(VmId::nil(), "br0").is_err());
         }
     }
 
@@ -902,7 +928,7 @@ mod tests {
         let uid = uuid::Uuid::new_v4();
         let doc = referring(&uid.to_string(), serde_json::json!({}));
         let spec: NewVmSpec = serde_json::from_value(doc).expect("a spec");
-        let (_, spec, _) = spec.into_spec("br0").expect("into_spec");
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").expect("into_spec");
         assert_eq!(spec.volumes.len(), 1);
         assert!(spec.volumes[0].referenced);
         assert_eq!(spec.volumes[0].id, uid, "the object's uid, not a fresh one");
@@ -923,7 +949,10 @@ mod tests {
         ] {
             let spec: NewVmSpec =
                 serde_json::from_value(referring(&uid, extra.clone())).expect("parses");
-            let err = spec.into_spec("br0").expect_err("refused").to_string();
+            let err = spec
+                .into_spec(VmId::nil(), "br0")
+                .expect_err("refused")
+                .to_string();
             assert_eq!(
                 err, "a referenced volume has its size and image already",
                 "for {extra}"
@@ -934,7 +963,7 @@ mod tests {
         let spec: NewVmSpec =
             serde_json::from_value(referring(&uid, serde_json::json!({"params": {"tag": "d"}})))
                 .expect("parses");
-        let (_, spec, _) = spec.into_spec("br0").expect("accepted");
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").expect("accepted");
         assert_eq!(spec.volumes[0].spec.params.as_ref().unwrap()["tag"], "d");
     }
 
@@ -948,7 +977,7 @@ mod tests {
             "volumes": [{"base_image": "tiny.raw", "size_bytes": 2048}]
         });
         let spec: NewVmSpec = serde_json::from_value(doc).expect("a spec");
-        let (_, spec, _) = spec.into_spec("br0").expect("into_spec");
+        let (spec, _) = spec.into_spec(VmId::nil(), "br0").expect("into_spec");
         assert!(!spec.volumes[0].referenced);
         assert_eq!(spec.volumes[0].spec.size_bytes, 2048);
         assert_eq!(spec.volumes[0].spec.base_image.as_deref(), Some("tiny.raw"));
@@ -959,7 +988,34 @@ mod tests {
     fn a_reference_that_is_not_a_uid_is_refused() {
         let spec: NewVmSpec =
             serde_json::from_value(referring("data-1", serde_json::json!({}))).expect("parses");
-        let err = spec.into_spec("br0").expect_err("refused").to_string();
+        let err = spec
+            .into_spec(VmId::nil(), "br0")
+            .expect_err("refused")
+            .to_string();
         assert!(err.contains("data-1") && err.contains("uid"), "{err}");
+    }
+
+    /// A live migration converts the create document again on the destination, and the
+    /// arriving configuration names the source's tap and MAC: every conversion for one VM
+    /// gives each NIC the same id and default MAC, and another VM's NICs other ones.
+    #[test]
+    fn a_nic_keeps_its_id_and_mac_across_conversions_of_one_vms_document() {
+        let doc = r#"{"vcpus":1,"memory_mib":256,
+                     "boot":{"kind":"firmware","firmware":"fw"},
+                     "volumes":[{"size_bytes":1}],
+                     "nics":[{"vxlan_id":10001},{}]}"#;
+        let nics = |vm: VmId| {
+            let spec: NewVmSpec = serde_json::from_str(doc).expect("spec parses");
+            let (spec, _) = spec.into_spec(vm, "br0").expect("spec is valid");
+            spec.nics
+                .into_iter()
+                .map(|n| (n.id, n.spec.mac))
+                .collect::<Vec<_>>()
+        };
+        let (source, other) = (VmId::new_v4(), VmId::new_v4());
+
+        assert_eq!(nics(source), nics(source));
+        assert_ne!(nics(source)[0], nics(source)[1], "two NICs are two taps");
+        assert_ne!(nics(source)[0].0, nics(other)[0].0);
     }
 }

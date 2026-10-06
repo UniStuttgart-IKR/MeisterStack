@@ -606,8 +606,9 @@ async fn create_vm(
     State(st): State<ApiState>,
     ApiJson(req): ApiJson<NewVmSpec>,
 ) -> Result<(StatusCode, Json<CreatedResponse>), ApiError> {
-    let (id, spec, desired) = req
-        .into_spec(&st.default_bridge)
+    let id = VmId::new_v4();
+    let (spec, desired) = req
+        .into_spec(id, &st.default_bridge)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     st.hypervisor

@@ -1261,7 +1261,10 @@ fn converted(attached: &[VolumeId]) -> AgentVmSpec {
         "volumes": volumes,
     }))
     .expect("a create document");
-    document.into_spec("br0").expect("a valid document").1
+    document
+        .into_spec(VmId::nil(), "br0")
+        .expect("a valid document")
+        .0
 }
 
 /// IKR-B66: an attach and a detach replay the create document, whose conversion names the
