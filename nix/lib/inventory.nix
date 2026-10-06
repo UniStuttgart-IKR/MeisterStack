@@ -449,6 +449,9 @@ let
         let h = hosts.${id}; in
         { config, lib, ... }: {
           meisterstack.roles = h.roles;
+          # The addons host scrapes every role's metrics on this address.
+          meisterstack.metrics.listenAddress =
+            lib.mkIf (h.management != null) (lib.mkDefault h.management.address);
           # roles.nix derives MEISTER_ROLE; do not define it twice.
           meisterstack.context.defaults =
             removeAttrs (contextEnv id) [ "MEISTER_ROLE" ]

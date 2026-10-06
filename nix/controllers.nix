@@ -38,7 +38,7 @@ let
   };
 
   cloudDefaults = serving // {
-    metrics_listen = "0.0.0.0:${toString cfg.ports.cloud.metrics}";
+    metrics_listen = cfg.metrics.listen.cloud;
     # Cloud replicas need a client identity to forward requests to the replica
     # holding a cluster session. This identity is distinct from the serving certificate.
     identity_cert = "${pki}/identity.crt";
@@ -46,7 +46,7 @@ let
   };
 
   clusterDefaults = serving // clusterAuth // {
-    metrics_listen = "0.0.0.0:${toString cfg.ports.cluster.metrics}";
+    metrics_listen = cfg.metrics.listen.cluster;
     # Use a separate client credential for the cluster-to-cloud session.
     cloud_ca = "${pki}/ca.crt";
     cloud_cert = "${pki}/identity.crt";
@@ -57,12 +57,14 @@ let
   # an empty chain, and an evaluation that knew it would be empty says so first.
   namesAuthChain = effective: (effective.auth.chain or [ ]) != [ ];
 
+  networkOnline = lib.optional cfg.metrics.waitsForNetwork "network-online.target";
+
   controller = name: {
     description = "MeisterStack ${name}-controller";
     wantedBy = lib.mkIf cfg.autostart [ "multi-user.target" ];
     # Order after the context renderer only when that renderer is enabled.
-    after = [ "etcd.service" "meister-context.service" ];
-    wants = [ "etcd.service" ];
+    after = [ "etcd.service" "meister-context.service" ] ++ networkOnline;
+    wants = [ "etcd.service" ] ++ networkOnline;
     # Gate startup on the configuration and credential files the service needs.
     unitConfig.ConditionPathExists =
       lib.optional (!cfg.binariesInStore) "${cfg.binDir}/meister-${name}-controller"

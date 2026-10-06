@@ -70,6 +70,14 @@ let
       let c = cluster { meisterstack.data.label = null; }; in
       !(c.fileSystems ? "/var/lib/etcd") && !(c.fileSystems ? "/var/lib/meister-data");
 
+    "metrics listen on loopback unless asked" =
+      (cluster { }).meisterstack.cluster.effective.metrics_listen == "127.0.0.1:9101"
+      && (agent { }).meisterstack.agent.effective.metrics_listen == "127.0.0.1:9102";
+    "metrics on one address wait for the network" =
+      let c = cluster { meisterstack.metrics.listenAddress = "fd00::10"; }; in
+      c.meisterstack.cluster.effective.metrics_listen == "[fd00::10]:9101"
+      && builtins.elem "network-online.target" c.systemd.services.meister-cluster-controller.wants;
+
     "an agent holds no address on the default guest bridge unless asked" =
       !((agent { }).meisterstack.agent.effective.network ? bridge_addr);
     "an agent keeps guests from opening connections to the host" =

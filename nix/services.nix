@@ -8,6 +8,13 @@
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
+
+  metricsAddress = cfg.metrics.listenAddress;
+  # An IPv6 address takes brackets in front of a port.
+  hostPort = address: port:
+    if lib.hasInfix ":" address then "[${address}]:${toString port}"
+    else "${address}:${toString port}";
+  bindsOneAddress = !(builtins.elem metricsAddress [ "127.0.0.1" "::1" "0.0.0.0" "::" ]);
 in
 {
   imports = [
@@ -187,6 +194,45 @@ in
         those values at build time, writes the complete file into /etc and
         points this option at it. Then the config a unit reads is part of the
         system generation, which is what makes a rollback a rollback.
+      '';
+    };
+
+    metrics.listenAddress = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      example = "10.0.0.10";
+      description = ''
+        The address the three metrics listeners (`metrics_listen` of the
+        cloud, the cluster and the agent, ports in `meisterstack.ports`)
+        bind. They are unauthenticated, and their series name objects across
+        every tenant.
+
+        Loopback by default, so a host that does not say otherwise exposes
+        them to nobody. A fleet built with `lib.mkFleet` binds the host's
+        management address, which is what its Prometheus scrapes; a unit that
+        binds one address waits for `network-online.target`. `0.0.0.0` is
+        every address, and then only the host's firewall decides who reads
+        them. A role's `settings.metrics_listen` still wins over this.
+      '';
+    };
+
+    metrics.listen = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      internal = true;
+      readOnly = true;
+      default = lib.mapAttrs (_: role: hostPort metricsAddress role.metrics)
+        { inherit (cfg.ports) cloud cluster agent; };
+      description = "The `metrics_listen` value of each role, from `metrics.listenAddress`.";
+    };
+
+    metrics.waitsForNetwork = lib.mkOption {
+      type = lib.types.bool;
+      internal = true;
+      readOnly = true;
+      default = bindsOneAddress;
+      description = ''
+        Whether the role units order after `network-online.target`: a
+        listener bound to one address cannot bind before the address exists.
       '';
     };
 

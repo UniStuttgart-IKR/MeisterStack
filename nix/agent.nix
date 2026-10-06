@@ -32,8 +32,8 @@ let
     # remain top-level in context-based rendering.
     stop_grace_secs = 30;
 
-    # Metrics bind to a configured address and expose no authentication.
-    metrics_listen = "0.0.0.0:${toString cfg.ports.agent.metrics}";
+    # Metrics expose no authentication; see meisterstack.metrics.listenAddress.
+    metrics_listen = cfg.metrics.listen.agent;
 
     # Use ordinary PEM files so the shared key loader can enforce private-key modes.
   } // lib.optionalAttrs (!cfg.singleNode.enable) {
@@ -460,6 +460,7 @@ in
           "network-online.target"
           "var-lib-meisterstack-volumes.mount"
         ];
+        wants = lib.optional cfg.metrics.waitsForNetwork "network-online.target";
         # Populate the service PATH explicitly with networking, storage, image, and
         # process helpers used by drivers. A systemd unit does not inherit an operator
         # shell PATH, and helpers launched by other helpers also need these entries.
