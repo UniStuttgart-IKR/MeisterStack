@@ -253,10 +253,12 @@ in
       description = ''
         The ports this stack listens on, per role — to be READ, not set.
 
-        No firewall rule is written by these modules, and that is the point:
-        a host's firewall belongs to the host, and a service module that
-        opens a port decides something host-global behind its owner's back.
-        So the numbers are published here instead, and an operator's own
+        These modules open no port, and that is the point: a host's firewall
+        belongs to the host, and a service module that opens a port decides
+        something host-global behind its owner's back. The only rule they
+        write is the guest guard's drop table on an agent host
+        (nix/guest-guard.nix, `meisterstack.agent.guestGuard`), and it opens
+        nothing. So the numbers are published here instead, and an operator's own
         `networking.firewall` can name them:
 
           networking.firewall.allowedTCPPorts = with config.meisterstack.ports;
