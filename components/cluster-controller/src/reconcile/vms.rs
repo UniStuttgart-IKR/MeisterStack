@@ -628,20 +628,8 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             && volume.status.open_on.iter().any(|n| n == node)
         {
             let from = volume.status.node.clone().unwrap_or_default();
-            let uid = volume.metadata.uid.clone();
-            let mut carried = false;
-            volume = p
-                .store
-                .mutate_if::<Volume, _>(&name, &uid, |v| {
-                    carried = may_carry(&v.status, vm);
-                    if carried {
-                        v.status.node = Some(node.to_string());
-                    }
-                })
-                .await?;
-            if !carried {
-                anyhow::bail!("volume {name} was claimed while its record was being moved");
-            }
+            volume =
+                carry_record(p, vm, &volume, |v| v.status.node = Some(node.to_string())).await?;
             info!(volume = %name, from = %from, to = node,
                   "the vm's node already has the volume open; the record moves with it");
         }
@@ -661,18 +649,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             );
             if travels {
                 let from = volume.status.node.clone().unwrap_or_default();
-                let mut carried = false;
-                p.store
-                    .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
-                        carried = may_carry(&v.status, vm);
-                        if carried {
-                            follow_vm(v, &vm.metadata.name, node);
-                        }
-                    })
-                    .await?;
-                if !carried {
-                    anyhow::bail!("volume {name} was claimed while its record was being moved");
-                }
+                carry_record(p, vm, &volume, |v| follow_vm(v, &vm.metadata.name, node)).await?;
                 info!(volume = %name, from = %from, to = node,
                       "the record follows the vm; the bytes stay where they are");
                 anyhow::bail!("volume {name} is being re-opened on {node}");
@@ -738,6 +715,32 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Move `volume`'s record as `re_point` says, on the record this pass read and
+/// only while `vm` may still carry it: a claim taken between the read and the
+/// write stops the move. (IKR-B81)
+async fn carry_record(
+    p: &Pass<'_>,
+    vm: &Vm,
+    volume: &Volume,
+    re_point: impl Fn(&mut Volume),
+) -> anyhow::Result<Volume> {
+    let name = &volume.metadata.name;
+    let mut carried = false;
+    let moved = p
+        .store
+        .mutate_if::<Volume, _>(name, &volume.metadata.uid, |v| {
+            carried = may_carry(&v.status, vm);
+            if carried {
+                re_point(v);
+            }
+        })
+        .await?;
+    if !carried {
+        anyhow::bail!("volume {name} was claimed while its record was being moved");
+    }
+    Ok(moved)
 }
 
 /// Whether `vm` may move this volume's record to its node: nobody holds the
