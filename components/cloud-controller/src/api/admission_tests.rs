@@ -943,31 +943,50 @@ async fn a_binding_released_through_the_api_leaves_no_time_it_was_made() {
 
 // --- NL5-1: a tenant's network prefixes -------------------------------------
 
-/// A tenant's network prefixes are stored as the CIDRs of their networks; a change that
-/// overlaps a floating pool is refused; and an edit that leaves them as they stand is not
-/// judged again, so a pool created since does not block an edit of something else.
+/// A tenant called `name` whose network holds `prefixes`, as the store keeps it.
+fn tenant_with_network(name: &str, prefixes: &[&str]) -> Tenant {
+    Tenant::declare(
+        name,
+        TenantSpec {
+            network_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        },
+    )
+}
+
+/// `cloud_with_routers`, with a tenant `c` whose network is 10.30.0.0/24 beside `lab`'s
+/// floating pool 198.51.100.0/24.
+async fn cloud_with_a_tenant_network(what: &str) -> ApiState {
+    let st = cloud_with_routers(what).await;
+    st.store
+        .create(&tenant_with_network("c", &["10.30.0.0/24"]))
+        .await
+        .expect("tenant c");
+    st
+}
+
+/// A tenant's network prefixes are stored as the CIDRs of their networks, whatever host
+/// address the administrator wrote them with.
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]
-async fn a_tenants_network_prefixes_are_checked_when_they_change() {
-    let st = cloud_with_routers("nl5-prefixes").await;
-    let declared = |prefixes: &[&str]| {
-        Tenant::declare(
-            "c",
-            TenantSpec {
-                network_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
-                ..Default::default()
-            },
-        )
-    };
+async fn a_tenants_network_prefixes_are_stored_as_the_cidrs_of_their_networks() {
+    let st = cloud_with_routers("nl5-canonical").await;
     let (_, Json(created)) = create_tenant(
         State(st.clone()),
         DryRun::default(),
-        Json(declared(&["10.30.0.7/24"])),
+        Json(tenant_with_network("c", &["10.30.0.7/24"])),
     )
     .await
     .expect("a tenant with a prefix");
     assert_eq!(created.spec.network_prefixes, ["10.30.0.0/24"]);
+}
 
+/// A change of a tenant's network prefixes onto a floating pool is refused: the pool's addresses
+/// are not the tenant's guests' to send from.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenants_network_may_not_be_moved_onto_a_floating_pool() {
+    let st = cloud_with_a_tenant_network("nl5-onto-pool").await;
     let mut overlapping: Tenant = st.store.get("c").await.expect("the tenant");
     overlapping.spec.network_prefixes = vec!["198.51.100.0/25".into()];
     let refused = update_tenant(
@@ -985,7 +1004,13 @@ async fn a_tenants_network_prefixes_are_checked_when_they_change() {
         "{}",
         refused.message()
     );
+}
 
+/// A floating pool may not be created on a tenant's network.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_floating_pool_may_not_land_on_a_tenants_network() {
+    let st = cloud_with_a_tenant_network("nl5-pool-onto").await;
     let pool_on_it = FloatingPool::declare(
         "onto-c",
         controller_api::FloatingPoolSpec {
@@ -996,13 +1021,19 @@ async fn a_tenants_network_prefixes_are_checked_when_they_change() {
     let refused = create_floating_pool(State(st.clone()), DryRun::default(), Json(pool_on_it))
         .await
         .err()
-        .expect("a pool may not land on a tenant's network either");
+        .expect("a pool may not land on a tenant's network");
     assert!(
         refused.message().contains("tenant c's network"),
         "{}",
         refused.message()
     );
+}
 
+/// A routed subnet of one tenant may not be created on another tenant's network.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_routed_subnet_may_not_land_on_another_tenants_network() {
+    let st = cloud_with_a_tenant_network("nl5-subnet-onto").await;
     let subnet_on_it = RoutedSubnet::declare(
         "a-onto-c",
         controller_api::RoutedSubnetSpec {
@@ -1020,8 +1051,15 @@ async fn a_tenants_network_prefixes_are_checked_when_they_change() {
         "{}",
         refused.message()
     );
+}
 
-    // A pool that got there anyway, written before the rule or past it.
+/// An edit that leaves a tenant's network prefixes as they stand is not judged on them again,
+/// so a pool that got onto them anyway, written before the rule or past it, does not block an
+/// edit of something else.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenants_unchanged_network_prefixes_are_not_judged_again() {
+    let st = cloud_with_a_tenant_network("nl5-unchanged").await;
     st.store
         .create(&FloatingPool::declare(
             "late",
