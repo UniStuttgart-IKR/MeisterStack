@@ -16,7 +16,8 @@ let
   pki = "/var/lib/meisterstack/pki";
 
   # The NewVmSpec the cloud hands down: the guest's kernel and initrd out of the
-  # agent's image directory, no disk and no network.
+  # agent's image directory, a blank disk, because the cloud and the agent both
+  # refuse a vm without one, and no network.
   spec = pkgs.writeText "tiny.json" (builtins.toJSON {
     vcpus = 1;
     memory_mib = 256;
@@ -26,7 +27,7 @@ let
       initramfs = "initrd";
       cmdline = "console=ttyS0 reboot=k panic=1";
     };
-    volumes = [ ];
+    volumes = [{ size_bytes = 67108864; }];
     nics = [ ];
     devices = [ ];
   });
