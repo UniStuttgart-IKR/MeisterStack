@@ -3204,8 +3204,9 @@ mod tests {
         );
         // `Unplaced` and no longer `node-unhealthy`: struktur 4 folded
         // `pendingReason` into the phase, and the closed set the object
-        // stores is `VmReason`. The twelve scheduler words are unchanged and
-        // still in the sentence and the metric label.
+        // stores is `VmReason`. The scheduler's own words
+        // (`PendingReason::ALL`) are unchanged and still in the sentence and
+        // the metric label.
         assert_eq!(report[1].reason, "Unplaced");
         assert!(report[1].volumes.is_empty());
     }

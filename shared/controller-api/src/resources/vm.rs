@@ -693,9 +693,9 @@ pub struct VmSilence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VmPlacement {
     /// The category, out of `PendingReason::category` — a WALL (`Unplaced`)
-    /// or a WAIT (`NotReady`). The twelve scheduler words themselves stay in
-    /// the sentence and in `PendingTally`'s metric label, which is counted
-    /// per pass and not read off this field.
+    /// or a WAIT (`NotReady`). The scheduler's own words (`PendingReason::ALL`)
+    /// stay in the sentence and in `PendingTally`'s metric label, which is
+    /// counted per pass and not read off this field.
     pub reason: VmReason,
     /// The sentence, which counts candidates and names capabilities. This is
     /// what an operator reads, and no closed word replaces it.
