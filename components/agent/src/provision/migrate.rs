@@ -39,6 +39,24 @@ fn refuse_devices(id: &VmId, devices: &[crate::types::DeviceWithId]) -> Result<(
     )
 }
 
+/// Refuse to send a guest whose NIC ids an agent before IKR-B66 rolled at random. The
+/// destination derives every NIC's id from the VM's and names its taps after them, and the
+/// arriving configuration names this node's: the guest would land on taps nobody bridged,
+/// behind MAC guards that drop its frames. Only this end knows the ids the guest runs with.
+fn refuse_nics_with_rolled_ids(id: &VmId, nics: &[crate::types::NicWithId]) -> Result<()> {
+    let rolled: Vec<String> = crate::types::nics_with_rolled_ids(id, nics)
+        .map(|nic| nic.id.to_string())
+        .collect();
+    if rolled.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "vm {id} predates NIC ids derived from the vm's own (nic {}): a destination would \
+         name its taps otherwise than this node did; move the vm by reboot or recreate it",
+        rolled.join(", ")
+    )
+}
+
 impl Provisioner {
     /// Prepare a receiving VMM with a durable attempt identity. Any existing VM
     /// row, including an unreadable row, refuses reception. Inline disks are
@@ -184,6 +202,7 @@ impl Provisioner {
             );
         }
         refuse_devices(id, &record.spec.devices)?;
+        refuse_nics_with_rolled_ids(id, &record.spec.nics)?;
         // An existing operation owns this VM. Do not replace its identity or peer
         // with a second send request.
         if let Some(op) = &record.operation {

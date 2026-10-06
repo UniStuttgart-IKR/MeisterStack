@@ -549,6 +549,19 @@ fn nic_id(vm: &VmId, position: usize) -> NicId {
     uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
+/// The NICs of the VM `vm` whose ids are not the ones [`nic_id`] derives: a record made by an
+/// agent that rolled them at random. A conversion of the VM's document on another node names
+/// these NICs' taps, and without a MAC in the document their MACs, otherwise.
+pub(crate) fn nics_with_rolled_ids<'a>(
+    vm: &'a VmId,
+    nics: &'a [NicWithId],
+) -> impl Iterator<Item = &'a NicWithId> + 'a {
+    nics.iter()
+        .enumerate()
+        .filter(move |(position, nic)| nic.id != nic_id(vm, *position))
+        .map(|(_, nic)| nic)
+}
+
 /// Derive NIC IDs and default omitted MAC addresses and bridge names.
 fn nics_with_ids(
     nics: Vec<NewNic>,
@@ -1017,5 +1030,26 @@ mod tests {
         assert_eq!(nics(source), nics(source));
         assert_ne!(nics(source)[0], nics(source)[1], "two NICs are two taps");
         assert_ne!(nics(source)[0].0, nics(other)[0].0);
+    }
+
+    /// A record whose NIC ids an older agent rolled at random is told apart from one whose
+    /// ids every conversion of the VM's document derives again.
+    #[test]
+    fn a_nic_id_rolled_at_random_is_told_from_a_derived_one() {
+        let doc = r#"{"vcpus":1,"memory_mib":256,
+                     "boot":{"kind":"firmware","firmware":"fw"},
+                     "volumes":[{"size_bytes":1}],
+                     "nics":[{},{}]}"#;
+        let vm = VmId::new_v4();
+        let spec: NewVmSpec = serde_json::from_str(doc).expect("spec parses");
+        let (mut spec, _) = spec.into_spec(vm, "br0").expect("spec is valid");
+        assert_eq!(nics_with_rolled_ids(&vm, &spec.nics).count(), 0);
+
+        spec.nics[1].id = NicId::new_v4();
+
+        let rolled: Vec<_> = nics_with_rolled_ids(&vm, &spec.nics)
+            .map(|nic| nic.id)
+            .collect();
+        assert_eq!(rolled, [spec.nics[1].id]);
     }
 }

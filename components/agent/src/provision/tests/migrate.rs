@@ -654,6 +654,101 @@ async fn a_vm_with_a_device_is_not_sent() {
     );
 }
 
+/// The NICs the conversion of a create document naming two NICs gives the VM `id`.
+fn derived_nics(id: VmId) -> Vec<crate::types::NicWithId> {
+    use crate::types::NewVmSpecExt;
+    let document: crate::types::NewVmSpec = serde_json::from_value(serde_json::json!({
+        "vcpus": 1,
+        "memory_mib": 256,
+        "boot": {"kind": "firmware", "firmware": "fw"},
+        "volumes": [{"size_bytes": 1}],
+        "nics": [{}, {}],
+    }))
+    .expect("a create document");
+    document
+        .into_spec(id, "br0")
+        .expect("a valid document")
+        .0
+        .nics
+}
+
+/// A running guest whose record names `nics`, as an agent of that time wrote them.
+async fn running_with_nics(
+    p: &Provisioner,
+    store: &crate::store::Store,
+    id: VmId,
+    nics: Vec<crate::types::NicWithId>,
+) {
+    p.provision(id, migratable_spec(store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    let mut record = store.get(&id).expect("a lookup").expect("a record");
+    record.spec.nics = nics;
+    store.put(&id, &record).expect("stored");
+}
+
+/// IKR-B66: a guest whose NIC ids an older agent rolled at random is not sent, since the
+/// destination would name its taps after ids it derives; nothing is claimed or opened.
+#[tokio::test]
+async fn a_vm_whose_nic_ids_were_rolled_at_random_is_not_sent() {
+    let (_temp, root) = migration_root("mig-rolled-nic");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+    let id = VmId::new_v4();
+    let mut legacy = derived_nics(id);
+    legacy[1].id = agent_api::networking::NicId::new_v4();
+    let rolled = legacy[1].id;
+    running_with_nics(&p, &store, id, legacy).await;
+
+    let refused = p
+        .begin_migrate_out(
+            &id,
+            "tcp:10.0.0.9:49000",
+            "attempt-1",
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .expect_err("a guest on rolled NIC ids does not migrate");
+    let said = format!("{refused:#}");
+    assert!(said.contains(&rolled.to_string()), "{said}");
+    assert!(said.contains("by reboot"), "{said}");
+    let record = store.get(&id).expect("a lookup").expect("still a record");
+    assert!(record.operation.is_none(), "no send was begun");
+    assert!(record.migration.is_none(), "no attempt was claimed");
+    assert!(
+        !hv.said().iter().any(|line| line.starts_with("migrate_out")),
+        "{:?}",
+        hv.said()
+    );
+}
+
+/// A guest whose NIC ids are the ones every conversion of its document derives is sent.
+#[tokio::test]
+async fn a_vm_whose_nic_ids_are_derived_is_sent() {
+    let (_temp, root) = migration_root("mig-derived-nic");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+    let id = VmId::new_v4();
+    running_with_nics(&p, &store, id, derived_nics(id)).await;
+
+    p.begin_migrate_out(
+        &id,
+        "tcp:10.0.0.9:49000",
+        "attempt-1",
+        &tokio::sync::Mutex::new(()),
+    )
+    .await
+    .expect("the stream is open");
+    assert!(
+        hv.said()
+            .contains(&"migrate_out tcp:10.0.0.9:49000".to_string()),
+        "{:?}",
+        hv.said()
+    );
+}
+
 /// Successful departure retains a Migrated record. An untyped send error
 /// retains the operation barrier because it does not prove an abort.
 #[tokio::test]
