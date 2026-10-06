@@ -11,12 +11,9 @@ pkgs.testers.runNixOSTest {
   name = "meister-credentials";
 
   nodes.machine = { ... }: {
-    imports = [ self.nixosModules.services self.nixosModules.managed ];
+    imports = [ self.nixosModules.services self.nixosModules.store-host ];
     meisterstack.roles = [ "agent" ];
-    meisterstack.managed.enable = true;
-    meisterstack.managed.trustedPublicKeys = [
-      "credentials-test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    ];
+    meisterstack.storeHost.enable = true;
     # The whole point of this test: the agent runs as `meister` and not as
     # root, so the key it opens has to be readable by `meister` and by
     # nobody else.
@@ -132,6 +129,6 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"test -f {pki}/identity.key")
     machine.fail("test -e /run/credentials/meister-agent.service")
 
-    print("a key on a managed host is meister:meister 0600, and the loader says so")
+    print("a key on a store-built host is meister:meister 0600, and the loader says so")
   '';
 }

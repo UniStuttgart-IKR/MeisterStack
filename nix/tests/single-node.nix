@@ -22,10 +22,8 @@ in
 pkgs.testers.runNixOSTest {
   name = "meister-single-node";
   nodes.rig = { ... }: {
-    imports = [ self.nixosModules.services self.nixosModules.managed ];
-    meisterstack.managed.enable = true;
-    # Required by nix/managed.nix and never used here: nothing is copied in.
-    meisterstack.managed.trustedPublicKeys = [ "single-node-test:not-a-real-key" ];
+    imports = [ self.nixosModules.services self.nixosModules.store-host ];
+    meisterstack.storeHost.enable = true;
     # The whole of what makes it a single node: the one role, the profile,
     # and no controller anywhere — nix/single-node.nix asserts both.
     meisterstack.roles = [ "agent" ];

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
 # Evaluate resolver ownership: provider scripts disable resolvconf by default;
-# without a provider the managed module leaves the host's choice unchanged.
+# without a provider the store-host module leaves the host's choice unchanged.
 { nixpkgs, lib, pkgs, system, self }:
 
 let
@@ -19,30 +19,29 @@ let
     ] ++ modules;
   }).config;
 
-  managedModules = [
+  storeHostModules = [
     self.nixosModules.services
-    self.nixosModules.managed
+    self.nixosModules.store-host
     {
       meisterstack.roles = [ "agent" ];
-      meisterstack.managed.enable = true;
-      meisterstack.managed.trustedPublicKeys = [ "probe:not-a-real-key" ];
+      meisterstack.storeHost.enable = true;
     }
   ];
 
   bare = probe [ ];
-  quiet = probe managedModules;
-  withProvider = probe (managedModules ++ [
+  quiet = probe storeHostModules;
+  withProvider = probe (storeHostModules ++ [
     { meisterstack.context.providerScript = "echo the provider writes the resolver"; }
   ]);
 
   bad =
     lib.optional (withProvider.networking.resolvconf.enable != false)
-      ("a managed host whose provider script writes /etc/resolv.conf still has "
+      ("a store-built host whose provider script writes /etc/resolv.conf still has "
         + "resolvconf enabled: two authors for one file, which is an activation "
         + "that fails and a rollback that fails with it")
     ++ lib.optional
       (quiet.networking.resolvconf.enable != bare.networking.resolvconf.enable)
-      ("a managed host with no provider script changed networking.resolvconf.enable "
+      ("a store-built host with no provider script changed networking.resolvconf.enable "
         + "from ${lib.boolToString bare.networking.resolvconf.enable} to "
         + "${lib.boolToString quiet.networking.resolvconf.enable}: this profile "
         + "decides the resolver only where something else already writes it");
@@ -53,7 +52,7 @@ pkgs.runCommand "one-resolver-author" { } (
     touch $out
   '' else ''
     ${lib.concatMapStrings (l: "echo ${lib.escapeShellArg l}\n") bad}
-    echo "-> /etc/resolv.conf has one author (nix/managed.nix, lane 5C)"
+    echo "-> /etc/resolv.conf has one author (nix/store-host.nix, lane 5C)"
     exit 1
   ''
 )

@@ -18,11 +18,10 @@ let
         boot.loader.grub.device = "nodev";
       }
       self.nixosModules.services
-      self.nixosModules.managed
+      self.nixosModules.store-host
       {
         meisterstack.roles = [ "agent" ];
-        meisterstack.managed.enable = true;
-        meisterstack.managed.trustedPublicKeys = [ "probe:not-a-real-key" ];
+        meisterstack.storeHost.enable = true;
       }
       extra
     ];
