@@ -374,6 +374,8 @@ impl Provisioner {
         // since this vm was first admitted (a smaller budget, a larger
         // profile) must not start it past what it can hold now.
         self.check_device_admission(id, &record.spec).await?;
+        // Read off the disks of the last run, which the next line forgets.
+        self.restore_drifted_inline_ids(id, &mut record)?;
         record.phase = Phase::Provisioning;
         record.volumes.clear();
         record.nics.clear();

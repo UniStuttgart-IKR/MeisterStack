@@ -1405,3 +1405,84 @@ fn fixed_disks_keep_the_records_ids_and_volumes_come_from_the_spec() {
         "an inline disk does not detach"
     );
 }
+
+/// A stopped VM made by `converted(&[])` whose record names a fresh inline id, as an attach
+/// and a detach on an agent before IKR-B66 left one. Returns the id of the disk it held.
+async fn drifted_vm(
+    provisioner: &Provisioner,
+    store: &crate::store::Store,
+    vm: VmId,
+    also_held: Option<VolumeId>,
+) -> VolumeId {
+    provisioner
+        .provision(vm, converted(&[]), Desired::Running, true)
+        .await
+        .expect("the vm is made");
+    let mut record = store.get(&vm).expect("a read").expect("a record");
+    let held = record.spec.volumes[0].id;
+    record.spec.volumes[0].id = VolumeId::new_v4();
+    if let Some(other) = also_held {
+        record.volumes.push(Volume::attached(
+            agent_api::storage::VolumeHandle {
+                id: other,
+                backend: format!("/fake/{other}.raw"),
+                size_bytes: 4096,
+                params: None,
+            },
+            VolumeAttachment::Path(format!("/fake/{other}.raw").into()),
+        ));
+    }
+    store.put(&vm, &record).expect("stored");
+    provisioner.stop(&vm, record).await.expect("the vm stops");
+    held
+}
+
+/// IKR-B66: a record an older agent left naming a fresh inline id names the disk its VM held
+/// again, and the restart boots that disk instead of a fresh copy of the base image.
+#[tokio::test]
+async fn a_restart_boots_the_disk_a_drifted_record_held_and_not_a_fresh_one() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let disk = Arc::new(PlainDisk::default());
+    let provisioner = disk_provisioner(temp.path(), store.clone(), disk.clone());
+    let vm = VmId::new_v4();
+    let held = drifted_vm(&provisioner, &store, vm, None).await;
+
+    let stopped = store.get(&vm).expect("a read").expect("a record");
+    provisioner
+        .resume(&vm, stopped)
+        .await
+        .expect("the vm starts again");
+
+    assert_eq!(*disk.provisioned.lock().unwrap(), vec![held, held]);
+    let record = store.get(&vm).expect("a read").expect("a record");
+    assert_eq!(record.spec.volumes[0].id, held, "the record names it again");
+}
+
+/// A drifted record whose named and held disks do not pair is not started: which disk the
+/// guest boots from cannot be told, and nothing is provisioned.
+#[tokio::test]
+async fn a_drifted_record_whose_disks_do_not_pair_is_not_started() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let disk = Arc::new(PlainDisk::default());
+    let provisioner = disk_provisioner(temp.path(), store.clone(), disk.clone());
+    let vm = VmId::new_v4();
+    let held = drifted_vm(&provisioner, &store, vm, Some(VolumeId::new_v4())).await;
+
+    let stopped = store.get(&vm).expect("a read").expect("a record");
+    let refused = provisioner
+        .resume(&vm, stopped)
+        .await
+        .expect_err("two held disks, one named");
+
+    assert!(
+        format!("{refused:#}").contains("cannot be told"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        *disk.provisioned.lock().unwrap(),
+        vec![held],
+        "only the create provisioned"
+    );
+}

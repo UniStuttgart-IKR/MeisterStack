@@ -152,6 +152,55 @@ fn describe_fixed(volume: &VolumeWithId) -> String {
     }
 }
 
+/// The inline disk ids an attach or a detach on an agent before IKR-B66 replaced in a record:
+/// each as the spec position that names the new id, and the held id it replaced.
+///
+/// Such a record names inline disks the VM did not hold on its last run, while the VM held
+/// disks the record no longer names that are no `Volume`'s: the guest's own, under their old
+/// ids. Both lists keep the inline disks in the same order, so they pair in order. A disk a
+/// crash left provisioned and unattached is no drift. When the counts differ, which disk is
+/// which cannot be told and the record is refused.
+fn drifted_inline_ids(
+    record: &VmRecord,
+    is_volume: impl Fn(&VolumeId) -> Result<bool>,
+) -> Result<Vec<(usize, VolumeId)>> {
+    let named = |id: &VolumeId| record.spec.volumes.iter().any(|v| v.id == *id);
+    let mut orphaned = Vec::new();
+    for held in record.volumes.iter().map(Volume::id) {
+        if !named(&held) && !is_volume(&held)? {
+            orphaned.push(held);
+        }
+    }
+    if orphaned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unheld: Vec<usize> = record
+        .spec
+        .volumes
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.referenced)
+        .filter(|(_, v)| !record.volumes.iter().any(|held| held.id() == v.id))
+        .filter(|(_, v)| !record.unattached_volumes.iter().any(|h| h.id == v.id))
+        .map(|(position, _)| position)
+        .collect();
+    if unheld.len() != orphaned.len() {
+        bail!(
+            "the record names {} inline disk(s) this vm did not hold on its last run, and it \
+             held {} disk(s) the record no longer names ({}); which is which cannot be told, \
+             and a start would provision fresh disks from the base image",
+            unheld.len(),
+            orphaned.len(),
+            orphaned
+                .iter()
+                .map(VolumeId::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(unheld.into_iter().zip(orphaned).collect())
+}
+
 /// Increase memory allowance for storage attachments with backend processes.
 /// The returned attachment, rather than the spec, reveals whether a process is
 /// needed. Never lower limits beneath backends already running in the cgroup.
@@ -174,6 +223,25 @@ pub(crate) fn widen_for_storage_backends(
 }
 
 impl Provisioner {
+    /// Give a stopped record back the inline disk ids an older agent replaced, before a start
+    /// provisions the replacements from the base image (IKR-B66). See `drifted_inline_ids`.
+    pub(super) fn restore_drifted_inline_ids(
+        &self,
+        id: &VmId,
+        record: &mut VmRecord,
+    ) -> Result<()> {
+        let is_volume = |volume: &VolumeId| Ok(self.store.get_volume(volume)?.is_some());
+        let drifted = drifted_inline_ids(record, is_volume)
+            .with_context(|| format!("vm {id} cannot be started on its own disks"))?;
+        for (position, held) in drifted {
+            let entry = &mut record.spec.volumes[position];
+            warn!(vm_id = %id, named = %entry.id, held = %held,
+                  "the record named an inline disk this vm never held; it names the one it held again");
+            entry.id = held;
+        }
+        Ok(())
+    }
+
     /// Resolve a referenced volume from its existing record. Missing records or
     /// handles refuse attachment; this path never provisions replacement data.
     pub(super) fn reference(
