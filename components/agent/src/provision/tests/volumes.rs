@@ -162,31 +162,7 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
     storage.insert("filesystem".to_string(), counting.clone());
 
     // A volume this node already owns, exactly as position 2 leaves one.
-    let volume_id = VolumeId::new_v4();
-    let handle = VolumeHandle {
-        id: volume_id,
-        backend: format!("/fake/{volume_id}.raw"),
-        size_bytes: 4096,
-        params: None,
-    };
-    store
-        .put_volume(
-            &volume_id,
-            &crate::types::VolumeRecord {
-                spec: agent_api::storage::VolumeSpec {
-                    base_image: None,
-                    size_bytes: 4096,
-                    driver: Some("filesystem".into()),
-                    params: None,
-                },
-                handle: Some(handle.clone()),
-                phase: crate::types::VolumeRecordPhase::Ready,
-                reason: None,
-                message: None,
-                gone_at: None,
-            },
-        )
-        .expect("a volume record");
+    let volume_id = a_volume_held_here(&store);
 
     let provisioner = Provisioner::new(
         store.clone(),
@@ -211,7 +187,7 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
     // Resolve references without provisioning new data.
     let (driver, resolved) = provisioner.reference(&volume_id, None).expect("resolved");
     assert_eq!(driver, "filesystem");
-    assert_eq!(resolved.backend, handle.backend);
+    assert_eq!(resolved.backend, format!("/fake/{volume_id}.raw"));
     assert_eq!(counting.provisions.load(Ordering::SeqCst), 0);
 
     // Attach options travel with the VM and override what the volume was
@@ -403,36 +379,11 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
     let deaf_guest = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Prepare boot, currently attached and replacement volume records.
-    let mut ids = Vec::new();
-    for _ in 0..3 {
-        let id = VolumeId::new_v4();
-        let handle = VolumeHandle {
-            id,
-            backend: format!("/fake/{id}.raw"),
-            size_bytes: 4096,
-            params: None,
-        };
-        store
-            .put_volume(
-                &id,
-                &crate::types::VolumeRecord {
-                    spec: agent_api::storage::VolumeSpec {
-                        base_image: None,
-                        size_bytes: 4096,
-                        driver: Some("filesystem".into()),
-                        params: None,
-                    },
-                    handle: Some(handle),
-                    phase: crate::types::VolumeRecordPhase::Ready,
-                    reason: None,
-                    message: None,
-                    gone_at: None,
-                },
-            )
-            .expect("a volume record");
-        ids.push(id);
-    }
-    let (boot, going, arriving) = (ids[0], ids[1], ids[2]);
+    let (boot, going, arriving) = (
+        a_volume_held_here(&store),
+        a_volume_held_here(&store),
+        a_volume_held_here(&store),
+    );
 
     let mut storage: std::collections::HashMap<String, Arc<dyn VolumeDriver>> =
         std::collections::HashMap::new();
@@ -1215,33 +1166,6 @@ async fn a_restarted_attach_reuses_the_persisted_inline_handle() {
         1,
         "retry attaches the original disk"
     );
-}
-
-/// A volume this node owns already, as a `Volume` object's provisioning leaves one.
-fn a_volume_held_here(store: &crate::store::Store) -> VolumeId {
-    let id = VolumeId::new_v4();
-    let spec = agent_api::storage::VolumeSpec {
-        base_image: None,
-        size_bytes: 4096,
-        driver: Some("filesystem".into()),
-        params: None,
-    };
-    let handle = agent_api::storage::VolumeHandle {
-        id,
-        backend: format!("/fake/{id}.raw"),
-        size_bytes: 4096,
-        params: None,
-    };
-    let record = crate::types::VolumeRecord {
-        spec,
-        handle: Some(handle),
-        phase: crate::types::VolumeRecordPhase::Ready,
-        reason: None,
-        message: None,
-        gone_at: None,
-    };
-    store.put_volume(&id, &record).expect("a volume record");
-    id
 }
 
 /// The node's spec for a create document with one inline boot disk and the `attached`

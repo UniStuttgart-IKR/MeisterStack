@@ -230,30 +230,7 @@ impl agent_api::Migratable for MigratingVmm {
 
 /// Migratable fixture with one referenced volume and its independent store record.
 fn migratable_spec(store: &crate::store::Store) -> AgentVmSpec {
-    let id = VolumeId::new_v4();
-    store
-        .put_volume(
-            &id,
-            &crate::types::VolumeRecord {
-                spec: agent_api::storage::VolumeSpec {
-                    base_image: None,
-                    size_bytes: 4096,
-                    driver: Some("filesystem".into()),
-                    params: None,
-                },
-                handle: Some(agent_api::storage::VolumeHandle {
-                    id,
-                    backend: format!("/fake/{id}.raw"),
-                    size_bytes: 4096,
-                    params: None,
-                }),
-                phase: crate::types::VolumeRecordPhase::Ready,
-                reason: None,
-                message: None,
-                gone_at: None,
-            },
-        )
-        .expect("a volume record");
+    let id = a_volume_held_here(store);
     let mut spec = spec(1, 256, vec![]);
     spec.volumes = vec![crate::types::VolumeWithId {
         id,

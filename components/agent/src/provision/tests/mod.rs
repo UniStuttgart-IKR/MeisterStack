@@ -185,6 +185,33 @@ impl agent_api::storage::VolumeAttacher for PlainDisk {
     }
 }
 
+/// A volume this node owns already, as a `Volume` object's provisioning leaves one.
+fn a_volume_held_here(store: &crate::store::Store) -> VolumeId {
+    let id = VolumeId::new_v4();
+    let spec = agent_api::storage::VolumeSpec {
+        base_image: None,
+        size_bytes: 4096,
+        driver: Some("filesystem".into()),
+        params: None,
+    };
+    let handle = agent_api::storage::VolumeHandle {
+        id,
+        backend: format!("/fake/{id}.raw"),
+        size_bytes: 4096,
+        params: None,
+    };
+    let record = crate::types::VolumeRecord {
+        spec,
+        handle: Some(handle),
+        phase: crate::types::VolumeRecordPhase::Ready,
+        reason: None,
+        message: None,
+        gone_at: None,
+    };
+    store.put_volume(&id, &record).expect("a volume record");
+    id
+}
+
 fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
     let nic_id = agent_api::networking::NicId::new_v4();
     let nic_spec = agent_api::networking::NicSpec {
