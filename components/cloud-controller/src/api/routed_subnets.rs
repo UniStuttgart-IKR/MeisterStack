@@ -136,7 +136,7 @@ pub(super) async fn create_routed_subnet(
         warn!(subnet = %name, cidr = %created.spec.cidr, lost_to = %won.what,
               "lost the claim on this block, taking the subnet back");
         let overlap = format!("{} overlaps {}", created.spec.cidr, won.what);
-        take_back::<RoutedSubnet>(&st, &name, "routed subnet").await;
+        take_back::<RoutedSubnet>(&st, &created, "routed subnet").await;
         if named {
             return Err(conflict(overlap));
         }
@@ -190,7 +190,10 @@ pub(super) async fn delete_routed_subnet(
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
     let current: RoutedSubnet = st.store.get(&name).await?;
-    st.store.delete::<RoutedSubnet>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<RoutedSubnet>(&name, &current.metadata.resource_version)
+        .await?;
     info!(subnet = %name, tenant = %current.spec.tenant, cidr = %current.spec.cidr,
           "routed subnet deleted");
     Ok(controller_api::removed(

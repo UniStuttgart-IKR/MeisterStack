@@ -536,6 +536,60 @@ pub struct VmStatus {
     /// restarting it on the source after a pass or controller restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evacuating: Option<Evacuating>,
+    /// The last intent the cloud handed down to this VM's cluster and the
+    /// cluster acked. Cloud tier only, and written on that ack and nowhere
+    /// else: `observedAt` also moves with every reported phase, so it cannot
+    /// say when the cluster was last told. (IKR-B74)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_down: Option<HandedDown>,
+    /// The last hand-down the cluster refused, while no later one was acked.
+    /// Cloud tier only. A cluster that refuses a re-send of a VM it holds
+    /// goes on reporting the VM, and every report used to start a pass that
+    /// asked the same again: the refusal is what holds the next ask back.
+    /// (IKR-B74)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hand_down_refused: Option<HandDownRefused>,
+    /// When the cloud bound the VM to `spec.clusterName`. Cloud tier only,
+    /// written with the binding and cleared when the binding is let go.
+    /// Until the cluster reports the VM, placement books it in this order,
+    /// which is the order the passes that bound them booked them in. None for
+    /// an unbound VM and for a binding from before the field. (IKR-B78)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_at: Option<DateTime<Utc>>,
+}
+
+/// A hand-down the cluster refused, and the intent it carried.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HandDownRefused {
+    pub at: DateTime<Utc>,
+    /// The `metadata.generation` the refused hand-down carried.
+    pub generation: u64,
+    /// The `metadata.labels` it carried: labels move no generation, and a
+    /// label edit is new intent as much as a spec edit is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// The cluster's own sentence, kept after its next report has replaced
+    /// the refusal in the phase.
+    pub message: String,
+    /// The cluster that refused: its no is no answer from any other cluster
+    /// the VM is bound to since. Empty in a record from before the field,
+    /// which is then nobody's word and holds nothing back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cluster: String,
+}
+
+/// A hand-down the cluster acked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HandedDown {
+    pub at: DateTime<Utc>,
+    /// `metadata.labels` as that hand-down carried them. Labels are no part
+    /// of the spec and move no generation, so this is how the cloud knows the
+    /// cluster's copy, which the anti-affinity of the VM's neighbours reads,
+    /// still wears them. (IKR-B71)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A restart-move in flight: which machine it is leaving, and which half of
@@ -640,9 +694,9 @@ pub struct VmSilence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VmPlacement {
     /// The category, out of `PendingReason::category` — a WALL (`Unplaced`)
-    /// or a WAIT (`NotReady`). The twelve scheduler words themselves stay in
-    /// the sentence and in `PendingTally`'s metric label, which is counted
-    /// per pass and not read off this field.
+    /// or a WAIT (`NotReady`). The scheduler's own words (`PendingReason::ALL`)
+    /// stay in the sentence and in `PendingTally`'s metric label, which is
+    /// counted per pass and not read off this field.
     pub reason: VmReason,
     /// The sentence, which counts candidates and names capabilities. This is
     /// what an operator reads, and no closed word replaces it.

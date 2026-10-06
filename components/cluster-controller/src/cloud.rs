@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use controller_api::{
-    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion,
+    EtcdStore, Node, ProviderNetwork, Router, StoreError, Vm, VmSpec, Volume, deletion, events,
     resources::{new_vm, new_volume},
 };
 use proto::cluster_plane_client::ClusterPlaneClient;
@@ -789,6 +789,12 @@ async fn handle_create(
     if !spec.vm.is_object() {
         bail!("spec.vm must be the agent's NewVmSpec object");
     }
+    // Every vm the cloud sends is a tenant's. The cloud refuses these fields
+    // at its own edge; a cloud from before that rule must not get a tenant's
+    // tap onto a provider network or a host bridge through this one.
+    let own_wire = controller_api::vni::check_tenant_nics(&spec.vm)
+        .err()
+        .map(|e| e.message().to_string());
 
     // The truth is made at the edge. The cloud resolved the tenant's VNI and
     // sent it alongside; this is where it becomes part of the spec, before
@@ -797,31 +803,107 @@ async fn handle_create(
     // node with an overlay. From here down nothing knows what a tenant is.
     bind_nics(&c, &mut spec.vm);
 
-    match store
-        .create(&declared_for_cloud(&c, &spec, traceparent))
-        .await
-    {
-        Ok(_) => {
-            info!(vm = %c.name, "created for the cloud");
-            return Ok(());
+    if own_wire.is_none() {
+        match store
+            .create(&declared_for_cloud(&c, &spec, traceparent))
+            .await
+        {
+            Ok(_) => {
+                info!(vm = %c.name, "created for the cloud");
+                return Ok(());
+            }
+            Err(StoreError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
         }
-        Err(StoreError::AlreadyExists(_)) => {}
-        Err(e) => return Err(e.into()),
     }
 
-    let current: Vm = store.get(&c.name).await?;
+    let current: Vm = match (store.get(&c.name).await, own_wire.as_deref()) {
+        (Ok(current), _) => current,
+        // Nothing of the cloud's here yet: a new VM, and the rule holds.
+        (Err(StoreError::NotFound(_)), Some(why)) => bail!("{why}"),
+        (Err(e), _) => return Err(e.into()),
+    };
     refuse_unless_ours(&current, &c)?;
+    // Kept only by a VM that already hangs on exactly these wires: any other
+    // is a new one, and refused like a new VM — whatever the shape rule says.
+    if let Some(why) = &own_wire
+        && controller_api::vni::own_wires(&current.spec.vm)
+            != controller_api::vni::own_wires(&spec.vm)
+    {
+        bail!("{why}");
+    }
     let shape_moved = shape_moved(&current, &spec, &c.name)?;
+    // Said only of a re-send this tier takes: a refused one kept nothing.
+    if let Some(why) = own_wire {
+        note_own_wire_kept(store, &current, &why).await;
+    }
     // `evacuation` drifts like `runStrategy` does and for the same reason:
     // both are the owner's INTENT, both are mutable at the cloud's edge, and
     // this session is the only way either reaches the tier that acts on it.
     let evacuation_moved = current.spec.evacuation != spec.evacuation;
-    if !shape_moved && !evacuation_moved && current.spec.run_strategy == spec.run_strategy {
+    let placement_moved = placement_moved(&current, &spec, &c);
+    if !shape_moved
+        && !evacuation_moved
+        && !placement_moved
+        && current.spec.run_strategy == spec.run_strategy
+    {
         return Ok(());
     }
-    write_drift(store, &c.name, &spec).await?;
-    note_drift(&c.name, &spec, shape_moved, evacuation_moved);
+    write_drift(store, &current, &c, &spec).await?;
+    note_drift(
+        &c.name,
+        &spec,
+        shape_moved,
+        evacuation_moved,
+        placement_moved,
+    );
     Ok(())
+}
+
+/// A cloud VM stored before the tenant-NIC rule keeps its own wire: a re-send
+/// manages it on (stop, start, drift), since the NIC set of a VM that exists
+/// cannot change through this road (`shape_moved`), and refusing it would
+/// leave a running VM nobody can stop from the cloud and a phase that flaps
+/// between the refusal and the cluster's report. It is said, on the VM and in
+/// the log, so an operator can recreate it. (IKR-B67)
+async fn note_own_wire_kept(store: &EtcdStore, vm: &Vm, why: &str) {
+    warn!(vm = %vm.metadata.name, why, "a tenant vm from before the nic rule keeps its own wire");
+    events::record(
+        store,
+        crate::reconcile::warning(
+            vm,
+            events::reason::TENANT_WIRE_KEPT,
+            format!(
+                "stored before the rule and kept as it is; recreate it to drop the wire: {why}"
+            ),
+        ),
+    )
+    .await;
+}
+
+/// The cloud VM's own labels under this tier's ownership marks: what the
+/// cluster's copy carries, so another cloud VM's `antiAffinity` term finds it
+/// on its node. The marks are written last, over anything the cloud sent
+/// under their keys. (IKR-B71)
+fn label_for_cloud(metadata: &mut controller_api::Metadata, c: &proto::CreateVm) {
+    metadata.labels = c
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    metadata.mark_managed_by_cloud(&c.uid);
+}
+
+/// Whether the owner's words about where on this cluster the VM may run moved:
+/// class, node selector, anti-affinity, or the labels other VMs' terms match.
+/// They decide the next placement here, and the cloud is their owner.
+fn placement_moved(current: &Vm, spec: &VmSpec, c: &proto::CreateVm) -> bool {
+    let mut labelled = current.metadata.clone();
+    label_for_cloud(&mut labelled, c);
+    current.spec.class != spec.class
+        || current.spec.node_selector != spec.node_selector
+        || current.spec.anti_affinity != spec.anti_affinity
+        || current.metadata.labels != labelled.labels
 }
 
 /// The cloud's create, as this tier's own object.
@@ -839,7 +921,7 @@ fn declared_for_cloud(c: &proto::CreateVm, spec: &VmSpec, traceparent: &str) -> 
             ..spec.clone()
         },
     );
-    vm.metadata.mark_managed_by_cloud(&c.uid);
+    label_for_cloud(&mut vm.metadata, c);
     if !traceparent.is_empty() {
         vm.metadata.set_traceparent(traceparent);
     }
@@ -871,25 +953,46 @@ fn refuse_unless_ours(current: &Vm, c: &proto::CreateVm) -> anyhow::Result<()> {
 }
 
 /// Detect spec changes and allow only referenced-disk hot-plug after the boot
-/// entry, using the same shape rule as both REST APIs. Reject other changes
-/// rather than acknowledging a spec this tier did not store.
+/// entry, using the same shape rule as both REST APIs, and new NIC address
+/// lists. Reject other changes rather than acknowledging a spec this tier did
+/// not store.
+///
+/// The address lists are the cloud's word as of this send (`bind_nics`): a
+/// tenant's floating addresses and routed subnets move while its VMs exist.
+/// Held to the lists it was created with, every later send of the VM was
+/// refused, and its stop, its disks and its labels with it. The lists are
+/// taken with the send; a running VM's tap takes them when its node next
+/// provisions it (`floating::inject_nic_list`). (Nachlese NL2-C1)
 fn shape_moved(current: &Vm, spec: &VmSpec, name: &str) -> anyhow::Result<bool> {
     let moved = current.spec.vm != spec.vm;
-    if moved && !controller_api::vm_shape_unchanged(&current.spec.vm, &spec.vm) {
+    let fixed = controller_api::floating::without_nic_lists;
+    if moved && !controller_api::vm_shape_unchanged(&fixed(&current.spec.vm), &fixed(&spec.vm)) {
         bail!(
             "vm {name} arrived with a spec.vm that is not the stored one plus appended volume \
-             references; the shape of a vm is fixed once it exists"
+             references and the addresses its nics may use; the shape of a vm is fixed once it \
+             exists"
         );
     }
     Ok(moved)
 }
 
-/// The three fields that may drift, onto the stored object.
-async fn write_drift(store: &EtcdStore, name: &str, spec: &VmSpec) -> anyhow::Result<()> {
+/// The fields that may drift, onto the object `refuse_unless_ours` judged and
+/// no other: one recreated under the name since is not this command's.
+/// (IKR-B81)
+async fn write_drift(
+    store: &EtcdStore,
+    current: &Vm,
+    c: &proto::CreateVm,
+    spec: &VmSpec,
+) -> anyhow::Result<()> {
     store
-        .mutate::<Vm, _>(name, |v| {
+        .mutate_if::<Vm, _>(&c.name, &current.metadata.uid, |v| {
             v.spec.run_strategy = spec.run_strategy;
             v.spec.evacuation = spec.evacuation;
+            v.spec.class = spec.class.clone();
+            v.spec.node_selector = spec.node_selector.clone();
+            v.spec.anti_affinity = spec.anti_affinity.clone();
+            label_for_cloud(&mut v.metadata, c);
             if v.spec.vm != spec.vm {
                 v.spec.vm = spec.vm.clone();
                 // What `carry_generation` does at a REST edge, done by hand
@@ -903,14 +1006,22 @@ async fn write_drift(store: &EtcdStore, name: &str, spec: &VmSpec) -> anyhow::Re
     Ok(())
 }
 
-/// Which of the three it was, for the log. The order is the order the caller
+/// Which of them it was, for the log. The order is the order the caller
 /// decided in.
-fn note_drift(name: &str, spec: &VmSpec, shape_moved: bool, evacuation_moved: bool) {
+fn note_drift(
+    name: &str,
+    spec: &VmSpec,
+    shape_moved: bool,
+    evacuation_moved: bool,
+    placement_moved: bool,
+) {
     if shape_moved {
-        info!(vm = %name, "spec.vm volumes updated from the cloud");
+        info!(vm = %name, "spec.vm volumes or nic addresses updated from the cloud");
     } else if evacuation_moved {
         info!(vm = %name, evacuation = spec.evacuation.as_str(),
               "evacuation policy updated from the cloud");
+    } else if placement_moved {
+        info!(vm = %name, "placement constraints updated from the cloud");
     } else {
         info!(vm = %name, strategy = ?spec.run_strategy, "run strategy updated from the cloud");
     }
@@ -970,8 +1081,9 @@ async fn handle_create_secret(store: &EtcdStore, c: proto::CreateSecret) -> anyh
         // this tier cannot tell "rotated" from "re-sealed" without the key.
         return Ok(());
     }
+    // On the copy whose owner was just checked. (IKR-B81)
     store
-        .mutate::<controller_api::Secret, _>(&c.name, |v| {
+        .mutate_if::<controller_api::Secret, _>(&c.name, &current.metadata.uid, |v| {
             v.spec.data = secret.spec.data.clone();
             v.spec.tenant = secret.spec.tenant.clone();
             v.spec.description = secret.spec.description.clone();
@@ -1024,27 +1136,31 @@ async fn delete_cloud_record<T: controller_api::Resource>(
     if deletion::finish_delete(store, checked, the_clouds).await? {
         return Ok(());
     }
-    let done = |obj: &T| !the_clouds(obj);
-    answer_unwritten(store, &checked.metadata().name, done, "deleted").await
+    // Gone, or another object's: done.
+    let deleted = |now: Option<&T>| now.is_none_or(|obj| !the_clouds(obj)).then_some(());
+    answer_unwritten(store, &checked.metadata().name, deleted, "deleted").await
 }
 
-/// The answer to a cloud command whose guarded write did not land: done when the name names
-/// nothing any more or an object `done` holds for, otherwise an error the cloud retries, never
-/// an ack for an object of the cloud's that still waits on the command.
-async fn answer_unwritten<T: controller_api::Resource>(
+/// The answer to a cloud command whose guarded write did not land, read off what the name holds
+/// now (`None`: nothing): `settled` says what the command came to, or `None` while the cloud's
+/// object still waits on it — an error the cloud retries, never an ack for it.
+async fn answer_unwritten<T: controller_api::Resource, A>(
     store: &EtcdStore,
     name: &str,
-    done: impl Fn(&T) -> bool,
+    settled: impl Fn(Option<&T>) -> Option<A>,
     doing: &str,
-) -> anyhow::Result<()> {
-    match store.get::<T>(name).await {
-        Err(StoreError::NotFound(_)) => Ok(()),
-        Ok(current) if done(&current) => Ok(()),
-        Ok(_) => bail!(
+) -> anyhow::Result<A> {
+    let now = match store.get::<T>(name).await {
+        Ok(current) => Some(current),
+        Err(StoreError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    match settled(now.as_ref()) {
+        Some(answer) => Ok(answer),
+        None => bail!(
             "{}/{name} changed while it was {doing}; not {doing} yet",
             T::RESOURCE
         ),
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -1060,8 +1176,8 @@ async fn handle_create_router(store: &EtcdStore, c: proto::CreateRouter) -> anyh
         serde_json::from_str(&c.spec_json).context("invalid spec_json")?;
     mirror_network(store, &c).await?;
 
-    let nats = cloud_nats(&c)?;
     let mut router = Router::declare(&c.name, spec.clone());
+    let nats = cloud_nats(&c, &router)?;
     router.metadata.mark_managed_by_cloud(&c.uid);
     stamp_resolved(&mut router, &c, &nats);
     match store.create(&router).await {
@@ -1094,8 +1210,9 @@ async fn handle_create_router(store: &EtcdStore, c: proto::CreateRouter) -> anyh
     if settled {
         return Ok(());
     }
+    // On the router whose owner was just checked. (IKR-B81)
     store
-        .mutate::<Router, _>(&c.name, |r| {
+        .mutate_if::<Router, _>(&c.name, &current.metadata.uid, |r| {
             r.spec = spec.clone();
             stamp_resolved(r, &c, &nats);
         })
@@ -1118,12 +1235,30 @@ fn stamp_resolved(router: &mut Router, c: &proto::CreateRouter, nats: &[controll
 /// refused rather than defaulted, because a NAT rule this tier cannot spell
 /// would reach a node as a rule it cannot render, and the honest place to
 /// find that out is the hop where the word arrives.
-fn cloud_nats(c: &proto::CreateRouter) -> anyhow::Result<Vec<controller_api::NatRule>> {
+///
+/// A floating address is refused, too, unless its inside end is a guest on
+/// `router`'s own inside prefix. The cloud renders only such rules; a cloud
+/// from before that rule must not get a public address DNATed into another
+/// tenant's prefix through this hop. (IKR-B68)
+fn cloud_nats(
+    c: &proto::CreateRouter,
+    router: &Router,
+) -> anyhow::Result<Vec<controller_api::NatRule>> {
     c.nats
         .iter()
         .map(|r| {
             let kind = controller_api::NatKind::parse(&r.kind)
                 .with_context(|| format!("router {}: unknown nat kind {:?}", c.name, r.kind))?;
+            if kind == controller_api::NatKind::DnatAndSnat
+                && let Some(why) =
+                    controller_api::network::inside_address_refusal(router, &r.logical_ip)
+            {
+                bail!(
+                    "router {}: floating address {} refused: {why}",
+                    c.name,
+                    r.external_ip
+                );
+            }
             Ok(controller_api::NatRule {
                 kind,
                 external_ip: r.external_ip.clone(),
@@ -1160,8 +1295,11 @@ async fn mirror_network(store: &EtcdStore, c: &proto::CreateRouter) -> anyhow::R
     if current.spec == spec {
         return Ok(());
     }
+    // On the mirror that was just found to be the cloud's. (IKR-B81)
     store
-        .mutate::<ProviderNetwork, _>(&c.network_name, |n| n.spec = spec.clone())
+        .mutate_if::<ProviderNetwork, _>(&c.network_name, &current.metadata.uid, |n| {
+            n.spec = spec.clone()
+        })
         .await?;
     info!(network = %c.network_name, "the cloud's provider network moved");
     Ok(())
@@ -1261,8 +1399,9 @@ async fn handle_create_volume(store: &EtcdStore, c: proto::CreateVolume) -> anyh
     // was decided once, at both tiers, and is left as it is.
     let cloud = &volume.spec;
     if cloud.size_gib > current.spec.size_gib {
+        // On the volume whose owner was just checked. (IKR-B81)
         store
-            .mutate::<Volume, _>(&c.name, |v| {
+            .mutate_if::<Volume, _>(&c.name, &current.metadata.uid, |v| {
                 grow_to_cloud_size(v, cloud);
             })
             .await?;
@@ -1339,14 +1478,11 @@ async fn handle_destroy_snapshot(
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<controller_api::VolumeSnapshot, _>(&d.name, |s| {
-            if s.metadata.deletion_timestamp.is_none() {
-                s.metadata.deletion_timestamp = Some(Utc::now());
-            }
-        })
-        .await?;
-    info!(snapshot = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "snapshot",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
 }
 
@@ -1367,14 +1503,11 @@ async fn handle_destroy_volume(store: &EtcdStore, d: proto::DestroyVolume) -> an
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<Volume, _>(&d.name, |v| {
-            if v.metadata.deletion_timestamp.is_none() {
-                v.metadata.deletion_timestamp = Some(Utc::now());
-            }
-        })
-        .await?;
-    info!(volume = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "volume",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
 }
 
@@ -1452,35 +1585,71 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
     if current.is_deleting() {
         return Ok(());
     }
-    mark_for_teardown(store, &current, &d.uid).await?;
-    info!(vm = %d.name, "marked for teardown by the cloud");
+    note_teardown(
+        "vm",
+        &d.name,
+        mark_for_teardown(store, &current, &d.uid).await?,
+    );
     Ok(())
 }
 
-/// Mark the VM a cloud destroy was judged against for teardown, under the uid it was judged at,
-/// never whatever its name names by the time of the write (NL3-3).
+/// What a cloud destroy found to mark.
+#[derive(Debug, PartialEq, Eq)]
+enum Teardown {
+    /// The judged object is marked for teardown, by this destroy or one before it.
+    Marked,
+    /// The judged object went or became another's in between: nothing of this cloud object is
+    /// left here to mark.
+    NothingLeft,
+}
+
+/// Mark the object a cloud destroy was judged against for teardown — a VM, a volume, a
+/// snapshot — under the uid it was judged at, never whatever its name names by the time of the
+/// write (NL3-3, IKR-B81).
 ///
-/// A VM that went, became another cloud object's or was marked by someone else in between
-/// leaves the destroy nothing to do. One that is still the cloud's and unmarked is an error the
-/// cloud retries.
-async fn mark_for_teardown(store: &EtcdStore, checked: &Vm, cloud_uid: &str) -> anyhow::Result<()> {
-    let the_clouds = |v: &Vm| v.metadata.cloud_uid() == Some(cloud_uid);
+/// An object that went or became another cloud object's in between leaves the destroy nothing
+/// to do. One that is still the cloud's and unmarked is an error the cloud retries.
+async fn mark_for_teardown<T: controller_api::Resource>(
+    store: &EtcdStore,
+    checked: &T,
+    cloud_uid: &str,
+) -> anyhow::Result<Teardown> {
+    let the_clouds = |v: &T| v.metadata().cloud_uid() == Some(cloud_uid);
+    let meta = checked.metadata();
     let mut marked = false;
     let written = store
-        .mutate_if::<Vm, _>(&checked.metadata.name, &checked.metadata.uid, |v| {
+        .mutate_if::<T, _>(&meta.name, &meta.uid, |v| {
             marked = the_clouds(v);
-            if marked && v.metadata.deletion_timestamp.is_none() {
-                v.metadata.deletion_timestamp = Some(Utc::now());
+            if marked && v.metadata().deletion_timestamp.is_none() {
+                v.metadata_mut().deletion_timestamp = Some(Utc::now());
             }
         })
         .await;
+    // A mark that did not land: gone or another cloud object's is nothing left; this cloud
+    // object, marked by somebody else, is marked; unmarked it is not done yet.
+    let settled = |now: Option<&T>| match now {
+        Some(obj) if the_clouds(obj) => obj
+            .metadata()
+            .deletion_timestamp
+            .is_some()
+            .then_some(Teardown::Marked),
+        _ => Some(Teardown::NothingLeft),
+    };
     match written {
-        Ok(_) if marked => Ok(()),
+        Ok(_) if marked => Ok(Teardown::Marked),
         Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
-            let done = |v: &Vm| !the_clouds(v) || v.is_deleting();
-            answer_unwritten(store, &checked.metadata.name, done, "marked for teardown").await
+            answer_unwritten(store, &meta.name, settled, "marked for teardown").await
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Say what a destroy did: `marked` on a mark, and quietly that nothing of the cloud object was
+/// left otherwise.
+fn note_teardown(kind: &str, name: &str, outcome: Teardown) {
+    match outcome {
+        Teardown::Marked => info!(kind, name, "marked for teardown by the cloud"),
+        Teardown::NothingLeft => debug!(kind, name, "nothing of this cloud object left to mark"),
     }
 }
 
@@ -1531,15 +1700,22 @@ async fn build_status(
         mem_mib = mem_mib.saturating_add(node.status.capacity.mem_mib);
         profiles.extend(node.status.capacity.capabilities.iter().cloned());
     }
+    let vms = store.list::<Vm>().await?;
     // Every node, ready or not: a node that is down is exactly the one an
     // operator is looking for one tier up, and leaving it out of the report
     // would be the cloud saying it does not exist.
     let reported_nodes: Vec<proto::NodeReport> = nodes
         .iter()
-        .map(|node| node_report(node, registry.images.is_complete(&node.metadata.name)))
+        .map(|node| {
+            let name = &node.metadata.name;
+            node_report(
+                node,
+                registry.images.is_complete(name),
+                controller_api::bound_on(name, &vms),
+            )
+        })
         .collect();
 
-    let vms = store.list::<Vm>().await?;
     // Absence from this list is what the cloud accepts as proof that a VM was
     // torn down, and `list` drops what it cannot decode. A short list would
     // read up there as a deletion, so the completeness travels with it and the
@@ -1630,6 +1806,7 @@ async fn build_status(
     let routers = store.list::<Router>().await?;
     let mut routers_complete = routers.len() == store.count::<Router>().await?;
     let reported_routers = report_cloud_routers(&routers, &mut routers_complete);
+    let (unplaced, unplaced_omitted) = report_unplaced(&vms);
 
     Ok(ClusterStatus {
         nodes_ready,
@@ -1648,6 +1825,10 @@ async fn build_status(
         secrets: reported_secrets,
         pools: reported_pools,
         nodes: reported_nodes,
+        // What waits here for a node, so the cloud does not count its room
+        // as free. (IKR-B78)
+        unplaced,
+        unplaced_omitted,
         routers: reported_routers,
         routers_complete,
         // Passed through unchanged: this tier keeps no Image objects, and a
@@ -1696,7 +1877,15 @@ async fn handle_create_vm_migration(
     if m.vm.is_empty() {
         bail!("create_vm_migration without a vm to move");
     }
-    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, migration_target(&m), &m.tenant)
+    if m.vm_uid.is_empty() {
+        bail!(
+            "create_vm_migration without the vm's uid; a cloud that does not say which vm it \
+             means does not get one moved by its name"
+        );
+    }
+    // `m.tenant` is the cloud's say and not this tier's to record: whose a
+    // migration is follows the guest (`start_from_the_cloud`).
+    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, &m.vm_uid, migration_target(&m))
         .await
 }
 
@@ -1756,7 +1945,11 @@ fn update_node_patch(u: &proto::UpdateNode) -> Option<serde_json::Value> {
 /// `images_complete` is the one field that comes from neither half: it is off
 /// the session's own `ImageView`, because the claim is about the last REPORT
 /// and not about the object. See `NodeReport.images_complete`.
-fn node_report(node: &Node, images_complete: bool) -> proto::NodeReport {
+fn node_report(
+    node: &Node,
+    images_complete: bool,
+    bound: controller_api::Capacity,
+) -> proto::NodeReport {
     proto::NodeReport {
         name: node.metadata.name.clone(),
         ready: node.status.ready,
@@ -1765,6 +1958,10 @@ fn node_report(node: &Node, images_complete: bool) -> proto::NodeReport {
         labels: node.spec.labels.clone().into_iter().collect(),
         vcpus: node.status.capacity.vcpus,
         mem_mib: node.status.capacity.mem_mib,
+        // What its VMs ask for, so the cloud binds only where one node has
+        // room and not where the sum of them does. (IKR-B78)
+        bound_vcpus: bound.vcpus,
+        bound_mem_mib: bound.mem_mib,
         capabilities: node.status.capacity.capabilities.clone(),
         vms: node.status.vms,
         images_complete,
@@ -1884,6 +2081,27 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
         }
     }
     out
+}
+
+/// What each cloud VM held here without a node asks for, at most
+/// [`controller_api::UNPLACED_CARRIED_MAX`] of them, and how many more there are. A
+/// cluster-local VM is this cluster's own: the cloud neither places it nor
+/// can wait for it. (IKR-B78)
+fn report_unplaced(vms: &[Vm]) -> (Vec<proto::VmDemand>, u32) {
+    let demand =
+        controller_api::unplaced_demand(vms.iter().filter(|v| v.metadata.managed_by_cloud()));
+    let omitted = demand
+        .len()
+        .saturating_sub(controller_api::UNPLACED_CARRIED_MAX);
+    let carried = demand
+        .into_iter()
+        .take(controller_api::UNPLACED_CARRIED_MAX)
+        .map(|c| proto::VmDemand {
+            vcpus: c.vcpus,
+            mem_mib: c.mem_mib,
+        })
+        .collect();
+    (carried, u32::try_from(omitted).unwrap_or(u32::MAX))
 }
 
 /// Whether the volume listing is all of them. Its own function only because
@@ -2077,11 +2295,10 @@ mod tests {
             announced: vec!["10.43.0.0/24".into()],
         };
 
-        let nats = cloud_nats(&command).expect("a kind this tier knows");
-        assert_eq!(nats[0].kind, controller_api::NatKind::DnatAndSnat);
-
         let spec: controller_api::RouterSpec = serde_json::from_str(&command.spec_json).unwrap();
         let mut router = Router::declare("lab-out", spec);
+        let nats = cloud_nats(&command, &router).expect("a kind this tier knows");
+        assert_eq!(nats[0].kind, controller_api::NatKind::DnatAndSnat);
         router.metadata.mark_managed_by_cloud("u-7");
         stamp_resolved(&mut router, &command, &nats);
         assert_eq!(router.status.external_addr, "10.128.1.200/24");
@@ -2097,7 +2314,7 @@ mod tests {
             }],
             ..command.clone()
         };
-        let e = cloud_nats(&nonsense).expect_err("an unknown kind");
+        let e = cloud_nats(&nonsense, &router).expect_err("an unknown kind");
         assert!(format!("{e:#}").contains("masquerade"), "{e:#}");
 
         // And back up: `active` is whether a machine is really forwarding,
@@ -2197,7 +2414,7 @@ mod tests {
     /// not exist.
     #[test]
     fn a_node_report_carries_what_an_operator_decided_and_what_the_agent_said() {
-        let up = node_report(&node("manacor", true, false), false);
+        let up = node_report(&node("manacor", true, false), false, Default::default());
         assert_eq!(up.name, "manacor");
         assert!(up.ready, "the agent is talking");
         assert!(!up.schedulable, "and an operator drained it");
@@ -2205,13 +2422,25 @@ mod tests {
         assert_eq!((up.vcpus, up.mem_mib, up.vms), (32, 65_536, 2));
         assert_eq!(up.capabilities, vec!["nvrm/4q".to_string()]);
 
-        let down = node_report(&node("felanitx", false, true), false);
+        let down = node_report(&node("felanitx", false, true), false, Default::default());
         assert!(!down.ready);
         assert!(down.schedulable);
         // A healthy machine says nothing, and that is what travels: an empty
         // list is also what an agent from before the field reports, so it can
         // only ever mean "said nothing".
         assert!(up.conditions.is_empty());
+    }
+
+    /// IKR-B78: what a node's VMs ask for travels up beside its capacity, so
+    /// the cloud can tell one node's room from the cluster's sum.
+    #[test]
+    fn what_a_nodes_vms_ask_for_travels_up_beside_its_capacity() {
+        let bound = controller_api::Capacity {
+            vcpus: 3,
+            mem_mib: 3072,
+        };
+        let up = node_report(&node("manacor", true, true), false, bound);
+        assert_eq!((up.bound_vcpus, up.bound_mem_mib), (3, 3072));
     }
 
     /// The evidence of a drain, on the road that carries the ask.
@@ -2223,7 +2452,7 @@ mod tests {
     /// drain column reading `0 moved, 0 leaving, 0 staying`.
     #[test]
     fn the_numbers_of_a_drain_travel_up_beside_the_ask() {
-        let quiet = node_report(&node("manacor", true, false), false);
+        let quiet = node_report(&node("manacor", true, false), false, Default::default());
         assert!(
             quiet.draining.is_none(),
             "nobody is emptying this one, so there is nothing to say"
@@ -2243,7 +2472,7 @@ mod tests {
                 message: "its owner said evacuation: never".into(),
             }],
         });
-        let up = node_report(&emptying, false);
+        let up = node_report(&emptying, false, Default::default());
         assert!(up.drain, "the ask");
         let evidence = up.draining.expect("and the evidence beside it");
         assert_eq!(
@@ -2292,7 +2521,7 @@ mod tests {
                 message: "/var/lib/meisterstack has 0 bytes free".into(),
             },
         ];
-        let up = node_report(&wedged, false);
+        let up = node_report(&wedged, false, Default::default());
         assert_eq!(
             up.conditions
                 .iter()
@@ -2395,6 +2624,7 @@ mod tests {
             vni,
             floating_ips: floating.iter().map(|s| s.to_string()).collect(),
             routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
+            labels: Default::default(),
         }
     }
 
@@ -2441,6 +2671,261 @@ mod tests {
         assert_eq!(spec["nics"][0]["floating_ips"][0], "192.0.2.9");
         // ... and the field it said nothing about is still filled in.
         assert_eq!(spec["nics"][0]["routed_subnets"][0], "10.7.1.0/24");
+    }
+
+    /// A cloud create whose first NIC picks the provider network `ext`.
+    fn on_its_own_wire(run_strategy: &str) -> proto::CreateVm {
+        proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": run_strategy,
+                "vm": { "vcpus": 1, "nics": [{ "physnet": "ext" }] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        }
+    }
+
+    /// IKR-B67 one tier down: a cloud from before the rule does not get a
+    /// tenant's tap onto the provider segment through this session.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_whose_nic_picks_its_own_wire_is_refused_before_it_is_stored() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let why = format!(
+            "{:#}",
+            handle_create(&store, on_its_own_wire("Running"), "")
+                .await
+                .expect_err("a tap on ext")
+        );
+        assert!(why.contains("nics[0].physnet"), "{why}");
+        assert!(matches!(
+            store.get::<Vm>("web-1").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// A VM stored without a wire of its own does not get one by a re-send:
+    /// that is a new wire, refused like a new VM. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_does_not_give_a_stored_vm_a_wire_of_its_own() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let plain = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "vm": { "vcpus": 1, "nics": [{}] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        };
+        handle_create(&store, plain, "").await.expect("created");
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, on_its_own_wire("Running"), "")
+                .await
+                .expect_err("a tap on ext")
+        );
+
+        assert!(why.contains("nics[0].physnet"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert!(after.spec.vm["nics"][0].get("physnet").is_none());
+    }
+
+    /// One stored before the rule is managed on, not stranded: a stop reaches
+    /// it, and the wire it kept is said on the VM. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_stored_before_the_nic_rule_is_managed_on_and_said() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let c = on_its_own_wire("Running");
+        let spec: VmSpec = serde_json::from_str(&c.spec_json).unwrap();
+        let stored = store
+            .create(&declared_for_cloud(&c, &spec, ""))
+            .await
+            .expect("a vm from before the rule");
+
+        handle_create(&store, on_its_own_wire("Stopped"), "")
+            .await
+            .expect("managed on");
+
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Stopped
+        );
+        let said: controller_api::Event = store
+            .get(&events::name_of(
+                Vm::KIND,
+                &stored.metadata.uid,
+                "web-1",
+                events::reason::TENANT_WIRE_KEPT,
+            ))
+            .await
+            .expect("the kept wire is said");
+        assert!(
+            said.spec.message.contains("nics[0].physnet"),
+            "{}",
+            said.spec.message
+        );
+    }
+
+    /// A VM stored before the rule with its own wire does not take another by a re-send, and is
+    /// not said to have kept one: the refusal kept nothing. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_stored_wire_resent_as_another_is_refused_and_not_said_kept() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let c = on_its_own_wire("Running");
+        let spec: VmSpec = serde_json::from_str(&c.spec_json).unwrap();
+        let stored = store
+            .create(&declared_for_cloud(&c, &spec, ""))
+            .await
+            .expect("a vm from before the rule");
+        let elsewhere = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": "Stopped",
+                "vm": { "vcpus": 1, "nics": [{ "physnet": "other" }] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        };
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, elsewhere, "")
+                .await
+                .expect_err("a tap on another wire")
+        );
+
+        assert!(why.contains("nics[0].physnet"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert_eq!(after.spec.vm["nics"][0]["physnet"], "ext");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Running
+        );
+        assert!(matches!(
+            store
+                .get::<controller_api::Event>(&events::name_of(
+                    Vm::KIND,
+                    &stored.metadata.uid,
+                    "web-1",
+                    events::reason::TENANT_WIRE_KEPT,
+                ))
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// A cloud VM `run_strategy`, on the tenant overlay, with the floating addresses `floating`.
+    fn floating_on(run_strategy: &str, floating: &[&str]) -> proto::CreateVm {
+        proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": run_strategy,
+                "vm": { "vcpus": 1, "nics": [{}] },
+            })
+            .to_string(),
+            ..create(Some(10_007), floating, &["10.7.1.0/24"])
+        }
+    }
+
+    /// A floating address that moved after the VM was made does not make every later send of
+    /// it a new shape: the send is taken, its stop arrives, and the NIC carries the addresses
+    /// as the cloud sent them now — a released one included. (Nachlese NL2-C1)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_with_other_floating_addresses_is_taken_with_its_stop() {
+        let store = crate::test_etcd::fresh_store("nl2-c1-test").await;
+        handle_create(&store, floating_on("Running", &["10.255.0.7"]), "")
+            .await
+            .expect("created");
+        let before: Vm = store.get("web-1").await.expect("the cloud's vm");
+
+        handle_create(&store, floating_on("Stopped", &["10.255.0.9"]), "")
+            .await
+            .expect("the send is taken");
+
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Stopped
+        );
+        assert_eq!(
+            after.spec.vm["nics"][0]["floating_ips"],
+            serde_json::json!(["10.255.0.9"])
+        );
+        assert_eq!(after.metadata.generation, before.metadata.generation + 1);
+
+        handle_create(&store, floating_on("Stopped", &[]), "")
+            .await
+            .expect("the release is taken");
+        let released: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert!(released.spec.vm["nics"][0].get("floating_ips").is_none());
+        assert_eq!(
+            released.spec.vm["nics"][0]["routed_subnets"],
+            serde_json::json!(["10.7.1.0/24"])
+        );
+    }
+
+    /// The address lists are all that may move with them: a send that also adds a NIC is
+    /// refused, and the stored VM keeps its addresses. (Nachlese NL2-C1)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_with_other_addresses_and_another_nic_is_refused() {
+        let store = crate::test_etcd::fresh_store("nl2-c1-test").await;
+        handle_create(&store, floating_on("Running", &["10.255.0.7"]), "")
+            .await
+            .expect("created");
+        let two_nics = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": "Stopped",
+                "vm": { "vcpus": 1, "nics": [{}, {}] },
+            })
+            .to_string(),
+            ..floating_on("Stopped", &["10.255.0.9"])
+        };
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, two_nics, "")
+                .await
+                .expect_err("a nic more")
+        );
+
+        assert!(why.contains("shape of a vm is fixed"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(
+            after.spec.vm["nics"][0]["floating_ips"],
+            serde_json::json!(["10.255.0.7"])
+        );
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Running
+        );
+    }
+
+    /// Only the cloud's VMs waiting for a node travel up, and no more of them than one status
+    /// carries; the rest is counted. (IKR-B78)
+    #[test]
+    fn only_the_clouds_unplaced_vms_travel_up_and_at_most_so_many() {
+        let mut vms = vec![vm("local", None, VmPhaseKind::Pending)];
+        vms.extend((0..controller_api::UNPLACED_CARRIED_MAX + 2).map(|i| {
+            vm(
+                &format!("cloud-{i}"),
+                Some(&format!("uid-{i}")),
+                VmPhaseKind::Pending,
+            )
+        }));
+
+        let (carried, omitted) = report_unplaced(&vms);
+
+        assert_eq!(carried.len(), controller_api::UNPLACED_CARRIED_MAX);
+        assert_eq!(omitted, 2, "the cluster-local vm is not counted");
     }
 
     #[test]
@@ -2720,8 +3205,9 @@ mod tests {
         );
         // `Unplaced` and no longer `node-unhealthy`: struktur 4 folded
         // `pendingReason` into the phase, and the closed set the object
-        // stores is `VmReason`. The twelve scheduler words are unchanged and
-        // still in the sentence and the metric label.
+        // stores is `VmReason`. The scheduler's own words
+        // (`PendingReason::ALL`) are unchanged and still in the sentence and
+        // the metric label.
         assert_eq!(report[1].reason, "Unplaced");
         assert!(report[1].volumes.is_empty());
     }
@@ -2853,6 +3339,7 @@ mod tests {
             vm: "web-1".into(),
             target_node: target.into(),
             tenant: "acme".into(),
+            vm_uid: "uid-web-1".into(),
         };
         // proto3 has no absent string, so empty IS "did not say" — and the
         // difference between `--to agent-3` and no `--to` at all is this line.
@@ -2888,6 +3375,74 @@ mod tests {
                 .expect_err("nothing to move")
         );
         assert!(why.contains("vm to move"), "{why}");
+
+        // IKR-B81: a cloud that does not say which vm it means gets none moved
+        // by its name.
+        let uidless = proto::CreateVmMigration {
+            vm_uid: String::new(),
+            ..ask("")
+        };
+        let why = format!(
+            "{:#}",
+            handle_create_vm_migration(&store, uidless)
+                .await
+                .expect_err("which vm?")
+        );
+        assert!(why.contains("uid"), "{why}");
+    }
+
+    /// IKR-B72: a migrate asked for at the cloud meets the REST edge's whole refusal, with its
+    /// word (`Invalid`), and no record is written. An instance-store disk and a node-local
+    /// volume were refused only at the REST edge before.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_migration_asked_for_at_the_cloud_meets_the_rest_edges_refusal() {
+        let store = crate::test_etcd::fresh_store("cloud-migration-test").await;
+        let mut pool = controller_api::StoragePool::declare("fast", Default::default());
+        pool.status.locality = Some(controller_api::Locality::NodeLocal);
+        store.create(&pool).await.expect("the pool");
+        store
+            .create(&cloud_volume("data", None, VolumePhaseKind::Ready))
+            .await
+            .expect("the volume");
+
+        for (name, disks, why) in [
+            (
+                "inline",
+                serde_json::json!([{ "size_bytes": 1 }]),
+                "instance-store",
+            ),
+            (
+                "pinned",
+                serde_json::json!([{ "volume": "data" }]),
+                "node-local",
+            ),
+        ] {
+            let mut guest = vm(name, Some(name), VmPhaseKind::Running);
+            guest.spec.node_name = Some("manacor".into());
+            guest.spec.vm = serde_json::json!({ "volumes": disks });
+            store.create(&guest).await.expect("the guest");
+            let record = format!("{name}-move");
+            let ask = proto::CreateVmMigration {
+                name: record.clone(),
+                vm: name.into(),
+                target_node: String::new(),
+                tenant: "acme".into(),
+                vm_uid: name.into(),
+            };
+            let err = handle_create_vm_migration(&store, ask)
+                .await
+                .expect_err("the REST edge would refuse it");
+            assert_eq!(controller_api::Refusal::reason_of(&err), "Invalid");
+            assert!(format!("{err:#}").contains(why), "{err:#}");
+            assert!(
+                store
+                    .get::<controller_api::VmMigration>(&record)
+                    .await
+                    .is_err(),
+                "and nothing was started"
+            );
+        }
     }
 
     /// Repeated cloud creation updates an existing volume to the larger size.
@@ -3087,6 +3642,35 @@ mod tests {
         ));
     }
 
+    /// IKR-B68 at this hop: a floating address whose inside end is not a
+    /// guest on the router's own inside prefix is refused, whatever the cloud
+    /// sent; one inside it passes, and a routed prefix is no such address.
+    #[test]
+    fn a_floating_address_outside_the_routers_prefix_is_refused_here() {
+        let router = Router::declare(
+            "lab-out",
+            controller_api::RouterSpec {
+                internal_addr: "10.42.0.1/24".into(),
+                ..Default::default()
+            },
+        );
+        let carrying = |kind: &str, logical_ip: &str| proto::CreateRouter {
+            name: "lab-out".into(),
+            nats: vec![proto::NatRule {
+                kind: kind.into(),
+                external_ip: "10.128.1.201".into(),
+                logical_ip: logical_ip.into(),
+            }],
+            ..Default::default()
+        };
+        let e = cloud_nats(&carrying("dnat_and_snat", "10.43.0.5"), &router)
+            .expect_err("another prefix");
+        assert!(format!("{e:#}").contains("10.128.1.201"), "{e:#}");
+        assert!(cloud_nats(&carrying("dnat_and_snat", "10.42.0.1"), &router).is_err());
+        assert!(cloud_nats(&carrying("dnat_and_snat", "10.42.0.9"), &router).is_ok());
+        assert!(cloud_nats(&carrying("routed", "10.43.0.0/24"), &router).is_ok());
+    }
+
     /// The router the delete names goes: the guard is not a wall. (NL2-6)
     #[tokio::test]
     #[ignore = "needs an etcd; see crate::test_etcd"]
@@ -3104,6 +3688,164 @@ mod tests {
             store.get::<Router>("out").await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// IKR-B71 at this tier: the node selector, anti-affinity, class and labels the cloud was
+    /// given arrive on the stored object, move with a later create, and are what this tier's
+    /// scheduler places by.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_vm_is_placed_here_by_the_constraints_the_cloud_was_given() {
+        let store = crate::test_etcd::fresh_store("cloud-placement-test").await;
+        let asking = |zone: &str| proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "class": "gpu",
+                "nodeSelector": { "network-node": zone },
+                "antiAffinity": [{ "selector": { "app": "web" } }],
+                "vm": { "vcpus": 1, "memory_mib": 512 },
+            })
+            .to_string(),
+            labels: [("app".to_string(), "web".to_string())].into(),
+            ..create(None, &[], &[])
+        };
+        handle_create(&store, asking("cobra3"), "")
+            .await
+            .expect("created");
+        let stored: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(stored.metadata.labels["app"], "web");
+        assert_eq!(stored.metadata.cloud_uid(), Some("uid-1"));
+
+        // What each node holds: (tenant, app) of every VM on it.
+        let node = |name: &str, zone: &str, hosted: &[(&str, &str)]| controller_api::Candidate {
+            name: name.into(),
+            connected: true,
+            alive: true,
+            schedulable: true,
+            unhealthy: Vec::new(),
+            free: controller_api::Capacity {
+                vcpus: 8,
+                mem_mib: 8192,
+            },
+            catalogue: vec!["hypervisor/cloud-hypervisor".to_string()],
+            kind: controller_api::CandidateKind::Node,
+            labels: [("network-node".to_string(), zone.to_string())].into(),
+            accepts: vec!["gpu".to_string()],
+            hosted: hosted
+                .iter()
+                .map(|(tenant, app)| controller_api::Hosted {
+                    tenant: Some(tenant.to_string()),
+                    labels: [("app".to_string(), app.to_string())].into(),
+                })
+                .collect(),
+            machine: None,
+        };
+        let fleet = [
+            node("cobra2", "cobra2", &[]),
+            node("cobra3b", "cobra3", &[("acme", "web")]),
+            node("cobra3", "cobra3", &[("umbrella", "web")]),
+        ];
+        assert_eq!(
+            controller_api::Scheduler::assign(&controller_api::FirstFit, &stored, &fleet),
+            Some("cobra3".to_string()),
+            "the labelled node, and not the one already holding a web of its own tenant; \
+             another tenant's web is not one it can mean"
+        );
+
+        handle_create(&store, asking("cobra2"), "")
+            .await
+            .expect("the cloud moved the selector");
+        let moved: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(moved.spec.node_selector["network-node"], "cobra2");
+        assert_eq!(moved.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
+    }
+
+    /// IKR-B71: a create that differs only in its labels is drift, and the
+    /// cluster's copy takes the new labels under its own marks.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_label_only_resend_relabels_the_cloud_vm_here() {
+        let store = crate::test_etcd::fresh_store("cloud-placement-test").await;
+        let labelled = |app: &str| proto::CreateVm {
+            spec_json: serde_json::json!({ "vm": { "vcpus": 1, "memory_mib": 512 } }).to_string(),
+            labels: [("app".to_string(), app.to_string())].into(),
+            ..create(None, &[], &[])
+        };
+        handle_create(&store, labelled("web"), "")
+            .await
+            .expect("created");
+        let before: Vm = store.get("web-1").await.expect("the cloud's vm");
+
+        handle_create(&store, labelled("db"), "")
+            .await
+            .expect("relabelled");
+
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(after.metadata.labels["app"], "db");
+        assert_eq!(after.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
+        assert_eq!(
+            after.metadata.generation, before.metadata.generation,
+            "labels are no new spec"
+        );
+    }
+
+    /// IKR-B81: a volume destroy judged on a record that was replaced under the same name
+    /// leaves the new record unmarked, as a VM destroy does (NL3-3).
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_volume_destroy_judged_on_an_old_record_leaves_the_recreated_one_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = store
+            .create(&cloud_volume("data", Some("u-1"), VolumePhaseKind::Ready))
+            .await
+            .expect("the cloud's volume");
+        store.delete::<Volume>("data").await.expect("it goes");
+        store
+            .create(&cloud_volume("data", Some("u-2"), VolumePhaseKind::Ready))
+            .await
+            .expect("another cloud volume of that name");
+
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a destroy done");
+
+        assert_eq!(
+            outcome,
+            Teardown::NothingLeft,
+            "and it is not said to be marked"
+        );
+        let still: Volume = store.get("data").await.expect("the new volume");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+        assert!(!still.is_deleting());
+    }
+
+    /// IKR-B81: a migrate from the cloud moves the cloud's vm and not a
+    /// cluster-local one that carries its name.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_migration_does_not_move_a_cluster_local_vm_of_the_same_name() {
+        let store = crate::test_etcd::fresh_store("cloud-migration-test").await;
+        let mut local = vm("web-1", None, VmPhaseKind::Running);
+        local.spec.node_name = Some("manacor".into());
+        store.create(&local).await.expect("the cluster's own vm");
+        let ask = proto::CreateVmMigration {
+            name: "web-1-move".into(),
+            vm: "web-1".into(),
+            target_node: String::new(),
+            tenant: "acme".into(),
+            vm_uid: "uid-cloud-web-1".into(),
+        };
+
+        let why = handle_create_vm_migration(&store, ask)
+            .await
+            .expect_err("not the cloud's to move");
+        assert!(format!("{why:#}").contains("not the cloud's"), "{why:#}");
+        assert!(
+            store
+                .get::<controller_api::VmMigration>("web-1-move")
+                .await
+                .is_err()
+        );
     }
 
     /// The running VM `t`, stored as the cloud's object `cloud_uid`.
@@ -3124,10 +3866,15 @@ mod tests {
         store.delete::<Vm>("t").await.expect("it goes");
         stored_vm(&store, "u-2").await;
 
-        mark_for_teardown(&store, &checked, "u-1")
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
             .await
             .expect("nothing of u-1 is left here, which is a destroy done");
 
+        assert_eq!(
+            outcome,
+            Teardown::NothingLeft,
+            "and it is not said to be marked"
+        );
         let still: Vm = store.get("t").await.expect("the new vm");
         assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
         assert!(!still.is_deleting());
@@ -3150,6 +3897,22 @@ mod tests {
         let still: Vm = store.get("t").await.expect("the new vm");
         assert_eq!(still.metadata.uid, fresh.metadata.uid);
         assert!(!still.is_deleting());
+    }
+
+    /// The judged VM is marked, and says so. (IKR-B81)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_mark_on_the_judged_vm_is_said_to_be_marked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+
+        let outcome = mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("marked");
+
+        assert_eq!(outcome, Teardown::Marked);
+        let marked: Vm = store.get("t").await.expect("the vm, until its teardown");
+        assert!(marked.is_deleting());
     }
 
     /// The VM the destroy names is marked for teardown: the guard is not a wall. (NL3-3)

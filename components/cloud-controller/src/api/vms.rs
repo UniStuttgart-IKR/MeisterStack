@@ -80,7 +80,7 @@ pub(super) fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiEr
 /// key returns 422; a volume that is not Ready yet is accepted.
 ///
 /// Volume readiness and cluster reachability constrain placement in
-/// `servable_clusters`; this tier does not select a node.
+/// `reconcile::placement::wanted`; this tier does not select a node.
 pub(super) async fn check_volume_refs(
     st: &ApiState,
     tenant: Option<&str>,
@@ -168,6 +168,9 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
     controller_api::vm_spec::check(&spec.vm)?;
     check_vm_shape(&spec.vm)?;
     check_owned_nic_fields(&spec.vm)?;
+    // Unconditionally: every vm at this tier is a tenant's, `create_vm_traced`
+    // insists on one.
+    controller_api::vni::check_tenant_nics(&spec.vm)?;
     check_owned_volume_fields(&spec.vm, &catalogue_sources(store, &spec.vm).await)?;
     if spec.user_data_said_twice() {
         return Err(controller_api::invalid_field(
@@ -839,6 +842,9 @@ pub(super) async fn update_vm(
     check_volume_refs(&st, current.spec.tenant.as_deref(), &name, &body.spec).await?;
     check_reschedule(&st, &current, &body).await?;
     body.status = current.status.clone();
+    if releasing(&current, &body).is_some() {
+        crate::reconcile::release_binding(&mut body);
+    }
     // Recalculate replacement usage under the tenant fence for updates as well
     // as creates, excluding the current VM from the existing total.
     controller_api::carry_generation(&current, &mut body)?;
@@ -869,8 +875,10 @@ pub(super) async fn delete_vm(
     let current: Vm = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(current.spec.tenant.as_deref()), Verb::Write)?;
+    // On the object whose tenant was checked: one deleted and made again
+    // under the name since is somebody else's. (IKR-B81)
     st.store
-        .mutate::<Vm, _>(&name, |v| {
+        .mutate_if::<Vm, _>(&name, &current.metadata.uid, |v| {
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
@@ -1964,6 +1972,32 @@ mod tests {
             json!({ "nics": [{ "vxlan_id": null, "floating_ips": null }] }),
         ] {
             check_owned_nic_fields(&spec).expect("nothing control-plane-owned here");
+        }
+    }
+
+    /// IKR-B67: `physnet: ext` from a tenant member was taken while
+    /// `vxlan_id` was refused. Every vm at this tier is a tenant's.
+    #[tokio::test]
+    async fn a_vm_whose_nic_picks_its_own_wire_is_refused_at_the_cloud() {
+        // No base image, so nothing below reads the store.
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/b67-test")
+            .await
+            .expect("the etcd client is built lazily");
+        for field in ["physnet", "bridge"] {
+            let spec: VmSpec = serde_json::from_value(json!({ "vm": {
+                "vcpus": 1, "memory_mib": 512,
+                "boot": { "kind": "firmware", "firmware": "fw" },
+                "volumes": [{ "size_bytes": 1 }],
+                "nics": [{ field: "ext" }],
+            }}))
+            .expect("a vm spec");
+            let err = validate_vm_spec(&store, &spec)
+                .await
+                .expect_err("a tenant's tap on a wire it chose");
+            assert_eq!(
+                err.field(),
+                Some(format!("spec.vm.nics[0].{field}").as_str())
+            );
         }
     }
 

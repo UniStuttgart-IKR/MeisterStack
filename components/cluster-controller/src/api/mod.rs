@@ -32,7 +32,7 @@ mod vms;
 mod volumes;
 
 use consoles::*;
-pub(crate) use migrations::*;
+use migrations::*;
 use network::*;
 pub(crate) use nodes::*;
 use vms::*;

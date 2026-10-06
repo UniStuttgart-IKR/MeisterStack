@@ -162,6 +162,7 @@ resources! {
         fn settle(&mut self, now: DateTime<Utc>) {
             if !volume_claim_holds(&self.status) {
                 self.status.attached_to = None;
+                self.status.attached_uid = None;
                 self.status.claimant_gone = false;
             }
             let phase = settle_volume(self.metadata.deletion_timestamp.is_some(), &self.status);

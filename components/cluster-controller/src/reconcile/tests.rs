@@ -2701,6 +2701,7 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
         kek: None,
         held: &[],
         overcommit: controller_api::Overcommit::default(),
+        told: Default::default(),
     };
 
     // First pass: the backend grows, the guest is not told.
@@ -2788,6 +2789,7 @@ fn quiet_pass<'a>(
         kek: None,
         held: &[],
         overcommit: controller_api::Overcommit::default(),
+        told: Default::default(),
     }
 }
 
@@ -2930,13 +2932,132 @@ fn naming_data(mut vm: Vm) -> Vm {
     vm
 }
 
-/// The volume `data`, claimed by the VM `t`, open on a node and stored. Open, so that a release
-/// shows as `claimantGone` instead of letting the claim fall at once.
-async fn data_claimed_by_t(store: &EtcdStore) -> Volume {
+/// The volume `data`, claimed by the VM `t` whose object is `uid` (IKR-B81), open on a node and
+/// stored. Open, so that a release shows as `claimantGone` instead of letting the claim fall at
+/// once.
+async fn data_claimed_by_t(store: &EtcdStore, uid: &str) -> Volume {
     let mut volume = controller_api::resources::new_volume("data", Default::default());
     volume.status.attached_to = Some("t".into());
+    volume.status.attached_uid = Some(uid.into());
     volume.status.open_on = vec!["agent-1".into()];
     store.create(&volume).await.expect("the claimed volume")
+}
+
+/// `data` on the shared pool `nfs`, at home on agent-1 and Ready there, claimed by the VM `t`
+/// whose object is `uid`, and open on `open_on`.
+async fn shared_data_held_by(store: &EtcdStore, uid: &str, open_on: &[&str]) -> Volume {
+    let mut nfs = pool("nfs", "nfs", &[]);
+    nfs.status.locality = Some(Locality::Shared);
+    store.create(&nfs).await.expect("the shared pool");
+    let mut volume = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            pool: "nfs".into(),
+            ..Default::default()
+        },
+    );
+    volume.status.node = Some("agent-1".into());
+    volume.status.attached_to = Some("t".into());
+    volume.status.attached_uid = Some(uid.into());
+    volume.status.open_on = open_on.iter().map(|n| n.to_string()).collect();
+    volume.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    volume.settle(Utc::now());
+    store.create(&volume).await.expect("the claimed volume")
+}
+
+/// A VM made again under the claimant's name, on another node, does not move the claimant's
+/// shared disk record after it: the claim is checked before the record follows. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_on_another_node_does_not_move_the_claimants_record() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1"]).await;
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    let held = hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("the disk is the claimant's");
+
+    assert!(format!("{held:#}").contains("held by t"), "{held:#}");
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
+    assert_eq!(data.status.attached_uid.as_deref(), Some("uid-claimant"));
+}
+
+/// The same for the other re-point: the namesake's node having the disk open does not make the
+/// record its. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_whose_node_has_the_disk_open_does_not_repoint_it() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1", "agent-2"]).await;
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("the disk is the claimant's");
+
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
+}
+
+/// A claim from before claims carried a uid, whose claimant is already found gone while a node
+/// still has the bytes open, is not carried by a VM made again under its name: a claim of
+/// unknown uid is nobody's to carry. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_does_not_carry_a_gone_claimants_record_of_unknown_uid() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1"]).await;
+    store
+        .mutate::<Volume, _>("data", |v| {
+            v.status.attached_uid = None;
+            v.status.claimant_gone = true;
+        })
+        .await
+        .expect("a gone claim from before claims carried a uid");
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("an unknown uid carries nothing");
+
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
+    assert_eq!(data.status.attached_uid, None);
 }
 
 /// A VM recreated under the same name after the listing survives the old one's teardown,
@@ -2954,7 +3075,7 @@ async fn a_vm_recreated_under_the_same_name_survives_the_old_teardown() {
         .create(&naming_data(bound_to(None)))
         .await
         .expect("a new vm under the same name");
-    data_claimed_by_t(&store).await;
+    data_claimed_by_t(&store, &fresh.metadata.uid).await;
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
@@ -2978,7 +3099,7 @@ async fn a_vm_torn_down_as_listed_lets_go_of_its_volumes() {
         .create(&naming_data(deleting_vm()))
         .await
         .expect("a deleting vm");
-    data_claimed_by_t(&store).await;
+    data_claimed_by_t(&store, &listed.metadata.uid).await;
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
@@ -3128,4 +3249,307 @@ async fn a_placement_onto_a_slot_a_migration_claimed_first_leaves_the_guest_unbo
         [&theirs.metadata.name],
         "the placement's own claim was given back"
     );
+}
+
+// --- IKR-B74: what a node was told lately is not told again every pass -----
+
+/// The stop a stopping guest needs goes to its node once, and the pass after
+/// it writes nothing either: a write is a watch event, and every watch event
+/// is another pass. The lab saw a Stop every 85 ms for a whole stop grace.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_stop_is_sent_once_and_the_passes_after_it_write_nothing() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let mut vm = controller_api::resources::new_vm(
+        "web",
+        controller_api::VmSpec {
+            node_name: Some("agent-1".into()),
+            run_strategy: RunStrategy::Stopped,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    reported_as(&mut vm, "agent-1", VmPhaseKind::Running);
+    store.create(&vm).await.expect("the vm");
+    let registry = Arc::new(SessionRegistry::new());
+    let heard = scripted_node(&registry, "agent-1");
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    for _ in 0..3 {
+        let current: Vm = store.get("web").await.expect("the vm");
+        reconcile_vm(&pass, current).await.expect("a pass");
+    }
+    let stops = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| matches!(op, proto::command::Op::Stop(_)))
+        .count();
+    assert_eq!(stops, 1, "{:?}", heard.lock().unwrap());
+
+    let before: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&pass, before.clone()).await.expect("a pass");
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(
+        after.metadata.resource_version, before.metadata.resource_version,
+        "a pass that says nothing writes nothing"
+    );
+}
+
+/// `web` on agent-1: Stopped asked for, Running reported, its generation
+/// already closed. Stored, with a node that answers and writes down what it
+/// heard.
+async fn stopping_web(
+    store: &EtcdStore,
+) -> (
+    Arc<SessionRegistry>,
+    Arc<std::sync::Mutex<Vec<proto::command::Op>>>,
+) {
+    let mut vm = controller_api::resources::new_vm(
+        "web",
+        controller_api::VmSpec {
+            node_name: Some("agent-1".into()),
+            run_strategy: RunStrategy::Stopped,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    reported_as(&mut vm, "agent-1", VmPhaseKind::Running);
+    store.create(&vm).await.expect("the vm");
+    store
+        .mutate::<Vm, _>("web", |v| {
+            v.status.observed_generation = v.metadata.generation;
+        })
+        .await
+        .expect("its generation closed");
+    let registry = Arc::new(SessionRegistry::new());
+    let heard = scripted_node(&registry, "agent-1");
+    (registry, heard)
+}
+
+/// How many Stops the node heard.
+fn stops(heard: &std::sync::Mutex<Vec<proto::command::Op>>) -> usize {
+    heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| matches!(op, proto::command::Op::Stop(_)))
+        .count()
+}
+
+/// A Stop a fresh memo has not said goes down, and closing a generation that
+/// is already closed writes nothing: the guard in `close_generation` itself,
+/// not the memo, keeps the pass quiet.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_stop_for_a_closed_generation_writes_nothing() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let (registry, heard) = stopping_web(&store).await;
+    let connected = sessions(&["agent-1"]);
+
+    let before: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&quiet_pass(&store, &registry, &connected), before.clone())
+        .await
+        .expect("a pass");
+
+    assert_eq!(stops(&heard), 1, "a fresh memo says it");
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(
+        after.metadata.resource_version, before.metadata.resource_version,
+        "and nothing moved, so nothing is written"
+    );
+}
+
+/// A generation bumped inside the window with the same action is news: it
+/// goes down and is closed, where before it waited unclosed for ever once the
+/// phase followed.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_generation_bumped_inside_the_window_is_sent_and_closed() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let (registry, heard) = stopping_web(&store).await;
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+    let current: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&pass, current).await.expect("a pass");
+
+    let bumped = store
+        .mutate::<Vm, _>("web", |v| v.metadata.generation += 1)
+        .await
+        .expect("a new generation");
+    reconcile_vm(&pass, bumped.clone()).await.expect("a pass");
+
+    assert_eq!(stops(&heard), 2);
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(after.status.observed_generation, bumped.metadata.generation);
+}
+
+/// Every EnsureRouter a pass would send, written down.
+#[derive(Default)]
+struct HeardRouters(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl controller_api::network::RouterSink for HeardRouters {
+    async fn ensure(&self, node: &str, _: proto::EnsureRouter) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(node.to_string());
+        Ok(())
+    }
+
+    async fn destroy(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A router whose plan has not moved and which rests is carried down once and
+/// not on every pass. The lab saw every router on the gateway ensured about
+/// twelve times a second while one guest of another tenant was stopping.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn an_unchanged_resting_router_is_carried_down_once() {
+    let store = crate::test_etcd::fresh_store("router-retell-test").await;
+    let network = store.create(&provider("ext", "ext")).await.expect("ext");
+    store.create(&ready_router("r1")).await.expect("the router");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["gw-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+    *pass.nodes.lock().unwrap() = vec![gateway_node("gw-1", &["ext"], true)];
+    let heard = HeardRouters::default();
+
+    for _ in 0..3 {
+        let router: controller_api::Router = store.get("r1").await.expect("the router");
+        reconcile_router(
+            &pass,
+            &heard,
+            &controller_api::network::MeisterNetwork,
+            router,
+            std::slice::from_ref(&network),
+            &Default::default(),
+        )
+        .await
+        .expect("a pass");
+    }
+    assert_eq!(*heard.0.lock().unwrap(), vec!["gw-1".to_string()]);
+}
+
+// --- IKR-B81: a volume claim is the claimant object's ---------------------
+
+/// A VM `name` with uid `uid`, referring to the volume `data` or not.
+fn claimant(name: &str, uid: &str, refers: bool) -> Vm {
+    let disks = if refers {
+        serde_json::json!({ "volumes": [{ "volume": "data" }] })
+    } else {
+        serde_json::json!({})
+    };
+    let mut vm = controller_api::resources::new_vm(
+        name,
+        controller_api::VmSpec {
+            vm: disks,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    vm.metadata.uid = uid.into();
+    vm
+}
+
+/// The volume `data`, claimed by `web` with the uid `uid` (or none).
+fn claimed(uid: Option<&str>, gone: bool) -> Volume {
+    let mut v = controller_api::resources::new_volume("data", Default::default());
+    v.status.attached_to = Some("web".into());
+    v.status.attached_uid = uid.map(str::to_string);
+    v.status.claimant_gone = gone;
+    v
+}
+
+#[test]
+fn a_claim_is_judged_by_the_uid_it_carries_and_not_by_the_name() {
+    let v = claimed(Some("u-1"), false);
+    let held = |gone| ClaimantVerdict { gone, bind: None };
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-2", true)]),
+        held(true),
+        "the same name, another vm"
+    );
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-1", true)]),
+        held(false)
+    );
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-1", false)]),
+        held(true),
+        "the claimant no longer refers to it"
+    );
+}
+
+/// A claim written before claims carried a uid is bound to the live VM of its
+/// name once, and a claim already found gone is never handed to a VM made
+/// under the name since.
+#[test]
+fn a_claim_from_before_uids_is_bound_once_and_never_revived_by_a_name() {
+    let live = [claimant("web", "u-1", true)];
+    assert_eq!(
+        claimant_verdict(&claimed(None, false), &live),
+        ClaimantVerdict {
+            gone: false,
+            bind: Some("u-1".into())
+        }
+    );
+    assert_eq!(
+        claimant_verdict(&claimed(None, true), &live),
+        ClaimantVerdict {
+            gone: true,
+            bind: None
+        }
+    );
+    assert!(claimant_verdict(&claimed(None, false), &[]).gone);
+}
+
+/// A VM made again under the name of the one that holds a disk does not take
+/// the disk: it waits for that claim to fall.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_made_again_under_a_name_does_not_take_the_old_ones_disk() {
+    let store = crate::test_etcd::fresh_store("claim-test").await;
+    let mut data = claimed(Some("u-old"), false);
+    data.status.node = Some("agent-1".into());
+    data.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    data.settle(Utc::now());
+    store.create(&data).await.expect("the volume");
+    let mut web = claimant("web", "u-new", true);
+    web.spec.node_name = Some("agent-1".into());
+    let web = store.create(&web).await.expect("the new web");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    let why = hold_volumes(&pass, &web, "agent-1")
+        .await
+        .expect_err("held by the old web");
+    assert!(format!("{why:#}").contains("held by"), "{why:#}");
+    let still: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(still.status.attached_uid.as_deref(), Some("u-old"));
+}
+
+/// The teardown of an old incarnation leaves the claim of the VM that now
+/// carries its name alone.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_release_by_an_old_vm_leaves_the_new_ones_claim() {
+    let store = crate::test_etcd::fresh_store("claim-test").await;
+    store
+        .create(&claimed(Some("u-new"), false))
+        .await
+        .expect("the volume");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    release_named_volumes(&pass, &claimant("web", "u-old", true), &["data".into()]).await;
+
+    let still: Volume = store.get("data").await.expect("the volume");
+    assert!(!still.status.claimant_gone, "u-new still holds it");
 }

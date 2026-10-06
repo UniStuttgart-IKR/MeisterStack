@@ -263,7 +263,10 @@ pub(super) async fn delete_image(
                    copies until they next hear otherwise");
         }
     }
-    st.store.delete::<Image>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<Image>(&name, &image.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         Image::KIND,
         &name,

@@ -42,3 +42,6 @@ tempfile = { workspace = true }
 # discovery test in src/api.rs.
 tower = { workspace = true }
 http-body-util = { workspace = true }
+# A record the store refuses to write, written past it: how a pass meets a
+# volume it cannot parse. See reconcile/tests.rs `unparsable`.
+etcd-client = { workspace = true }

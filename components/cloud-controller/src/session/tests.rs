@@ -24,6 +24,8 @@ fn a_reported_node_reaches_the_cluster_object_unchanged() {
             .collect(),
         vcpus: 32,
         mem_mib: 65_536,
+        bound_vcpus: 4,
+        bound_mem_mib: 8192,
         capabilities: vec!["nvrm/4q".into()],
         accepts: vec!["router".into()],
         vms: 3,
@@ -40,6 +42,7 @@ fn a_reported_node_reaches_the_cluster_object_unchanged() {
     assert!(!kept.schedulable, "the drain travels up with the rest");
     assert_eq!(kept.labels["zone"], "a");
     assert_eq!((kept.vcpus, kept.mem_mib, kept.vms), (32, 65_536, 3));
+    assert_eq!((kept.bound_vcpus, kept.bound_mem_mib), (4, 8192));
     assert_eq!(kept.capabilities, vec!["nvrm/4q".to_string()]);
     // And the node's own word about itself, which is what tells a wedged
     // machine from a healthy one at the tier that places on clusters.
@@ -116,6 +119,8 @@ async fn a_cluster_with_no_session_is_named_in_the_refusal() {
 fn status(complete: bool, uids: &[&str]) -> ClusterStatus {
     ClusterStatus {
         nodes: Vec::new(),
+        unplaced: Vec::new(),
+        unplaced_omitted: 0,
         routers: Vec::new(),
         routers_complete: true,
         nodes_ready: 1,
@@ -395,7 +400,7 @@ fn a_cluster_nobody_reported_on_is_unknown_not_empty() {
 /// beat that rewrote it rewrote every `NodeSummary` with it.
 #[test]
 fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
-    use super::ingest::cluster_facts_are_news;
+    use super::ingest::ClusterFacts;
 
     let summary = |name: &str, ready: bool| controller_api::NodeSummary {
         name: name.to_string(),
@@ -408,72 +413,113 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
         mem_mib: 32768,
         capabilities: vec!["network/vxlan".to_string()],
     };
+    let said = ClusterFacts {
+        ready: 2,
+        total: 2,
+        vms: 3,
+        nodes: nodes.clone(),
+        capacity: Some(capacity.clone()),
+        ..Default::default()
+    };
 
     // A cluster nobody has heard from: the first report is news, because
     // `connected` is what it changes.
     let mut status = controller_api::ClusterStatus::default();
-    assert!(cluster_facts_are_news(
-        &status,
-        2,
-        2,
-        3,
-        &nodes,
-        Some(&capacity)
-    ));
+    assert!(said.are_news_to(&status));
 
-    // What that report left behind.
-    status.connected = true;
-    status.nodes_ready = 2;
-    status.nodes_total = 2;
-    status.vms = 3;
-    status.nodes = nodes.clone();
-    status.capacity.vcpus = 16;
-    status.capacity.mem_mib = 32768;
-    status.capacity.capabilities = vec!["network/vxlan".to_string()];
-
-    // The second, identical one: nothing.
+    // What that report left behind, and the second, identical one: nothing.
+    said.write_onto(&mut status);
     assert!(
-        !cluster_facts_are_news(&status, 2, 2, 3, &nodes, Some(&capacity)),
+        !said.are_news_to(&status),
         "the same report twice is one write"
     );
 
     // And each fact on its own is still news.
-    assert!(cluster_facts_are_news(
-        &status,
-        1,
-        2,
-        3,
-        &nodes,
-        Some(&capacity)
-    ));
-    assert!(cluster_facts_are_news(
-        &status,
-        2,
-        2,
-        4,
-        &nodes,
-        Some(&capacity)
-    ));
+    assert!(
+        ClusterFacts {
+            ready: 1,
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
+    assert!(
+        ClusterFacts {
+            vms: 4,
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
     let one_down = vec![summary("agent-1a", true), summary("agent-1b", false)];
     assert!(
-        cluster_facts_are_news(&status, 2, 2, 3, &one_down, Some(&capacity)),
+        ClusterFacts {
+            nodes: one_down,
+            ..said.clone()
+        }
+        .are_news_to(&status),
         "a node that went not-ready is news even while the counts agree"
     );
-    assert!(cluster_facts_are_news(
-        &status,
-        2,
-        2,
-        3,
-        &nodes,
-        Some(&proto::ClusterCapacity {
-            vcpus: 32,
-            ..capacity.clone()
-        })
-    ));
+    assert!(
+        ClusterFacts {
+            capacity: Some(proto::ClusterCapacity {
+                vcpus: 32,
+                ..capacity.clone()
+            }),
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
 
     // A report with no capacity block says nothing about capacity, and
     // nothing is what it writes.
-    assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, None));
+    assert!(
+        !ClusterFacts {
+            capacity: None,
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
+
+    // A VM waiting down there for a node changes no count and is news, and
+    // so is a list of them that stops short.
+    let waiting = vec![controller_api::Capacity {
+        vcpus: 1,
+        mem_mib: 1024,
+    }];
+    assert!(
+        ClusterFacts {
+            unplaced: waiting,
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
+    assert!(
+        ClusterFacts {
+            unplaced_omitted: 1,
+            ..said.clone()
+        }
+        .are_news_to(&status)
+    );
+}
+
+/// A cluster that sends more unplaced demands than one status carries does
+/// not get them onto the Cluster object: the cloud keeps the first ones and
+/// counts the rest with those the cluster already left out. (IKR-B78)
+#[test]
+fn an_overlong_unplaced_list_is_cut_here_and_the_rest_counted() {
+    let mut said = status(true, &[]);
+    said.unplaced = vec![
+        proto::VmDemand {
+            vcpus: 1,
+            mem_mib: 512,
+        };
+        controller_api::UNPLACED_CARRIED_MAX + 3
+    ];
+    said.unplaced_omitted = 2;
+
+    let facts = ClusterFacts::of(&said);
+
+    assert_eq!(facts.unplaced.len(), controller_api::UNPLACED_CARRIED_MAX);
+    assert_eq!(facts.unplaced_omitted, 5);
 }
 
 /// Only a complete image inventory can prove that a path image is absent.

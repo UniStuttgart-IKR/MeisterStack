@@ -284,6 +284,19 @@ pub(super) async fn holder_of(
         Err(StoreError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    // The VM of that name is the holder only if it is the claimant object: a
+    // guest made under the name since is somebody else, and is not paused for
+    // a copy of a disk it never held. A claim from before claims carried a
+    // uid keeps the name, as it always did, until the claimant pass binds it.
+    // (IKR-B81)
+    if volume
+        .status
+        .attached_uid
+        .as_deref()
+        .is_some_and(|uid| uid != vm.metadata.uid)
+    {
+        return Ok(None);
+    }
     // The uid, because that is what a node was handed on CreateInstance, and
     // the node from the BINDING rather than from the status, for the reason
     // the status ingest gives.
@@ -302,7 +315,7 @@ pub(super) async fn note_snapshot_failed(
 ) -> anyhow::Result<()> {
     warn!(snapshot = %snapshot.metadata.name, error = %message, "snapshot failed");
     p.store
-        .mutate::<VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
+        .mutate_if::<VolumeSnapshot, _>(&snapshot.metadata.name, &snapshot.metadata.uid, |s| {
             s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
                 VolumeSnapshotPhaseKind::Failed,
                 reason,
@@ -336,7 +349,7 @@ pub(super) async fn requeue_snapshot(
     let name = snapshot.metadata.name.clone();
     let kicked = p
         .store
-        .mutate::<VolumeSnapshot, _>(&name, |s| {
+        .mutate_if::<VolumeSnapshot, _>(&name, &snapshot.metadata.uid, |s| {
             // Back to Pending, which is what makes the next pass dispatch
             // again — `reconcile_snapshot` branches on the phase, and the
             // phase is this word.

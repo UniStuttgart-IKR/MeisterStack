@@ -147,7 +147,7 @@ pub(super) async fn delete_provider_network(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: ProviderNetwork = st.store.get(&name).await?;
+    let current: ProviderNetwork = st.store.get(&name).await?;
     let on_it: Vec<String> = st
         .store
         .list::<controller_api::Router>()
@@ -163,7 +163,10 @@ pub(super) async fn delete_provider_network(
             on_it.join(", ")
         )));
     }
-    st.store.delete::<ProviderNetwork>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<ProviderNetwork>(&name, &current.metadata.resource_version)
+        .await?;
     info!(network = %name, "provider network deleted");
     Ok(controller_api::removed(
         ProviderNetwork::KIND,
@@ -245,18 +248,7 @@ pub(super) async fn create_router(
                 ))
             })?;
 
-    let subnets = floating::all_subnets(&st.store).await?;
-    for named in &body.spec.routed_subnets {
-        let Some(subnet) = subnets.iter().find(|s| &s.metadata.name == named) else {
-            return Err(invalid(format!("no routed subnet called {named}")));
-        };
-        if subnet.spec.tenant != owner {
-            return Err(forbidden(format!(
-                "routed subnet {named} belongs to {}, not to {owner}",
-                subnet.spec.tenant
-            )));
-        }
-    }
+    check_routed_subnets(&st, &body.spec.routed_subnets, &owner).await?;
 
     let existing = st.store.list::<controller_api::Router>().await?;
     if let Some(other) = other_router_on(
@@ -287,6 +279,30 @@ pub(super) async fn create_router(
           network = %created.spec.provider_network, snat = created.spec.snat,
           "router created");
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Refuse a routed subnet that does not exist or is another tenant's.
+async fn check_routed_subnets(
+    st: &ApiState,
+    named: &[String],
+    owner: &str,
+) -> Result<(), ApiError> {
+    if named.is_empty() {
+        return Ok(());
+    }
+    let subnets = floating::all_subnets(&st.store).await?;
+    for name in named {
+        let Some(subnet) = subnets.iter().find(|s| &s.metadata.name == name) else {
+            return Err(invalid(format!("no routed subnet called {name}")));
+        };
+        if subnet.spec.tenant != owner {
+            return Err(forbidden(format!(
+                "routed subnet {name} belongs to {}, not to {owner}",
+                subnet.spec.tenant
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Find another named router for this tenant/provider-network pair. Excluding the
@@ -339,6 +355,10 @@ pub(super) async fn update_router(
         .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
     keep_server_owned(&mut body.metadata, &current.metadata);
     check_owned(&current, &body, ROUTER_OWNED)?;
+    // `routedSubnets` is editable, so it is held to the create's rule here
+    // too; checked at create alone, an update could announce another
+    // tenant's prefix.
+    check_routed_subnets(&st, &body.spec.routed_subnets, &current.spec.tenant).await?;
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
     match dry.preview(&body) {
@@ -364,7 +384,10 @@ pub(super) async fn delete_router(
     // answer that keeps a router whose cluster never existed from becoming
     // undeletable.
     if current.status.cluster.is_empty() {
-        st.store.delete::<controller_api::Router>(&name).await?;
+        // The router that was judged, not one made under the name since. (IKR-B81)
+        st.store
+            .delete_if::<controller_api::Router>(&name, &current.metadata.resource_version)
+            .await?;
         info!(router = %name, tenant = %current.spec.tenant, "router deleted (never placed)");
         return Ok(controller_api::removed(
             controller_api::Router::KIND,
@@ -373,7 +396,7 @@ pub(super) async fn delete_router(
         ));
     }
     st.store
-        .mutate::<controller_api::Router, _>(&name, |r| {
+        .mutate_if::<controller_api::Router, _>(&name, &current.metadata.uid, |r| {
             if r.metadata.deletion_timestamp.is_none() {
                 r.metadata.deletion_timestamp = Some(chrono::Utc::now());
             }

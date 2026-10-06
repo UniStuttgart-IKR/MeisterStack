@@ -186,81 +186,125 @@ pub(super) async fn beat(
     Ok(())
 }
 
-/// Does this report say anything the Cluster object does not already say?
-///
-/// The same four questions the node half asks, one tier up, and the same
-/// omission: NOT the heartbeat. Pulled out so the decision can be made in a
-/// test without an etcd.
-pub(super) fn cluster_facts_are_news(
-    status: &controller_api::ClusterStatus,
-    ready: u32,
-    total: u32,
-    vms: u32,
-    nodes: &[controller_api::NodeSummary],
-    capacity: Option<&proto::ClusterCapacity>,
-) -> bool {
-    if !status.connected
-        || status.nodes_ready != ready
-        || status.nodes_total != total
-        || status.vms != vms
-        || status.nodes != nodes
-    {
-        return true;
-    }
-    capacity.is_some_and(|cap| {
-        status.capacity.vcpus != cap.vcpus
-            || status.capacity.mem_mib != cap.mem_mib
-            || status.capacity.capabilities != cap.capabilities
-    })
+/// What one status says about the cluster ITSELF: how many nodes it has, how
+/// many are ready, how much room they add up to, who they are, and what waits
+/// on them for a node — in this cloud's words.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClusterFacts {
+    pub(super) ready: u32,
+    pub(super) total: u32,
+    pub(super) vms: u32,
+    pub(super) nodes: Vec<controller_api::NodeSummary>,
+    pub(super) unplaced: Vec<controller_api::Capacity>,
+    pub(super) unplaced_omitted: u32,
+    /// None: the status said nothing about capacity, and nothing is written.
+    pub(super) capacity: Option<proto::ClusterCapacity>,
 }
 
-/// What the cluster says about ITSELF: how many nodes it has, how many are
-/// ready, how much room they add up to, and who they are.
+impl ClusterFacts {
+    pub(super) fn of(status: &ClusterStatus) -> Self {
+        let (unplaced, unplaced_omitted) = unplaced_kept(status);
+        Self {
+            ready: status.nodes_ready,
+            total: status.nodes_total,
+            vms: status.vms.len() as u32,
+            // Evidence, mirrored whole: the cluster's list of nodes replaces
+            // this cloud's copy of it rather than being merged into it. A node
+            // that has gone is a node that is gone, and a merge would keep it
+            // on the object for ever — the same rule the VM phases below
+            // follow and the same rule the tier below follows about what an
+            // agent reported.
+            nodes: status.nodes.iter().map(node_summary).collect(),
+            unplaced,
+            unplaced_omitted,
+            capacity: status.capacity.clone(),
+        }
+    }
+
+    /// Does this say anything the Cluster object does not already say?
+    ///
+    /// The same four questions the node half asks, one tier up, and the same
+    /// omission: NOT the heartbeat. Pulled out so the decision can be made in
+    /// a test without an etcd.
+    pub(super) fn are_news_to(&self, status: &controller_api::ClusterStatus) -> bool {
+        if !status.connected
+            || status.nodes_ready != self.ready
+            || status.nodes_total != self.total
+            || status.vms != self.vms
+            || status.nodes != self.nodes
+            || status.unplaced != self.unplaced
+            || status.unplaced_omitted != self.unplaced_omitted
+        {
+            return true;
+        }
+        self.capacity.as_ref().is_some_and(|cap| {
+            status.capacity.vcpus != cap.vcpus
+                || status.capacity.mem_mib != cap.mem_mib
+                || status.capacity.capabilities != cap.capabilities
+        })
+    }
+
+    /// Write these facts onto the status of a cluster a session speaks for.
+    pub(super) fn write_onto(&self, status: &mut controller_api::ClusterStatus) {
+        status.connected = true;
+        status.nodes_ready = self.ready;
+        status.nodes_total = self.total;
+        status.vms = self.vms;
+        status.nodes = self.nodes.clone();
+        status.unplaced = self.unplaced.clone();
+        status.unplaced_omitted = self.unplaced_omitted;
+        if let Some(cap) = &self.capacity {
+            status.capacity.vcpus = cap.vcpus;
+            status.capacity.mem_mib = cap.mem_mib;
+            status.capacity.capabilities = cap.capabilities.clone();
+        }
+    }
+}
+
+/// What waits at the cluster for a node, as this cloud keeps it: at most
+/// [`controller_api::UNPLACED_CARRIED_MAX`] demands, and every one past them
+/// counted with those the cluster already left out. A cluster that sends more
+/// does not get them onto the Cluster object, every write of which is all of
+/// it. (IKR-B78)
+fn unplaced_kept(status: &ClusterStatus) -> (Vec<controller_api::Capacity>, u32) {
+    let kept: Vec<controller_api::Capacity> = status
+        .unplaced
+        .iter()
+        .take(controller_api::UNPLACED_CARRIED_MAX)
+        .map(|d| controller_api::Capacity {
+            vcpus: d.vcpus,
+            mem_mib: d.mem_mib,
+        })
+        .collect();
+    let cut = u32::try_from(status.unplaced.len() - kept.len()).unwrap_or(u32::MAX);
+    (kept, status.unplaced_omitted.saturating_add(cut))
+}
+
+/// What the cluster says about ITSELF, written when it is news.
 pub(super) async fn ingest_cluster_facts(
     store: &EtcdStore,
     cluster: &str,
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let capacity = status.capacity.clone();
-    let (ready, total, vms) = (
-        status.nodes_ready,
-        status.nodes_total,
-        status.vms.len() as u32,
-    );
-    // Evidence, mirrored whole: the cluster's list of nodes replaces this
-    // cloud's copy of it rather than being merged into it. A node that has
-    // gone is a node that is gone, and a merge would keep it on the object
-    // for ever — the same rule the VM phases below follow and the same rule
-    // the tier below follows about what an agent reported.
-    let nodes: Vec<controller_api::NodeSummary> = status.nodes.iter().map(node_summary).collect();
+    let facts = ClusterFacts::of(status);
     // The beat in its own key (D-C7), and the object only when the cluster's
     // own facts moved.
     store.beat::<Cluster>(cluster, at).await?;
     let current = store.get::<Cluster>(cluster).await?;
-    if !cluster_facts_are_news(
-        &current.status,
-        ready,
-        total,
-        vms,
-        &nodes,
-        capacity.as_ref(),
-    ) {
+    if !facts.are_news_to(&current.status) {
         return Ok(());
     }
+    if facts.unplaced_omitted > 0 && current.status.unplaced_omitted == 0 {
+        warn!(
+            cluster,
+            omitted = facts.unplaced_omitted,
+            "more vms wait there for a node than its status carries; its nodes offer no room \
+               until fewer do"
+        );
+    }
     store
-        .mutate::<Cluster, _>(cluster, |c| {
-            c.status.connected = true;
-            c.status.nodes_ready = ready;
-            c.status.nodes_total = total;
-            c.status.vms = vms;
-            c.status.nodes = nodes.clone();
-            if let Some(cap) = &capacity {
-                c.status.capacity.vcpus = cap.vcpus;
-                c.status.capacity.mem_mib = cap.mem_mib;
-                c.status.capacity.capabilities = cap.capabilities.clone();
-            }
-        })
+        .mutate::<Cluster, _>(cluster, |c| facts.write_onto(&mut c.status))
         .await?;
     Ok(())
 }
@@ -277,6 +321,8 @@ pub(super) fn node_summary(n: &proto::NodeReport) -> controller_api::NodeSummary
         labels: n.labels.clone().into_iter().collect(),
         vcpus: n.vcpus,
         mem_mib: n.mem_mib,
+        bound_vcpus: n.bound_vcpus,
+        bound_mem_mib: n.bound_mem_mib,
         capabilities: n.capabilities.clone(),
         vms: n.vms,
         conditions: n

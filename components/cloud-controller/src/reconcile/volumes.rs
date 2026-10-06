@@ -113,7 +113,7 @@ pub(super) async fn dispatch_volume(
     // The generation this command carried down — the one thing we KNOW,
     // because we sent it. Same statement the VM half makes on the same road.
     store
-        .mutate::<controller_api::Volume, _>(&name, |v| {
+        .mutate_if::<controller_api::Volume, _>(&name, &volume.metadata.uid, |v| {
             v.status.observed_generation = v.status.observed_generation.max(dispatched);
             // Which cluster's record holds this volume — the same statement
             // `Vm.status.clusterName` makes at dispatch, and the only one
@@ -248,14 +248,18 @@ pub(super) async fn note_snapshot_pending(
         return Ok(());
     }
     store
-        .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-            s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
-                controller_api::VolumeSnapshotPhaseKind::Pending,
-                controller_api::VolumeSnapshotReason::SourceGone,
-                Some(reason.clone()),
-                chrono::Utc::now(),
-            ));
-        })
+        .mutate_if::<controller_api::VolumeSnapshot, _>(
+            &snapshot.metadata.name,
+            &snapshot.metadata.uid,
+            |s| {
+                s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
+                    controller_api::VolumeSnapshotPhaseKind::Pending,
+                    controller_api::VolumeSnapshotReason::SourceGone,
+                    Some(reason.clone()),
+                    chrono::Utc::now(),
+                ));
+            },
+        )
         .await?;
     Ok(())
 }
@@ -278,7 +282,7 @@ pub(super) async fn note_volume_pending(
         return Ok(());
     }
     store
-        .mutate::<controller_api::Volume, _>(&volume.metadata.name, |v| {
+        .mutate_if::<controller_api::Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
             v.status.reported = Some(controller_api::VolumeReported::here(
                 controller_api::VolumePhaseKind::Pending,
                 controller_api::VolumeReason::Unplaced,
@@ -340,7 +344,7 @@ pub(super) async fn move_volumes(
         // not. They are cleared here and nowhere else — this is the one
         // moment a volume stops having been spoken about.
         store
-            .mutate::<controller_api::Volume, _>(&name, |v| {
+            .mutate_if::<controller_api::Volume, _>(&name, &volume.metadata.uid, |v| {
                 v.status.cluster = Some(cluster.to_string());
                 v.status.observed_at = None;
                 v.status.observed_generation = 0;

@@ -138,7 +138,7 @@ pub(super) async fn create_storage_pool(
     if created.spec.default
         && let Err(why) = check_storage_pool(&st, &created, Some(&created.metadata.name)).await
     {
-        take_back::<StoragePool>(&st, &created.metadata.name, "storage pool").await;
+        take_back::<StoragePool>(&st, &created, "storage pool").await;
         return Err(why);
     }
 
@@ -246,7 +246,7 @@ pub(super) async fn delete_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: StoragePool = st.store.get(&name).await?;
+    let current: StoragePool = st.store.get(&name).await?;
     let held: Vec<String> = st
         .store
         .list::<Volume>()
@@ -261,7 +261,10 @@ pub(super) async fn delete_storage_pool(
             held.join(", ")
         )));
     }
-    st.store.delete::<StoragePool>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<StoragePool>(&name, &current.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         StoragePool::KIND,
         &name,
@@ -592,9 +595,11 @@ pub(super) async fn delete_volume(
         .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
 
     let held_by = current.status.attached_to.clone();
+    // On the object whose tenant was checked: one deleted and made again
+    // under the name since is somebody else's. (IKR-B81)
     let released = st
         .store
-        .mutate::<Volume, _>(&name, |v| {
+        .mutate_if::<Volume, _>(&name, &current.metadata.uid, |v| {
             // The timestamp is the decision; `Releasing` is derived from it.
             // See the cluster's own delete edge and `settle_volume`.
             if v.metadata.deletion_timestamp.is_none() {
@@ -803,8 +808,10 @@ pub(super) async fn delete_volume_snapshot(
     let current: VolumeSnapshot = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
+    // On the object whose tenant was checked: one deleted and made again
+    // under the name since is somebody else's. (IKR-B81)
     st.store
-        .mutate::<VolumeSnapshot, _>(&name, |s| {
+        .mutate_if::<VolumeSnapshot, _>(&name, &current.metadata.uid, |s| {
             if s.metadata.deletion_timestamp.is_none() {
                 s.metadata.deletion_timestamp = Some(chrono::Utc::now());
             }

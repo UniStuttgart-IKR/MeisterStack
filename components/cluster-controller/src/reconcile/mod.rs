@@ -39,6 +39,7 @@ mod placement;
 mod requeue;
 mod routers;
 mod snapshots;
+mod told;
 mod vms;
 mod volumes;
 
@@ -47,6 +48,7 @@ pub(crate) use placement::*;
 pub(crate) use requeue::*;
 pub(crate) use routers::*;
 pub(crate) use snapshots::*;
+use told::Told;
 pub(crate) use vms::*;
 pub(crate) use volumes::*;
 
@@ -109,6 +111,9 @@ pub async fn run(
     network: Arc<dyn NetworkBackend>,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
+    // Lives as long as the loop: what was said in one pass is what the next
+    // one need not say again. See `Told`.
+    let told = Arc::new(Told::default());
     // How many ticks between two deadline passes. A five-minute budget does
     // not need a five-second resolution, and six listings per tick would be a
     // monitoring feature that changes the thing it monitors — the same
@@ -136,6 +141,7 @@ pub async fn run(
             kek.as_deref(),
             migration,
             network.as_ref(),
+            &told,
         )
         .await;
         // Measured around the whole pass and not around its parts: what an
@@ -238,6 +244,7 @@ async fn pass(
     kek: Option<&controller_api::secrets::Kek>,
     migration: crate::migration::Timeouts,
     network: &dyn NetworkBackend,
+    told: &Arc<Told>,
 ) -> anyhow::Result<()> {
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
@@ -279,6 +286,7 @@ async fn pass(
         kek,
         held: &held,
         overcommit,
+        told: told.clone(),
     };
     for vm in vms {
         let name = vm.metadata.name.clone();
@@ -364,7 +372,7 @@ fn normal<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
     about(vm, reason, message, EventType::Normal)
 }
 
-fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
+pub(crate) fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
     about(vm, reason, message, EventType::Warning)
 }
 
@@ -412,6 +420,8 @@ struct Pass<'a> {
     held: &'a [CapacityReservation],
     /// Allowance rule for the confirmation a placement makes against the store, not `nodes`.
     overcommit: Overcommit,
+    /// What this replica told its nodes lately, across passes. (IKR-B74)
+    told: Arc<Told>,
 }
 
 #[cfg(test)]

@@ -199,9 +199,9 @@ fn gateway_sentence(physnet: &str, router: &Router, candidates: &[Candidate]) ->
     )
 }
 
-async fn reconcile_router(
+pub(super) async fn reconcile_router(
     pass: &Pass<'_>,
-    dispatch: &crate::dispatch::Dispatch,
+    dispatch: &dyn RouterSink,
     backend: &dyn NetworkBackend,
     router: Router,
     networks: &[ProviderNetwork],
@@ -236,7 +236,21 @@ async fn reconcile_router(
             .await;
         }
     };
+    // Carried down already and resting since: the same plan again is the same
+    // EnsureRouter to every gateway again, once per pass, and a pass runs on
+    // every write to any VM. A router that is not resting (a node said its
+    // namespace or a leg is gone, or it never came up) is told again at once.
+    // (IKR-B74)
+    if router.status.phase().kind().is_terminal() && pass.told.router_lately(&plan) {
+        debug!(router = %name, "plan unchanged and carried down lately");
+        return Ok(());
+    }
     let outcome = backend.realise(dispatch, &plan).await;
+    if outcome.phase.is_terminal() {
+        pass.told.note_router(&plan);
+    } else {
+        pass.told.forget_router(&plan.id);
+    }
     settle(pass, &router, &plan, outcome).await?;
     debug!(router = %name, backend = backend.name(), nodes = ?plan.nodes,
            active = ?plan.active, "router pass");
@@ -292,7 +306,7 @@ async fn ensure_nats(pass: &Pass<'_>, router: Router) -> anyhow::Result<Router> 
     let name = router.metadata.name.clone();
     Ok(pass
         .store
-        .mutate::<Router, _>(&name, |r| {
+        .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
             r.status.nats = nats.clone();
             r.status.announced = announced.clone();
         })
@@ -354,7 +368,7 @@ async fn note(
         )
     });
     pass.store
-        .mutate::<Router, _>(&name, |r| {
+        .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
             r.status.reported = Some(said.clone());
             r.status.observed_generation = generation;
             if let Some((nodes, active, refused, releasing)) = &placement {

@@ -71,8 +71,13 @@ async fn teardown(
     let cluster = router.status.cluster.clone();
     if cluster.is_empty() {
         // Never handed to anybody: there is nothing out there to tear down.
-        store.delete::<Router>(&name).await?;
-        info!(router = %name, "router deleted (never placed)");
+        // The router that was judged, at the revision it was judged at; one
+        // placed or made again under the name since is decided next pass.
+        // (IKR-B81)
+        let never_placed = |r: &Router| r.is_deleting() && r.status.cluster.is_empty();
+        if controller_api::deletion::finish_delete(store, router, never_placed).await? {
+            info!(router = %name, "router deleted (never placed)");
+        }
         return Ok(());
     }
 
@@ -100,8 +105,10 @@ async fn teardown(
         }
         return Ok(());
     }
-    store.delete::<Router>(&name).await?;
-    info!(router = %name, cluster = %cluster, "router deleted");
+    // On the revision whose absence below was judged. (IKR-B81)
+    if controller_api::deletion::finish_delete(store, router, Router::is_deleting).await? {
+        info!(router = %name, cluster = %cluster, "router deleted");
+    }
     Ok(())
 }
 
@@ -218,7 +225,7 @@ async fn reconcile_router(
         .and_then(|t| t.spec.vni);
     if router.spec.vni != vni && vni.is_some() {
         store
-            .mutate::<Router, _>(&name, |r| r.spec.vni = vni)
+            .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| r.spec.vni = vni)
             .await?;
     }
 
@@ -235,10 +242,13 @@ async fn reconcile_router(
         .routed_subnets
         .iter()
         .filter_map(|named| {
+            // The tenant as well as the name: admission checks both, and a
+            // subnet released and cut again for somebody else under the same
+            // name must not be announced by this router.
             estate
                 .subnets
                 .iter()
-                .find(|s| &s.metadata.name == named)
+                .find(|s| &s.metadata.name == named && s.spec.tenant == router.spec.tenant)
                 .map(|s| s.spec.cidr.clone())
         })
         .filter(|cidr| !cidr.is_empty())
@@ -278,8 +288,9 @@ async fn reconcile_router(
         || router.status.observed_generation != generation
         || cleared_refusals;
     if moved {
+        let uid = router.metadata.uid.clone();
         router = store
-            .mutate::<Router, _>(&name, |r| {
+            .mutate_if::<Router, _>(&name, &uid, |r| {
                 r.status.cluster = cluster.clone();
                 r.status.nats = nats.clone();
                 r.status.announced = announced.clone();
@@ -350,7 +361,7 @@ async fn stamp_floating(
         let generation = ip.metadata.generation;
         let name = ip.metadata.name.clone();
         if let Err(e) = store
-            .mutate::<controller_api::FloatingIp, _>(&name, |f| {
+            .mutate_if::<controller_api::FloatingIp, _>(&name, &ip.metadata.uid, |f| {
                 f.status.observed_generation = f.status.observed_generation.max(generation);
             })
             .await
@@ -421,7 +432,7 @@ async fn dispatch(
                 && router.status.nodes.is_empty()
             {
                 store
-                    .mutate::<Router, _>(&name, |r| {
+                    .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
                         // This tier's own anticipation, so it names nobody —
                         // which is also what stops it ever being read as a
                         // router that is up.
@@ -475,7 +486,7 @@ async fn note(
     let cluster = cluster.map(str::to_string);
     let now = Utc::now();
     store
-        .mutate::<Router, _>(&name, |r| {
+        .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
             r.status.reported = Some(controller_api::RouterReported::here(
                 phase,
                 reason,
@@ -528,6 +539,7 @@ mod tests {
             "lab-out",
             controller_api::RouterSpec {
                 tenant: "lab".into(),
+                internal_addr: "10.30.0.1/24".into(),
                 ..Default::default()
             },
         );

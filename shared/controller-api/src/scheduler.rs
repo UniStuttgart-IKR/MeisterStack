@@ -17,7 +17,18 @@ use crate::resources::{AntiAffinity, CapacityReservation, NodeSummary, StoragePo
 
 /// CPU and memory supply or demand. Storage capacity is excluded because
 /// drivers and pools own backend-specific space admission.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
 pub struct Capacity {
     pub vcpus: u32,
     pub mem_mib: u64,
@@ -168,13 +179,44 @@ pub struct Candidate {
     /// currently have no node acceptance list on the wire, so the cluster
     /// performs the final class check.
     pub accepts: Vec<String>,
-    /// Labels of bound VMs for anti-affinity checks, derived with capacity usage
-    /// from each pass's VM inventory.
-    pub hosted: Vec<BTreeMap<String, String>>,
+    /// The VMs bound here as anti-affinity sees them, derived with capacity
+    /// usage from each pass's VM inventory.
+    pub hosted: Vec<Hosted>,
     /// Machine profile for live-migration compatibility, not ordinary VM
     /// placement. None at the cloud tier or for older nodes means unavailable
     /// evidence, not compatibility.
     pub machine: Option<crate::MachineProfile>,
+}
+
+/// One VM a candidate already holds, as anti-affinity measures it: whose it
+/// is and what it is labelled.
+///
+/// The tenant travels with the labels because a term only ever means the
+/// owner's own VMs. Labels are the tenant's to choose, so measured across
+/// tenants one tenant's labels would push another's VMs off a machine, and a
+/// term's refusals would tell its owner what somebody else runs where.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hosted {
+    pub tenant: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl Hosted {
+    pub fn of(vm: &Vm) -> Self {
+        Self {
+            tenant: vm.spec.tenant.clone(),
+            labels: vm.metadata.labels.clone(),
+        }
+    }
+}
+
+/// The VMs bound to `on` by `bound`, every phase counted, exactly as
+/// [`free_on`] counts them: what anti-affinity is measured against.
+pub fn hosted_on(on: &str, vms: &[Vm], bound: fn(&Vm) -> Option<&str>) -> Vec<Hosted> {
+    vms.iter()
+        .filter(|v| bound(v) == Some(on))
+        .map(Hosted::of)
+        .collect()
 }
 
 /// Require every selector pair to match; an empty selector matches all labels.
@@ -191,12 +233,15 @@ pub fn selector_for(vm: &Vm, kind: CandidateKind) -> &BTreeMap<String, String> {
     }
 }
 
-/// Does this candidate already hold a VM that `term` says to stay away from?
-fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
+/// Does this candidate already hold a VM of `vm`'s own tenant that `term`
+/// says to stay away from? Another tenant's VMs are never meant; see
+/// [`Hosted`].
+fn collides(term: &AntiAffinity, vm: &Vm, candidate: &Candidate) -> bool {
     candidate
         .hosted
         .iter()
-        .any(|labels| selects(&term.selector, labels))
+        .filter(|h| h.tenant == vm.spec.tenant)
+        .any(|h| selects(&term.selector, &h.labels))
 }
 
 /// Apply hard VM constraints while preserving inventory order: health,
@@ -215,7 +260,7 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
                 .anti_affinity
                 .iter()
                 .filter(|t| t.required)
-                .any(|t| collides(t, c))
+                .any(|t| collides(t, vm, c))
         })
         .collect()
 }
@@ -573,24 +618,144 @@ pub struct NodeDemand<'a> {
     /// Intersection of nodes permitted by all referenced volumes.
     /// None means unrestricted; an empty set means no common placement exists.
     pub allowed: Option<Vec<String>>,
+    /// What the VM asks of ONE machine. A cluster's capacity is a sum, and
+    /// a sum can hold a VM no node of it can (IKR-B78).
+    pub size: Capacity,
+    /// The workload class one node must accept, as `VmSpec::class` reads it.
+    pub class: &'a str,
 }
 
 impl NodeDemand<'_> {
-    /// Require a usable node satisfying the selector and volume constraints before
-    /// binding a VM to this cluster.
-    pub fn met_by_a_node(&self, nodes: &[NodeSummary]) -> bool {
-        nodes.iter().any(|n| {
-            n.ready
-                && n.schedulable
-                // Apply the node-health veto before cloud placement, matching node scheduling.
-                && !n.conditions.iter().any(crate::NodeCondition::vetoes_placement)
-                && selects(self.selector, &n.labels)
-                && self
-                    .allowed
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.iter().any(|a| a == &n.name))
-        })
+    /// Require ONE usable node satisfying the selector, the volume constraints,
+    /// the class and the room before binding a VM to this cluster.
+    pub fn met_by_a_node(&self, rooms: &[NodeRoom]) -> bool {
+        self.node_for(rooms).is_some()
     }
+
+    /// Take this VM's size off the node it is assumed to land on, so the next
+    /// VM measured against `rooms` in the same pass sees it. False when no
+    /// node takes it.
+    pub fn debit(&self, rooms: &mut [NodeRoom]) -> bool {
+        let Some(at) = self.node_for(rooms) else {
+            return false;
+        };
+        rooms[at].room = rooms[at].room.minus(self.size);
+        true
+    }
+
+    /// Take this VM's size off EVERY node that takes it: for a VM whose node
+    /// is not known, so that none of the nodes it may be on counts its room
+    /// as free. No node keeps more room than [`debit`](Self::debit) would
+    /// have left it, whichever node the VM is really on.
+    pub fn debit_each(&self, rooms: &mut [NodeRoom]) {
+        for room in rooms
+            .iter_mut()
+            .filter(|r| r.takes(self.size) && self.wants(&r.node))
+        {
+            room.room = room.room.minus(self.size);
+        }
+    }
+
+    /// Whether ONE usable node of `nodes` may run this VM, room aside: all
+    /// that can be asked of a cluster whose room is not known, and enough to
+    /// tell a VM that waits for that room from one none of its nodes would
+    /// ever take.
+    pub fn allowed_on_a_node(&self, nodes: &[NodeSummary]) -> bool {
+        nodes.iter().any(|n| n.usable() && self.wants(n))
+    }
+
+    /// Of the nodes that take this VM, the one with the most room.
+    fn node_for(&self, rooms: &[NodeRoom]) -> Option<usize> {
+        roomiest(rooms, self.size, |r| self.wants(&r.node))
+    }
+
+    /// Whether this VM may run on `node`, room aside: its selector, the
+    /// locality of its volumes and its class.
+    fn wants(&self, node: &NodeSummary) -> bool {
+        selects(self.selector, &node.labels)
+            && self
+                .allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|a| a == &node.name))
+            && crate::resources::accepts_class(&node.accepts, self.class)
+    }
+}
+
+/// One reported node as the cloud measures it within a pass: what its
+/// cluster said, and the room left on it once the VMs counted against it are
+/// taken off. (IKR-B78)
+#[derive(Clone, Debug)]
+pub struct NodeRoom {
+    pub node: NodeSummary,
+    pub room: Capacity,
+}
+
+impl NodeRoom {
+    /// What `node` has left, as its cluster reported the VMs bound to it.
+    pub fn reported(node: &NodeSummary, overcommit: Overcommit) -> Self {
+        let capacity = Capacity {
+            vcpus: node.vcpus,
+            mem_mib: node.mem_mib,
+        };
+        let bound = Capacity {
+            vcpus: node.bound_vcpus,
+            mem_mib: node.bound_mem_mib,
+        };
+        Self {
+            node: node.clone(),
+            room: overcommit.allowance(capacity).minus(bound),
+        }
+    }
+
+    /// Usable, and with room for `size` left. The health veto applies before
+    /// cloud placement, as it does to node scheduling.
+    fn takes(&self, size: Capacity) -> bool {
+        self.node.usable() && size.fits_in(self.room)
+    }
+}
+
+/// The rooms of one cluster's nodes, less `unplaced`: what VMs ask for that
+/// the cluster holds without a node yet, or that are bound to it and not
+/// reported by it yet. Neither is in any node's bound sum, and both will
+/// land on one. Each comes off the node with the most room it fits, which is
+/// the assumption that never overstates what the next VM finds; the next
+/// report says where they really went. One no node takes takes no room: it
+/// waits down there.
+pub fn node_rooms(
+    nodes: &[NodeSummary],
+    overcommit: Overcommit,
+    unplaced: &[Capacity],
+) -> Vec<NodeRoom> {
+    let mut rooms: Vec<NodeRoom> = nodes
+        .iter()
+        .map(|n| NodeRoom::reported(n, overcommit))
+        .collect();
+    for size in unplaced {
+        if let Some(at) = roomiest(&rooms, *size, |_| true) {
+            rooms[at].room = rooms[at].room.minus(*size);
+        }
+    }
+    rooms
+}
+
+/// Of the rooms that take `size` and that `wants` accepts, the one with the
+/// most room — memory first, then vCPUs, then the name, so two passes over
+/// one report assume the same.
+fn roomiest(
+    rooms: &[NodeRoom],
+    size: Capacity,
+    wants: impl Fn(&NodeRoom) -> bool,
+) -> Option<usize> {
+    rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.takes(size) && wants(r))
+        .max_by(|(_, a), (_, b)| {
+            (a.room.mem_mib, a.room.vcpus)
+                .cmp(&(b.room.mem_mib, b.room.vcpus))
+                .then_with(|| b.node.name.cmp(&a.node.name))
+        })
+        .map(|(at, _)| at)
 }
 
 /// Intersect another volume's allowed nodes. None imposes no restriction;
@@ -623,7 +788,7 @@ pub fn preferred<'a>(vm: &Vm, feasible: Vec<&'a Candidate>) -> Vec<&'a Candidate
     let clean: Vec<&Candidate> = feasible
         .iter()
         .copied()
-        .filter(|c| !soft.iter().any(|t| collides(t, c)))
+        .filter(|c| !soft.iter().any(|t| collides(t, vm, c)))
         .collect();
     if clean.is_empty() { feasible } else { clean }
 }
@@ -804,12 +969,17 @@ pub enum PendingReason {
     /// A cloud-init secret cannot yet be resolved, such as an absent mirror,
     /// missing key or unavailable sealing key. Separate from storage readiness.
     SecretNotReady,
+    /// The room left on the nodes of a cluster that could otherwise take the
+    /// VM is not known: more VMs wait there for a node than its status lists.
+    /// Not `NoCapacity`, because nothing says the room is gone, and not a
+    /// node-level ask, because none of the VM's asks is what is missing.
+    RoomUnknown,
 }
 
 impl PendingReason {
     /// All reasons in declaration order, used to publish zero-valued metric series
     /// for categories with no pending VMs.
-    pub const ALL: [PendingReason; 12] = [
+    pub const ALL: [PendingReason; 13] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
         PendingReason::NodeUnhealthy,
@@ -822,6 +992,7 @@ impl PendingReason {
         PendingReason::VolumeNotReady,
         PendingReason::NoNodeForVolume,
         PendingReason::SecretNotReady,
+        PendingReason::RoomUnknown,
     ];
 
     /// Where this variant sits in `ALL` — the slot a `PendingTally` counts
@@ -851,6 +1022,7 @@ impl PendingReason {
             PendingReason::VolumeNotReady => "volume-not-ready",
             PendingReason::SecretNotReady => "secret-not-ready",
             PendingReason::NoNodeForVolume => "no-node-for-volume",
+            PendingReason::RoomUnknown => "room-unknown",
         }
     }
 
@@ -870,7 +1042,8 @@ impl PendingReason {
             | PendingReason::Unserved
             | PendingReason::Split
             | PendingReason::AntiAffinity
-            | PendingReason::NoNodeForVolume => VmReason::Unplaced,
+            | PendingReason::NoNodeForVolume
+            | PendingReason::RoomUnknown => VmReason::Unplaced,
         }
     }
 }
@@ -1030,7 +1203,7 @@ const CUTS: [Cut; 6] = [
                 .anti_affinity
                 .iter()
                 .filter(|t| t.required)
-                .any(|t| collides(t, c))
+                .any(|t| collides(t, vm, c))
         },
         verdict: |_, _, _, _| {
             (
@@ -1092,7 +1265,7 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
 pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
         c.free = c.free.minus(Capacity::wanted_by(vm));
-        c.hosted.push(vm.metadata.labels.clone());
+        c.hosted.push(Hosted::of(vm));
     }
 }
 
@@ -1105,18 +1278,33 @@ pub fn free_on(
     vms: &[Vm],
     overcommit: Overcommit,
 ) -> Capacity {
-    let bound = vms
-        .iter()
-        .filter(|v| v.spec.node_name.as_deref() == Some(node))
-        .fold(Capacity::default(), |sum, vm| {
-            sum.plus(Capacity::wanted_by(vm))
-        });
     overcommit
         .allowance(Capacity {
             vcpus: capacity.vcpus,
             mem_mib: capacity.mem_mib,
         })
-        .minus(bound)
+        .minus(bound_on(node, vms))
+}
+
+/// What each of `vms` held without a node asks for: the half of its demand no
+/// node's bound sum carries yet. One entry per VM, because each lands on one
+/// machine. A VM on its way out will land nowhere. (IKR-B78)
+pub fn unplaced_demand<'a>(vms: impl IntoIterator<Item = &'a Vm>) -> Vec<Capacity> {
+    vms.into_iter()
+        .filter(|v| v.spec.node_name.is_none() && !v.is_deleting())
+        .map(Capacity::wanted_by)
+        .collect()
+}
+
+/// What the VMs bound to `node` ask for, Pending included. The used half of
+/// [`free_on`], and what a cluster reports up per node so the cloud measures
+/// one node's room the same way.
+pub fn bound_on(node: &str, vms: &[Vm]) -> Capacity {
+    vms.iter()
+        .filter(|v| v.spec.node_name.as_deref() == Some(node))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        })
 }
 
 /// Sum reservations independently of bound VM usage: migrating guests stay bound to their
@@ -1268,7 +1456,13 @@ mod tests {
         Candidate {
             machine: None,
             labels: labels(on),
-            hosted: holding.iter().map(|h| labels(h)).collect(),
+            hosted: holding
+                .iter()
+                .map(|h| Hosted {
+                    tenant: None,
+                    labels: labels(h),
+                })
+                .collect(),
             ..candidate(name, true, true)
         }
     }
@@ -2252,6 +2446,70 @@ mod tests {
         );
     }
 
+    /// A candidate holding one VM labelled `app=web` of `tenant`.
+    fn holding_web_of(name: &str, tenant: Option<&str>) -> Candidate {
+        Candidate {
+            hosted: vec![Hosted {
+                tenant: tenant.map(str::to_string),
+                labels: labels(&[("app", "web")]),
+            }],
+            ..candidate(name, true, true)
+        }
+    }
+
+    /// `avoiding`, asked by a VM of `tenant`.
+    fn avoiding_as(tenant: &str, pairs: &[(&str, &str)], required: bool) -> Vm {
+        let mut v = avoiding(pairs, required);
+        v.spec.tenant = Some(tenant.into());
+        v
+    }
+
+    /// A term means its owner's own VMs: another tenant's VM wearing the
+    /// label does not push this one off the machine. (IKR-B71)
+    #[test]
+    fn a_term_does_not_see_another_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("umbrella"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("acme", &[("app", "web")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// The same machine, holding the tenant's own `web`, is avoided.
+    #[test]
+    fn a_term_still_sees_its_own_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("acme"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("acme", &[("app", "web")], true), &only),
+            None
+        );
+    }
+
+    /// An unscoped VM's term means unscoped VMs only, and no tenant's VM.
+    #[test]
+    fn an_unscoped_term_does_not_see_a_tenants_vm() {
+        let only = [holding_web_of("agent-1a", Some("acme"))];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// What a pass spends carries the tenant, so the next VM of the same
+    /// tenant in that pass sees it and one of another tenant does not.
+    #[test]
+    fn a_spent_placement_is_hosted_under_its_tenant() {
+        let mut room = vec![candidate("agent-1a", true, true)];
+        let mut first = avoiding_as("acme", &[("app", "web")], true);
+        first.metadata.labels = labels(&[("app", "web")]);
+        spend(&mut room, "agent-1a", &first);
+        assert_eq!(FirstFit.assign(&first, &room), None);
+        assert_eq!(
+            FirstFit.assign(&avoiding_as("umbrella", &[("app", "web")], true), &room),
+            Some("agent-1a".into())
+        );
+    }
+
     /// Soft anti-affinity yields when enforcing it would prevent placement.
     #[test]
     fn a_preferred_term_gives_way_rather_than_leaving_the_vm_pending() {
@@ -2605,7 +2863,8 @@ mod tests {
                 "anti-affinity",
                 "volume-not-ready",
                 "no-node-for-volume",
-                "secret-not-ready"
+                "secret-not-ready",
+                "room-unknown"
             ]
         );
         // and the sentence is still the sentence
@@ -2936,8 +3195,10 @@ mod tests {
         let anywhere = NodeDemand {
             selector: &BTreeMap::new(),
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
         };
-        assert!(anywhere.met_by_a_node(&[node]));
+        assert!(anywhere.met_by_a_node(&rooms(&[node])));
     }
 
     /// Unknown reported health conditions still veto placement and remain visible
@@ -3104,12 +3365,19 @@ mod tests {
                 .collect(),
             vcpus: 8,
             mem_mib: 8192,
+            bound_vcpus: 0,
+            bound_mem_mib: 0,
             capabilities: Vec::new(),
             accepts: Vec::new(),
             vms: 0,
             conditions: Vec::new(),
             draining: None,
         }
+    }
+
+    /// The nodes as their cluster reported them, nothing unplaced.
+    fn rooms(nodes: &[NodeSummary]) -> Vec<NodeRoom> {
+        node_rooms(nodes, Overcommit::default(), &[])
     }
 
     /// The same summary with one condition on it — a machine that is up,
@@ -3132,22 +3400,52 @@ mod tests {
         let demand = NodeDemand {
             selector: &want,
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
         };
-        assert!(demand.met_by_a_node(&[summary("a", true, true, &[("disk", "nvme")])]));
-        assert!(!demand.met_by_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
-        assert!(!demand.met_by_a_node(&[]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("a", true, true, &[("disk", "nvme")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", true, true, &[("disk", "sata")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[])));
 
         // A node that is down or drained does not count, which is the whole
         // reason to ask before the binding rather than after it.
-        assert!(!demand.met_by_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
-        assert!(!demand.met_by_a_node(&[summary("a", true, false, &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", false, true, &[("disk", "nvme")])])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("a", true, false, &[("disk", "nvme")])])));
         // A reachable but unhealthy matching node cannot satisfy cloud placement.
-        assert!(!demand.met_by_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&rooms(&[wedged_summary("a", &[("disk", "nvme")])])));
         // One healthy machine beside it is enough, as it always was.
-        assert!(demand.met_by_a_node(&[
+        assert!(demand.met_by_a_node(&rooms(&[
             wedged_summary("a", &[("disk", "nvme")]),
             summary("b", true, true, &[("disk", "nvme")]),
-        ]));
+        ])));
+    }
+
+    /// Room aside, a node is still asked for its labels, its health and the
+    /// disk it holds: a full node may take the VM once room is known, a node
+    /// without the labels never will.
+    #[test]
+    fn a_node_room_aside_is_asked_everything_but_its_room() {
+        let want: BTreeMap<String, String> = [("disk".to_string(), "nvme".to_string())]
+            .into_iter()
+            .collect();
+        let demand = NodeDemand {
+            selector: &want,
+            allowed: Some(vec!["a".to_string()]),
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 1024,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut full = summary("a", true, true, &[("disk", "nvme")]);
+        full.bound_mem_mib = full.mem_mib;
+        assert!(!demand.met_by_a_node(&rooms(std::slice::from_ref(&full))));
+        assert!(demand.allowed_on_a_node(&[full]));
+
+        assert!(!demand.allowed_on_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
+        assert!(!demand.allowed_on_a_node(&[summary("b", true, true, &[("disk", "nvme")])]));
+        assert!(!demand.allowed_on_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
+        assert!(!demand.allowed_on_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
     }
 
     /// And the volume half: a node-local disk pins the VM to one machine, so
@@ -3158,12 +3456,14 @@ mod tests {
         let demand = NodeDemand {
             selector: &none,
             allowed: Some(vec!["manacor".to_string()]),
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
         };
-        assert!(demand.met_by_a_node(&[
+        assert!(demand.met_by_a_node(&rooms(&[
             summary("soller", true, true, &[]),
             summary("manacor", true, true, &[])
-        ]));
-        assert!(!demand.met_by_a_node(&[summary("soller", true, true, &[])]));
+        ])));
+        assert!(!demand.met_by_a_node(&rooms(&[summary("soller", true, true, &[])])));
     }
 
     /// Both halves at once, which is the case that made them one question:
@@ -3176,13 +3476,15 @@ mod tests {
         let demand = NodeDemand {
             selector: &want,
             allowed: Some(vec!["manacor".to_string()]),
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
         };
-        assert!(demand.met_by_a_node(&[summary("manacor", true, true, &[("zone", "a")])]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("manacor", true, true, &[("zone", "a")])])));
         assert!(
-            !demand.met_by_a_node(&[
+            !demand.met_by_a_node(&rooms(&[
                 summary("manacor", true, true, &[("zone", "b")]),
                 summary("soller", true, true, &[("zone", "a")])
-            ]),
+            ])),
             "one node has the labels and the other has the disk: neither can run it"
         );
     }
@@ -3214,11 +3516,159 @@ mod tests {
         let demand = NodeDemand {
             selector: &none,
             allowed: None,
+            size: Capacity::default(),
+            class: crate::resources::CLASS_VM,
         };
-        assert!(demand.met_by_a_node(&[summary("a", true, true, &[])]));
+        assert!(demand.met_by_a_node(&rooms(&[summary("a", true, true, &[])])));
         assert!(
-            !demand.met_by_a_node(&[]),
+            !demand.met_by_a_node(&rooms(&[])),
             "but a cluster with no nodes serves nothing"
+        );
+    }
+
+    /// IKR-B78: a cluster of two 8 GiB nodes holds 16 GiB, and a 12 GiB VM fits
+    /// that sum and neither node. One node has to have the room, after what is
+    /// bound to it, and take the class.
+    #[test]
+    fn one_node_has_to_have_the_room_and_not_the_sum_of_them() {
+        let none = BTreeMap::new();
+        let asking = |mem_mib: u64, class: &'static str| NodeDemand {
+            selector: &none,
+            allowed: None,
+            size: Capacity { vcpus: 1, mem_mib },
+            class,
+        };
+        let two = [summary("a", true, true, &[]), summary("b", true, true, &[])];
+        assert!(asking(4096, crate::resources::CLASS_VM).met_by_a_node(&rooms(&two)));
+        assert!(!asking(12_288, crate::resources::CLASS_VM).met_by_a_node(&rooms(&two)));
+
+        let mut busy = two.clone();
+        for node in &mut busy {
+            node.bound_mem_mib = 6144;
+        }
+        assert!(
+            !asking(4096, crate::resources::CLASS_VM).met_by_a_node(&rooms(&busy)),
+            "4 GiB free in all and 2 GiB on each"
+        );
+
+        let mut routers_only = two.clone();
+        for node in &mut routers_only {
+            node.accepts = vec!["router".to_string()];
+        }
+        assert!(!asking(1024, crate::resources::CLASS_VM).met_by_a_node(&rooms(&routers_only)));
+    }
+
+    /// IKR-B78 within one pass: two 4 GiB VMs bound in the same pass do not
+    /// both fit a node with 6 GiB of room, so the second sees the first.
+    #[test]
+    fn a_vm_bound_in_the_same_pass_takes_its_room_off_a_node() {
+        let none = BTreeMap::new();
+        let four_gib = NodeDemand {
+            selector: &none,
+            allowed: None,
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 4096,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut one = summary("a", true, true, &[]);
+        one.bound_mem_mib = 2048;
+        let mut ledger = rooms(&[one]);
+        assert!(four_gib.debit(&mut ledger));
+        assert!(!four_gib.met_by_a_node(&ledger));
+        assert!(!four_gib.debit(&mut ledger), "no node takes the second");
+    }
+
+    /// A VM whose node is not known takes its room off every node it may be
+    /// on, and off none it may not: not one its selector misses, and not one
+    /// it does not fit.
+    #[test]
+    fn a_vm_whose_node_is_not_known_takes_its_room_off_every_node_it_may_be_on() {
+        let ssd: BTreeMap<String, String> = [("disk".to_string(), "ssd".to_string())]
+            .into_iter()
+            .collect();
+        let four_gib = NodeDemand {
+            selector: &ssd,
+            allowed: None,
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 4096,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut full = summary("c", true, true, &[("disk", "ssd")]);
+        full.bound_mem_mib = 6144;
+        let mut ledger = rooms(&[
+            summary("a", true, true, &[("disk", "ssd")]),
+            summary("b", true, true, &[("disk", "sata")]),
+            full,
+        ]);
+
+        four_gib.debit_each(&mut ledger);
+
+        let left: Vec<u64> = ledger.iter().map(|r| r.room.mem_mib).collect();
+        assert_eq!(left, [4096, 8192, 2048]);
+    }
+
+    /// What a cluster holds unplaced, and what is bound there unreported, comes
+    /// off the node with the most room; one no node takes takes nothing.
+    #[test]
+    fn unplaced_demand_comes_off_the_roomiest_node_it_fits() {
+        let mut small = summary("a", true, true, &[]);
+        small.mem_mib = 4096;
+        let big = summary("b", true, true, &[]);
+        let unplaced = [
+            Capacity {
+                vcpus: 1,
+                mem_mib: 2048,
+            },
+            Capacity {
+                vcpus: 1,
+                mem_mib: 65_536,
+            },
+        ];
+        let ledger = node_rooms(&[small, big], Overcommit::default(), &unplaced);
+        assert_eq!(
+            ledger[0].room.mem_mib, 4096,
+            "the smaller node keeps its room"
+        );
+        assert_eq!(
+            ledger[1].room.mem_mib, 6144,
+            "the 2 GiB came off the bigger one"
+        );
+    }
+
+    /// An unplaced VM lands only on a node it can land on: not a drained one.
+    #[test]
+    fn unplaced_demand_does_not_come_off_a_node_that_takes_nothing() {
+        let drained = summary("a", true, false, &[]);
+        let ledger = node_rooms(
+            &[drained],
+            Overcommit::default(),
+            &[Capacity {
+                vcpus: 1,
+                mem_mib: 1024,
+            }],
+        );
+        assert_eq!(ledger[0].room.mem_mib, 8192);
+    }
+
+    /// What a cluster reports as unplaced: each VM without a node, one entry
+    /// each, and not one on its way out.
+    #[test]
+    fn unplaced_demand_is_each_vm_without_a_node_that_stays() {
+        let waiting = sized(2, 2048);
+        let mut placed = sized(1, 1024);
+        placed.spec.node_name = Some("agent-1a".into());
+        let mut leaving = sized(4, 4096);
+        leaving.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        assert_eq!(
+            unplaced_demand(&[waiting, placed, leaving]),
+            [Capacity {
+                vcpus: 2,
+                mem_mib: 2048
+            }]
         );
     }
 

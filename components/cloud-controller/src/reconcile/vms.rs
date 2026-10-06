@@ -19,7 +19,7 @@ pub(super) async fn reconcile_vm(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
     vm: Vm,
@@ -35,7 +35,7 @@ pub(super) async fn reconcile_vm(
         span,
         &context,
         reconcile_vm_traced(
-            store, registry, scheduler, sessions, clusters, book, pending, vm, context,
+            store, registry, scheduler, sessions, ledger, book, pending, vm, context,
         ),
     )
     .await
@@ -60,7 +60,7 @@ pub(super) async fn reconcile_vm_traced(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
     vm: Vm,
@@ -84,7 +84,7 @@ pub(super) async fn reconcile_vm_traced(
     }
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        return place(store, registry, scheduler, clusters, pending, vm, &outgoing).await;
+        return place(store, registry, scheduler, ledger, pending, vm, &outgoing).await;
     };
 
     let Some(report) = current_report(registry, &vm, &cluster) else {
@@ -141,7 +141,7 @@ async fn place(
     store: &EtcdStore,
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
+    ledger: &std::sync::Mutex<Ledger>,
     pending: &PendingTally,
     vm: Vm,
     outgoing: &str,
@@ -159,9 +159,9 @@ async fn place(
     // a sum and its catalogue a union, so a cluster can look able to
     // serve a VM that no single node of it can — and until this the
     // answer was found one tier down, after the VM had been sent there.
-    let node_level = match servable_clusters(store, &vm).await? {
-        Servable::Clusters(names) => names,
-        Sentence(reason) => {
+    let wanted = match wanted(store, &vm).await? {
+        Ok(wanted) => wanted,
+        Err(reason) => {
             pending.note(controller_api::PendingReason::VolumeNotReady);
             return note_pending(
                 store,
@@ -172,7 +172,8 @@ async fn place(
             .await;
         }
     };
-    match pick_cluster(scheduler, clusters, &vm, &node_level) {
+    let picked = pick_cluster(scheduler, ledger, &vm, &wanted);
+    match picked {
         Ok(pick) => bind(store, vm, pick).await,
         Err((known, (category, reason))) => {
             // Say WHY on the object and not only in this replica's debug
@@ -190,47 +191,6 @@ async fn place(
     }
 }
 
-/// Decide and SPEND under one lock, and let go before anything awaits — see
-/// the cluster tier's `place` for why the binding and not the API edge is the
-/// authority.
-///
-/// `Err` carries how many candidates the sentence was measured against,
-/// beside the category and the sentence itself.
-fn pick_cluster(
-    scheduler: &dyn Scheduler,
-    clusters: &std::sync::Mutex<Vec<Candidate>>,
-    vm: &Vm,
-    node_level: &[String],
-) -> Result<String, (usize, (controller_api::PendingReason, String))> {
-    let mut clusters = clusters.lock().unwrap();
-    let allowed: Vec<Candidate> = clusters
-        .iter()
-        .filter(|c| node_level.iter().any(|n| n == &c.name))
-        .cloned()
-        .collect();
-    match scheduler.assign(vm, &allowed) {
-        Some(pick) => {
-            controller_api::spend(&mut clusters, &pick, vm);
-            Ok(pick)
-        }
-        // The sentence is measured against what was actually
-        // offered. A cluster cut away for having no suitable node is
-        // not a cluster that "had no room", and saying so would send
-        // an operator to look at the wrong thing.
-        None if allowed.is_empty() && !clusters.is_empty() => Err((
-            clusters.len(),
-            (
-                controller_api::PendingReason::NoNodeForVolume,
-                node_level_reason(vm, clusters.len()),
-            ),
-        )),
-        None => Err((
-            allowed.len(),
-            controller_api::pending_reason_of(vm, &allowed),
-        )),
-    }
-}
-
 /// Write the binding the scheduler picked, and record it where a person can
 /// see it.
 ///
@@ -239,13 +199,19 @@ fn pick_cluster(
 /// retried onto a newer object — a retry would re-apply this replica's choice
 /// over the winner's and move a VM that is already placed. One write, one
 /// winner, and the loser is told.
-async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
+pub(super) async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     let mut bound = vm;
     bound.spec.cluster_name = Some(pick.clone());
     // The binding answers whatever a previous pass wrote about why there was
     // none: clearing the FACT is all there is to do, because `settle_vm`
     // reads it only while the VM is waiting.
     bound.status.placement = None;
+    // A refusal is the word of the cluster that gave it, and this binding
+    // may be to another: it must not hold the first hand-down here back.
+    bound.status.hand_down_refused = None;
+    // The order the next passes book it in until the cluster reports it:
+    // after every VM bound before it, as this pass booked it. See `unreported`.
+    bound.status.bound_at = Some(Utc::now());
     match store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
@@ -273,10 +239,100 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     }
 }
 
-/// Dispatch when the cluster lacks the VM, has different intent, or has not
-/// received the current spec generation. Generation changes include disk hot-plug.
+/// Let `vm`'s binding go, and with it the time it was made: `status.boundAt`
+/// dates the binding in `spec.clusterName` and must not outlive it. Every
+/// path that lets a binding go — a drain reschedule, an evacuation, the API
+/// release — goes through here. (IKR-B78)
+pub(crate) fn release_binding(vm: &mut Vm) {
+    vm.spec.cluster_name = None;
+    vm.status.bound_at = None;
+}
+
+/// How long a cluster that answered a VM's intent is left with its answer
+/// before the same intent is sent again. A lifecycle drift stands for a whole
+/// stop grace or boot; sent every pass, each ack's write was the watch event
+/// that started the next pass, and one stopping guest cost tens of commands a
+/// second. A refusal is written as well, and the cluster's next report starts
+/// a pass just the same. (IKR-B74)
+const RETELL_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
+/// Whether an answer given at `at` is still the cluster's word at `now`.
+fn answered_lately(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(at) < RETELL_AFTER
+}
+
+/// Whether the cluster acked a hand-down of this VM within [`RETELL_AFTER`]:
+/// then telling it the same again is noise. Only the ack's own record counts,
+/// never a reported phase.
+pub(super) fn handed_down_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
+    vm.status
+        .handed_down
+        .as_ref()
+        .is_some_and(|h| answered_lately(h.at, now))
+}
+
+/// Whether the cluster the VM is bound to refused its current intent — its
+/// generation and its labels — within [`RETELL_AFTER`]: asking again gets the
+/// same no. New intent is not what was refused and goes down at once, and
+/// neither does another cluster's no hold back the first hand-down to this
+/// one. (IKR-B74)
+pub(super) fn refused_lately(vm: &Vm, now: DateTime<Utc>) -> bool {
+    vm.status.hand_down_refused.as_ref().is_some_and(|r| {
+        answered_lately(r.at, now)
+            && vm.spec.cluster_name.as_deref() == Some(r.cluster.as_str())
+            && r.generation == vm.metadata.generation
+            && r.labels == vm.metadata.labels
+    })
+}
+
+/// [`handed_down_lately`] or [`refused_lately`], by an answer no earlier than
+/// `intent`: an answer from before an intent says nothing about it.
+pub(super) fn answered_since(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let acked = handed_down_lately(vm, now)
+        && vm
+            .status
+            .handed_down
+            .as_ref()
+            .is_some_and(|h| h.at >= intent);
+    let refused = refused_lately(vm, now)
+        && vm
+            .status
+            .hand_down_refused
+            .as_ref()
+            .is_some_and(|r| r.at >= intent);
+    acked || refused
+}
+
+/// Whether the cluster's copy may wear other labels than the VM: edited since
+/// the last acked hand-down, or never handed down under this record, which
+/// is every VM dispatched before labels travelled. (IKR-B71)
+pub(super) fn labels_unsent(vm: &Vm) -> bool {
+    vm.status
+        .handed_down
+        .as_ref()
+        .is_none_or(|h| h.labels != vm.metadata.labels)
+}
+
+/// Whether the VM has to go down to its cluster now: the cluster lacks it, or
+/// has not been sent the current spec generation or labels, or its phase
+/// still disagrees with the intent it acked longer than [`RETELL_AFTER`] ago —
+/// unless the cluster refused exactly this intent within that window.
+/// Generation changes include disk hot-plug and runStrategy edits; the drift
+/// arm is the repair for a cluster that lost what it acked, not the way
+/// intent travels.
+pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool {
+    if refused_lately(vm, now) {
+        return false;
+    }
+    let stale = vm.metadata.generation > vm.status.observed_generation;
+    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some()
+        && !handed_down_lately(vm, now);
+    missing || stale || labels_unsent(vm) || drifted
+}
+
+/// Dispatch what [`must_hand_down`] says has to go down.
 /// `observedGeneration` records acknowledged dispatch, not guest readiness.
-async fn hand_down(
+pub(super) async fn hand_down(
     store: &EtcdStore,
     registry: &SessionRegistry,
     book: &OnceCell<AddressBook>,
@@ -285,10 +341,10 @@ async fn hand_down(
     report: &crate::session::Report,
     outgoing: &str,
 ) -> anyhow::Result<()> {
+    // `current_report` already held back a report older than our last
+    // command, so absence here is evidence.
     let missing = !report.uids.contains(&vm.metadata.uid);
-    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some();
-    let stale = vm.metadata.generation > vm.status.observed_generation;
-    if !(missing || drifted || stale) {
+    if !must_hand_down(vm, missing, Utc::now()) {
         return Ok(());
     }
     // Asked only when something is about to go down, because it costs a
@@ -424,7 +480,7 @@ pub(super) async fn drain_cluster(
             }
             controller_api::drain::Verdict::Reschedule => {
                 store
-                    .mutate::<Vm, _>(&name, |v| v.spec.cluster_name = None)
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, release_binding)
                     .await?;
                 events::record(
                     store,
@@ -444,7 +500,7 @@ pub(super) async fn drain_cluster(
             }
             controller_api::drain::Verdict::Restart => {
                 store
-                    .mutate::<Vm, _>(&name, |v| {
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                         v.status.evacuating = Some(controller_api::Evacuating {
                             from: cluster.to_string(),
                             step: controller_api::EvacuationStep::Stopping
@@ -614,7 +670,7 @@ pub(super) async fn evacuate(
     let name = vm.metadata.name.clone();
     if cluster != mark.from {
         store
-            .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+            .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
             .await?;
         events::record(
             store,
@@ -634,9 +690,14 @@ pub(super) async fn evacuate(
             if vm.status.phase().kind() == VmPhaseKind::Running
                 || vm.status.phase().kind() == VmPhaseKind::Paused
             {
-                // Level-triggered: the same dispatch every pass until the
-                // phase moves, and idempotent at the cluster because what
-                // changes down there is one object's desired state.
+                // Level-triggered: the same dispatch until the phase moves,
+                // idempotent at the cluster because what changes down there
+                // is one object's desired state. Once per `RETELL_AFTER`
+                // after the mark, acked or refused, not once per pass.
+                // (IKR-B74)
+                if answered_since(vm, mark.since, Utc::now()) {
+                    return Ok(());
+                }
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
                     .await;
             }
@@ -646,8 +707,8 @@ pub(super) async fn evacuate(
                 return Ok(());
             }
             store
-                .mutate::<Vm, _>(&name, |v| {
-                    v.spec.cluster_name = None;
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
+                    release_binding(v);
                     v.status.evacuating = Some(controller_api::Evacuating {
                         from: mark.from.clone(),
                         step: controller_api::EvacuationStep::Moving.as_str().to_string(),
@@ -664,7 +725,7 @@ pub(super) async fn evacuate(
         // honest; looping is not.
         Some(controller_api::EvacuationStep::Moving) => {
             store
-                .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
                 .await?;
             warn!(vm = %name, cluster, "evacuation came back to the same cluster; giving it up");
             Ok(())
@@ -703,13 +764,14 @@ pub(super) async fn dispatch_create(
         vni: tenant_vni(store, vm.spec.tenant.as_deref()).await?,
         floating_ips: addresses.floating_ips,
         routed_subnets: addresses.routed_subnets,
+        labels: vm.metadata.labels.clone().into_iter().collect(),
     });
 
     let dispatched = vm.metadata.generation;
     match registry.send_command(cluster, traceparent, op).await {
         Ok(Ack::Acked(_)) => {
             store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     // The generation this command carried down. Everything
                     // below is a guess about what the cluster will do with
                     // it; this is the one thing we KNOW, because we sent it.
@@ -720,6 +782,15 @@ pub(super) async fn dispatch_create(
                     // it, a status built before the create landed could pass
                     // for proof that the VM was never there.
                     v.status.observed_at = Some(Utc::now());
+                    // The labels this command carried, not the object's
+                    // by now: an edit since is still to go down.
+                    v.status.handed_down = Some(controller_api::HandedDown {
+                        at: Utc::now(),
+                        labels: vm.metadata.labels.clone(),
+                    });
+                    // Answered: whatever was refused before is not the
+                    // cluster's word any more.
+                    v.status.hand_down_refused = None;
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has
@@ -744,7 +815,7 @@ pub(super) async fn dispatch_create(
             let msg = refusal.message;
             warn!(cluster, error = %msg, "cluster refused the create");
             store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     v.status.reported = Some(controller_api::VmReported::here(
                         VmPhaseKind::Failed,
                         controller_api::VmReason::Refused,
@@ -753,6 +824,16 @@ pub(super) async fn dispatch_create(
                     ));
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     v.status.observed_at = Some(Utc::now());
+                    // What was refused, so the same is not asked again before
+                    // `RETELL_AFTER`: the cluster's next report replaces the
+                    // phase above, and every report starts a pass. (IKR-B74)
+                    v.status.hand_down_refused = Some(controller_api::HandDownRefused {
+                        at: Utc::now(),
+                        generation: dispatched,
+                        labels: vm.metadata.labels.clone(),
+                        message: msg.clone(),
+                        cluster: cluster.to_string(),
+                    });
                 })
                 .await?;
         }
@@ -782,9 +863,13 @@ pub(super) async fn teardown(
     let uid = vm.metadata.uid.clone();
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        // Never placed anywhere: there is nothing to tear down.
-        store.delete::<Vm>(&name).await?;
-        info!("vm deleted (never placed)");
+        // Never placed anywhere: there is nothing to tear down. The VM that
+        // was judged, at its revision; one bound or made again under the name
+        // since is decided next pass. (IKR-B81)
+        let never_placed = |v: &Vm| v.is_deleting() && v.spec.cluster_name.is_none();
+        if controller_api::deletion::finish_delete(store, vm, never_placed).await? {
+            info!("vm deleted (never placed)");
+        }
         return Ok(());
     };
 
@@ -806,7 +891,7 @@ pub(super) async fn teardown(
         {
             Ok(Ack::Acked(_)) => {
                 store
-                    .mutate::<Vm, _>(&name, |v| {
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                         v.status.observed_at = Some(Utc::now());
                     })
                     .await?;
@@ -829,8 +914,10 @@ pub(super) async fn teardown(
         debug!(cluster = %cluster, "waiting for a status younger than what we already know");
         return Ok(());
     }
-    store.delete::<Vm>(&name).await?;
-    info!(cluster = %cluster, "vm deleted");
+    // On the revision whose absence from the report was judged. (IKR-B81)
+    if controller_api::deletion::finish_delete(store, vm, Vm::is_deleting).await? {
+        info!(cluster = %cluster, "vm deleted");
+    }
     Ok(())
 }
 
@@ -893,6 +980,13 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
         // cannot set it through the cluster API.
         "evacuation": vm.spec.evacuation.as_str(),
         "tenant": vm.spec.tenant,
+        // The node half of placement is the cluster's to answer, so the owner's
+        // words about it have to reach the cluster's scheduler. The cluster
+        // selector stays here: it was answered when this cluster was chosen.
+        // (IKR-B71)
+        "class": vm.spec.class,
+        "nodeSelector": vm.spec.node_selector,
+        "antiAffinity": vm.spec.anti_affinity,
         "vm": vm.spec.vm,
     }))?)
 }

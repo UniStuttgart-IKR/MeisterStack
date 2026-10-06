@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::dispatch::{Dispatch, NodeCommand};
 
+pub(crate) mod admission;
+
 /// Deadlines for destination preparation and transfer observation.
 /// Preparation may be cancelled before dispatch; an uncertain transfer outcome
 /// retains ownership and requires recovery. Only the transfer budget is configurable.
@@ -248,8 +250,8 @@ pub async fn start_from_the_cloud(
     store: &EtcdStore,
     name: &str,
     vm: &str,
+    cloud_uid: &str,
     target_node: Option<&str>,
-    tenant: &str,
 ) -> anyhow::Result<()> {
     // The vm has to be one of ours, and saying so here is what makes the
     // cloud's answer a sentence instead of a migration that fails a pass
@@ -258,14 +260,27 @@ pub async fn start_from_the_cloud(
         .get(vm)
         .await
         .map_err(|e| anyhow::anyhow!("vm {vm} is not on this cluster: {e}"))?;
-    // A cloud's command does not pass the REST edge, so its refusal is said here.
-    if let Some(why) = device_refusal(&guest) {
-        anyhow::bail!("{why}");
+    // And it has to be the cloud's object, not one that carries its name: a
+    // cluster-local vm, or the copy of another cloud vm, is not the cloud's
+    // to move. (IKR-B81)
+    if guest.metadata.cloud_uid() != Some(cloud_uid) {
+        return Err(controller_api::Refusal::invalid(format!(
+            "vm {vm} on this cluster is not the cloud's vm {cloud_uid}"
+        ))
+        .into());
+    }
+    // A cloud's command does not pass the REST edge, so the REST edge's whole
+    // refusal is asked here: instance-store disks, node-local volumes,
+    // devices, nowhere to go. (IKR-B72)
+    if let Some(why) = admission::refusal(store, &guest, target_node).await? {
+        return Err(controller_api::Refusal::invalid(why).into());
     }
     let migration = VmMigration::declare(
         name,
         controller_api::VmMigrationSpec {
-            tenant: tenant.to_string(),
+            // Whose it is follows the guest, as at the REST edge: a record of
+            // what happened to somebody's VM belongs in their history.
+            tenant: guest.spec.tenant.clone().unwrap_or_default(),
             vm: vm.to_string(),
             target_node: target_node.map(str::to_string),
         },
@@ -1396,11 +1411,15 @@ fn close_volumes_at(vm: &Vm, node: &str) {
 
 /// Move referenced volume homes that still name the source to the destination.
 /// Failures are logged after the migration succeeds; there is no retry here.
+/// Only a volume this guest object claims (`VolumeStatus::claimed_by`): a volume
+/// made under a referenced name since, held by another object, or claimed from
+/// before claims carried a uid is not this migration's to move; the last waits
+/// for the claimant pass to bind it. (IKR-B81)
 async fn move_volume_home(store: &EtcdStore, vm: &Vm, from: &str, to: &str) {
     for name in vm.spec.referenced_volumes() {
         let moved = store
             .mutate::<Volume, _>(&name, |v| {
-                if v.status.node.as_deref() == Some(from) {
+                if v.status.node.as_deref() == Some(from) && v.status.claimed_by(&vm.metadata.uid) {
                     v.status.node = Some(to.to_string());
                 }
             })

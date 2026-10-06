@@ -29,6 +29,11 @@ pub(super) fn validate_vm_spec(spec: &VmSpec) -> Result<(), ApiError> {
             "user_data and user_data_from are two starting points; name one",
         ));
     }
+    // A vm that names a tenant is held to the tenant's rule whoever writes
+    // it here; one without a tenant is the operator's own.
+    if spec.tenant.as_deref().is_some_and(|t| !t.is_empty()) {
+        controller_api::vni::check_tenant_nics(&spec.vm)?;
+    }
     Ok(())
 }
 
@@ -518,9 +523,12 @@ pub(super) async fn delete_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    refuse_if_cloud_owned(&st.store.get::<Vm>(&name).await?)?;
+    let current: Vm = st.store.get(&name).await?;
+    refuse_if_cloud_owned(&current)?;
+    // On the VM that passed the guard: one the cloud made under the name
+    // since is the cloud's to delete, not this edge's. (IKR-B81)
     st.store
-        .mutate::<Vm, _>(&name, |v| {
+        .mutate_if::<Vm, _>(&name, &current.metadata.uid, |v| {
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }

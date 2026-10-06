@@ -72,6 +72,7 @@ pub(super) async fn create_floating_ip(
     if let Some(vm) = body.spec.vm.as_deref().filter(|v| !v.is_empty()) {
         check_vm_of_tenant(&st, vm, &owner).await?;
     }
+    check_router_binding(&st, &body.spec, &owner).await?;
 
     let pools = floating::all_pools(&st.store).await?;
     let pool = floating::pick_pool(&pools, Some(body.spec.pool.as_str()))?;
@@ -91,6 +92,45 @@ pub(super) async fn create_floating_ip(
     info!(address = %created.spec.address, tenant = %owner, pool = %pool.metadata.name,
           vm = ?created.spec.vm, "floating address reserved");
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Refuse a router binding that is not the tenant's own way out.
+///
+/// The router has to exist and be this tenant's, or the address would be
+/// translated in somebody else's namespace; a missing and a foreign router
+/// get the same answer, so the refusal names nobody else's router. The
+/// inside end has to be a guest on that router's overlay
+/// (`network::inside_address_refusal`). `nat_rules` checks both again when
+/// it renders, for what was stored before this edge did.
+async fn check_router_binding(
+    st: &ApiState,
+    spec: &controller_api::FloatingIpSpec,
+    tenant: &str,
+) -> Result<(), ApiError> {
+    if spec.router.is_empty() {
+        return Ok(());
+    }
+    let unknown = || {
+        invalid_field(
+            "spec.router",
+            format!("no router {:?} in this tenant", spec.router),
+        )
+    };
+    let router: controller_api::Router = match st.store.get(&spec.router).await {
+        Ok(router) => router,
+        Err(StoreError::NotFound(_)) => return Err(unknown()),
+        Err(e) => return Err(e.into()),
+    };
+    if router.spec.tenant != tenant {
+        return Err(unknown());
+    }
+    if spec.internal_address.is_empty() {
+        return Ok(());
+    }
+    match controller_api::network::inside_address_refusal(&router, &spec.internal_address) {
+        Some(why) => Err(invalid_field("spec.internalAddress", why)),
+        None => Ok(()),
+    }
 }
 
 pub(super) async fn get_floating_ip(
@@ -143,6 +183,7 @@ pub(super) async fn update_floating_ip(
     if let Some(vm) = body.spec.vm.as_deref().filter(|v| !v.is_empty()) {
         check_vm_of_tenant(&st, vm, &current.spec.tenant).await?;
     }
+    check_router_binding(&st, &body.spec, &current.spec.tenant).await?;
     keep_server_owned(&mut body.metadata, &current.metadata);
     check_owned(&current, &body, FLOATING_IP_OWNED)?;
     body.spec.vm = body.spec.vm.filter(|v| !v.is_empty());
@@ -169,7 +210,12 @@ pub(super) async fn delete_floating_ip(
     let current: FloatingIp = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
-    st.store.delete::<FloatingIp>(&name).await?;
+    // The reservation that was judged, not whatever the address names by now:
+    // released and reserved again by another tenant in between, it is theirs.
+    // (IKR-B81)
+    st.store
+        .delete_if::<FloatingIp>(&name, &current.metadata.resource_version)
+        .await?;
     info!(address = %name, tenant = %current.spec.tenant, "floating address released");
     Ok(controller_api::removed(
         FloatingIp::KIND,
@@ -366,8 +412,12 @@ pub(super) async fn collisions(
 /// A failure here is an ERROR: what stays behind is a pool or a subnet lying
 /// on top of another one, and no pass, retry or reconnect ever clears it —
 /// only a person does.
-pub(super) async fn take_back<T: Resource>(st: &ApiState, name: &str, kind: &str) {
-    if let Err(e) = st.store.delete::<T>(name).await {
+///
+/// The object this request created, by its uid and revision: a name taken
+/// back after somebody else took it would be their object. (IKR-B81)
+pub(super) async fn take_back<T: Resource>(st: &ApiState, created: &T, kind: &str) {
+    let name = created.metadata().name.as_str();
+    if let Err(e) = controller_api::deletion::take_back_created(&st.store, created).await {
         error!(name, kind, error = %format!("{e:#}"),
                "could not take back an object that lost its claim; it now overlaps another \
                 one and has to be deleted by hand");
@@ -446,7 +496,7 @@ pub(super) async fn create_floating_pool(
     // administrator named these ranges and this default mark outright, so
     // there is nothing for the server to pick differently on a second round.
     if let Some(why) = pool_lost_claim(&st, &created).await? {
-        take_back::<FloatingPool>(&st, &created.metadata.name, "floating pool").await;
+        take_back::<FloatingPool>(&st, &created, "floating pool").await;
         return Err(conflict(why));
     }
 
@@ -503,7 +553,7 @@ pub(super) async fn delete_floating_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: FloatingPool = st.store.get(&name).await?;
+    let current: FloatingPool = st.store.get(&name).await?;
     let held: Vec<String> = floating::all_reservations(&st.store)
         .await?
         .into_iter()
@@ -516,7 +566,10 @@ pub(super) async fn delete_floating_pool(
             held.join(", ")
         )));
     }
-    st.store.delete::<FloatingPool>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<FloatingPool>(&name, &current.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         FloatingPool::KIND,
         &name,

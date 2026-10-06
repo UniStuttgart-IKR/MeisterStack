@@ -140,17 +140,7 @@ pub fn accepts_class(accepts: &[String], class: &str) -> bool {
 /// nodes do not broaden acceptance. An empty fleet returns an empty list;
 /// node-level placement remains the final eligibility check.
 pub fn cluster_accepts(nodes: &[crate::NodeSummary]) -> Vec<String> {
-    let usable: Vec<&crate::NodeSummary> = nodes
-        .iter()
-        .filter(|n| {
-            n.ready
-                && n.schedulable
-                && !n
-                    .conditions
-                    .iter()
-                    .any(crate::NodeCondition::vetoes_placement)
-        })
-        .collect();
+    let usable: Vec<&crate::NodeSummary> = nodes.iter().filter(|n| n.usable()).collect();
     if usable.is_empty() || usable.iter().any(|n| n.accepts.is_empty()) {
         return Vec::new();
     }

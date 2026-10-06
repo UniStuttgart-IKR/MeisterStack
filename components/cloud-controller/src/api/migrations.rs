@@ -106,6 +106,9 @@ pub(super) async fn create_vm_migration(
         vm: body.spec.vm.clone(),
         target_node: target,
         tenant: owner,
+        // The guest that was authorised, not whatever its name names at the
+        // cluster. (IKR-B81)
+        vm_uid: vm.metadata.uid.clone(),
     };
 
     // Which replica can send it. A cluster dials ONE cloud replica, so two of

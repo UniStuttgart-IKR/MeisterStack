@@ -434,6 +434,26 @@ fn the_cluster_tier_parses_what_the_cloud_sends() {
     assert!(spec.node_name.is_none() && spec.cluster_name.is_none());
 }
 
+/// IKR-B71: a node selector, an anti-affinity term and a class set at the
+/// cloud reach the cluster's scheduler; the cluster selector, answered here,
+/// does not travel.
+#[test]
+fn the_node_half_of_placement_travels_to_the_cluster() {
+    let mut v = vm();
+    v.spec.class = "gpu".into();
+    v.spec.node_selector = [("network-node".to_string(), "cobra3".to_string())].into();
+    v.spec.cluster_selector = [("region".to_string(), "stuttgart".to_string())].into();
+    v.spec.anti_affinity = vec![controller_api::resources::AntiAffinity {
+        selector: [("app".to_string(), "web".to_string())].into(),
+        required: true,
+    }];
+    let spec: VmSpec = serde_json::from_str(&build_spec_json(&v).unwrap()).unwrap();
+    assert_eq!(spec.class, "gpu");
+    assert_eq!(spec.node_selector, v.spec.node_selector);
+    assert_eq!(spec.anti_affinity, v.spec.anti_affinity);
+    assert!(spec.cluster_selector.is_empty());
+}
+
 // --- the address book ----------------------------------------------------
 
 fn owned(name: &str, tenant: Option<&str>) -> Vm {
@@ -564,7 +584,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     let carried = book.for_vm(&owned("web", Some("acme"))).carried;
     let mut names: Vec<_> = carried
         .iter()
-        .map(|(resource, name, generation)| (*resource, name.as_str(), *generation))
+        .map(|c| (c.resource, c.name.as_str(), c.generation))
         .collect();
     names.sort();
     assert_eq!(
@@ -591,7 +611,11 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     // which is what a routed subnet IS — it reaches a node inside some
     // VM's create or it reaches none.
     let idle = book.for_vm(&owned("idle", Some("acme"))).carried;
-    assert_eq!(idle, [("routedsubnets", "acme-net".to_string(), 5)]);
+    let idle: Vec<_> = idle
+        .iter()
+        .map(|c| (c.resource, c.name.as_str(), c.generation))
+        .collect();
+    assert_eq!(idle, [("routedsubnets", "acme-net", 5)]);
 }
 
 /// The generation is read when the command is BUILT and never again.
@@ -616,7 +640,7 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
     assert!(
         carried
             .iter()
-            .all(|(resource, _, generation)| *resource != "floatingips" || *generation == 2),
+            .all(|c| c.resource != "floatingips" || c.generation == 2),
         "the command still carries what it was built with"
     );
 }
@@ -737,4 +761,828 @@ fn an_observed_volume_whose_spec_moved_is_handed_down_again() {
     // Once it has gone, the dedup holds again.
     volume.status.observed_generation = 2;
     assert!(!needs_dispatch(&volume));
+}
+
+// --- IKR-B74: a drift is told again after a while, not on every pass -------
+
+/// A stopping guest: Stopped asked for, Running reported, the current
+/// generation acked by the cluster `told` seconds after `at(0)`.
+fn stopping(told: i64) -> Vm {
+    let mut v = vm();
+    v.spec.run_strategy = RunStrategy::Stopped;
+    v.status.reported = Some(controller_api::VmReported::by(
+        "cluster-1",
+        VmPhaseKind::Running,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(0),
+    ));
+    v.settle(at(0));
+    v.status.observed_generation = v.metadata.generation;
+    v.status.observed_at = Some(at(told));
+    v.status.handed_down = Some(controller_api::HandedDown {
+        at: at(told),
+        labels: v.metadata.labels.clone(),
+    });
+    v
+}
+
+/// The lab's loop: every ack was a write, the write started the next pass,
+/// and the pass dispatched the same create again. Now the cluster that acked
+/// the intent is left to act on it for `RETELL_AFTER`.
+#[test]
+fn a_drift_the_cluster_acked_lately_is_not_dispatched_again() {
+    let v = stopping(10);
+    assert!(!must_hand_down(&v, false, at(11)), "told a second ago");
+    assert!(
+        !must_hand_down(&v, false, at(39)),
+        "still inside the window"
+    );
+    assert!(must_hand_down(&v, false, at(40)), "told again after it");
+}
+
+/// What is news goes down at once, whatever was said a moment ago: a cluster
+/// that lacks the VM, and a spec generation it has not been sent.
+#[test]
+fn a_missing_vm_or_a_new_generation_is_dispatched_at_once() {
+    let v = stopping(10);
+    assert!(must_hand_down(&v, true, at(11)));
+    let mut edited = stopping(10);
+    edited.metadata.generation += 1;
+    assert!(must_hand_down(&edited, false, at(11)));
+}
+
+/// An evacuation mark is new intent: a dispatch from before it says nothing
+/// about it, one after it does.
+#[test]
+fn only_a_dispatch_after_the_intent_counts_as_told() {
+    let v = stopping(10);
+    assert!(answered_since(&v, at(5), at(11)));
+    assert!(!answered_since(&v, at(12), at(13)));
+}
+
+/// `stopping(10)` with a new generation the cluster refused at `at(refused)`.
+fn refused_at(refused: i64) -> Vm {
+    let mut v = stopping(10);
+    v.metadata.generation += 1;
+    v.status.hand_down_refused = Some(controller_api::HandDownRefused {
+        at: at(refused),
+        generation: v.metadata.generation,
+        labels: v.metadata.labels.clone(),
+        message: "the shape of a vm is fixed once it exists".into(),
+        cluster: "cluster-1".into(),
+    });
+    v
+}
+
+/// The same loop over a detour: a cluster that refuses a re-send goes on
+/// reporting the VM, and each report started a pass that asked again. The
+/// refusal holds the same intent back for `RETELL_AFTER`, held or missing.
+#[test]
+fn an_intent_the_cluster_refused_lately_is_not_asked_again() {
+    let v = refused_at(20);
+    assert!(!must_hand_down(&v, false, at(21)), "refused a second ago");
+    assert!(!must_hand_down(&v, true, at(21)), "missing is no news");
+    assert!(
+        !must_hand_down(&v, false, at(49)),
+        "still inside the window"
+    );
+    assert!(must_hand_down(&v, false, at(50)), "asked again after it");
+}
+
+/// What was refused is that intent and no other: an edit since goes down at
+/// once.
+#[test]
+fn new_intent_after_a_refusal_goes_down_at_once() {
+    let mut edited = refused_at(20);
+    edited.metadata.generation += 1;
+    assert!(must_hand_down(&edited, false, at(21)));
+    let mut relabelled = refused_at(20);
+    relabelled
+        .metadata
+        .labels
+        .insert("app".into(), "web".into());
+    assert!(must_hand_down(&relabelled, false, at(21)));
+}
+
+/// A refusal is the word of the cluster that gave it: bound to another one
+/// since, the VM goes down there at once, and so does one whose refusal
+/// names no cluster.
+#[test]
+fn another_clusters_refusal_holds_nothing_back() {
+    let mut moved = refused_at(20);
+    moved.spec.cluster_name = Some("cluster-2".into());
+    assert!(must_hand_down(&moved, true, at(21)));
+    let mut unnamed = refused_at(20);
+    if let Some(r) = unnamed.status.hand_down_refused.as_mut() {
+        r.cluster.clear();
+    }
+    assert!(must_hand_down(&unnamed, false, at(21)));
+}
+
+/// A refusal after an evacuation mark answers it as an ack would: the stop
+/// is asked once per window, refused or not.
+#[test]
+fn a_refusal_after_the_intent_counts_as_answered() {
+    let v = refused_at(20);
+    assert!(answered_since(&v, at(15), at(21)));
+    assert!(!answered_since(&v, at(25), at(26)));
+}
+
+/// A label-only edit of a bound, acked VM goes down at once: labels move no
+/// generation, and the neighbours' anti-affinity at the cluster reads them.
+#[test]
+fn a_label_edit_of_an_acked_vm_is_handed_down() {
+    let mut v = stopping(10);
+    v.spec.run_strategy = RunStrategy::Running;
+    assert!(!must_hand_down(&v, false, at(11)), "nothing new");
+    v.metadata.labels.insert("app".into(), "web".into());
+    assert!(must_hand_down(&v, false, at(11)));
+}
+
+/// A VM handed down before the record existed goes down once more, so the
+/// cluster's copy gets the labels it never carried.
+#[test]
+fn a_vm_handed_down_before_labels_travelled_goes_down_once_more() {
+    let mut v = stopping(10);
+    v.spec.run_strategy = RunStrategy::Running;
+    v.status.handed_down = None;
+    assert!(must_hand_down(&v, false, at(11)));
+}
+
+/// A phase the cluster reported a moment ago is not a hand-down: the drift
+/// it shows goes down unless the cluster itself acked the intent lately.
+#[test]
+fn a_fresh_report_does_not_stand_in_for_a_hand_down() {
+    let mut v = stopping(10);
+    v.status.observed_at = Some(at(100));
+    assert!(must_hand_down(&v, false, at(101)));
+}
+
+// --- IKR-B78: a cluster is offered only where one node can take the VM -----
+
+/// A ready node of 4 vCPUs and `mem_mib`, nothing bound.
+fn reported_node(name: &str, mem_mib: u64) -> controller_api::NodeSummary {
+    controller_api::NodeSummary {
+        name: name.into(),
+        ready: true,
+        schedulable: true,
+        vcpus: 4,
+        mem_mib,
+        ..Default::default()
+    }
+}
+
+/// The cluster `ikr-netlab` with two nodes of `mem_mib` each.
+fn netlab(mem_mib: u64) -> Cluster {
+    let mut cluster = Cluster::declare("ikr-netlab", Default::default());
+    cluster.status.nodes = vec![
+        reported_node("cobra0", mem_mib),
+        reported_node("cobra1", mem_mib),
+    ];
+    cluster.status.capacity.vcpus = 8;
+    cluster.status.capacity.mem_mib = 2 * mem_mib;
+    cluster
+}
+
+/// `vm()`, unbound, asking for one vCPU and `mem_mib`.
+fn asking(mem_mib: u64) -> Vm {
+    let mut v = vm();
+    v.spec.cluster_name = None;
+    v.spec.vm = serde_json::json!({ "vcpus": 1, "memory_mib": mem_mib });
+    v
+}
+
+/// The pass's ledger over one cluster, as `expire_and_collect_clusters`
+/// builds it.
+fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
+    let name = cluster.metadata.name.clone();
+    let mut ledger = Ledger::default();
+    ledger
+        .nodes
+        .insert(name.clone(), booked_rooms(cluster, vms));
+    ledger.clusters.push(Candidate {
+        name: name.clone(),
+        connected: true,
+        alive: true,
+        schedulable: true,
+        unhealthy: Vec::new(),
+        free: free_on(&name, &cluster.status.capacity, vms, Overcommit::default()),
+        catalogue: vec!["hypervisor/cloud-hypervisor".to_string()],
+        kind: CandidateKind::Cluster,
+        labels: Default::default(),
+        accepts: Vec::new(),
+        hosted: Vec::new(),
+        machine: None,
+    });
+    std::sync::Mutex::new(ledger)
+}
+
+/// `rooms_of` with each unreported VM booked by its own asks, as
+/// `unreported_on` books a VM without volumes.
+fn booked_rooms(cluster: &Cluster, vms: &[Vm]) -> Rooms {
+    let booked: Vec<Booking> = unreported(&cluster.metadata.name, vms)
+        .into_iter()
+        .map(|v| Booking::Where(Wanted::of(v, None, None)))
+        .collect();
+    rooms_of(cluster, &booked, Overcommit::default())
+}
+
+/// The node rooms of [`booked_rooms`]; none where they are not known.
+fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
+    booked_rooms(cluster, vms).nodes().to_vec()
+}
+
+/// The lab's repro: 4096 MiB asked, every node with 2048 MiB. The sum of the
+/// cluster had room, the cloud bound, and the VM sat Pending a tier down.
+#[test]
+fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
+    let rooms = rooms(&netlab(2048), &[]);
+    let too_big = asking(4096);
+    assert!(!Wanted::of(&too_big, None, None).served_by("ikr-netlab", &rooms));
+    let fits = asking(1024);
+    assert!(Wanted::of(&fits, None, None).served_by("ikr-netlab", &rooms));
+
+    let (category, sentence) = node_level_reason(&too_big, 1);
+    assert_eq!(category, controller_api::PendingReason::NoCapacity);
+    assert!(sentence.contains("4096 MiB"), "{sentence}");
+}
+
+/// A burst of creates in one pass: each 2560 MiB VM fits the cluster's sum
+/// three times over two 4096 MiB nodes, and only one fits each node. The
+/// third is not bound, because the first two took their room off a node
+/// and not only off the sum.
+#[test]
+fn vms_bound_in_one_pass_take_their_room_off_the_nodes() {
+    let ledger = ledger_of(&netlab(4096), &[]);
+    let burst: Vec<Vm> = (0..3).map(|_| asking(2560)).collect();
+    let picked: Vec<bool> = burst
+        .iter()
+        .map(|v| {
+            pick_cluster(
+                &controller_api::FirstFit,
+                &ledger,
+                v,
+                &Wanted::of(v, None, None),
+            )
+            .is_ok()
+        })
+        .collect();
+    assert_eq!(picked, [true, true, false]);
+}
+
+/// A VM bound to the cluster that it has not reported yet holds a node's
+/// room as surely as one it placed; one it reported is in its own numbers
+/// and is not counted twice.
+#[test]
+fn a_vm_bound_but_not_reported_yet_holds_a_nodes_room() {
+    let cluster = netlab(4096);
+    let mut sent = asking(3072);
+    sent.spec.cluster_name = Some("ikr-netlab".into());
+    let roomy: Vec<u64> = rooms(&cluster, std::slice::from_ref(&sent))
+        .iter()
+        .map(|r| r.room.mem_mib)
+        .collect();
+    assert_eq!(roomy, [1024, 4096]);
+
+    sent.status.reported = Some(controller_api::VmReported::by(
+        "ikr-netlab",
+        VmPhaseKind::Pending,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(0),
+    ));
+    assert!(
+        rooms(&cluster, std::slice::from_ref(&sent))
+            .iter()
+            .all(|r| r.room.mem_mib == 4096)
+    );
+}
+
+/// The pass that binds a VM and every pass after it, until the cluster
+/// reports it, book it on the same node: the one its selector picks, not the
+/// roomiest of all. Booked elsewhere, the selected node looked free again a
+/// pass later.
+#[test]
+fn a_vm_bound_but_not_reported_yet_is_booked_where_its_binding_booked_it() {
+    let mut cluster = netlab(4096);
+    cluster.status.nodes[0]
+        .labels
+        .insert("disk".into(), "ssd".into());
+    cluster.status.nodes[1].mem_mib = 6144;
+    let mut ssd = asking(3072);
+    ssd.spec.node_selector.insert("disk".into(), "ssd".into());
+    let ledger = ledger_of(&cluster, &[]);
+    pick_cluster(
+        &controller_api::FirstFit,
+        &ledger,
+        &ssd,
+        &Wanted::of(&ssd, None, None),
+    )
+    .expect("bound");
+    let booked =
+        |rooms: &[NodeRoom]| -> Vec<u64> { rooms.iter().map(|r| r.room.mem_mib).collect() };
+    let at_binding = booked(ledger.lock().unwrap().rooms("ikr-netlab"));
+
+    ssd.spec.cluster_name = Some("ikr-netlab".into());
+    let next_pass = booked(&rooms(&cluster, std::slice::from_ref(&ssd)));
+
+    assert_eq!(at_binding, [1024, 6144]);
+    assert_eq!(next_pass, at_binding);
+}
+
+/// Two VMs bound in two passes, the later one first by name: every pass
+/// after books them in the order they were bound, and so on the nodes the
+/// passes that bound them assumed. In the order of their names the later VM
+/// took the node the earlier binding had assumed.
+#[test]
+fn vms_bound_in_two_passes_are_booked_in_the_order_they_were_bound() {
+    let mut cluster = netlab(4096);
+    cluster.status.nodes[1].mem_mib = 6144;
+    let bound = |mut v: Vm, name: &str, secs: i64| {
+        v.metadata.name = name.into();
+        v.spec.cluster_name = Some("ikr-netlab".into());
+        v.status.bound_at = Some(at(secs));
+        v
+    };
+    let left = |rooms: &[NodeRoom]| -> Vec<u64> { rooms.iter().map(|r| r.room.mem_mib).collect() };
+    let zeta = asking(2048);
+    let first = ledger_of(&cluster, &[]);
+    pick_cluster(
+        &controller_api::FirstFit,
+        &first,
+        &zeta,
+        &Wanted::of(&zeta, None, None),
+    )
+    .expect("zeta bound in the first pass");
+    let zeta = bound(zeta, "zeta", 0);
+    let alpha = asking(3072);
+    let second = ledger_of(&cluster, std::slice::from_ref(&zeta));
+    pick_cluster(
+        &controller_api::FirstFit,
+        &second,
+        &alpha,
+        &Wanted::of(&alpha, None, None),
+    )
+    .expect("alpha bound in the second pass");
+    let at_binding = left(second.lock().unwrap().rooms("ikr-netlab"));
+    let alpha = bound(alpha, "alpha", 5);
+
+    let third = left(&rooms(&cluster, &[alpha, zeta]));
+
+    assert_eq!(at_binding, [1024, 4096]);
+    assert_eq!(third, at_binding);
+}
+
+/// What the cluster holds without a node comes off a node before the next
+/// VM is measured.
+#[test]
+fn what_a_cluster_holds_unplaced_holds_a_nodes_room() {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced = vec![
+        Capacity {
+            vcpus: 1,
+            mem_mib: 3072,
+        };
+        2
+    ];
+    let rooms = rooms(&cluster, &[]);
+    let more_than_is_left = asking(2048);
+    assert!(!Wanted::of(&more_than_is_left, None, None).served_by("ikr-netlab", &rooms));
+}
+
+/// A cluster whose list of what waits there for a node stops short offers no
+/// room on any node: what the rest takes is not known. (IKR-B78)
+#[test]
+fn a_cluster_whose_unplaced_list_was_cut_short_offers_no_room() {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced_omitted = 1;
+    let rooms = rooms(&cluster, &[]);
+    assert!(!Wanted::of(&asking(512), None, None).served_by("ikr-netlab", &rooms));
+}
+
+/// A VM that waits because the room of the cluster that could take it is not
+/// known says so, under its own category, and names the list that was cut
+/// short — not its own asks, none of which is what is missing.
+#[test]
+fn a_vm_waiting_on_a_cluster_whose_room_is_not_known_is_told_so() {
+    let (category, sentence) = told(&ledger_of_unknown_room(), &asking(512));
+
+    assert_eq!(category, controller_api::PendingReason::RoomUnknown);
+    assert!(
+        sentence.contains("ikr-netlab (3 more than its status lists)"),
+        "{sentence}"
+    );
+    assert!(sentence.contains("cut short"), "{sentence}");
+}
+
+/// `netlab(4096)` with three more VMs waiting there for a node than its
+/// status lists, as the pass's ledger.
+fn ledger_of_unknown_room() -> std::sync::Mutex<Ledger> {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced_omitted = 3;
+    ledger_of(&cluster, &[])
+}
+
+/// What `pick_cluster` says of `vm` over `ledger`, which places it nowhere.
+fn told(ledger: &std::sync::Mutex<Ledger>, vm: &Vm) -> (controller_api::PendingReason, String) {
+    pick_cluster(
+        &controller_api::FirstFit,
+        ledger,
+        vm,
+        &Wanted::of(vm, None, None),
+    )
+    .expect_err("placed nowhere")
+    .1
+}
+
+/// A VM whose selector no node of a cluster carries is not waiting for that
+/// cluster's room, known or not: it is told its selector, which is what will
+/// keep it waiting once the room is known.
+#[test]
+fn a_vm_no_node_of_a_cluster_of_unknown_room_selects_is_told_its_selector() {
+    let mut picky = asking(512);
+    picky.spec.node_selector.insert("gpu".into(), "a100".into());
+
+    let (category, sentence) = told(&ledger_of_unknown_room(), &picky);
+
+    assert_eq!(category, controller_api::PendingReason::SelectorUnmatched);
+    assert!(sentence.contains("gpu=a100"), "{sentence}");
+}
+
+/// A cluster whose room is not known but whose catalogue lacks what the VM
+/// asks for would not take it with any room: the VM is told what is lacking.
+#[test]
+fn a_vm_a_cluster_of_unknown_room_would_not_serve_is_told_what_it_lacks() {
+    let ledger = ledger_of_unknown_room();
+    ledger.lock().unwrap().clusters[0].catalogue.clear();
+
+    let (category, sentence) = told(&ledger, &asking(512));
+
+    assert_eq!(category, controller_api::PendingReason::Unserved);
+    assert!(sentence.contains("hypervisor"), "{sentence}");
+}
+
+/// A VM bound but not reported yet whose volumes cannot be read right now
+/// takes its room off every node it may be on, as one whose volume is gone:
+/// which of them it lands on is not known.
+#[test]
+fn a_vm_whose_volumes_cannot_be_read_takes_room_off_every_node_it_may_be_on() {
+    let mut sent = asking(3072);
+    sent.spec.cluster_name = Some("ikr-netlab".into());
+    let unreadable = booking_of(
+        &sent,
+        Err(anyhow::anyhow!("invalid object: does not parse")),
+    );
+    let gone = booking_of(
+        &sent,
+        Ok(Err("volume data does not exist here any more".into())),
+    );
+    for booked in [unreadable, gone] {
+        let left: Vec<u64> = rooms_of(&netlab(4096), &[booked], Overcommit::default())
+            .nodes()
+            .iter()
+            .map(|r| r.room.mem_mib)
+            .collect();
+        assert_eq!(left, [1024, 1024]);
+    }
+}
+
+// --- IKR-B81: a write lands on the object that was judged -------------------
+
+/// The test etcd (`MEISTER_TEST_ETCD`).
+fn test_etcd() -> String {
+    std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into())
+}
+
+/// A fresh prefix of the test etcd for `area`, and a store under it.
+async fn test_area(area: &str) -> (EtcdStore, String) {
+    let prefix = format!("/{area}/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[test_etcd()], &prefix)
+        .await
+        .expect("an etcd to talk to");
+    (store, prefix)
+}
+
+/// A store under a fresh prefix of the test etcd.
+async fn test_store(area: &str) -> EtcdStore {
+    test_area(area).await.0
+}
+
+/// A record of kind `T` called `name` under `prefix` that no reader can parse,
+/// written past the store, which only writes what parses. The key is the
+/// store's own layout.
+async fn unparsable<T: Resource>(prefix: &str, name: &str) {
+    let mut etcd = etcd_client::Client::connect([test_etcd()], None)
+        .await
+        .expect("an etcd to talk to");
+    etcd.put(
+        format!("{prefix}/registry/{}/{name}", T::RESOURCE),
+        "{not json",
+        None,
+    )
+    .await
+    .expect("the record");
+}
+
+/// `netlab(mem_mib)`, connected and heard from now, in `store`.
+async fn connected_netlab(store: &EtcdStore, mem_mib: u64) {
+    connected(store, netlab(mem_mib)).await;
+}
+
+/// `cluster`, connected and heard from now, in `store`.
+async fn connected(store: &EtcdStore, mut cluster: Cluster) {
+    cluster.status.connected = true;
+    cluster.status.capacity.capabilities = vec!["hypervisor/cloud-hypervisor".to_string()];
+    store.create(&cluster).await.expect("the cluster");
+    store
+        .beat::<Cluster>(&cluster.metadata.name, Utc::now())
+        .await
+        .expect("its heartbeat");
+}
+
+/// A preview answers with the pass's own decision and sentence: bound where
+/// one node takes the VM, and the node-level sentence where none does.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_preview_says_what_the_pass_would_decide() {
+    let store = test_store("preview-test").await;
+    connected_netlab(&store, 2048).await;
+    let preview = |vm: Vm| {
+        let store = &store;
+        async move {
+            would_place(store, &controller_api::FirstFit, Overcommit::default(), &vm)
+                .await
+                .expect("a preview")
+        }
+    };
+
+    assert_eq!(
+        preview(asking(1024)).await,
+        "would place on cluster ikr-netlab"
+    );
+    assert_eq!(
+        preview(asking(4096)).await,
+        node_level_reason(&asking(4096), 1).1
+    );
+}
+
+/// A preview of a VM that waits on a cluster whose room is not known says
+/// that, and names the list that was cut short. (IKR-B78)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_preview_names_the_list_that_was_cut_short() {
+    let store = test_store("preview-test").await;
+    let mut cut_short = netlab(4096);
+    cut_short.status.unplaced_omitted = 2;
+    connected(&store, cut_short).await;
+
+    let preview = would_place(
+        &store,
+        &controller_api::FirstFit,
+        Overcommit::default(),
+        &asking(512),
+    )
+    .await
+    .expect("a preview");
+
+    assert_eq!(
+        Some(preview),
+        room_unknown_reason(&[("ikr-netlab", 2)]).map(|(_, sentence)| sentence)
+    );
+}
+
+/// One bound, unreported VM whose volume record does not parse takes its
+/// room off every node it may be on, and the pass still measures the
+/// cluster: one VM's unreadable volume does not stop the pass for every
+/// other VM.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_unreadable_volume_of_one_vm_does_not_stop_the_pass() {
+    let (store, prefix) = test_area("unreadable-test").await;
+    connected_netlab(&store, 4096).await;
+    unparsable::<controller_api::Volume>(&prefix, "lost-disk").await;
+    let bound = |name: &str, mem_mib: u64| {
+        let mut v = asking(mem_mib);
+        v.metadata.name = name.into();
+        v.spec.cluster_name = Some("ikr-netlab".into());
+        v
+    };
+    let mut broken = bound("broken", 1024);
+    broken.spec.vm["volumes"] = serde_json::json!([{ "volume": "lost-disk" }]);
+    let vms = [broken, bound("fine", 2048)];
+
+    let ledger = expire_and_collect_clusters(
+        &store,
+        &sessions(&["ikr-netlab"]),
+        &vms,
+        Overcommit::default(),
+    )
+    .await
+    .expect("the pass measures the clusters");
+
+    let left: Vec<u64> = ledger
+        .rooms("ikr-netlab")
+        .iter()
+        .map(|r| r.room.mem_mib)
+        .collect();
+    assert_eq!(left, [1024, 3072]);
+}
+
+/// What a dispatch carried is stamped onto the reservation it was read from,
+/// not onto one released and reserved again under the same address since.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_stamp_for_an_old_reservation_leaves_the_new_one_alone() {
+    let store = test_store("stamp-test").await;
+    let reservation = || {
+        controller_api::FloatingIp::declare(
+            "198.51.100.9",
+            controller_api::FloatingIpSpec {
+                tenant: "acme".into(),
+                address: "198.51.100.9".into(),
+                ..Default::default()
+            },
+        )
+    };
+    let old = store.create(&reservation()).await.expect("the old one");
+    let carried = Carried {
+        resource: controller_api::FloatingIp::RESOURCE,
+        name: old.metadata.name.clone(),
+        uid: old.metadata.uid.clone(),
+        generation: old.metadata.generation,
+    };
+    store
+        .delete::<controller_api::FloatingIp>("198.51.100.9")
+        .await
+        .expect("released");
+    store.create(&reservation()).await.expect("reserved again");
+
+    stamp_addresses(&store, &[carried]).await;
+
+    let new: controller_api::FloatingIp = store.get("198.51.100.9").await.expect("the new one");
+    assert_eq!(
+        new.status.observed_generation, 0,
+        "nothing travelled for it"
+    );
+}
+
+/// The lab's loop end to end: a cluster that keeps the VM and refuses its
+/// re-send is asked once over three passes, and the refusal is on the VM.
+/// Each pass is one the cluster's report started. (IKR-B74)
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_cluster_that_refuses_a_resend_is_asked_once_in_three_passes() {
+    let store = test_store("refused-test").await;
+    let registry = Arc::new(crate::session::SessionRegistry::new());
+    let asked = registry.refusing("cluster-1", "the shape of a vm is fixed once it exists");
+    // Stored at generation 1 and never acked: a generation to send.
+    let held = store.create(&vm()).await.expect("a bound vm");
+    let report = crate::session::Report {
+        at: Utc::now(),
+        uids: [held.metadata.uid.clone()].into_iter().collect(),
+        routers: None,
+    };
+
+    for _ in 0..3 {
+        let listed: Vm = store.get("t").await.expect("the vm");
+        hand_down(
+            &store,
+            &registry,
+            &OnceCell::new(),
+            &listed,
+            "cluster-1",
+            &report,
+            "",
+        )
+        .await
+        .expect("a pass");
+    }
+
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let after: Vm = store.get("t").await.expect("the vm");
+    let refusal = after.status.hand_down_refused.expect("the refusal is kept");
+    assert_eq!(refusal.generation, held.metadata.generation);
+    assert!(refusal.message.contains("shape"), "{}", refusal.message);
+}
+
+/// A binding drops the refusal the VM carries: whichever cluster it came
+/// from, it is no word of the cluster bound now. A drain reschedule or an
+/// evacuation lets the binding go without a new generation, and the refusal
+/// held the first hand-down to the next cluster back.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_new_binding_drops_the_old_clusters_refusal() {
+    let store = test_store("rebind-test").await;
+    let mut unbound = refused_at(20);
+    unbound.spec.cluster_name = None;
+    let unbound = store.create(&unbound).await.expect("an unbound vm");
+    assert!(unbound.status.hand_down_refused.is_some(), "refused before");
+
+    bind(&store, unbound, "cluster-2".into())
+        .await
+        .expect("bound");
+
+    let bound: Vm = store.get("t").await.expect("the vm");
+    assert_eq!(bound.spec.cluster_name.as_deref(), Some("cluster-2"));
+    assert!(bound.status.hand_down_refused.is_none());
+}
+
+/// A binding says when it was made: the order the passes after it book the
+/// VM in until its cluster reports it.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_binding_says_when_it_was_made() {
+    let store = test_store("rebind-test").await;
+    let mut unbound = vm();
+    unbound.spec.cluster_name = None;
+    let unbound = store.create(&unbound).await.expect("an unbound vm");
+    let before = Utc::now();
+
+    bind(&store, unbound, "cluster-1".into())
+        .await
+        .expect("bound");
+
+    let bound: Vm = store.get("t").await.expect("the vm");
+    assert!(bound.status.bound_at.is_some_and(|t| t >= before));
+}
+
+/// Letting a binding go takes the time it was made with it: an unbound VM
+/// carries no `boundAt` for a binding that is not there any more.
+#[test]
+fn a_released_binding_leaves_no_time_it_was_made() {
+    let mut v = vm();
+    v.status.bound_at = Some(at(10));
+
+    release_binding(&mut v);
+
+    assert_eq!(v.spec.cluster_name, None);
+    assert_eq!(v.status.bound_at, None);
+}
+
+/// An evacuation that lets the binding of its stopped VM go lets the time
+/// it was made go with it.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_evacuation_letting_the_binding_go_leaves_no_time_it_was_made() {
+    let store = test_store("evacuation-test").await;
+    let mut stopped = vm();
+    stopped.status.bound_at = Some(at(10));
+    stopped.status.reported = Some(controller_api::VmReported::by(
+        "cluster-1",
+        VmPhaseKind::Stopped,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(20),
+    ));
+    stopped.settle(at(20));
+    stopped.status.evacuating = Some(controller_api::Evacuating {
+        from: "cluster-1".into(),
+        step: controller_api::EvacuationStep::Stopping
+            .as_str()
+            .to_string(),
+        since: at(15),
+    });
+    let stopped = store.create(&stopped).await.expect("a stopped vm");
+
+    evacuate(
+        &store,
+        &crate::session::SessionRegistry::new(),
+        &stopped,
+        "cluster-1",
+        &OnceCell::new(),
+        "",
+    )
+    .await
+    .expect("a step");
+
+    let moving: Vm = store.get("t").await.expect("the vm");
+    assert_eq!(moving.spec.cluster_name, None);
+    assert_eq!(moving.status.bound_at, None);
+}
+
+/// The teardown of a VM that was never placed deletes that VM and not one
+/// made under its name since.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_teardown_judged_on_an_old_vm_leaves_the_recreated_one() {
+    let store = test_store("teardown-test").await;
+    let unplaced = || {
+        let mut v = vm();
+        v.spec.cluster_name = None;
+        v.metadata.deletion_timestamp = Some(Utc::now());
+        v
+    };
+    let old = store.create(&unplaced()).await.expect("the old vm");
+    store.delete::<Vm>("t").await.expect("it goes");
+    let mut fresh = vm();
+    fresh.spec.cluster_name = None;
+    let fresh = store.create(&fresh).await.expect("a new vm of that name");
+
+    teardown(&store, &crate::session::SessionRegistry::new(), &old, "")
+        .await
+        .expect("a pass");
+
+    let still: Vm = store.get("t").await.expect("the new vm");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
 }

@@ -675,6 +675,22 @@ message ClusterStatus {
   // Cloud-managed secret UIDs and generations held by the cluster. The cloud
   // avoids resending unchanged copies and removes mirrors absent upstream.
   repeated SecretStateReport secrets = 13;
+  // What each cloud VM this cluster holds without a node asks for: room no
+  // node's bound_* carries yet. The cloud takes it off the nodes before it
+  // measures one node's room for a VM. Cluster-local VMs are not in it: the
+  // cloud neither places them nor can wait for them. At most a bound of them,
+  // see unplaced_omitted. Empty from an older cluster.
+  repeated VmDemand unplaced = 16;
+  // How many more cloud VMs wait here for a node than `unplaced` carries: the
+  // list stops at a bound, because the cloud copies it whole onto one object.
+  // Nonzero means the room left on the nodes is not known up there.
+  uint32 unplaced_omitted = 17;
+}
+
+// What one VM asks of the one machine it will run on.
+message VmDemand {
+  uint32 vcpus = 1;
+  uint64 mem_mib = 2;
 }
 
 // One mirrored secret, as the cluster holding it sees it.
@@ -783,7 +799,12 @@ message NodeReport {
   // False means unavailable or incomplete; absence then proves nothing. See
   // StatusReport.images_complete for the corresponding agent-hop contract.
   bool images_complete = 13;
-
+  // What the VMs bound to this node ask for, as this cluster counts them,
+  // cluster-local VMs included. The cloud measures one node's room with it, so
+  // it binds a VM only to a cluster with a node that can take it. Zero from an
+  // older cluster leaves the whole capacity as the room.
+  uint32 bound_vcpus = 14;
+  uint64 bound_mem_mib = 15;
 }
 
 // The evidence a drain leaves, relayed one tier up. See
@@ -913,9 +934,14 @@ message CreateVmMigration {
   // Where to. Empty = the cluster's scheduler chooses, which is what an
   // operator who did not say `--to` asked for.
   string target_node = 3;
-  // Whose guest this is. Carried and not enforced at the cluster, the same
-  // rule `CreateVm` follows: the cluster keeps no directory.
+  // Unused by the cluster: whose a migration is follows the guest it moves,
+  // never this field. Still filled by the cloud for clusters older than that
+  // rule, and kept on the wire only for them. (IKR-B72)
   string tenant = 4;
+  // The cloud vm's uid. The cluster moves only the copy that carries it as
+  // its cloud uid: a cluster-local vm of the same name is not the cloud's to
+  // move. Empty, from a cloud older than the field, is refused.
+  string vm_uid = 5;
 }
 
 // Release the cluster's volume object without deprovisioning backend data.
@@ -1066,6 +1092,10 @@ message CreateVm {
   // Cloud-resolved tenant routed prefixes used by NIC source filtering.
   // Empty means no routed-prefix claim.
   repeated string routed_subnets = 6;
+  // The cloud VM's metadata.labels. The cluster stores them on its copy, so a
+  // spec.antiAffinity term of another cloud VM finds this one on its node; the
+  // cloud ownership labels are set by the cluster over whatever arrives here.
+  map<string, string> labels = 7;
 }
 
 // Set deletionTimestamp on the cluster VM. Its finalizer uses DestroyInstance

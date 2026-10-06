@@ -39,9 +39,9 @@ type Answer = Result<Vec<u8>, Refusal>;
 /// A typed refusal: the sentence a person reads and the REST reason word a
 /// caller branches on instead of matching prose. One type for both ends of a
 /// session: the answer a peer sent back (`Ack::Rejected`), and a handler's
-/// own failure this tier copies into its `ErrorMsg.reason` (`unavailable`).
-/// Legacy peers may send an empty reason, so callers must retain a
-/// conservative fallback.
+/// own failure this tier copies into its `ErrorMsg.reason` (`unavailable`,
+/// `invalid`). Legacy peers may send an empty reason, so callers must retain
+/// a conservative fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub message: String,
@@ -74,6 +74,13 @@ impl Refusal {
     /// invent a disagreement.
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(message, "Unavailable")
+    }
+
+    /// "The request cannot be carried out as written" — the same answer a REST
+    /// edge gives with 422, said by a handler the request reached through a
+    /// session instead.
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::new(message, "Invalid")
     }
 
     /// The refusal `error` carries, wherever it sits: under the line a session

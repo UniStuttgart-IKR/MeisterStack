@@ -10,6 +10,7 @@
 
 use crate::object::Resource;
 use crate::resources::{Counter, CounterSpec};
+use crate::rest::{ApiError, invalid_field};
 use crate::store::{EtcdStore, Result, StoreError};
 
 /// The counter object's name. `<prefix>/registry/counters/vni`.
@@ -118,6 +119,65 @@ pub fn physnet_of(nic: &serde_json::Map<String, serde_json::Value>) -> Option<&s
         .filter(|p| !p.is_empty())
 }
 
+/// The NIC fields that pick a wire themselves instead of the tenant's overlay.
+const WIRE_FIELDS: [&str; 2] = ["physnet", "bridge"];
+
+/// Refuse a tenant's VM whose NIC picks its own wire.
+///
+/// A tenant's NICs belong on its overlay, which the cluster binds from the
+/// tenant's VNI. A provider network belongs to no tenant: a tap on it shares
+/// layer 2 with every router's external leg and every floating IP, and the
+/// agent fences it by its MAC alone, because the address space out there is
+/// the operator's. A host bridge is any wire on the machine, and it is the
+/// one the tap lands on whenever the tenant has no VNI. Neither is a tenant's
+/// to choose. Empty and null say nothing, as for `physnet_of`. A VM without
+/// a tenant is the operator's own, and the caller does not ask then.
+pub fn check_tenant_nics(vm: &serde_json::Value) -> std::result::Result<(), ApiError> {
+    match own_wires(vm).first() {
+        Some(wire) => Err(invalid_field(
+            &format!("spec.vm.nics[{}].{}", wire.nic, wire.field),
+            format!(
+                "spec.vm.nics[{}].{} is not a tenant's to set: a tenant's vm hangs on its own \
+                 overlay, and a provider network or a host bridge is shared with everybody on it",
+                wire.nic, wire.field
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One wire a NIC picks for itself: which NIC, by which field, and the name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnWire<'a> {
+    pub nic: usize,
+    pub field: &'static str,
+    pub name: &'a str,
+}
+
+/// Every wire the VM's NICs pick for themselves, NIC by NIC: what
+/// [`check_tenant_nics`] refuses a tenant, as a list two specs can be
+/// compared by. Empty and null pick nothing.
+pub fn own_wires(vm: &serde_json::Value) -> Vec<OwnWire<'_>> {
+    let nics = vm
+        .get("nics")
+        .and_then(|n| n.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut wires = Vec::new();
+    for (nic, entry) in nics.iter().enumerate() {
+        for field in WIRE_FIELDS {
+            if let Some(name) = entry
+                .get(field)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+            {
+                wires.push(OwnWire { nic, field, name });
+            }
+        }
+    }
+    wires
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +275,35 @@ mod tests {
         let mut empty = serde_json::json!({ "nics": [] });
         assert_eq!(inject_vxlan_id(&mut empty, 10_007), 0);
         assert_eq!(empty, serde_json::json!({ "nics": [] }));
+    }
+
+    // --- a tenant's wires ---------------------------------------------------
+
+    /// IKR-B67: a tenant member wrote `physnet: ext` and got a tap on the
+    /// provider segment beside every router's external leg.
+    #[test]
+    fn a_tenant_nic_may_not_name_a_provider_network_or_a_host_bridge() {
+        for (field, value) in [("physnet", "ext"), ("bridge", "br0")] {
+            let vm = serde_json::json!({ "nics": [{}, { field: value }] });
+            let err = check_tenant_nics(&vm).unwrap_err();
+            assert_eq!(
+                err.field(),
+                Some(format!("spec.vm.nics[1].{field}").as_str()),
+                "{}",
+                err.message()
+            );
+        }
+    }
+
+    /// Empty and null are "said nothing", exactly as VNI injection reads them.
+    #[test]
+    fn a_tenant_nic_that_names_no_wire_passes() {
+        for vm in [
+            serde_json::json!({ "nics": [{}, { "mac": "52:54:00:11:22:33" }] }),
+            serde_json::json!({ "nics": [{ "physnet": "", "bridge": null }] }),
+            serde_json::json!({ "vcpus": 1 }),
+        ] {
+            check_tenant_nics(&vm).expect("no wire picked");
+        }
     }
 }

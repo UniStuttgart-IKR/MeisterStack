@@ -20,14 +20,35 @@ pub(super) struct Addresses {
     pub(super) floating_ips: Vec<String>,
     pub(super) routed_subnets: Vec<String>,
     /// The objects the two lists above were read out of, each with the
-    /// generation it carried at that moment — `(resource, name, generation)`.
+    /// generation it carried at that moment.
     ///
     /// The generation is captured HERE and not read again at stamping time,
     /// and that is the whole honesty of the field: an assign that lands
     /// between building this command and writing the status has not
     /// travelled, and claiming it had would make `APPLIED` a lie in exactly
     /// the window the column exists to show.
-    pub(super) carried: Vec<(&'static str, String, u64)>,
+    pub(super) carried: Vec<Carried>,
+}
+
+/// One object a `CreateVm` was built out of, as it was when it was read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Carried {
+    pub(super) resource: &'static str,
+    pub(super) name: String,
+    /// Which object of that name: the stamp lands on this one or on none.
+    pub(super) uid: String,
+    pub(super) generation: u64,
+}
+
+impl Carried {
+    fn of<S, St>(object: &controller_api::Object<S, St>, resource: &'static str) -> Self {
+        Self {
+            resource,
+            name: object.metadata.name.clone(),
+            uid: object.metadata.uid.clone(),
+            generation: object.metadata.generation,
+        }
+    }
 }
 
 /// Address and router inventory cached for one reconcile pass.
@@ -112,28 +133,16 @@ impl AddressBook {
         routed_subnets.sort();
         routed_subnets.dedup();
 
-        let carried: Vec<(&'static str, String, u64)> = self
+        let carried: Vec<Carried> = self
             .reservations
             .iter()
             .filter(mine)
-            .map(|ip| {
-                (
-                    controller_api::FloatingIp::RESOURCE,
-                    ip.metadata.name.clone(),
-                    ip.metadata.generation,
-                )
-            })
+            .map(|ip| Carried::of(ip, controller_api::FloatingIp::RESOURCE))
             .chain(
                 self.subnets
                     .iter()
                     .filter(|s| s.spec.tenant == tenant)
-                    .map(|s| {
-                        (
-                            controller_api::RoutedSubnet::RESOURCE,
-                            s.metadata.name.clone(),
-                            s.metadata.generation,
-                        )
-                    }),
+                    .map(|s| Carried::of(s, controller_api::RoutedSubnet::RESOURCE)),
             )
             .collect();
 
@@ -153,20 +162,27 @@ impl AddressBook {
 ///
 /// Only on the acked branch, and only upwards (`max`): a dispatch that was
 /// refused carried nothing, and a late write from an older pass must not undo
-/// a newer one's.
-pub(super) async fn stamp_addresses(store: &EtcdStore, carried: &[(&'static str, String, u64)]) {
-    for (resource, name, generation) in carried {
+/// a newer one's. On the uid that was read: an address released and reserved
+/// again under the same name did not travel. (IKR-B81)
+pub(super) async fn stamp_addresses(store: &EtcdStore, carried: &[Carried]) {
+    for Carried {
+        resource,
+        name,
+        uid,
+        generation,
+    } in carried
+    {
         let generation = *generation;
         let outcome = if *resource == controller_api::FloatingIp::RESOURCE {
             store
-                .mutate::<controller_api::FloatingIp, _>(name, |ip| {
+                .mutate_if::<controller_api::FloatingIp, _>(name, uid, |ip| {
                     ip.status.observed_generation = ip.status.observed_generation.max(generation);
                 })
                 .await
                 .map(|_| ())
         } else {
             store
-                .mutate::<controller_api::RoutedSubnet, _>(name, |s| {
+                .mutate_if::<controller_api::RoutedSubnet, _>(name, uid, |s| {
                     s.status.observed_generation = s.status.observed_generation.max(generation);
                 })
                 .await
@@ -194,7 +210,9 @@ pub(super) async fn stamp_vm_addresses(store: &EtcdStore, vms: &[Vm]) -> anyhow:
         }
         let name = vm.metadata.name.clone();
         if let Err(e) = store
-            .mutate::<Vm, _>(&name, |v| v.status.addresses = want.clone())
+            .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
+                v.status.addresses = want.clone()
+            })
             .await
         {
             // Debug: bookkeeping nothing decides on, and the next pass writes

@@ -54,7 +54,7 @@ pub(super) async fn expire_vm_reports(
         let was = vm.status.phase().kind();
         let message = format!("{node} stopped answering");
         match store
-            .mutate::<Vm, _>(&name, |v| {
+            .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                 // Re-read inside the mutate: a report may have landed between
                 // the listing and here, and taking a phase away from a node
                 // that has just spoken is the one way this can do harm.
@@ -294,7 +294,7 @@ pub(super) async fn evacuate(
     // too — the VM is where the mark wanted it.
     if node != mark.from {
         p.store
-            .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+            .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
             .await?;
         events::record(
             p.store,
@@ -313,9 +313,10 @@ pub(super) async fn evacuate(
             if vm.status.phase().kind() == VmPhaseKind::Running
                 || vm.status.phase().kind() == VmPhaseKind::Paused
             {
-                // Level-triggered like every other command here: sent again
-                // every pass until the phase moves, and idempotent at the
-                // node because the record's desired state is what changes.
+                // Level-triggered: the same Stop until the phase moves,
+                // idempotent at the node because the record's desired state
+                // is what changes. Once per `told::RETELL_AFTER`, not once
+                // per pass. (IKR-B74)
                 return send_lifecycle(p, vm, node, Lifecycle::Stop, outgoing).await;
             }
             if vm.status.phase().kind() != VmPhaseKind::Stopped {
@@ -330,7 +331,7 @@ pub(super) async fn evacuate(
             // Off. One write does the rest: the binding falls, and everything
             // that follows is the reschedule that already exists.
             p.store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     v.spec.node_name = None;
                     v.status.evacuating = Some(controller_api::Evacuating {
                         from: mark.from.clone(),
@@ -351,7 +352,7 @@ pub(super) async fn evacuate(
         // rather than loop: the drain will list it as having nowhere to go.
         Some(controller_api::EvacuationStep::Moving) => {
             p.store
-                .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
                 .await?;
             warn!(vm = %name, node, "evacuation came back to the same node; giving it up");
             Ok(())
@@ -409,7 +410,7 @@ pub(super) async fn unbind_refused(
         until,
     };
     p.store
-        .mutate::<Vm, _>(&name, |v| {
+        .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
             v.spec.node_name = None;
             // The node refused to serve it at all, which is a statement about
             // the MACHINE — it is remembered in `refusedBy` for exactly that
@@ -610,6 +611,13 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
     let migrating = crate::migration::migration_in_flight(p.store, vm).await?;
     for name in vm.spec.referenced_volumes() {
         let mut volume: Volume = p.store.get(&name).await?;
+        // Whose disk it is before anything moves it: both re-points below
+        // write the record's home, and another VM's record is not this VM's
+        // to move, whatever their names. (IKR-B81)
+        if !may_carry(&volume.status, vm) {
+            let holder = volume.status.attached_to.clone().unwrap_or_default();
+            return wait_for_holder(p, vm, &name, &holder).await;
+        }
         // The node this vm is on already HAS the disk open — which today
         // happens exactly one way: a live migration put it there, the record
         // still calls the source home, and the source is on its way out.
@@ -620,10 +628,8 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             && volume.status.open_on.iter().any(|n| n == node)
         {
             let from = volume.status.node.clone().unwrap_or_default();
-            volume = p
-                .store
-                .mutate::<Volume, _>(&name, |v| v.status.node = Some(node.to_string()))
-                .await?;
+            volume =
+                carry_record(p, vm, &volume, |v| v.status.node = Some(node.to_string())).await?;
             info!(volume = %name, from = %from, to = node,
                   "the vm's node already has the volume open; the record moves with it");
         }
@@ -643,9 +649,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             );
             if travels {
                 let from = volume.status.node.clone().unwrap_or_default();
-                p.store
-                    .mutate::<Volume, _>(&name, |v| follow_vm(v, &vm.metadata.name, node))
-                    .await?;
+                carry_record(p, vm, &volume, |v| follow_vm(v, &vm.metadata.name, node)).await?;
                 info!(volume = %name, from = %from, to = node,
                       "the record follows the vm; the bytes stay where they are");
                 anyhow::bail!("volume {name} is being re-opened on {node}");
@@ -661,7 +665,11 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             );
         }
         match volume.status.attached_to.as_deref() {
-            Some(holder) if holder == vm.metadata.name => {
+            // This object's claim, by uid: a VM made again under the name of
+            // the one that holds the disk is not that VM, and a claim from
+            // before claims carried a uid is not adopted by a name either —
+            // the claimant pass binds it or lets it fall. (IKR-B81)
+            Some(_) if volume.status.claimed_by(&vm.metadata.uid) => {
                 // Held by us already, and nothing to write: `openOn` is the
                 // node's own answer since D4 and arrives with its next report
                 // (`VolumeStateReport.open`). This pass used to put the node
@@ -670,16 +678,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
                 // machine has opened it.
                 continue;
             }
-            Some(holder) => {
-                // The claim is somebody else's, and since D4 it may still be
-                // standing after that somebody has gone: it falls when no Vm
-                // object carries it AND no machine reports the bytes open
-                // (`volume_claim_holds`). So the wait gets a word of its own
-                // — nothing here will ever take a disk off its holder, and an
-                // operator has to be able to see who has it.
-                note_vm_held(p, vm, &name, holder).await?;
-                anyhow::bail!("volume {name} is held by {holder}");
-            }
+            Some(holder) => return wait_for_holder(p, vm, &name, holder).await,
             None => {}
         }
         // The one exception to `AccessMode`, enforced where the second entry
@@ -700,6 +699,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         }
         let mut held = volume;
         held.status.attached_to = Some(vm.metadata.name.clone());
+        held.status.attached_uid = Some(vm.metadata.uid.clone());
         // A fresh claim: whatever a previous holder's absence established is
         // about that holder and not this one.
         held.status.claimant_gone = false;
@@ -717,6 +717,53 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
     Ok(())
 }
 
+/// Move `volume`'s record as `re_point` says, on the record this pass read and
+/// only while `vm` may still carry it: a claim taken between the read and the
+/// write stops the move. (IKR-B81)
+async fn carry_record(
+    p: &Pass<'_>,
+    vm: &Vm,
+    volume: &Volume,
+    re_point: impl Fn(&mut Volume),
+) -> anyhow::Result<Volume> {
+    let name = &volume.metadata.name;
+    let mut carried = false;
+    let moved = p
+        .store
+        .mutate_if::<Volume, _>(name, &volume.metadata.uid, |v| {
+            carried = may_carry(&v.status, vm);
+            if carried {
+                re_point(v);
+            }
+        })
+        .await?;
+    if !carried {
+        anyhow::bail!("volume {name} was claimed while its record was being moved");
+    }
+    Ok(moved)
+}
+
+/// Whether `vm` may move this volume's record to its node: nobody holds the
+/// volume, or the claim is this VM object's by uid (`claimed_by`). A claim
+/// from before claims carried a uid is nobody's to carry: by its name alone a
+/// VM made again under it would carry the record of a claimant already found
+/// gone. The claimant pass binds such a claim to its VM or lets it fall, and
+/// the wait lasts until then. (IKR-B81)
+fn may_carry(status: &controller_api::VolumeStatus, vm: &Vm) -> bool {
+    status.attached_to.is_none() || status.claimed_by(&vm.metadata.uid)
+}
+
+/// The claim is somebody else's, and since D4 it may still be standing after
+/// that somebody has gone: it falls when no Vm object carries it AND no
+/// machine reports the bytes open (`volume_claim_holds`). So the wait gets a
+/// word of its own — nothing here will ever take a disk off its holder, and an
+/// operator has to be able to see who has it. Always an error: the dispatch
+/// stops here.
+async fn wait_for_holder(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyhow::Result<()> {
+    note_vm_held(p, vm, volume, holder).await?;
+    anyhow::bail!("volume {volume} is held by {holder}")
+}
+
 /// Record VolumeHeld separately from VolumeNotReady: another VM's claim must
 /// be released, not displaced by this request. Close evidence can lag teardown.
 async fn note_vm_held(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyhow::Result<()> {
@@ -730,7 +777,7 @@ async fn note_vm_held(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyh
         return Ok(());
     }
     p.store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             v.status.placement = Some(controller_api::VmPlacement {
                 reason: controller_api::VmReason::VolumeHeld,
                 message: said.clone(),
@@ -751,7 +798,9 @@ pub(super) async fn release_volumes(p: &Pass<'_>, vm: &Vm) {
     release_named_volumes(p, vm, &vm.spec.referenced_volumes()).await
 }
 
-/// Let go of exactly these, and only where the claim names THIS VM.
+/// Let go of exactly these, and only where the claim is THIS VM object's
+/// (`VolumeStatus::held_by`): a VM of the same name made since holds its own
+/// claim, by its own uid. (IKR-B81)
 ///
 /// The half `release_volumes` is now written in terms of. A teardown lets go
 /// of everything the VM refers to; a detach lets go of the difference, and
@@ -762,7 +811,7 @@ pub(super) async fn release_named_volumes(p: &Pass<'_>, vm: &Vm, names: &[String
         let held = p
             .store
             .mutate::<Volume, _>(name, |v| {
-                if v.status.attached_to.as_deref() == Some(vm.metadata.name.as_str()) {
+                if v.status.held_by(&vm.metadata.name, &vm.metadata.uid) {
                     // Record claimant departure without releasing the claim yet. `settle`
                     // requires both this fact and empty `openOn` before freeing it. Destroy ACKs
                     // alone cannot prove handles closed. Rescheduling the same VM retains its claim.
@@ -831,7 +880,7 @@ pub(super) async fn dispatch_create(
     let dispatched = vm.metadata.generation;
     let settles_here = volume_drift(vm).is_none();
     p.store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             // Advance the acknowledged generation only when this dispatch settles it.
             // For changed attachments, `ingest_attachments` instead waits for the reported
             // disk set; command acknowledgement alone is insufficient evidence.
@@ -900,6 +949,21 @@ pub(super) async fn send_lifecycle(
     action: Lifecycle,
     outgoing: &str,
 ) -> anyhow::Result<()> {
+    let uid = &vm.metadata.uid;
+    let said = told::LifecycleSaid {
+        node: node.to_string(),
+        action,
+        generation: vm.metadata.generation,
+    };
+    // The phase lags the command by a stop grace or a boot, and every write
+    // to any VM runs a pass: said once per `told::RETELL_AFTER`, not once per
+    // pass. (IKR-B74)
+    if p.told.lifecycle_lately(uid, &said) {
+        debug!(?action, "said lately; waiting for the phase to follow");
+        // This generation's intent went to this node, so it is acted on;
+        // closing it here also mends a close that failed after the send.
+        return close_generation(p.store, vm).await;
+    }
     info!(
         ?action,
         strategy = ?vm.spec.run_strategy,
@@ -907,15 +971,27 @@ pub(super) async fn send_lifecycle(
         "run strategy drifted, sending command"
     );
     p.registry
-        .send_command(node, outgoing, lifecycle_op(action, &vm.metadata.uid))
+        .send_command(node, outgoing, lifecycle_op(action, uid))
         .await?;
-    // The other half of "acted on this generation". A runStrategy change
-    // travels as a lifecycle command and never as a new spec, so without this
-    // a stopped VM would read `pending` forever — the one drift Position 2
-    // deliberately leaves possible on a VM.
+    p.told.note_lifecycle(uid, said);
+    close_generation(p.store, vm).await
+}
+
+/// The other half of "acted on this generation". A runStrategy change travels
+/// as a lifecycle command and never as a new spec, so without this a stopped
+/// VM would read `pending` forever — the one drift Position 2 deliberately
+/// leaves possible on a VM.
+///
+/// Written only when it moves: a write that changes nothing is still a watch
+/// event, and every watch event is another pass. On the uid the pass judged,
+/// so a VM recreated under the name keeps its own generation.
+async fn close_generation(store: &EtcdStore, vm: &Vm) -> anyhow::Result<()> {
     let dispatched = vm.metadata.generation;
-    p.store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+    if vm.status.observed_generation >= dispatched {
+        return Ok(());
+    }
+    store
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             v.status.observed_generation = v.status.observed_generation.max(dispatched);
         })
         .await?;
@@ -939,7 +1015,7 @@ pub(super) async fn heal_if_failed(
         Requeue::Not => {}
         Requeue::Reset => {
             p.store
-                .mutate::<Vm, _>(name, |v| {
+                .mutate_if::<Vm, _>(name, &vm.metadata.uid, |v| {
                     v.status.requeue_attempts = 0;
                     v.status.last_requeue = None;
                 })
@@ -949,7 +1025,7 @@ pub(super) async fn heal_if_failed(
         // Failed, so the agent's own retry gets its window before ours.
         Requeue::Arm => {
             p.store
-                .mutate::<Vm, _>(name, |v| {
+                .mutate_if::<Vm, _>(name, &vm.metadata.uid, |v| {
                     if v.status.last_requeue.is_none() {
                         v.status.last_requeue = Some(Utc::now());
                     }
@@ -968,7 +1044,7 @@ pub(super) async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
     let attempt = vm.status.requeue_attempts + 1;
     info!(attempt, node = %node, "requeueing failed vm");
     p.store
-        .mutate::<Vm, _>(name, |v| {
+        .mutate_if::<Vm, _>(name, &vm.metadata.uid, |v| {
             v.status.requeue_attempts = attempt;
             v.status.last_requeue = Some(Utc::now());
         })
@@ -1004,7 +1080,7 @@ pub(super) async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
         Ok(_) => {
             // The agent took it this time; let its report say the rest.
             p.store
-                .mutate::<Vm, _>(name, |v| {
+                .mutate_if::<Vm, _>(name, &vm.metadata.uid, |v| {
                     // A kick re-sends the spec, so it is a dispatch like any
                     // other and says so.
                     v.status.observed_generation = v.status.observed_generation.max(dispatched);
