@@ -557,6 +557,16 @@ impl crate::LinuxNetworkDriver {
         spec: &RouterSpec,
     ) -> networking::Result<RouterState> {
         let g = self.gateway()?;
+        let netns = router_netns(&spec.id);
+        // A name whose namespace cannot be entered is taken back first, so that what follows
+        // sees the namespace that is really there.
+        self.clear_dead_netns(&netns).await;
+        // A demotion silences the old namespace before anything that can fail: a pass stopping
+        // halfway would leave it answering ARP for an address the controller has made active on
+        // another node (N2).
+        if !spec.active {
+            self.silence_if_present(&netns).await?;
+        }
         if !g.physnets.contains_key(&spec.physnet) {
             let mut have: Vec<&str> = g.physnets.keys().map(String::as_str).collect();
             have.sort_unstable();
@@ -586,8 +596,6 @@ impl crate::LinuxNetworkDriver {
         // `ensure_overlay`'s own words.
         let internal_bridge = networking::BridgeDriver::ensure_overlay(self, spec.vxlan_id).await?;
 
-        let netns = router_netns(&spec.id);
-        self.clear_dead_netns(&netns).await;
         self.ip_again(&["netns", "add", &netns]).await;
         // `lo` is down in a fresh namespace, and conntrack's own traffic and
         // every locally originated probe need it.
@@ -931,6 +939,15 @@ impl crate::LinuxNetworkDriver {
                 "the namespaces {} carry the router prefix and could not be silenced",
                 failed.join(", ")
             ))),
+        }
+    }
+
+    /// Silence a router namespace if the kernel lists it. One that is not listed has nothing to
+    /// silence; legs a later pass creates are born silent.
+    async fn silence_if_present(&self, netns: &str) -> networking::Result<()> {
+        match self.netns_present().await?.iter().any(|n| n == netns) {
+            true => self.silence_legs(netns).await,
+            false => Ok(()),
         }
     }
 
@@ -1651,6 +1668,47 @@ esac
 
         assert_eq!(outcome.failed, [spec(true).id]);
         assert!(!outcome.complete());
+    }
+
+    /// A demotion silences the old namespace before anything that can fail: here the overlay
+    /// cannot be built, and both legs were silenced all the same (N2).
+    #[tokio::test]
+    async fn a_demotion_that_fails_early_has_silenced_the_namespace_first() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let standby = spec(false);
+        let netns = router_netns(&standby.id);
+        let listed = std::slice::from_ref(&netns);
+        let d = fake_driver(dir, &logging_ip(&log, listed, &BOTH_LEGS, None));
+
+        let err = d
+            .ensure_router_impl(&standby)
+            .await
+            .expect_err("this node has no [network.vxlan] section, so no overlay is built");
+
+        assert!(matches!(err, NetworkError::InvalidSpec(_)), "{err:#}");
+        assert_eq!(silenced_legs(&log, &netns), BOTH_LEGS);
+    }
+
+    /// A demotion that cannot silence the old namespace stops there and says why (N2).
+    #[tokio::test]
+    async fn a_demotion_that_cannot_silence_the_namespace_stops_there() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let standby = spec(false);
+        let netns = router_netns(&standby.id);
+        let listed = std::slice::from_ref(&netns);
+        let ip = logging_ip(&dir.join("ip.log"), listed, &BOTH_LEGS, Some(&netns));
+        let d = fake_driver(dir, &ip);
+
+        let err = d
+            .ensure_router_impl(&standby)
+            .await
+            .expect_err("a namespace that may still answer is not a standby");
+
+        assert!(matches!(err, NetworkError::Backend(_)), "{err:#}");
+        assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
     }
 
     /// A hung `ip` is killed within the deadline and does not block the next command (R3-F08).
