@@ -30,18 +30,28 @@ pub(crate) const RETELL_AFTER: Duration = Duration::from_secs(30);
 /// One memo per kind of command, each keyed by the object's uid.
 #[derive(Default)]
 pub(crate) struct Told {
-    lifecycle: Memo<Lifecycle>,
+    lifecycle: Memo<LifecycleSaid>,
     routers: Memo<RouterPlan>,
 }
 
+/// A lifecycle command as it went down: to which node, which action, and for
+/// which generation of the VM. Another node or a newer generation is news,
+/// even with the same action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LifecycleSaid {
+    pub(crate) node: String,
+    pub(crate) action: Lifecycle,
+    pub(crate) generation: u64,
+}
+
 impl Told {
-    /// Whether `action` went to the VM `uid` within [`RETELL_AFTER`].
-    pub(crate) fn lifecycle_lately(&self, uid: &str, action: Lifecycle) -> bool {
-        self.lifecycle.said_lately(uid, &action)
+    /// Whether exactly this went to the VM `uid` within [`RETELL_AFTER`].
+    pub(crate) fn lifecycle_lately(&self, uid: &str, said: &LifecycleSaid) -> bool {
+        self.lifecycle.said_lately(uid, said)
     }
 
-    pub(crate) fn note_lifecycle(&self, uid: &str, action: Lifecycle) {
-        self.lifecycle.note(uid, action);
+    pub(crate) fn note_lifecycle(&self, uid: &str, said: LifecycleSaid) {
+        self.lifecycle.note(uid, said);
     }
 
     /// Whether exactly this plan was carried down within [`RETELL_AFTER`].
@@ -102,15 +112,33 @@ impl<T: PartialEq> Memo<T> {
 mod tests {
     use super::*;
 
+    fn said(node: &str, action: Lifecycle, generation: u64) -> LifecycleSaid {
+        LifecycleSaid {
+            node: node.into(),
+            action,
+            generation,
+        }
+    }
+
     /// The same action to the same VM is said once; another action, or
     /// another VM, is news.
     #[test]
     fn the_same_command_to_the_same_object_is_said_once_within_the_window() {
         let told = Told::default();
-        assert!(!told.lifecycle_lately("u-1", Lifecycle::Stop));
-        told.note_lifecycle("u-1", Lifecycle::Stop);
-        assert!(told.lifecycle_lately("u-1", Lifecycle::Stop));
-        assert!(!told.lifecycle_lately("u-1", Lifecycle::Start));
-        assert!(!told.lifecycle_lately("u-2", Lifecycle::Stop));
+        let stop = said("agent-1", Lifecycle::Stop, 1);
+        assert!(!told.lifecycle_lately("u-1", &stop));
+        told.note_lifecycle("u-1", stop.clone());
+        assert!(told.lifecycle_lately("u-1", &stop));
+        assert!(!told.lifecycle_lately("u-1", &said("agent-1", Lifecycle::Start, 1)));
+        assert!(!told.lifecycle_lately("u-2", &stop));
+    }
+
+    /// The same action for a newer generation, or to another node, is news.
+    #[test]
+    fn a_new_generation_or_another_node_is_news() {
+        let told = Told::default();
+        told.note_lifecycle("u-1", said("agent-1", Lifecycle::Stop, 1));
+        assert!(!told.lifecycle_lately("u-1", &said("agent-1", Lifecycle::Stop, 2)));
+        assert!(!told.lifecycle_lately("u-1", &said("agent-2", Lifecycle::Stop, 1)));
     }
 }

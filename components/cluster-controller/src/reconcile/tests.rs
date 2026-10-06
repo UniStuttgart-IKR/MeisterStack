@@ -3155,6 +3155,93 @@ async fn a_stop_is_sent_once_and_the_passes_after_it_write_nothing() {
     );
 }
 
+/// `web` on agent-1: Stopped asked for, Running reported, its generation
+/// already closed. Stored, with a node that answers and writes down what it
+/// heard.
+async fn stopping_web(
+    store: &EtcdStore,
+) -> (
+    Arc<SessionRegistry>,
+    Arc<std::sync::Mutex<Vec<proto::command::Op>>>,
+) {
+    let mut vm = controller_api::resources::new_vm(
+        "web",
+        controller_api::VmSpec {
+            node_name: Some("agent-1".into()),
+            run_strategy: RunStrategy::Stopped,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    reported_as(&mut vm, "agent-1", VmPhaseKind::Running);
+    store.create(&vm).await.expect("the vm");
+    store
+        .mutate::<Vm, _>("web", |v| {
+            v.status.observed_generation = v.metadata.generation;
+        })
+        .await
+        .expect("its generation closed");
+    let registry = Arc::new(SessionRegistry::new());
+    let heard = scripted_node(&registry, "agent-1");
+    (registry, heard)
+}
+
+/// How many Stops the node heard.
+fn stops(heard: &std::sync::Mutex<Vec<proto::command::Op>>) -> usize {
+    heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| matches!(op, proto::command::Op::Stop(_)))
+        .count()
+}
+
+/// A Stop a fresh memo has not said goes down, and closing a generation that
+/// is already closed writes nothing: the guard in `close_generation` itself,
+/// not the memo, keeps the pass quiet.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_stop_for_a_closed_generation_writes_nothing() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let (registry, heard) = stopping_web(&store).await;
+    let connected = sessions(&["agent-1"]);
+
+    let before: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&quiet_pass(&store, &registry, &connected), before.clone())
+        .await
+        .expect("a pass");
+
+    assert_eq!(stops(&heard), 1, "a fresh memo says it");
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(
+        after.metadata.resource_version, before.metadata.resource_version,
+        "and nothing moved, so nothing is written"
+    );
+}
+
+/// A generation bumped inside the window with the same action is news: it
+/// goes down and is closed, where before it waited unclosed for ever once the
+/// phase followed.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_generation_bumped_inside_the_window_is_sent_and_closed() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let (registry, heard) = stopping_web(&store).await;
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+    let current: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&pass, current).await.expect("a pass");
+
+    let bumped = store
+        .mutate::<Vm, _>("web", |v| v.metadata.generation += 1)
+        .await
+        .expect("a new generation");
+    reconcile_vm(&pass, bumped.clone()).await.expect("a pass");
+
+    assert_eq!(stops(&heard), 2);
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(after.status.observed_generation, bumped.metadata.generation);
+}
+
 /// Every EnsureRouter a pass would send, written down.
 #[derive(Default)]
 struct HeardRouters(std::sync::Mutex<Vec<String>>);

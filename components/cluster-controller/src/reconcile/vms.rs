@@ -313,9 +313,10 @@ pub(super) async fn evacuate(
             if vm.status.phase().kind() == VmPhaseKind::Running
                 || vm.status.phase().kind() == VmPhaseKind::Paused
             {
-                // Level-triggered like every other command here: sent again
-                // every pass until the phase moves, and idempotent at the
-                // node because the record's desired state is what changes.
+                // Level-triggered: the same Stop until the phase moves,
+                // idempotent at the node because the record's desired state
+                // is what changes. Once per `told::RETELL_AFTER`, not once
+                // per pass. (IKR-B74)
                 return send_lifecycle(p, vm, node, Lifecycle::Stop, outgoing).await;
             }
             if vm.status.phase().kind() != VmPhaseKind::Stopped {
@@ -916,12 +917,19 @@ pub(super) async fn send_lifecycle(
     outgoing: &str,
 ) -> anyhow::Result<()> {
     let uid = &vm.metadata.uid;
+    let said = told::LifecycleSaid {
+        node: node.to_string(),
+        action,
+        generation: vm.metadata.generation,
+    };
     // The phase lags the command by a stop grace or a boot, and every write
     // to any VM runs a pass: said once per `told::RETELL_AFTER`, not once per
     // pass. (IKR-B74)
-    if p.told.lifecycle_lately(uid, action) {
+    if p.told.lifecycle_lately(uid, &said) {
         debug!(?action, "said lately; waiting for the phase to follow");
-        return Ok(());
+        // This generation's intent went to this node, so it is acted on;
+        // closing it here also mends a close that failed after the send.
+        return close_generation(p.store, vm).await;
     }
     info!(
         ?action,
@@ -932,7 +940,7 @@ pub(super) async fn send_lifecycle(
     p.registry
         .send_command(node, outgoing, lifecycle_op(action, uid))
         .await?;
-    p.told.note_lifecycle(uid, action);
+    p.told.note_lifecycle(uid, said);
     close_generation(p.store, vm).await
 }
 
