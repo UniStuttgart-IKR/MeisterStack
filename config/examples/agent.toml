@@ -249,10 +249,12 @@ default_bridge = "meister_br0"
 #socket_timeout_ms = 5000
 
 # Optional hard VRAM admission budget. Once a vGPU type is on the card, the
-# card itself is a hard limit too: per-type max_instance, and all admitted
-# sizes together within vgpu_available_mib. Without either, overcommit is
-# only warned about. Admission counts the devices of every vm this node has a
-# record of, running or stopped: a stopped vm keeps its share.
+# card itself is a hard limit too: per-type max_instance, all admitted
+# sizes together within vgpu_available_mib, and no backend without a
+# vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
+# Without either, overcommit is only warned about. Admission counts the
+# devices of every vm this node has a record of, running or stopped: a
+# stopped vm keeps its share.
 #vram_budget_mib = 8192
 
 # The host's share of the card in MiB that vgpuprofile subtracts before it

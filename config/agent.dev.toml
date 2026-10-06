@@ -81,9 +81,11 @@ binary = "./bin/vhost-user-nvrm"       # symlink to ~/git/Leandro/target/release
 vgpuprofile = "./bin/vgpuprofile"
 
 # Optional hard VRAM admission budget. Once a vGPU type is on the card, the
-# card itself is a hard limit too: per-type max_instance, and all admitted
-# sizes together within vgpu_available_mib. Without either, overcommit is
-# only warned about. Every vm on record counts, running or stopped.
+# card itself is a hard limit too: per-type max_instance, all admitted
+# sizes together within vgpu_available_mib, and no backend without a
+# vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
+# Without either, overcommit is only warned about. Every vm on record
+# counts, running or stopped.
 # vram_budget_mib = 8192               # optional; unset = no node budget beyond the card rule above
 
 # The host's share of the card in MiB that vgpuprofile subtracts before it

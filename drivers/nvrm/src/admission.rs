@@ -82,25 +82,34 @@ fn refuse_instance_overflow(live: &[&Claim], vgpu: Option<&VgpuType>) -> device:
     Ok(())
 }
 
-/// Once a vGPU type is on the card, every backend on it must fit beside the
-/// others: the admitted sizes together may not exceed `vgpu_available_mib`.
-/// Per-type instance counts alone let mixed types overbook the card, and a
-/// backend without any VRAM limit could take what the profiles promise.
+/// How a tenant or an operator gets a size of their own on a card that
+/// carries vGPU types: as a type, which the card resolves with its share.
+const A_SIZE_AS_A_TYPE: &str = "give it a vgpu_type; for a size of its own, vgpu_type = \"<N>M\" \
+     resolves a profile with N MiB for the guest on this card";
+
+/// Once a vGPU type is on the card, every backend on it must be vGPU-typed
+/// and fit beside the others: the admitted sizes together may not exceed
+/// `vgpu_available_mib`. A type's profile size carries its share of the
+/// card's own carve-out; a cap or a bare profile size does not, so summed
+/// against the card it would overbook it, and a backend without any limit
+/// could take what the profiles promise. Per-type instance counts alone let
+/// mixed types overbook the card.
 fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> device::Result<()> {
     let Some(card) = card_size(live, want) else {
         return Ok(());
     };
-    if want.is_unbounded() {
+    if want.vgpu_type.is_none() {
         return Err(DeviceError::InvalidSpec(format!(
-            "device {id} sets no VRAM limit (no vgpu_type, vram_profile_mib or \
-             vram_limit_mib), and this card carries vGPU-typed backends whose profiles it \
-             could take; give it a profile or a cap"
+            "device {id} {}, and this card carries vGPU-typed backends: beside them only a \
+             vGPU type can be measured against the card; {A_SIZE_AS_A_TYPE}",
+            without_a_type(want)
         )));
     }
-    if live.iter().any(|c| c.is_unbounded()) {
+    if let Some(untyped) = live.iter().find(|c| c.vgpu_type.is_none()) {
         return Err(DeviceError::InvalidSpec(format!(
-            "a backend without a VRAM limit is running on this card, so it cannot promise \
-             device {id} a vGPU profile beside it"
+            "a backend that {} runs on this card, so it cannot promise device {id} a vGPU \
+             profile beside it until that backend is gone",
+            without_a_type(untyped)
         )));
     }
     let used: u64 = live.iter().map(|c| c.mib).sum();
@@ -112,6 +121,14 @@ fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> devic
         )));
     }
     Ok(())
+}
+
+fn without_a_type(claim: &Claim) -> &'static str {
+    if claim.is_unbounded() {
+        "sets no VRAM limit at all"
+    } else {
+        "has a cap or a profile size of its own and no vGPU type"
+    }
 }
 
 /// The card's size from any vGPU-typed claim, or `None` when no vGPU type is
@@ -207,12 +224,26 @@ pub(crate) mod tests {
         assert!(said.contains("8192 MiB"), "{said}");
     }
 
-    /// A cap counts against the card like a profile once vGPU types share it.
+    /// A cap or a bare profile size does not carry its share of the card's
+    /// carve-out, so beside vGPU types it is refused even where the sum fits,
+    /// and the refusal says how to ask for a size as a type.
     #[test]
-    fn a_capped_backend_counts_against_the_card_beside_vgpu_types() {
+    fn a_capped_backend_is_refused_beside_vgpu_types() {
         let q4 = typed(&resolved("RTX2070-4Q", 4096, 2));
-        refuse_card_overcommit(&[&q4], &capped(4096), &device()).expect("exactly the card");
-        refuse_card_overcommit(&[&q4], &capped(4097), &device()).expect_err("one MiB over");
+        let said = refuse_card_overcommit(&[&q4], &capped(1024), &device())
+            .expect_err("1024 MiB would fit, uncounted carve-out and all")
+            .to_string();
+        assert!(said.contains("vgpu_type = \"<N>M\""), "{said}");
+    }
+
+    /// The other order: a vGPU type cannot join a card a capped backend is on.
+    #[test]
+    fn a_vgpu_type_is_refused_beside_a_capped_backend() {
+        let q4 = typed(&resolved("RTX2070-4Q", 4096, 2));
+        let said = refuse_card_overcommit(&[&capped(1024)], &q4, &device())
+            .expect_err("the cap's share of the card is unknown")
+            .to_string();
+        assert!(said.contains("cap or a profile size"), "{said}");
     }
 
     /// A backend that may take the whole card cannot join vGPU-typed ones.
@@ -232,7 +263,7 @@ pub(crate) mod tests {
         let said = refuse_card_overcommit(&[&unlimited()], &q2, &device())
             .expect_err("the running backend could take the profile")
             .to_string();
-        assert!(said.contains("without a VRAM limit"), "{said}");
+        assert!(said.contains("no VRAM limit at all"), "{said}");
     }
 
     /// The devices of one admission count against each other as well as
