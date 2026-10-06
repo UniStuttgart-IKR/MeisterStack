@@ -8,12 +8,9 @@
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
+  inherit (import ./lib/net.nix { inherit lib; }) hostPort;
 
   metricsAddress = cfg.metrics.listenAddress;
-  # An IPv6 address takes brackets in front of a port.
-  hostPort = address: port:
-    if lib.hasInfix ":" address then "[${address}]:${toString port}"
-    else "${address}:${toString port}";
   bindsOneAddress = !(builtins.elem metricsAddress [ "127.0.0.1" "::1" "0.0.0.0" "::" ]);
 in
 {
@@ -199,7 +196,11 @@ in
 
     metrics.listenAddress = lib.mkOption {
       type = lib.types.str;
-      default = "127.0.0.1";
+      # A boot-rendered image is generic and learns its address only at
+      # boot, but the fleet's Prometheus scrapes it at that address.
+      default = if cfg.context.enable then "0.0.0.0" else "127.0.0.1";
+      defaultText = lib.literalExpression
+        ''if config.meisterstack.context.enable then "0.0.0.0" else "127.0.0.1"'';
       example = "10.0.0.10";
       description = ''
         The address the three metrics listeners (`metrics_listen` of the
@@ -209,10 +210,14 @@ in
 
         Loopback by default, so a host that does not say otherwise exposes
         them to nobody. A fleet built with `lib.mkFleet` binds the host's
-        management address, which is what its Prometheus scrapes; a unit that
-        binds one address waits for `network-online.target`. `0.0.0.0` is
-        every address, and then only the host's firewall decides who reads
-        them. A role's `settings.metrics_listen` still wins over this.
+        management address, which is what its Prometheus scrapes, and refuses
+        a host that binds neither that address nor every address; a unit that
+        binds one address waits for `network-online.target`. A host that
+        renders its config at boot (`meisterstack.context.enable`) binds every
+        address, because its image does not know the address it is scraped
+        at. `0.0.0.0` is every address, and then only the host's firewall
+        decides who reads them. A role's `settings.metrics_listen` still wins
+        over this.
       '';
     };
 

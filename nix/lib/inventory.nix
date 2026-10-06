@@ -9,6 +9,7 @@
 { lib }:
 
 let
+  net = import ./net.nix { inherit lib; };
   knownRoles = [ "cloud" "cluster" "agent" "addons" ];
   knownKinds = [ "raft" "compute" "custom" ];
   knownReboot = [ "auto" "approve" "never" ];
@@ -395,11 +396,33 @@ let
         else lib.concatStringsSep "," (map (p: "${p.id}=${p.address}") m);
 
       # Allocate one metrics port per role: cloud 9100, cluster 9101, agent 9102.
-      scrapeTargets = lib.concatMap
-        (h: lib.concatMap
-          (r: lib.optional (r != "addons") "${h.address}:${toString ports.metrics.${r}}")
-          h.roles)
+      metricsRoles = h: lib.filter (r: r != "addons") h.roles;
+      metricsTarget = h: role: net.hostPort h.address ports.metrics.${role};
+      scrapeTargets = lib.concatMap (h: map (metricsTarget h) (metricsRoles h))
         (lib.attrValues hosts);
+
+      # A target answers only where the listener binds the host's address or
+      # every address.
+      bindsMetricsTarget = h: role: listen:
+        builtins.elem listen
+          (map (a: net.hostPort a ports.metrics.${role}) [ h.address "0.0.0.0" "::" ]);
+
+      # The fleet's Prometheus loses a host whose listener binds elsewhere,
+      # without an error anywhere; refuse that host when it is evaluated.
+      metricsBindAssertions = h: config:
+        lib.optionals (addonsHost != null) (map
+          (role:
+            let listen = config.meisterstack.${role}.effective.metrics_listen or null; in
+            {
+              assertion = bindsMetricsTarget h role listen;
+              message =
+                "host ${h.id}: the Prometheus on ${addonsHost.id} scrapes the ${role} metrics "
+                + "at ${metricsTarget h role}, and this host's listener binds "
+                + "${if listen == null then "nothing" else listen}. Bind ${h.address} or every "
+                + "address (meisterstack.metrics.listenAddress), or the fleet's monitoring "
+                + "silently loses this host.";
+            })
+          (metricsRoles h));
 
       contextEnv = id:
         let h = hosts.${id}; in
@@ -487,7 +510,7 @@ let
 
           # For installable hosts, require the boot mode and disk layout to agree on
           # whether an EFI system partition exists.
-          assertions = lib.optionals (h.install != null) [
+          assertions = metricsBindAssertions h config ++ lib.optionals (h.install != null) [
             {
               assertion = h.boot != "uefi" || config.meisterstack.install.hasEsp;
               message =

@@ -163,6 +163,11 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # Every host binds its metrics where the fleet's Prometheus scrapes them.
+          scrape-targets = import ./nix/tests/scrape-targets.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # A managed host's units name the store, never /opt.
           managed-uses-the-package = import ./nix/tests/managed-uses-the-package.nix {
             inherit nixpkgs lib pkgs system self;
