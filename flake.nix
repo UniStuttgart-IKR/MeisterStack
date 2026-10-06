@@ -74,15 +74,14 @@
       lib = {
         # The seam a deployment tool builds on, so that it keeps no copy of what
         # these modules decide: address helpers, the renderer that turns MEISTER_*
-        # context defaults into role settings, the port tables, the comparison of
-        # a Leandro patch series with ours and the tags of our assertion messages.
+        # context defaults into role settings, the port tables and the comparison
+        # of a Leandro patch series with ours.
         net = import ./nix/lib/net.nix { inherit lib; };
         render = import ./nix/lib/render.nix;
         ports = (import ./nix/lib/ports.nix).roles;
         addonPorts = (import ./nix/lib/ports.nix).addons;
         leandroSeries = import ./nix/lib/leandro-series.nix { inherit lib; };
         patchDir = ./patches;
-        assertionTags = import ./nix/tests/lib.nix { inherit lib; };
       };
 
       # Expose package overrides through an overlay.
