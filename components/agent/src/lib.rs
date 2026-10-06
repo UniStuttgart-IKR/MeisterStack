@@ -873,7 +873,7 @@ async fn wait_out_the_backoff(
                    node stops answering for its routers' addresses before the cluster can give \
                    them to a standby, except where no other node can be made active");
             tried_this_round = true;
-            *silenced = stop_speaking_for_every_router(bridge).await;
+            *silenced = silence_routers_another_node_can_take_over(bridge).await;
         }
         if now >= until {
             return;
@@ -905,16 +905,18 @@ async fn say_goodbye(agent: &Arc<Agent>) {
     }
     // VMM transfers survive agent shutdown; shutdown does not authorize cleanup.
     // One-shot farewell: there is no next round to retry on, so the result is only logged.
-    let _ = stop_speaking_for_every_router(agent.reconciler.drivers().bridge.as_deref()).await;
+    let bridge = agent.reconciler.drivers().bridge.as_deref();
+    let _ = silence_routers_another_node_can_take_over(bridge).await;
 }
 
 /// Attempt to silence routers without destroying their namespaces. Called
 /// after the stopping report wait and after controller-session loss. Takes the
 /// bridge, not the agent, so a fake driver can test it.
 /// True only when every router namespace on this node is verifiably silent, whatever its record
-/// says (no bridge counts as silent); a driver error or partial `Silencing` is false so the
+/// says, or deliberately kept answering as the only possible gateway of its provider network
+/// (IKR-B76); no bridge counts as silent. A driver error or partial `Silencing` is false so the
 /// caller retries (R3-F06, R2-1).
-async fn stop_speaking_for_every_router(
+async fn silence_routers_another_node_can_take_over(
     bridge: Option<&dyn agent_api::networking::BridgeDriver>,
 ) -> bool {
     let Some(bridge) = bridge else {
@@ -922,13 +924,15 @@ async fn stop_speaking_for_every_router(
     };
     match bridge.fall_silent().await {
         Ok(outcome) if outcome.complete() => {
-            if !outcome.silenced.is_empty() {
-                info!(silenced = ?outcome.silenced, "this node's routers fell silent on the way out");
+            if !outcome.silenced.is_empty() || !outcome.kept.is_empty() {
+                info!(silenced = ?outcome.silenced, kept = ?outcome.kept,
+                      "this node's routers fell silent on the way out, except those no other \
+                       node can be made active for");
             }
             true
         }
         Ok(outcome) => {
-            warn!(silenced = ?outcome.silenced, failed = ?outcome.failed,
+            warn!(silenced = ?outcome.silenced, failed = ?outcome.failed, kept = ?outcome.kept,
                   "this node's routers could only be PARTIALLY silenced; the ones that failed \
                    may still answer for addresses its cluster has moved, and are retried on the \
                    next backoff round");
@@ -1331,13 +1335,13 @@ mod tests {
             }),
         ]);
 
-        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        let complete = silence_routers_another_node_can_take_over(Some(&bridge)).await;
         assert!(
             !complete,
             "one router still answering is not a completed farewell"
         );
 
-        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        let complete = silence_routers_another_node_can_take_over(Some(&bridge)).await;
         assert!(complete, "the retry reached every router");
         assert_eq!(*bridge.calls.lock().unwrap(), 2);
     }
@@ -1348,13 +1352,25 @@ mod tests {
         let bridge = ScriptedBridge::new(vec![Err(agent_api::networking::NetworkError::Backend(
             anyhow!("the netns directory could not be read"),
         ))]);
-        assert!(!stop_speaking_for_every_router(Some(&bridge)).await);
+        assert!(!silence_routers_another_node_can_take_over(Some(&bridge)).await);
+    }
+
+    /// A router kept answering as the only gateway of its provider network is no failure: the
+    /// pass is complete, and the dead man does not retry it every round (IKR-B76).
+    #[tokio::test]
+    async fn a_router_kept_answering_as_the_only_gateway_completes_the_pass() {
+        let bridge = ScriptedBridge::new(vec![Ok(agent_api::networking::Silencing {
+            silenced: Vec::new(),
+            failed: Vec::new(),
+            kept: vec![router(1)],
+        })]);
+        assert!(silence_routers_another_node_can_take_over(Some(&bridge)).await);
     }
 
     /// A node without a bridge driver has nothing to silence (R3-F06).
     #[tokio::test]
     async fn a_node_with_no_bridge_driver_has_nothing_to_silence() {
-        assert!(stop_speaking_for_every_router(None).await);
+        assert!(silence_routers_another_node_can_take_over(None).await);
     }
 
     /// One silencing attempt per backoff round; a failed round is retried on the next (R3-F06).
