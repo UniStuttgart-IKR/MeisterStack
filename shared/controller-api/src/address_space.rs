@@ -332,18 +332,22 @@ mod tests {
         space.opened_by_router(router, declared).err()
     }
 
-    /// A tenant that declares its network keeps its routers' prefixes inside it: one that
-    /// lies wholly in a declared prefix opens nothing new, one that only overlaps it is
-    /// refused.
+    /// A router prefix that lies wholly inside its tenant's declared network opens nothing new.
     #[test]
-    fn a_declared_network_holds_its_routers_prefixes() {
-        let space = claimed();
+    fn a_router_prefix_inside_the_declared_network_opens_nothing_new() {
         let declared = ["10.30.0.0/16".to_string()];
         assert_eq!(
-            space.opened_by_router(&router("acme", "10.30.4.1/24"), &declared),
+            claimed().opened_by_router(&router("acme", "10.30.4.1/24"), &declared),
             Ok(None)
         );
-        let why = refusal(&space, &router("acme", "10.30.0.1/15"), &declared)
+    }
+
+    /// A router prefix that only overlaps its tenant's declared network, sticking out of it, is
+    /// refused.
+    #[test]
+    fn a_router_prefix_sticking_out_of_the_declared_network_is_refused() {
+        let declared = ["10.30.0.0/16".to_string()];
+        let why = refusal(&claimed(), &router("acme", "10.30.0.1/15"), &declared)
             .expect("sticks out of the network");
         assert!(why.contains("not inside tenant acme's network"), "{why}");
     }
