@@ -36,13 +36,24 @@ pub struct Peer<'a> {
 /// A pending command's peer payload or structured refusal.
 type Answer = Result<Vec<u8>, Refusal>;
 
-/// Typed peer refusal using REST reason names. Legacy peers may send an
-/// empty reason, so callers must retain a conservative fallback.
+/// A typed refusal: the sentence a person reads and the REST reason word a
+/// caller branches on instead of matching prose. One type for both ends of a
+/// session: the answer a peer sent back (`Ack::Rejected`), and a handler's
+/// own failure this tier copies into its `ErrorMsg.reason` (`unavailable`).
+/// Legacy peers may send an empty reason, so callers must retain a
+/// conservative fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub message: String,
     pub reason: String,
 }
+
+/// Agent-defined reason that requests placement recovery after structural refusal.
+/// It lives in proto so the agent need not depend on controller-api.
+pub use proto::CANNOT_SERVE;
+
+/// Agent-defined reason for a source that refused a send before opening a stream.
+pub use proto::CANNOT_SEND;
 
 impl Refusal {
     pub fn new(message: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -57,6 +68,38 @@ impl Refusal {
     pub fn plain(message: impl Into<String>) -> Self {
         Self::new(message, String::new())
     }
+
+    /// "The party that holds the answer is out of reach right now." A caller
+    /// that retries is right, and the tier above should say 503 rather than
+    /// invent a disagreement.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(message, "Unavailable")
+    }
+
+    /// The refusal `error` carries, wherever it sits: under the line a session
+    /// adds ("agent … rejected command"), under a forward's ("the replica at …
+    /// answered 409"), or as the source of another error type. The outermost
+    /// one wins, because it is the word of the tier nearest the caller.
+    pub fn in_chain(error: &anyhow::Error) -> Option<&Refusal> {
+        // `chain()` follows `source()` and so passes over a refusal attached
+        // as anyhow context, which anyhow's own downcast finds.
+        error.downcast_ref::<Refusal>().or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<Refusal>())
+        })
+    }
+
+    /// The refusal `error` carries when its word is `reason`: how a caller asks
+    /// "did the node say `CannotServe`" without reading prose.
+    pub fn saying<'e>(error: &'e anyhow::Error, reason: &str) -> Option<&'e Refusal> {
+        Self::in_chain(error).filter(|refusal| refusal.reason == reason)
+    }
+
+    /// The word `error` carries, or the legacy empty reason when it carries none.
+    pub fn reason_of(error: &anyhow::Error) -> &str {
+        Self::in_chain(error).map_or("", |refusal| refusal.reason.as_str())
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -68,59 +111,6 @@ impl std::fmt::Display for Refusal {
 /// Preserve the refusal reason through anyhow error chains so callers can
 /// choose recovery behavior without matching message prose.
 impl std::error::Error for Refusal {}
-
-/// Structured handler error copied into the session ErrorMsg reason.
-/// Plain handler errors retain the legacy empty reason.
-#[derive(Debug)]
-pub struct Refused {
-    pub reason: &'static str,
-    pub message: String,
-}
-
-/// Agent-defined reason that requests placement recovery after structural refusal.
-/// It lives in proto so the agent need not depend on controller-api.
-pub use proto::CANNOT_SERVE;
-
-/// Agent-defined reason for a source that refused a send before opening a stream.
-pub use proto::CANNOT_SEND;
-
-impl Refused {
-    /// "The party that holds the answer is out of reach right now." A caller
-    /// that retries is right, and the tier above should say 503 rather than
-    /// invent a disagreement.
-    pub fn unavailable(message: impl Into<String>) -> Self {
-        Self {
-            reason: "Unavailable",
-            message: message.into(),
-        }
-    }
-
-    /// Structural node refusal before a VM record is created. Controllers
-    /// may release the binding and place elsewhere; failures after creation
-    /// retain ownership and retry on the current node.
-    pub fn cannot_serve(message: impl Into<String>) -> Self {
-        Self {
-            reason: CANNOT_SERVE,
-            message: message.into(),
-        }
-    }
-
-    /// The word an `anyhow` error carries, if it is one of these at all.
-    pub fn reason_of(error: &anyhow::Error) -> &'static str {
-        error
-            .downcast_ref::<Refused>()
-            .map(|refused| refused.reason)
-            .unwrap_or("")
-    }
-}
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Refused {}
 
 pub struct Pending {
     waiting: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
@@ -253,6 +243,70 @@ mod tests {
             matches!(answer, Ack::Rejected(r) if r.message == "no such vm" && r.reason.is_empty())
         );
         assert_eq!(in_flight(&pending), 0);
+    }
+
+    /// An error type of somebody else's whose `source()` is a refusal.
+    #[derive(Debug)]
+    struct Carrying(Refusal);
+
+    impl std::fmt::Display for Carrying {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("fetching the console")
+        }
+    }
+
+    impl std::error::Error for Carrying {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// NL-A5: the word is found under whatever the tiers above wrap it in: the
+    /// line a session adds, a forward's line over that, another error type's
+    /// `source()`, and a refusal attached as context.
+    #[test]
+    fn a_refusal_is_found_anywhere_in_the_chain() {
+        let session = anyhow::Error::new(Refusal::new("no gateway slot", CANNOT_SERVE))
+            .context("agent gw-1 rejected command");
+        assert_eq!(Refusal::reason_of(&session), CANNOT_SERVE);
+        let forwarded = session.context("the replica at 10.0.0.9:3001 answered 409 Conflict");
+        assert_eq!(
+            Refusal::in_chain(&forwarded).map(|r| r.message.as_str()),
+            Some("no gateway slot")
+        );
+
+        let wrapped = anyhow::Error::new(Carrying(Refusal::unavailable("gw-1 is gone")))
+            .context("serving the logs");
+        assert_eq!(Refusal::reason_of(&wrapped), "Unavailable");
+
+        let attached = anyhow::anyhow!("console unreachable").context(Refusal::unavailable("x"));
+        assert_eq!(Refusal::reason_of(&attached), "Unavailable");
+    }
+
+    /// The tier nearest the caller speaks: its refusal is the word, not the one
+    /// under it.
+    #[test]
+    fn the_outermost_refusal_is_the_word() {
+        let e = anyhow::Error::new(Refusal::new("no gateway slot", CANNOT_SERVE))
+            .context(Refusal::unavailable("the replica holding gw-1 is gone"));
+        assert_eq!(Refusal::reason_of(&e), "Unavailable");
+        assert!(Refusal::saying(&e, CANNOT_SERVE).is_none());
+    }
+
+    /// An error with no refusal in it carries the legacy empty reason, and a
+    /// refusal with another word is not the one asked about.
+    #[test]
+    fn only_a_refusal_with_the_word_asked_about_is_found() {
+        let silent = anyhow::anyhow!("node gw-1 has no active session").context("ensure");
+        assert_eq!(Refusal::reason_of(&silent), "");
+        assert!(Refusal::saying(&silent, CANNOT_SERVE).is_none());
+
+        let send = anyhow::Error::new(Refusal::new("vm has a device", CANNOT_SEND));
+        assert!(Refusal::saying(&send, CANNOT_SERVE).is_none());
+        assert_eq!(
+            Refusal::saying(&send, CANNOT_SEND).map(|r| r.message.as_str()),
+            Some("vm has a device")
+        );
     }
 
     /// Closed sessions and unanswered commands must remove pending entries so

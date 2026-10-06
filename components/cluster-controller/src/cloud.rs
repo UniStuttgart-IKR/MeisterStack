@@ -687,11 +687,12 @@ async fn dispatch_traced(
             warn!(error = format!("{e:#}"), "command failed");
             proto::command_result::Outcome::Error(proto::ErrorMsg {
                 message: format!("{e:#}"),
-                // The handler's own word, where it had one. Without this the
-                // cloud calls every failure a conflict — including "I could
-                // not reach the node", which is the one a caller should
-                // simply try again.
-                reason: controller_api::Refused::reason_of(&e).to_string(),
+                // The word of the refusal the error carries, where it carries
+                // one: the handler's own, or a node's it passed on. Without
+                // this the cloud calls every failure a conflict — including
+                // "I could not reach the node", which is the one a caller
+                // should simply try again.
+                reason: controller_api::Refusal::reason_of(&e).to_string(),
             })
         }
     };
@@ -769,7 +770,7 @@ async fn handle_logs(
         false,
     )
     .await
-    .map_err(|e| controller_api::Refused::unavailable(format!("{e:#}")))?
+    .map_err(|e| controller_api::Refusal::unavailable(format!("{e:#}")))?
     {
         Logs::From(payload) => Ok(payload),
         Logs::NotYet(_) => Ok(logs::NO_STREAMS.to_vec()),

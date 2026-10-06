@@ -820,14 +820,9 @@ pub(super) async fn dispatch_create(
     // asking again here would fail in exactly the same way. So the binding
     // falls and the scheduler decides again — see `unbind_refused`.
     if let Err(e) = &outcome
-        && e.downcast_ref::<controller_api::Refusal>()
-            .is_some_and(|r| r.reason == controller_api::CANNOT_SERVE)
+        && let Some(refusal) = controller_api::Refusal::saying(e, controller_api::CANNOT_SERVE)
     {
-        let said = e
-            .downcast_ref::<controller_api::Refusal>()
-            .map(|r| r.message.clone())
-            .unwrap_or_else(|| format!("{e:#}"));
-        return unbind_refused(p, vm, node, said).await;
+        return unbind_refused(p, vm, node, refusal.message.clone()).await;
     }
     // The payload of an ack is empty for every command that only changes
     // something, which is all of these; only the console fetch answers with

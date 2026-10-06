@@ -316,7 +316,7 @@ const TYPED_REFUSALS: [&str; 2] = [controller_api::CANNOT_SERVE, controller_api:
 
 /// The node's typed refusal under `e`, with its word as this tier spells it.
 fn typed_refusal(e: &anyhow::Error) -> Option<(&'static str, &controller_api::Refusal)> {
-    let refusal = e.downcast_ref::<controller_api::Refusal>()?;
+    let refusal = controller_api::Refusal::in_chain(e)?;
     let word = TYPED_REFUSALS
         .into_iter()
         .find(|word| *word == refusal.reason)?;
@@ -381,6 +381,7 @@ pub async fn serve_forwarded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use controller_api::NetworkBackend as _;
 
     /// `holder`'s REST edge on a free local port: the route a sibling forwards to.
     async fn serve_edge(holder: Arc<SessionRegistry>) -> String {
@@ -391,16 +392,21 @@ mod tests {
         endpoint
     }
 
-    /// A dispatcher whose store is never asked anything: every test below
-    /// hands the endpoint in, which is what `deliver` is separated for.
+    /// A dispatcher whose store is never asked anything: the tests below hand
+    /// the endpoint in, which is what `deliver` is separated for, or command a
+    /// node whose session `registry` holds.
     async fn dispatch(registry: Arc<SessionRegistry>) -> Dispatch {
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/dispatch-test")
+            .await
+            .expect("the etcd client is built lazily");
+        dispatch_over(registry, Arc::new(store))
+    }
+
+    /// A dispatcher over `registry` that reads from `store` which replica holds the other nodes.
+    fn dispatch_over(registry: Arc<SessionRegistry>, store: Arc<EtcdStore>) -> Dispatch {
         Dispatch::new(
             registry,
-            Arc::new(
-                EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/dispatch-test")
-                    .await
-                    .expect("the etcd client is built lazily"),
-            ),
+            store,
             Arc::new(Forward {
                 cluster: "cluster-1".into(),
                 sibling: controller_api::forward::Sibling {
@@ -409,6 +415,42 @@ mod tests {
                 },
             }),
         )
+    }
+
+    /// One router, active on `gw-1`: the plan the router reconciler hands its backend.
+    fn router_on_gw_1() -> controller_api::RouterPlan {
+        controller_api::RouterPlan {
+            id: "uid-r".into(),
+            name: "acme-out".into(),
+            physnet: "ext".into(),
+            external_addr: "198.51.100.10/24".into(),
+            external_gateway: "198.51.100.1".into(),
+            vni: 10_007,
+            internal_addr: "10.42.0.1/24".into(),
+            nats: Vec::new(),
+            nodes: vec!["gw-1".into()],
+            active: Some("gw-1".into()),
+            release: Vec::new(),
+            sole_gateway: true,
+        }
+    }
+
+    /// What an agent answers an EnsureRouter for a physnet it has no gateway slot for.
+    fn no_gateway_slot() -> controller_api::Refusal {
+        controller_api::Refusal::new(
+            "no gateway slot for physnet ext",
+            controller_api::CANNOT_SERVE,
+        )
+    }
+
+    /// The router backend's verdict on `gw-1` refusing structurally: a refusal with the
+    /// node's own sentence, not a node it could not reach.
+    fn assert_refused_by_gw_1(out: &controller_api::RouterOutcome) {
+        assert_eq!(out.refused, ["gw-1"], "{out:?}");
+        assert_eq!(out.phase, controller_api::RouterPhaseKind::Failed);
+        assert_eq!(out.reason, controller_api::RouterReason::Refused);
+        let said = out.message.as_deref().unwrap_or_default();
+        assert!(said.contains("no gateway slot for physnet ext"), "{said}");
     }
 
     /// D-P2, with the two replicas the lab had: the migration is reconciled
@@ -491,9 +533,8 @@ mod tests {
             .await
             .expect_err("the source refused");
 
-        let refusal = refused
-            .downcast_ref::<controller_api::Refusal>()
-            .expect("a typed refusal, not a sentence");
+        let refusal =
+            controller_api::Refusal::in_chain(&refused).expect("a typed refusal, not a sentence");
         assert_eq!(refusal.reason, controller_api::CANNOT_SEND);
         assert_eq!(refusal.message, "vm uid-1 has 1 device(s) (crosvm-gpu)");
         assert!(
@@ -533,13 +574,55 @@ mod tests {
             .expect_err("the source refused");
 
         assert!(
-            refused.downcast_ref::<controller_api::Refusal>().is_none(),
+            controller_api::Refusal::in_chain(&refused).is_none(),
             "{refused:#}"
         );
         assert!(
             format!("{refused:#}").contains("sending vm uid-1: refused"),
             "{refused:#}"
         );
+    }
+
+    /// NL-A5: a node's `CannotServe` for a router, through this replica's own session, is a
+    /// refusal the router backend remembers, and not a node it could not reach.
+    #[tokio::test]
+    async fn a_router_a_node_cannot_serve_is_refused_and_not_unreachable() {
+        let registry = Arc::new(SessionRegistry::new());
+        let agent = registry.agent_answering("gw-1", Err(no_gateway_slot()));
+
+        let out = controller_api::MeisterNetwork
+            .realise(&dispatch(registry).await, &router_on_gw_1())
+            .await;
+
+        assert_refused_by_gw_1(&out);
+        assert!(matches!(
+            agent.await.unwrap(),
+            Some(command::Op::EnsureRouter(_))
+        ));
+    }
+
+    /// NL-A5 across the hop: the same refusal from a node another replica holds, found
+    /// through the endpoint that replica wrote onto the node object, reads the same.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_router_a_node_of_another_replica_cannot_serve_is_refused_and_not_unreachable() {
+        let holder = Arc::new(SessionRegistry::new());
+        let agent = holder.agent_answering("gw-1", Err(no_gateway_slot()));
+        let store = crate::test_etcd::fresh_store("dispatch-router").await;
+        let mut gw = Node::declare("gw-1", controller_api::NodeSpec::default());
+        gw.status.session_endpoint = Some(serve_edge(holder).await);
+        store.create(&gw).await.expect("the node object");
+
+        let elsewhere = dispatch_over(Arc::new(SessionRegistry::new()), Arc::new(store));
+        let out = controller_api::MeisterNetwork
+            .realise(&elsewhere, &router_on_gw_1())
+            .await;
+
+        assert_refused_by_gw_1(&out);
+        assert!(matches!(
+            agent.await.unwrap(),
+            Some(command::Op::EnsureRouter(_))
+        ));
     }
 
     /// The other end of the same hop: a replica that was forwarded a command

@@ -1032,8 +1032,7 @@ async fn send(
 /// waits for. Any other failure, an empty legacy reason included, leaves the
 /// send's acceptance unknown.
 fn refused_to_send(e: &anyhow::Error) -> Option<&controller_api::Refusal> {
-    e.downcast_ref::<controller_api::Refusal>()
-        .filter(|refusal| refusal.reason == controller_api::CANNOT_SEND)
+    controller_api::Refusal::saying(e, controller_api::CANNOT_SEND)
 }
 
 /// Interpret matching source-abort evidence together with destination evidence.

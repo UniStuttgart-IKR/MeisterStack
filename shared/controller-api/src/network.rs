@@ -327,8 +327,9 @@ pub struct RouterOutcome {
 /// tests can supply a recorder without depending on controller internals.
 #[async_trait::async_trait]
 pub trait RouterSink: Send + Sync {
-    /// Idempotently ensure a router on one node. `Refused` with `CANNOT_SERVE`
-    /// denotes structural incompatibility; other errors do not establish that refusal.
+    /// Idempotently ensure a router on one node. A `Refusal` saying `CANNOT_SERVE`
+    /// anywhere in the error's chain denotes structural incompatibility; other
+    /// errors do not establish that refusal.
     async fn ensure(&self, node: &str, router: proto::EnsureRouter) -> anyhow::Result<()>;
     /// Let go of one router on one node, by uid.
     async fn destroy(&self, node: &str, id: &str) -> anyhow::Result<()>;
@@ -389,7 +390,7 @@ impl NetworkBackend for MeisterNetwork {
                         out.active_node = node.clone();
                     }
                 }
-                Err(e) if crate::Refused::reason_of(&e) == crate::CANNOT_SERVE => {
+                Err(e) if crate::Refusal::saying(&e, crate::CANNOT_SERVE).is_some() => {
                     tracing::warn!(router = %plan.name, node = %node,
                                    error = format!("{e:#}"), "node has no gateway slot");
                     out.refused.push(node.clone());
@@ -828,9 +829,11 @@ mod tests {
     impl RouterSink for Recorder {
         async fn ensure(&self, node: &str, router: proto::EnsureRouter) -> anyhow::Result<()> {
             match self.refuse.get(node) {
-                Some(&crate::CANNOT_SERVE) => {
-                    Err(crate::Refused::cannot_serve("no gateway slot for physnet ext").into())
-                }
+                Some(&crate::CANNOT_SERVE) => Err(rejected(
+                    node,
+                    crate::Refusal::new("no gateway slot for physnet ext", crate::CANNOT_SERVE),
+                    by_the_agent,
+                )),
                 Some(_) => anyhow::bail!("node {node} has no active session"),
                 None => {
                     self.sent
@@ -848,17 +851,36 @@ mod tests {
         }
     }
 
-    /// A sink whose nodes refuse the way a session hands an agent's refusal
-    /// back: the agent's sentence under the line that says who refused.
-    struct Rejecting;
+    /// A node's refusal as the cluster's dispatch hands it back: the agent's
+    /// `refusal` under the line `answered` writes about who answered.
+    fn rejected(
+        node: &str,
+        refusal: crate::Refusal,
+        answered: fn(&str) -> String,
+    ) -> anyhow::Error {
+        anyhow::Error::new(refusal).context(answered(node))
+    }
+
+    /// The line over an agent's refusal through this replica's own session.
+    fn by_the_agent(node: &str) -> String {
+        format!("agent {node} rejected command")
+    }
+
+    /// The line over an agent's refusal forwarded by the replica holding its session.
+    fn by_its_replica(_node: &str) -> String {
+        "the replica at 10.0.0.9:3001 answered 409 Conflict".to_string()
+    }
+
+    /// A sink whose every node refuses with `refusal`, under the line `answered` writes.
+    struct Rejecting {
+        refusal: crate::Refusal,
+        answered: fn(&str) -> String,
+    }
 
     #[async_trait::async_trait]
     impl RouterSink for Rejecting {
         async fn ensure(&self, node: &str, _router: proto::EnsureRouter) -> anyhow::Result<()> {
-            Err(
-                anyhow::Error::new(crate::Refusal::plain("no uplink carries vni 10007"))
-                    .context(format!("agent {node} rejected command")),
-            )
+            Err(rejected(node, self.refusal.clone(), self.answered))
         }
 
         async fn destroy(&self, _node: &str, _id: &str) -> anyhow::Result<()> {
@@ -951,14 +973,42 @@ mod tests {
     /// Display of the error would keep just the line naming who answered.
     #[tokio::test]
     async fn a_router_status_keeps_the_node_s_own_sentence() {
+        let sink = Rejecting {
+            refusal: crate::Refusal::plain("no uplink carries vni 10007"),
+            answered: by_the_agent,
+        };
         let out = MeisterNetwork
-            .realise(&Rejecting, &plan_on(&["gw-1"], Some("gw-1"), &[]))
+            .realise(&sink, &plan_on(&["gw-1"], Some("gw-1"), &[]))
             .await;
 
         assert_eq!(
             out.message.as_deref(),
             Some("gw-1: agent gw-1 rejected command: no uplink carries vni 10007")
         );
+    }
+
+    /// NL-A5: a node's `CannotServe` is a structural refusal in both shapes the
+    /// cluster's dispatch hands it over in, under the line naming the agent or
+    /// the replica that answered, and not a node that could not be reached.
+    #[tokio::test]
+    async fn a_cannot_serve_under_the_line_naming_who_answered_is_a_refusal() {
+        for answered in [by_the_agent as fn(&str) -> String, by_its_replica] {
+            let sink = Rejecting {
+                refusal: crate::Refusal::new(
+                    "no gateway slot for physnet ext",
+                    crate::CANNOT_SERVE,
+                ),
+                answered,
+            };
+            let out = MeisterNetwork
+                .realise(&sink, &plan_on(&["gw-1"], Some("gw-1"), &[]))
+                .await;
+            assert_eq!(out.refused, ["gw-1"], "{out:?}");
+            assert_eq!(
+                (out.phase, out.reason),
+                (RouterPhaseKind::Failed, RouterReason::Refused)
+            );
+        }
     }
 
     /// The config seam, the same shape `SchedulerConfig` has: a word chooses
