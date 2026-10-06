@@ -48,6 +48,12 @@ pub const DEFAULT_VXLAN_MTU: u32 = 1500 - VXLAN_OVERHEAD;
 /// for `lvs`.
 pub const DEFAULT_NFT: &str = "nft";
 
+/// How long an external command (`ip`, `nft`, `arping`) may run before it is killed (R3-F08).
+///
+/// Generous for commands that take milliseconds, but short enough that a wedged one costs one
+/// retried command instead of stalling the agent's serial command pump.
+pub(crate) const COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How this node reaches other VXLAN endpoints.
 #[derive(Clone, Debug)]
 pub struct VxlanConfig {

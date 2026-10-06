@@ -10,14 +10,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
 use agent_api::networking::{
     self, NatKind, NetworkError, RouterId, RouterPhase, RouterReason, RouterSpec, RouterState,
 };
+use agent_api::subprocess::output_within;
 use tracing::{debug, info, instrument, warn};
 
+use crate::COMMAND_DEADLINE;
 use crate::nftables::{LEG_EXTERNAL, LEG_INTERNAL, ROUTER_TABLE, address_of, router_ruleset};
 
 /// The bridge one provider network gets on this node.
@@ -236,48 +236,6 @@ fn arp_ignore(active: bool) -> &'static str {
     }
 }
 
-/// How long an external command (`ip`, `nft`) may run before it is killed (R3-F08).
-///
-/// Generous for commands that take milliseconds, but short enough that a wedged `ip` costs one
-/// retried command instead of stalling the agent's serial command pump.
-const COMMAND_DEADLINE: Duration = Duration::from_secs(5);
-
-/// Drain a child's stdout and stderr and wait for it to exit.
-///
-/// Takes `&mut Child` so a caller whose timeout drops this future still holds the handle
-/// needed to kill and reap the child.
-async fn drain_and_wait(
-    child: &mut tokio::process::Child,
-) -> std::io::Result<std::process::Output> {
-    use tokio::io::AsyncReadExt;
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-    a?;
-    b?;
-    let status = child.wait().await?;
-    Ok(std::process::Output {
-        status,
-        stdout: out,
-        stderr: err,
-    })
-}
-
-/// Kill a wedged child and reap it, on every path that gives up on a command.
-///
-/// Mirrors `kill_and_reap` in the agent's `images.rs`: a driver cannot depend on the agent
-/// crate. Errors only get a debug line; "already gone" is the outcome a kill wants.
-async fn kill_and_reap(child: &mut tokio::process::Child) {
-    if let Err(e) = child.start_kill() {
-        debug!(error = %e, "an ip/nft child was already gone when it was stopped");
-    }
-    if let Err(e) = child.wait().await {
-        debug!(error = %e, "reaping a stopped ip/nft child");
-    }
-}
-
 impl crate::LinuxNetworkDriver {
     /// This node's gateway slot, or the sentence it owes whoever asked for a
     /// router.
@@ -295,36 +253,21 @@ impl crate::LinuxNetworkDriver {
     /// them.
     ///
     /// Bounded by [`COMMAND_DEADLINE`]: a hung `ip` (stuck netns mount, unresponsive netlink)
-    /// would block the agent's serial pump and the node's `ops` lock. On timeout the child is
-    /// killed and reaped (R3-F08).
+    /// would block the agent's serial pump and the node's `ops` lock (R3-F08, R2-5).
     async fn ip(&self, args: &[&str]) -> networking::Result<String> {
         let binary = &self.gateway()?.ip;
-        let mut child = tokio::process::Command::new(binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                NetworkError::Backend(anyhow::anyhow!("running {binary} {}: {e}", args.join(" ")))
-            })?;
-        let out = match tokio::time::timeout(COMMAND_DEADLINE, drain_and_wait(&mut child)).await {
-            Ok(result) => result.map_err(|e| {
-                NetworkError::Backend(anyhow::anyhow!("running {binary} {}: {e}", args.join(" ")))
-            })?,
-            Err(_) => {
-                kill_and_reap(&mut child).await;
-                return Err(NetworkError::Backend(anyhow::anyhow!(
-                    "{binary} {} did not answer within {}s and was stopped",
-                    args.join(" "),
-                    COMMAND_DEADLINE.as_secs()
-                )));
-            }
-        };
+        let what = format!("{binary} {}", args.join(" "));
+        let out = output_within(
+            tokio::process::Command::new(binary).args(args),
+            None,
+            COMMAND_DEADLINE,
+            &what,
+        )
+        .await
+        .map_err(|e| NetworkError::Backend(e.into()))?;
         if !out.status.success() {
             return Err(NetworkError::Backend(anyhow::anyhow!(
-                "{binary} {} failed: {}",
-                args.join(" "),
+                "{what} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
@@ -405,39 +348,25 @@ impl crate::LinuxNetworkDriver {
     /// Program nftables inside a router's namespace.
     ///
     /// The script goes in on stdin for the reason the tap guard's does: a rule
-    /// containing a set literal never has to survive an argv split.
-    ///
-    /// Bounded by [`COMMAND_DEADLINE`] with kill-and-reap like `ip`; the stdin write is inside
-    /// the bound too, since a script `nft` does not drain would hang there first (R3-F08).
+    /// containing a set literal never has to survive an argv split. Bounded like `ip`,
+    /// stdin included: a script `nft` does not drain would hang there first (R3-F08).
     async fn netns_nft(&self, netns: &str, script: &str) -> networking::Result<()> {
-        use tokio::io::AsyncWriteExt;
         let g = self.gateway()?;
-        let mut child = tokio::process::Command::new(&g.ip)
-            .args(["netns", "exec", netns, self.nft.binary(), "-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| NetworkError::Backend(anyhow::anyhow!("running {}: {e}", g.ip)))?;
-        let talk = async {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("nft stdin vanished"))?
-                .write_all(script.as_bytes())
-                .await?;
-            drain_and_wait(&mut child).await
-        };
-        let out = match tokio::time::timeout(COMMAND_DEADLINE, talk).await {
-            Ok(result) => result.map_err(|e| NetworkError::Backend(e.into()))?,
-            Err(_) => {
-                kill_and_reap(&mut child).await;
-                return Err(NetworkError::Backend(anyhow::anyhow!(
-                    "nft did not answer within {}s in {netns} and was stopped",
-                    COMMAND_DEADLINE.as_secs()
-                )));
-            }
-        };
+        let out = output_within(
+            tokio::process::Command::new(&g.ip).args([
+                "netns",
+                "exec",
+                netns,
+                self.nft.binary(),
+                "-f",
+                "-",
+            ]),
+            Some(script.as_bytes()),
+            COMMAND_DEADLINE,
+            &format!("nft in {netns}"),
+        )
+        .await
+        .map_err(|e| NetworkError::Backend(e.into()))?;
         if out.status.success() {
             return Ok(());
         }
@@ -448,30 +377,22 @@ impl crate::LinuxNetworkDriver {
     }
 
     /// Send external gratuitous ARPs after activation, with best-effort error handling.
-    /// Children start before waiting; arping supplies its own requested deadline.
+    /// All addresses at once under one deadline, so a wedged `arping` costs the deadline once.
     async fn announce_garp(&self, netns: &str, spec: &RouterSpec) {
-        let addresses = garp_addresses(spec);
         let Ok(g) = self.gateway() else {
             return;
         };
-        let mut running = Vec::new();
-        for address in &addresses {
-            let child = tokio::process::Command::new(&g.ip)
-                .args(garp_command(&g.arping, netns, address))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn();
-            match child {
-                Ok(child) => running.push((address, child)),
-                Err(e) => warn!(address = %address, error = %e,
-                                "no gratuitous ARP for this address: {} could not be started",
-                                g.arping),
-            }
-        }
+        let addresses = garp_addresses(spec);
+        let shouts = addresses.iter().map(|address| async move {
+            let mut command = tokio::process::Command::new(&g.ip);
+            command.args(garp_command(&g.arping, netns, address));
+            let what = format!("{} for {address}", g.arping);
+            let outcome = output_within(&mut command, None, COMMAND_DEADLINE, &what).await;
+            (address, outcome)
+        });
         let mut announced = Vec::new();
-        for (address, child) in running {
-            match child.wait_with_output().await {
+        for (address, outcome) in futures::future::join_all(shouts).await {
+            match outcome {
                 Ok(out) if out.status.success() => announced.push(address.as_str()),
                 Ok(out) => warn!(address = %address,
                                  error = %String::from_utf8_lossy(&out.stderr).trim(),
@@ -1654,7 +1575,7 @@ esac
             .expect_err("a command that never answers is an error, not an eternal wait");
         let elapsed = start.elapsed();
         assert!(
-            elapsed < COMMAND_DEADLINE + Duration::from_secs(3),
+            elapsed < COMMAND_DEADLINE + std::time::Duration::from_secs(3),
             "bounded by the deadline this driver keeps, not by the fake's own hang: {elapsed:?}"
         );
         assert!(

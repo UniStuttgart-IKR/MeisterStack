@@ -8,9 +8,8 @@
 //! addresses and inbound guest traffic have no address policy here.
 //! Router NAT uses a separate ip-family table inside each router namespace.
 
-use std::process::Stdio;
-
 use agent_api::networking::{NetworkError, NicSpec};
+use agent_api::subprocess::output_within;
 use common::net::{Ipv4Ranges, RangeError};
 use tracing::{debug, info, instrument, warn};
 
@@ -262,46 +261,32 @@ impl Nft {
         &self.binary
     }
 
+    /// [`Self::run`] for the one synchronous caller, start-up: on a thread of its own with a
+    /// runtime of its own, because the caller may sit on a runtime thread that must not block
+    /// on itself. Bounded exactly as `run` is (R2-5).
     fn run_blocking(&self, script: &str) -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut child = std::process::Command::new(&self.binary)
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("running {}: {e}", self.binary))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("nft stdin vanished"))?
-            .write_all(script.as_bytes())?;
-        let out = child.wait_with_output()?;
-        if out.status.success() {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "nft refused the ruleset: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(self.run(script))
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("the thread running nft panicked"))?
+        })
     }
 
+    /// Apply `script` atomically, bounded by [`crate::COMMAND_DEADLINE`] (R2-5).
     async fn run(&self, script: &str) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let mut child = tokio::process::Command::new(&self.binary)
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("running {}: {e}", self.binary))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("nft stdin vanished"))?
-            .write_all(script.as_bytes())
-            .await?;
-        let out = child.wait_with_output().await?;
+        let out = output_within(
+            tokio::process::Command::new(&self.binary).args(["-f", "-"]),
+            Some(script.as_bytes()),
+            crate::COMMAND_DEADLINE,
+            &self.binary,
+        )
+        .await?;
         if out.status.success() {
             return Ok(());
         }
@@ -376,12 +361,16 @@ impl Nft {
         }
     }
 
-    /// The chain names in our table, out of `nft -j list table`.
+    /// The chain names in our table, out of `nft -j list table`, bounded like `run`.
     async fn chains(&self) -> anyhow::Result<Vec<String>> {
-        let out = tokio::process::Command::new(&self.binary)
-            .args(["-j", "list", "table", "netdev", TABLE])
-            .output()
-            .await?;
+        let out = output_within(
+            tokio::process::Command::new(&self.binary)
+                .args(["-j", "list", "table", "netdev", TABLE]),
+            None,
+            crate::COMMAND_DEADLINE,
+            &self.binary,
+        )
+        .await?;
         if !out.status.success() {
             // No table = nothing to reap, which is the state of a node that
             // has not booted a VM yet.

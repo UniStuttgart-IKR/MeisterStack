@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use agent_api::subprocess::kill_and_reap;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
@@ -749,11 +750,11 @@ async fn fetch_hop(pinned: &Pinned, into: &Path, bounds: &Bounds, left: Duration
     let digest = match drained {
         Ok(Ok(digest)) => digest,
         Ok(Err(e)) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child, "curl").await;
             return Err(e);
         }
         Err(_) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child, "curl").await;
             bail!(
                 "fetching {url} did not finish within {}s and was stopped; nothing usable was \
                  written",
@@ -774,7 +775,7 @@ async fn fetch_hop(pinned: &Pinned, into: &Path, bounds: &Bounds, left: Duration
     let status = match tokio::time::timeout(BOUND_GRACE, child.wait()).await {
         Ok(status) => status.context("waiting for curl")?,
         Err(_) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child, "curl").await;
             bail!("curl did not exit after fetching {url} and was stopped");
         }
     };
@@ -854,16 +855,6 @@ async fn drain(
             .with_context(|| format!("writing {}", into.display()))?;
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Kill and reap curl on handled transfer failures. Reaping itself has no timeout.
-async fn kill_and_reap(child: &mut tokio::process::Child) {
-    if let Err(e) = child.start_kill() {
-        debug!(error = %e, "curl was already gone when the fetch was stopped");
-    }
-    if let Err(e) = child.wait().await {
-        debug!(error = %e, "reaping the stopped curl");
-    }
 }
 
 #[cfg(test)]
