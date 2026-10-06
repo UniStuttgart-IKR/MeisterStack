@@ -121,12 +121,14 @@ pub(super) async fn create_routed_subnet(
             },
         );
         subnet.metadata.labels = body.metadata.labels.clone();
+        // A preview answers once the block is chosen: it is not in the store, so there is
+        // nothing to ask about after a write and nothing to take back. (RR6-2)
+        if let Some(preview) = dry.preview(&subnet) {
+            return Ok((StatusCode::CREATED, Json(preview)));
+        }
         #[cfg(test)]
         super::admission_tests::admission_gate(&subnet.metadata.name).await;
-        let created = match dry.preview(&subnet) {
-            Some(preview) => preview,
-            None => st.store.create(&subnet).await?,
-        };
+        let created = st.store.create(&subnet).await?;
 
         let lost = subnet_lost_claim(&st, &created, cidr).await;
         let cut_again = !named && matches!(lost, Ok(Some(_)));

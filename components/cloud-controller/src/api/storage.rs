@@ -127,10 +127,14 @@ pub(super) async fn create_storage_pool(
     let mut pool = StoragePool::declare(&body.metadata.name, body.spec);
     pool.metadata.labels = body.metadata.labels;
     check_storage_pool(&st, &pool, None).await?;
-    let created = match dry.preview(&pool) {
-        Some(preview) => preview,
-        None => st.store.create(&pool).await?,
-    };
+    // Before the write: a preview is not in the store, so there is nothing to ask about after
+    // it and nothing to take back. (RR6-2)
+    if let Some(preview) = dry.preview(&pool) {
+        return Ok((StatusCode::CREATED, Json(preview)));
+    }
+    #[cfg(test)]
+    super::admission_tests::admission_gate(&pool.metadata.name).await;
+    let created = st.store.create(&pool).await?;
 
     // And the same question again, from inside the store — the create is what
     // makes a race visible. No second round: an admin marked this pool default

@@ -530,12 +530,14 @@ pub(super) async fn create_floating_pool(
     let mut pool = FloatingPool::declare(&body.metadata.name, body.spec);
     pool.metadata.labels = body.metadata.labels;
     check_pool(&st, &pool, None).await?;
+    // Before the write: a preview is not in the store, so there is nothing to ask about after
+    // it and nothing to take back. (RR6-2)
+    if let Some(preview) = dry.preview(&pool) {
+        return Ok((StatusCode::CREATED, Json(preview)));
+    }
     #[cfg(test)]
     super::admission_tests::admission_gate(&pool.metadata.name).await;
-    let created = match dry.preview(&pool) {
-        Some(preview) => preview,
-        None => st.store.create(&pool).await?,
-    };
+    let created = st.store.create(&pool).await?;
 
     // And now the same questions again, from inside the store. No second
     // round: an administrator named these ranges and this default mark

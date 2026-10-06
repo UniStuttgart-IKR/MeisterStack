@@ -1797,6 +1797,158 @@ async fn a_routed_subnet_whose_question_after_its_write_has_no_answer_is_taken_b
     ));
 }
 
+// --- RR6-2: a preview is answered before the write ---------------------------
+
+/// What `?dryRun=All` hands a handler.
+async fn dry_run() -> DryRun {
+    let (mut parts, ()) = axum::http::Request::builder()
+        .uri("/?dryRun=All")
+        .body(())
+        .expect("a request")
+        .into_parts();
+    <DryRun as axum::extract::FromRequestParts<()>>::from_request_parts(&mut parts, &())
+        .await
+        .expect("a dry run")
+}
+
+/// What `request` answers, with the next request under `key` paused at the gate before its
+/// write: should it get there, `between` is done before it is let on. A request that answers
+/// before its write never meets the gate.
+async fn answer_past_the_write_gate<T>(
+    key: &str,
+    request: impl std::future::Future<Output = T>,
+    between: impl std::future::Future<Output = ()>,
+) -> T {
+    let gate = pause(key);
+    tokio::pin!(request);
+    let before_the_write = tokio::select! {
+        answer = &mut request => Some(answer),
+        () = gate.arrived() => None,
+    };
+    match before_the_write {
+        Some(answer) => answer,
+        None => {
+            between.await;
+            gate.release().await;
+            request.await
+        }
+    }
+}
+
+/// Whether `object` is a preview: marked so, and never written.
+fn is_preview<S, St>(object: &controller_api::Object<S, St>) -> bool {
+    object
+        .metadata
+        .annotations
+        .contains_key(controller_api::ANNOTATION_DRY_RUN)
+        && object.metadata.resource_version.is_empty()
+}
+
+/// A dry run of a floating pool answers its preview whatever is claimed after its check: it
+/// writes nothing, so there is nothing to ask about after a write and nothing to take back.
+/// (RR6-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_dry_run_pool_answers_its_preview_whatever_is_claimed_after_its_check() {
+    let (st, _) = bare_cloud("rr6-2-pool").await;
+    let pool = unique("p");
+
+    let answer = answer_past_the_write_gate(
+        &pool,
+        create_floating_pool(
+            State(st.clone()),
+            dry_run().await,
+            Json(pool_on_10_30(&pool)),
+        ),
+        pool_on(&st, "between", "10.30.0.0/25"),
+    )
+    .await;
+
+    let (status, Json(preview)) = answer.expect("a preview");
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(is_preview(&preview));
+    assert!(matches!(
+        st.store.get::<FloatingPool>(&pool).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A dry run of a routed subnet answers its preview whatever is claimed after its block was
+/// chosen. (RR6-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_dry_run_routed_subnet_answers_its_preview_whatever_is_claimed_after_its_check() {
+    let (st, _) = bare_cloud("rr6-2-subnet").await;
+    let subnet = unique("s");
+    let body = RoutedSubnet::declare(
+        &subnet,
+        controller_api::RoutedSubnetSpec {
+            tenant: "a".into(),
+            cidr: "10.7.1.0/24".into(),
+            ..Default::default()
+        },
+    );
+
+    let answer = answer_past_the_write_gate(
+        &subnet,
+        create_routed_subnet(State(st.clone()), dry_run().await, Json(body)),
+        pool_on(&st, "between", "10.7.1.0/25"),
+    )
+    .await;
+
+    let (status, Json(preview)) = answer.expect("a preview");
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(is_preview(&preview));
+    assert!(matches!(
+        st.store.get::<RoutedSubnet>(&subnet).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A dry run of a default storage pool answers its preview whatever is marked default after its
+/// check. (RR6-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_dry_run_storage_pool_answers_its_preview_whatever_is_marked_default_after_its_check() {
+    let (st, _) = bare_cloud("rr6-2-storage").await;
+    let name = unique("disks");
+    let default_pool = |name: &str| {
+        StoragePool::declare(
+            name,
+            StoragePoolSpec {
+                driver: "filesystem".into(),
+                default: true,
+                cluster: "c1".into(),
+                ..Default::default()
+            },
+        )
+    };
+
+    let answer = answer_past_the_write_gate(
+        &name,
+        create_storage_pool(
+            State(st.clone()),
+            dry_run().await,
+            Json(default_pool(&name)),
+        ),
+        async {
+            st.store
+                .create(&default_pool("between"))
+                .await
+                .expect("another default");
+        },
+    )
+    .await;
+
+    let (status, Json(preview)) = answer.expect("a preview");
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(is_preview(&preview));
+    assert!(matches!(
+        st.store.get::<StoragePool>(&name).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
 // --- NL6-1: the prefix behind a router is the tenant's word, held to its claims
 
 /// `cloud_with_routers` with its provider network `ext` on 10.172.0.0/24, and a tenant of its
