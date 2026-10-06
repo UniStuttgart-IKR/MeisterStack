@@ -249,6 +249,12 @@
             hostRunsNftables = true;
           };
 
+          # A control plane and an agent from the service modules alone, and a
+          # guest created through the cloud API that boots on the agent.
+          vm-two-node-services = import ./nix/tests/two-node-services.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # Exercise standalone socket access and a nested guest.
           vm-single-node = import ./nix/tests/single-node.nix {
             inherit nixpkgs lib pkgs system self;
