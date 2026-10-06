@@ -192,6 +192,14 @@ pub(super) fn rooms_of(
 ) -> Vec<NodeRoom> {
     let mut rooms =
         controller_api::node_rooms(&cluster.status.nodes, overcommit, &cluster.status.unplaced);
+    if cluster.status.unplaced_omitted > 0 {
+        // More waits there for a node than its report could carry: what is
+        // left on its nodes is not known, and unknown is no room.
+        for node in &mut rooms {
+            node.room = Capacity::default();
+        }
+        return rooms;
+    }
     for vm in unreported {
         vm.node.debit(&mut rooms);
     }

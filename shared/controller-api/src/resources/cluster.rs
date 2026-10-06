@@ -82,11 +82,17 @@ pub struct ClusterStatus {
     /// reports them back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodeSummary>,
-    /// What each VM the cluster holds without a node asks for, cluster-local
-    /// ones included: room no node's bound sum carries yet. Empty from a
-    /// cluster that predates the field. (IKR-B78)
+    /// What each cloud VM the cluster holds without a node asks for: room no
+    /// node's bound sum carries yet. At most as many as one status carries;
+    /// see `unplaced_omitted`. Empty from a cluster that predates the field.
+    /// (IKR-B78)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unplaced: Vec<crate::Capacity>,
+    /// How many more cloud VMs wait there for a node than `unplaced` carries.
+    /// Nonzero: the room left on its nodes is not known here, and placement
+    /// counts none. (IKR-B78)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unplaced_omitted: u32,
     /// What the drain of this cluster has done — the same evidence a node
     /// carries, one scope up.
     #[serde(default, skip_serializing_if = "Option::is_none")]

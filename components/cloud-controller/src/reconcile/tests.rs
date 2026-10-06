@@ -1084,6 +1084,16 @@ fn what_a_cluster_holds_unplaced_holds_a_nodes_room() {
     assert!(!Wanted::of(&more_than_is_left, None, None).served_by("ikr-netlab", &rooms));
 }
 
+/// A cluster whose list of what waits there for a node stops short offers no
+/// room on any node: what the rest takes is not known. (IKR-B78)
+#[test]
+fn a_cluster_whose_unplaced_list_was_cut_short_offers_no_room() {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced_omitted = 1;
+    let rooms = rooms(&cluster, &[]);
+    assert!(!Wanted::of(&asking(512), None, None).served_by("ikr-netlab", &rooms));
+}
+
 // --- IKR-B81: a write lands on the object that was judged -------------------
 
 /// A store under a fresh prefix of the test etcd (`MEISTER_TEST_ETCD`).

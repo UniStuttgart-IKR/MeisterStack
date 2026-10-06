@@ -1259,11 +1259,11 @@ pub fn free_on(
         .minus(bound_on(node, vms))
 }
 
-/// What each VM a cluster holds without a node asks for: the half of its
-/// demand no node's bound sum carries yet. One entry per VM, because each
-/// lands on one machine. A VM on its way out will land nowhere. (IKR-B78)
-pub fn unplaced_demand(vms: &[Vm]) -> Vec<Capacity> {
-    vms.iter()
+/// What each of `vms` held without a node asks for: the half of its demand no
+/// node's bound sum carries yet. One entry per VM, because each lands on one
+/// machine. A VM on its way out will land nowhere. (IKR-B78)
+pub fn unplaced_demand<'a>(vms: impl IntoIterator<Item = &'a Vm>) -> Vec<Capacity> {
+    vms.into_iter()
         .filter(|v| v.spec.node_name.is_none() && !v.is_deleting())
         .map(Capacity::wanted_by)
         .collect()

@@ -664,11 +664,16 @@ message ClusterStatus {
   // Cloud-managed secret UIDs and generations held by the cluster. The cloud
   // avoids resending unchanged copies and removes mirrors absent upstream.
   repeated SecretStateReport secrets = 13;
-  // What each VM this cluster holds without a node asks for, cluster-local
-  // VMs included: room no node's bound_* carries yet. The cloud takes it off
-  // the nodes before it measures one node's room for a VM. Empty from an
-  // older cluster.
+  // What each cloud VM this cluster holds without a node asks for: room no
+  // node's bound_* carries yet. The cloud takes it off the nodes before it
+  // measures one node's room for a VM. Cluster-local VMs are not in it: the
+  // cloud neither places them nor can wait for them. At most a bound of them,
+  // see unplaced_omitted. Empty from an older cluster.
   repeated VmDemand unplaced = 16;
+  // How many more cloud VMs wait here for a node than `unplaced` carries: the
+  // list stops at a bound, because the cloud copies it whole onto one object.
+  // Nonzero means the room left on the nodes is not known up there.
+  uint32 unplaced_omitted = 17;
 }
 
 // What one VM asks of the one machine it will run on.
