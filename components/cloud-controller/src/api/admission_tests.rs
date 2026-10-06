@@ -800,13 +800,22 @@ async fn a_floating_address_is_bound_only_to_its_tenants_router_and_inside_prefi
         let err = reserve_as(&st, member("a"), router, inside)
             .await
             .expect_err("not a's own way in");
-        assert_eq!(err.field(), Some(field), "{router} {inside}: {}", err.message());
+        assert_eq!(
+            err.field(),
+            Some(field),
+            "{router} {inside}: {}",
+            err.message()
+        );
     }
     // The missing router and b's router read the same: nothing of b's is named.
     let foreign = reserve_as(&st, member("a"), "b-out", "10.77.0.10")
         .await
         .expect_err("b's router");
-    assert!(!foreign.message().contains("tenant b"), "{}", foreign.message());
+    assert!(
+        !foreign.message().contains("tenant b"),
+        "{}",
+        foreign.message()
+    );
 
     let ok = reserve_as(&st, member("a"), "a-out", "10.42.0.9")
         .await

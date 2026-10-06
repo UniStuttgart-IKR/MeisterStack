@@ -281,7 +281,10 @@ pub fn inside_address_refusal(router: &Router, internal: &str) -> Option<String>
         return Some(format!("{internal:?} is not an ipv4 address"));
     };
     let inside = &router.spec.internal_addr;
-    let own = inside.split('/').next().and_then(|a| a.parse::<Ipv4Addr>().ok());
+    let own = inside
+        .split('/')
+        .next()
+        .and_then(|a| a.parse::<Ipv4Addr>().ok());
     let (Some(own), Ok(prefix)) = (own, inside.parse::<common::net::Ipv4Range>()) else {
         return Some(format!(
             "router {name} has no inside prefix ({inside:?}) to place {internal} in"

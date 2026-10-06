@@ -786,7 +786,10 @@ fn stopping(told: i64) -> Vm {
 fn a_drift_the_cluster_acked_lately_is_not_dispatched_again() {
     let v = stopping(10);
     assert!(!must_hand_down(&v, false, at(11)), "told a second ago");
-    assert!(!must_hand_down(&v, false, at(39)), "still inside the window");
+    assert!(
+        !must_hand_down(&v, false, at(39)),
+        "still inside the window"
+    );
     assert!(must_hand_down(&v, false, at(40)), "told again after it");
 }
 

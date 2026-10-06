@@ -828,7 +828,13 @@ async fn handle_create(
         return Ok(());
     }
     write_drift(store, &c, &spec).await?;
-    note_drift(&c.name, &spec, shape_moved, evacuation_moved, placement_moved);
+    note_drift(
+        &c.name,
+        &spec,
+        shape_moved,
+        evacuation_moved,
+        placement_moved,
+    );
     Ok(())
 }
 
@@ -2508,7 +2514,9 @@ mod tests {
         };
         let why = format!(
             "{:#}",
-            handle_create(&store, c, "").await.expect_err("a tap on ext")
+            handle_create(&store, c, "")
+                .await
+                .expect_err("a tap on ext")
         );
         assert!(why.contains("nics[0].physnet"), "{why}");
     }
@@ -2976,8 +2984,16 @@ mod tests {
             .expect("the volume");
 
         for (name, disks, why) in [
-            ("inline", serde_json::json!([{ "size_bytes": 1 }]), "instance-store"),
-            ("pinned", serde_json::json!([{ "volume": "data" }]), "node-local"),
+            (
+                "inline",
+                serde_json::json!([{ "size_bytes": 1 }]),
+                "instance-store",
+            ),
+            (
+                "pinned",
+                serde_json::json!([{ "volume": "data" }]),
+                "node-local",
+            ),
         ] {
             let mut guest = vm(name, Some(name), VmPhaseKind::Running);
             guest.spec.node_name = Some("manacor".into());
