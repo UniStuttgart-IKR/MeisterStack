@@ -824,6 +824,11 @@ async fn handle_create(
     };
     refuse_unless_ours(&current, &c)?;
     if let Some(why) = own_wire {
+        // Kept only by a VM that already hangs on it: a wire the stored VM
+        // does not have is a new one, and refused like a new VM.
+        if controller_api::vni::check_tenant_nics(&current.spec.vm).is_ok() {
+            bail!("{why}");
+        }
         note_own_wire_kept(store, &current, &why).await;
     }
     let shape_moved = shape_moved(&current, &spec, &c.name)?;
@@ -2674,6 +2679,34 @@ mod tests {
             store.get::<Vm>("web-1").await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// A VM stored without a wire of its own does not get one by a re-send:
+    /// that is a new wire, refused like a new VM. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_does_not_give_a_stored_vm_a_wire_of_its_own() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let plain = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "vm": { "vcpus": 1, "nics": [{}] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        };
+        handle_create(&store, plain, "").await.expect("created");
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, on_its_own_wire("Running"), "")
+                .await
+                .expect_err("a tap on ext")
+        );
+
+        assert!(why.contains("nics[0].physnet"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert!(after.spec.vm["nics"][0].get("physnet").is_none());
     }
 
     /// One stored before the rule is managed on, not stranded: a stop reaches
