@@ -366,7 +366,7 @@ pkgs.testers.runNixOSTest {
 
     # The fleet's own certificate authority, beside the repository. Its key
     # is made here and stays here.
-    operator.succeed("meister-ca --dir /root/ca")
+    operator.succeed("meister-ca --dir /root/ca --init")
     operator.succeed("test -f /root/ca/ca.key && test -f /root/ca/ca.crt")
     # The cloud's key-encryption key: an OPERATOR FILE, which this tool never
     # makes and never replaces. 64 hex characters and no newline.

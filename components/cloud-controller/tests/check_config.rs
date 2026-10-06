@@ -165,7 +165,7 @@ fn a_revocation_list_is_read_by_the_check_and_named_when_it_cannot_be() {
     let meister_ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/meister-ca");
     let made = Command::new("bash")
         .arg(&meister_ca)
-        .args(["--dir", ca.to_str().unwrap(), "--node", "n1"])
+        .args(["--dir", ca.to_str().unwrap(), "--init", "--node", "n1"])
         .output()
         .expect("bash");
     if !made.status.success() {

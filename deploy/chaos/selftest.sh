@@ -61,7 +61,7 @@ echo "A. a throwaway CA, from the tool the lab uses"
 # the break-glass identity `mtls.py` presents; the cloud and cluster entries
 # give both a serving certificate and the system identity each tier shows the
 # other.
-if "$REPO/tools/meister-ca" --dir "$ROOT/pki" \
+if "$REPO/tools/meister-ca" --dir "$ROOT/pki" --init \
        --cloud selftest-cloud:127.0.0.1 \
        --cluster cluster-1:127.0.0.1 \
        --admin root >"$ROOT/log/ca.log" 2>&1; then
