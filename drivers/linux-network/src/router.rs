@@ -351,6 +351,14 @@ impl crate::LinuxNetworkDriver {
         .map(|_| ())
     }
 
+    /// Read a sysctl inside a router's namespace.
+    async fn netns_sysctl_value(&self, netns: &str, key: &str) -> networking::Result<String> {
+        let value = self
+            .ip(&["netns", "exec", netns, "sysctl", "-n", key])
+            .await?;
+        Ok(value.trim().to_string())
+    }
+
     /// Program nftables inside a router's namespace.
     ///
     /// The script goes in on stdin for the reason the tap guard's does: a rule
@@ -380,6 +388,43 @@ impl crate::LinuxNetworkDriver {
             "nft refused the router ruleset in {netns}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )))
+    }
+
+    /// Let an active router answer ARP, then shout for its addresses if it was silent before.
+    ///
+    /// Silent is read off the kernel as well as the record (N1): a pass that wrote the active
+    /// record and then failed to activate leaves a silent router whose record says active, and
+    /// the retry that finally activates it is the moment the outside wire has to be told. A
+    /// record that said standby shouts even when the kernel answered already, because the
+    /// neighbours may still follow the node that was active. The shout comes after the record:
+    /// it states that this node carries the address, which the record keeps true across an
+    /// agent restart.
+    async fn activate(
+        &self,
+        netns: &str,
+        spec: &RouterSpec,
+        recorded_active: bool,
+    ) -> networking::Result<()> {
+        let was_silent = !recorded_active || self.some_leg_silent(netns).await;
+        self.set_arp_mode(netns, true).await?;
+        if was_silent {
+            self.announce_garp(netns, spec).await;
+        }
+        Ok(())
+    }
+
+    /// Whether a leg of the namespace does not answer ARP right now. Both legs, because a pass
+    /// that activated one and failed on the other has not shouted yet. A mode that cannot be
+    /// read counts as silent: a shout too many from the active router is harmless, one too few
+    /// leaves the neighbours pointing at the node that held the address before.
+    async fn some_leg_silent(&self, netns: &str) -> bool {
+        for leg in [LEG_EXTERNAL, LEG_INTERNAL] {
+            let mode = self.netns_sysctl_value(netns, &arp_ignore_key(leg)).await;
+            if !mode.is_ok_and(|mode| mode == arp_ignore(true)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Send external gratuitous ARPs after activation, with best-effort error handling.
@@ -582,11 +627,9 @@ impl crate::LinuxNetworkDriver {
             NetworkError::InvalidSpec(format!("this router names an address that is not one: {e}"))
         })?;
 
-        // What this router was BEFORE this pass, read while the record is
-        // still the old one: a standby that is being made active is the moment
-        // the outside wire has to be told, and it is the only one. See
-        // `announce_garp`.
-        let was_active = Self::read_record(&Self::record_path(&g.state_dir, &spec.id))
+        // What the record said BEFORE this pass, read while it is still the old one; see
+        // `activate` for why the kernel is asked as well.
+        let recorded_active = Self::read_record(&Self::record_path(&g.state_dir, &spec.id))
             .await
             .is_ok_and(|record| record.spec.active);
 
@@ -720,14 +763,7 @@ impl crate::LinuxNetworkDriver {
         // Activation last, after the rules and the record: no namespace answers ARP without
         // its NAT or before its record says active (R2-1).
         if spec.active {
-            self.set_arp_mode(&netns, true).await?;
-        }
-
-        // After the record and not before it: the shout is a statement that
-        // this node is carrying the address, and the record is what makes that
-        // true across a restart of the agent.
-        if spec.active && !was_active {
-            self.announce_garp(&netns, spec).await;
+            self.activate(&netns, spec, recorded_active).await?;
         }
 
         info!(netns = %netns, external = %spec.external_addr, internal = %spec.internal_addr,
@@ -1525,6 +1561,108 @@ esac
         serde_json::from_slice::<RouterRecord>(&bytes)
             .expect("and it parses")
             .spec
+    }
+
+    /// A fake `ip` for one namespace's sysctls: a value written is kept in a file under `kernel`
+    /// and read back, legs start silent as a pass creates them, and the first write of
+    /// `arp_ignore=0` is refused once. Every call is appended to `log`.
+    fn sysctl_keeping_ip(kernel: &Path, log: &Path) -> String {
+        format!(
+            r#"echo "$*" >> '{log}'
+case "$*" in
+"netns exec "*" sysctl -n "*) cat '{kernel}/'"$6" 2>/dev/null || echo 8;;
+"netns exec "*" sysctl -q -w "*".arp_ignore=0")
+  if [ ! -e '{kernel}/refused' ]; then : > '{kernel}/refused'; echo 'permission denied' >&2; exit 1; fi
+  echo "${{7#*=}}" > '{kernel}/'"${{7%=*}}";;
+"netns exec "*" sysctl -q -w "*) echo "${{7#*=}}" > '{kernel}/'"${{7%=*}}";;
+esac
+exit 0
+"#,
+            log = log.display(),
+            kernel = kernel.display(),
+        )
+    }
+
+    /// Whether the fake `ip` was asked to run `arping` for a gratuitous ARP.
+    fn shouted(log: &Path) -> bool {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .any(|call| call.contains(" arping -U "))
+    }
+
+    /// A driver whose fake `ip` keeps sysctls under `<dir>/kernel` and logs to `<dir>/ip.log`.
+    fn sysctl_keeping_driver(dir: &Path) -> crate::LinuxNetworkDriver {
+        let kernel = dir.join("kernel");
+        std::fs::create_dir(&kernel).expect("a directory for the fake kernel's sysctls");
+        fake_driver(dir, &sysctl_keeping_ip(&kernel, &dir.join("ip.log")))
+    }
+
+    /// The legs of a namespace in the fake kernel answer ARP already, and the one refusal is
+    /// spent.
+    fn already_answering(dir: &Path) {
+        let kernel = dir.join("kernel");
+        for leg in BOTH_LEGS {
+            std::fs::write(kernel.join(arp_ignore_key(leg)), "0\n").expect("an answering leg");
+        }
+        std::fs::write(kernel.join("refused"), b"").expect("no refusal left");
+    }
+
+    /// An activation that failed after the record said active is completed by a retry, and
+    /// that retry shouts: whether the router was silent is read off the kernel (N1).
+    #[tokio::test]
+    async fn a_retry_that_completes_a_failed_activation_shouts() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let active = spec(true);
+        let netns = router_netns(&active.id);
+        let d = sysctl_keeping_driver(dir);
+
+        d.activate(&netns, &active, true)
+            .await
+            .expect_err("the kernel refused the activation once");
+        assert!(
+            !shouted(&dir.join("ip.log")),
+            "no shout for a failed activation"
+        );
+        d.activate(&netns, &active, true)
+            .await
+            .expect("the retry activates");
+
+        assert!(shouted(&dir.join("ip.log")));
+    }
+
+    /// Ensuring a router again that answers already, as its record says, sends no shout (N1).
+    #[tokio::test]
+    async fn a_router_that_answers_already_is_not_shouted_for_again() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let active = spec(true);
+        let d = sysctl_keeping_driver(dir);
+        already_answering(dir);
+
+        d.activate(&router_netns(&active.id), &active, true)
+            .await
+            .expect("an activation");
+
+        assert!(!shouted(&dir.join("ip.log")));
+    }
+
+    /// A record that said standby shouts on activation even if the kernel answered already: the
+    /// neighbours may still follow the node that was active (N1).
+    #[tokio::test]
+    async fn a_router_the_record_called_standby_shouts_on_activation() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let active = spec(true);
+        let d = sysctl_keeping_driver(dir);
+        already_answering(dir);
+
+        d.activate(&router_netns(&active.id), &active, false)
+            .await
+            .expect("an activation");
+
+        assert!(shouted(&dir.join("ip.log")));
     }
 
     /// A namespace a failed pass left behind with no record is silenced from the kernel's list
