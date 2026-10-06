@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 mod admission;
+mod bounded;
 mod ledger;
 mod paths;
 mod strays;
@@ -48,6 +49,11 @@ const PROTECTED_ENV: [&str; 4] = ["LD_", "PATH", "HOME", "NVIDIA_"];
 /// What the backend reserves from `vram_profile_mib` when no
 /// `vram_reserve_mib` is set (Leandro vram.rs `DEFAULT_RESERVATION_MIB`).
 const BACKEND_DEFAULT_RESERVE_MIB: u64 = 256;
+
+/// How long `vgpuprofile` gets to answer. It asks the GPU driver a handful of
+/// questions and is done in well under a second; one still running after
+/// this is stuck in a driver that will not answer the backend either.
+const VGPUPROFILE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// `vgpuprofile`'s host reserve, written from `vgpu_host_reserve_mib`.
 const HOST_RESERVE_ENV: &str = "LEA_VGPU_HOST_RESERVE_MIB";
@@ -531,26 +537,27 @@ fn host_checks() {
     }
 }
 
-/// Resolve a configured type synchronously during driver construction.
-/// The helper returns KEY=VALUE records on stdout and diagnostics on stderr.
+/// Resolve a type against the card, within [`VGPUPROFILE_DEADLINE`]. The
+/// helper returns KEY=VALUE records on stdout and diagnostics on stderr.
 fn resolve_vgpu_type(bin: &Path, host_reserve_mib: u64, vtype: &str) -> anyhow::Result<VgpuType> {
-    let out = vgpuprofile_select(bin, host_reserve_mib, vtype)
-        .output()
-        .with_context(|| format!("running {}", bin.display()))?;
+    let out = bounded::output_within(
+        vgpuprofile_select(bin, host_reserve_mib, vtype),
+        VGPUPROFILE_DEADLINE,
+    )
+    .with_context(|| format!("running {}", bin.display()))?;
     vgpu_from_output(vtype, &out)
 }
 
-/// Resolve vGPU types asynchronously so GPU queries do not block a Tokio worker.
+/// The same off the runtime's workers, so a slow card stalls no other task.
 async fn resolve_vgpu_type_async(
     bin: &Path,
     host_reserve_mib: u64,
     vtype: &str,
 ) -> anyhow::Result<VgpuType> {
-    let out = tokio::process::Command::from(vgpuprofile_select(bin, host_reserve_mib, vtype))
-        .output()
+    let (bin, vtype) = (bin.to_path_buf(), vtype.to_string());
+    tokio::task::spawn_blocking(move || resolve_vgpu_type(&bin, host_reserve_mib, &vtype))
         .await
-        .with_context(|| format!("running {}", bin.display()))?;
-    vgpu_from_output(vtype, &out)
+        .context("the task asking vgpuprofile")?
 }
 
 /// `vgpuprofile --select <type>` with the node's host reserve and none of the
@@ -570,7 +577,7 @@ fn inherited_env() -> impl Iterator<Item = (String, String)> {
     std::env::vars().filter(|(k, _)| k == "PATH" || k == "HOME")
 }
 
-fn vgpu_from_output(vtype: &str, out: &std::process::Output) -> anyhow::Result<VgpuType> {
+fn vgpu_from_output(vtype: &str, out: &bounded::Finished) -> anyhow::Result<VgpuType> {
     if !out.status.success() {
         anyhow::bail!(
             "vgpuprofile --select {vtype} failed ({}): {}",
@@ -1038,7 +1045,7 @@ mod tests {
     #[test]
     fn a_failed_resolution_says_what_vgpuprofile_said() {
         use std::os::unix::process::ExitStatusExt;
-        let out = std::process::Output {
+        let out = bounded::Finished {
             status: std::process::ExitStatus::from_raw(1 << 8),
             stdout: Vec::new(),
             stderr: b"vgpuprofile: no type or size \"9Q\" on this card. It offers:\n".to_vec(),
