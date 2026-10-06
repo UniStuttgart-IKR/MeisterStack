@@ -95,6 +95,26 @@ pub(super) fn tenant_row(t: Tenant) -> Vec<String> {
     ]
 }
 
+/// The tenant `tenant create` posts. `networkPrefixes` goes only when some are named: a cloud
+/// of the release before refuses the field as unknown, and a tenant without prefixes must
+/// still be creatable there.
+fn create_body(
+    name: &str,
+    description: Option<&str>,
+    network_prefixes: &[String],
+) -> serde_json::Value {
+    let mut tenant = json!({
+        "apiVersion": "meister.io/v1",
+        "kind": "Tenant",
+        "metadata": { "name": name },
+        "spec": { "description": description.unwrap_or_default() },
+    });
+    if !network_prefixes.is_empty() {
+        tenant["spec"]["networkPrefixes"] = json!(network_prefixes);
+    }
+    tenant
+}
+
 // Convenience commands use merge patches for individual spec fields.
 
 pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
@@ -107,15 +127,7 @@ pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
             let body = ctx
                 .post(
                     "tenants",
-                    json!({
-                        "apiVersion": "meister.io/v1",
-                        "kind": "Tenant",
-                        "metadata": { "name": name },
-                        "spec": {
-                            "description": description.clone().unwrap_or_default(),
-                            "networkPrefixes": network_prefixes,
-                        },
-                    }),
+                    create_body(name, description.as_deref(), network_prefixes),
                 )
                 .await?;
             output::emit_line(ctx.global, &body, name)
@@ -180,5 +192,25 @@ pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
         // `ls`, `get` and `rm` never reach here: `main::dispatch` sends the
         // three verbs that need no code per resource straight to `generic`.
         TenantCmd::Read(_) | TenantCmd::Rm { .. } => unreachable!("dispatched generically"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tenant created without network prefixes is posted without the field, so a cloud that
+    /// does not know it yet still takes the tenant; named prefixes go as they were given.
+    #[test]
+    fn network_prefixes_are_posted_only_when_named() {
+        let bare = create_body("acme", None, &[]);
+        assert_eq!(bare["spec"], json!({ "description": "" }));
+
+        let prefixes = ["10.30.0.0/24".to_string()];
+        let declared = create_body("acme", Some("web"), &prefixes);
+        assert_eq!(
+            declared["spec"],
+            json!({ "description": "web", "networkPrefixes": ["10.30.0.0/24"] })
+        );
     }
 }
