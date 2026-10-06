@@ -308,8 +308,9 @@ impl NodeConditionType {
     /// not an error. An agent newer than its controller may raise a condition
     /// this build has never heard of; the node still stops being a candidate
     /// (an unknown word vetoes, see [`NodeCondition::vetoes_placement`]), and
-    /// the word travels through to the operator unshortened. Rejecting it would be the one reading that turns a newer
-    /// agent's honesty into a controller that ignores it.
+    /// the word travels through to the operator unshortened. Rejecting it
+    /// would be the one reading that turns a newer agent's honesty into a
+    /// controller that ignores it.
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.as_str() == s)
     }
