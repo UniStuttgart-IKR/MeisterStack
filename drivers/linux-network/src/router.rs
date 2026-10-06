@@ -608,15 +608,17 @@ impl crate::LinuxNetworkDriver {
         let g = self.gateway()?;
         let netns = router_netns(&spec.id);
         // A name whose namespace cannot be entered is taken back first, so that what follows
-        // sees the namespace that is really there.
-        self.clear_dead_netns(&netns).await;
+        // sees the namespace that is really there; for a demotion `silence_router_impl` does it.
+        //
         // A demotion silences the old namespace before anything else in this pass can fail: a
         // pass stopping halfway would leave it answering ARP for an address the controller has
         // made active on another node (N2). A caller that refuses the command before this pass
         // silences the router through `silence_router` (NL2-2). Its record says standby from
         // here on, so a pass that stops later no longer lists the router active nor announces
         // it (NL2-1).
-        if !spec.active {
+        if spec.active {
+            self.clear_dead_netns(&netns).await;
+        } else {
             self.silence_router_impl(&spec.id).await?;
         }
         if !g.physnets.contains_key(&spec.physnet) {
@@ -1001,8 +1003,13 @@ impl crate::LinuxNetworkDriver {
     /// standby here, and an announcement this node keeps would draw the address's traffic away
     /// from the node now active. A namespace the kernel could not list is tried all the same and
     /// still an error: unknown is not silent.
+    ///
+    /// A listed name whose namespace cannot be entered is taken back first, as a pass does. The
+    /// agent calls this ahead of the pass, and a name left listed could never be looked into, so
+    /// every demotion of the router would fail on it (NL3-5).
     pub(crate) async fn silence_router_impl(&self, id: &RouterId) -> networking::Result<()> {
         let dir = &self.gateway()?.state_dir;
+        self.clear_dead_netns(&router_netns(id)).await;
         let live = self.netns_present().await;
         self.silence_netns_and_record(dir, *id, live.as_deref().ok())
             .await?;
@@ -1908,6 +1915,45 @@ exit 0
             .expect_err("a namespace that may still answer is not a standby");
 
         assert!(!read_spec(&path).active);
+    }
+
+    /// A fake `ip` that lists `netns` until it is deleted and refuses every look into it, the
+    /// way a name left behind by a namespace that is gone answers. Every call goes to `log`.
+    fn corpse_ip(dir: &Path, log: &Path, netns: &str) -> String {
+        format!(
+            r#"echo "$*" >> '{log}'
+case "$*" in
+"netns list") [ -e '{gone}' ] || echo '{netns}';;
+"netns delete {netns}") : > '{gone}';;
+"-n {netns} "*|"netns exec {netns} "*) echo 'Invalid argument' >&2; exit 1;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            gone = dir.join("deleted").display(),
+        )
+    }
+
+    /// Silencing a router whose namespace name is listed but cannot be entered takes the name
+    /// back, as a pass does, and withdraws the active record: that corpse no longer fails the
+    /// agent's demotion step forever (NL3-5).
+    #[tokio::test]
+    async fn a_router_whose_namespace_cannot_be_entered_is_silenced_by_taking_the_name_back() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let path = write_record(dir, &spec(true));
+        let netns = router_netns(&spec(true).id);
+        let log = dir.join("ip.log");
+        let d = fake_driver(dir, &corpse_ip(dir, &log, &netns));
+
+        d.silence_router_impl(&spec(true).id)
+            .await
+            .expect("a namespace that is gone answers no ARP");
+
+        assert!(!read_spec(&path).active);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let delete = format!("netns delete {netns}");
+        assert!(calls.lines().any(|call| call == delete), "{calls}");
     }
 
     /// A hung `ip` is killed within the deadline and does not block the next command (R3-F08).
