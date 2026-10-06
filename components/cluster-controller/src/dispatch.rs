@@ -382,17 +382,6 @@ pub async fn serve_forwarded(
 mod tests {
     use super::*;
 
-    /// A registry with one node dialled into it, and a task that answers
-    /// whatever is sent down that session with `payload`; see
-    /// `SessionRegistry::agent_answering`.
-    fn agent_on(
-        registry: &Arc<SessionRegistry>,
-        node: &str,
-        payload: Vec<u8>,
-    ) -> tokio::task::JoinHandle<Option<command::Op>> {
-        registry.agent_answering(node, Ok(payload))
-    }
-
     /// `holder`'s REST edge on a free local port: the route a sibling forwards to.
     async fn serve_edge(holder: Arc<SessionRegistry>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -434,11 +423,8 @@ mod tests {
         // The replica that holds the session, with a REST edge in front of
         // it — the same router a real replica serves.
         let holder = Arc::new(SessionRegistry::new());
-        let agent = agent_on(
-            &holder,
-            "agent-1a",
-            br#"{"peer":"10.0.0.7:49000"}"#.to_vec(),
-        );
+        let agent =
+            holder.agent_answering("agent-1a", Ok(br#"{"peer":"10.0.0.7:49000"}"#.to_vec()));
         let endpoint = serve_edge(holder.clone()).await;
 
         // And the replica that holds the migration, which holds no session
