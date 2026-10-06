@@ -273,8 +273,34 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     }
 }
 
-/// Dispatch when the cluster lacks the VM, has different intent, or has not
-/// received the current spec generation. Generation changes include disk hot-plug.
+/// How long a cluster that acked a VM's intent is left to act on it before the
+/// same intent is sent again. A lifecycle drift stands for a whole stop grace
+/// or boot; sent every pass, each ack's `observed_at` write was the watch
+/// event that started the next pass, and one stopping guest cost tens of
+/// commands a second. (IKR-B74)
+const RETELL_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
+/// Whether the cluster was told about this VM since `intent` and within
+/// [`RETELL_AFTER`]: then telling it the same again is noise.
+pub(super) fn told_lately(vm: &Vm, intent: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    vm.status
+        .observed_at
+        .is_some_and(|at| at >= intent && now.signed_duration_since(at) < RETELL_AFTER)
+}
+
+/// Whether the VM has to go down to its cluster now: the cluster lacks it, or
+/// has not been sent the current spec generation, or its phase still disagrees
+/// with the intent it acked longer than [`RETELL_AFTER`] ago. Generation
+/// changes include disk hot-plug and runStrategy edits; the drift arm is the
+/// repair for a cluster that lost what it acked, not the way intent travels.
+pub(super) fn must_hand_down(vm: &Vm, missing: bool, now: DateTime<Utc>) -> bool {
+    let stale = vm.metadata.generation > vm.status.observed_generation;
+    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some()
+        && !told_lately(vm, DateTime::<Utc>::MIN_UTC, now);
+    missing || stale || drifted
+}
+
+/// Dispatch what [`must_hand_down`] says has to go down.
 /// `observedGeneration` records acknowledged dispatch, not guest readiness.
 async fn hand_down(
     store: &EtcdStore,
@@ -285,10 +311,10 @@ async fn hand_down(
     report: &crate::session::Report,
     outgoing: &str,
 ) -> anyhow::Result<()> {
+    // `current_report` already held back a report older than our last
+    // command, so absence here is evidence.
     let missing = !report.uids.contains(&vm.metadata.uid);
-    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some();
-    let stale = vm.metadata.generation > vm.status.observed_generation;
-    if !(missing || drifted || stale) {
+    if !must_hand_down(vm, missing, Utc::now()) {
         return Ok(());
     }
     // Asked only when something is about to go down, because it costs a
@@ -634,9 +660,13 @@ pub(super) async fn evacuate(
             if vm.status.phase().kind() == VmPhaseKind::Running
                 || vm.status.phase().kind() == VmPhaseKind::Paused
             {
-                // Level-triggered: the same dispatch every pass until the
-                // phase moves, and idempotent at the cluster because what
-                // changes down there is one object's desired state.
+                // Level-triggered: the same dispatch until the phase moves,
+                // idempotent at the cluster because what changes down there
+                // is one object's desired state. Once per `RETELL_AFTER`
+                // after the mark, not once per pass. (IKR-B74)
+                if told_lately(vm, mark.since, Utc::now()) {
+                    return Ok(());
+                }
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
                     .await;
             }

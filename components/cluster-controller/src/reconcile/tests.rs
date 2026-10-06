@@ -2677,6 +2677,7 @@ async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
         kek: None,
         held: &[],
         overcommit: controller_api::Overcommit::default(),
+        told: Default::default(),
     };
 
     // First pass: the backend grows, the guest is not told.
@@ -2764,6 +2765,7 @@ fn quiet_pass<'a>(
         kek: None,
         held: &[],
         overcommit: controller_api::Overcommit::default(),
+        told: Default::default(),
     }
 }
 
@@ -3104,4 +3106,96 @@ async fn a_placement_onto_a_slot_a_migration_claimed_first_leaves_the_guest_unbo
         [&theirs.metadata.name],
         "the placement's own claim was given back"
     );
+}
+
+// --- IKR-B74: what a node was told lately is not told again every pass -----
+
+/// The stop a stopping guest needs goes to its node once, and the pass after
+/// it writes nothing either: a write is a watch event, and every watch event
+/// is another pass. The lab saw a Stop every 85 ms for a whole stop grace.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_stop_is_sent_once_and_the_passes_after_it_write_nothing() {
+    let store = crate::test_etcd::fresh_store("lifecycle-test").await;
+    let mut vm = controller_api::resources::new_vm(
+        "web",
+        controller_api::VmSpec {
+            node_name: Some("agent-1".into()),
+            run_strategy: RunStrategy::Stopped,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    reported_as(&mut vm, "agent-1", VmPhaseKind::Running);
+    store.create(&vm).await.expect("the vm");
+    let registry = Arc::new(SessionRegistry::new());
+    let heard = scripted_node(&registry, "agent-1");
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    for _ in 0..3 {
+        let current: Vm = store.get("web").await.expect("the vm");
+        reconcile_vm(&pass, current).await.expect("a pass");
+    }
+    let stops = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| matches!(op, proto::command::Op::Stop(_)))
+        .count();
+    assert_eq!(stops, 1, "{:?}", heard.lock().unwrap());
+
+    let before: Vm = store.get("web").await.expect("the vm");
+    reconcile_vm(&pass, before.clone()).await.expect("a pass");
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(
+        after.metadata.resource_version, before.metadata.resource_version,
+        "a pass that says nothing writes nothing"
+    );
+}
+
+/// Every EnsureRouter a pass would send, written down.
+#[derive(Default)]
+struct HeardRouters(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl controller_api::network::RouterSink for HeardRouters {
+    async fn ensure(&self, node: &str, _: proto::EnsureRouter) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(node.to_string());
+        Ok(())
+    }
+
+    async fn destroy(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A router whose plan has not moved and which rests is carried down once and
+/// not on every pass. The lab saw every router on the gateway ensured about
+/// twelve times a second while one guest of another tenant was stopping.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn an_unchanged_resting_router_is_carried_down_once() {
+    let store = crate::test_etcd::fresh_store("router-retell-test").await;
+    let network = store.create(&provider("ext", "ext")).await.expect("ext");
+    store.create(&ready_router("r1")).await.expect("the router");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["gw-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+    *pass.nodes.lock().unwrap() = vec![gateway_node("gw-1", &["ext"], true)];
+    let heard = HeardRouters::default();
+
+    for _ in 0..3 {
+        let router: controller_api::Router = store.get("r1").await.expect("the router");
+        reconcile_router(
+            &pass,
+            &heard,
+            &controller_api::network::MeisterNetwork,
+            router,
+            std::slice::from_ref(&network),
+            &Default::default(),
+        )
+        .await
+        .expect("a pass");
+    }
+    assert_eq!(*heard.0.lock().unwrap(), vec!["gw-1".to_string()]);
 }

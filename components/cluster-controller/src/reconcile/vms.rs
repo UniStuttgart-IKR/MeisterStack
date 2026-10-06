@@ -905,6 +905,14 @@ pub(super) async fn send_lifecycle(
     action: Lifecycle,
     outgoing: &str,
 ) -> anyhow::Result<()> {
+    let uid = &vm.metadata.uid;
+    // The phase lags the command by a stop grace or a boot, and every write
+    // to any VM runs a pass: said once per `told::RETELL_AFTER`, not once per
+    // pass. (IKR-B74)
+    if p.told.lifecycle_lately(uid, action) {
+        debug!(?action, "said lately; waiting for the phase to follow");
+        return Ok(());
+    }
     info!(
         ?action,
         strategy = ?vm.spec.run_strategy,
@@ -912,15 +920,27 @@ pub(super) async fn send_lifecycle(
         "run strategy drifted, sending command"
     );
     p.registry
-        .send_command(node, outgoing, lifecycle_op(action, &vm.metadata.uid))
+        .send_command(node, outgoing, lifecycle_op(action, uid))
         .await?;
-    // The other half of "acted on this generation". A runStrategy change
-    // travels as a lifecycle command and never as a new spec, so without this
-    // a stopped VM would read `pending` forever — the one drift Position 2
-    // deliberately leaves possible on a VM.
+    p.told.note_lifecycle(uid, action);
+    close_generation(p.store, vm).await
+}
+
+/// The other half of "acted on this generation". A runStrategy change travels
+/// as a lifecycle command and never as a new spec, so without this a stopped
+/// VM would read `pending` forever — the one drift Position 2 deliberately
+/// leaves possible on a VM.
+///
+/// Written only when it moves: a write that changes nothing is still a watch
+/// event, and every watch event is another pass. On the uid the pass judged,
+/// so a VM recreated under the name keeps its own generation.
+async fn close_generation(store: &EtcdStore, vm: &Vm) -> anyhow::Result<()> {
     let dispatched = vm.metadata.generation;
-    p.store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+    if vm.status.observed_generation >= dispatched {
+        return Ok(());
+    }
+    store
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             v.status.observed_generation = v.status.observed_generation.max(dispatched);
         })
         .await?;

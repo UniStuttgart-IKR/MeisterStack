@@ -758,3 +758,54 @@ fn an_observed_volume_whose_spec_moved_is_handed_down_again() {
     volume.status.observed_generation = 2;
     assert!(!needs_dispatch(&volume));
 }
+
+// --- IKR-B74: a drift is told again after a while, not on every pass -------
+
+/// A stopping guest: Stopped asked for, Running reported, the current
+/// generation acked by the cluster `told` seconds after `at(0)`.
+fn stopping(told: i64) -> Vm {
+    let mut v = vm();
+    v.spec.run_strategy = RunStrategy::Stopped;
+    v.status.reported = Some(controller_api::VmReported::by(
+        "cluster-1",
+        VmPhaseKind::Running,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(0),
+    ));
+    v.settle(at(0));
+    v.status.observed_generation = v.metadata.generation;
+    v.status.observed_at = Some(at(told));
+    v
+}
+
+/// The lab's loop: every ack wrote `observed_at`, the write started the next
+/// pass, and the pass dispatched the same create again. Now the cluster that
+/// acked the intent is left to act on it for `RETELL_AFTER`.
+#[test]
+fn a_drift_the_cluster_acked_lately_is_not_dispatched_again() {
+    let v = stopping(10);
+    assert!(!must_hand_down(&v, false, at(11)), "told a second ago");
+    assert!(!must_hand_down(&v, false, at(39)), "still inside the window");
+    assert!(must_hand_down(&v, false, at(40)), "told again after it");
+}
+
+/// What is news goes down at once, whatever was said a moment ago: a cluster
+/// that lacks the VM, and a spec generation it has not been sent.
+#[test]
+fn a_missing_vm_or_a_new_generation_is_dispatched_at_once() {
+    let v = stopping(10);
+    assert!(must_hand_down(&v, true, at(11)));
+    let mut edited = stopping(10);
+    edited.metadata.generation += 1;
+    assert!(must_hand_down(&edited, false, at(11)));
+}
+
+/// An evacuation mark is new intent: a dispatch from before it says nothing
+/// about it, one after it does.
+#[test]
+fn only_a_dispatch_after_the_intent_counts_as_told() {
+    let v = stopping(10);
+    assert!(told_lately(&v, at(5), at(11)));
+    assert!(!told_lately(&v, at(12), at(13)));
+}
