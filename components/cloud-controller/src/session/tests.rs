@@ -501,6 +501,27 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
     );
 }
 
+/// A cluster that sends more unplaced demands than one status carries does
+/// not get them onto the Cluster object: the cloud keeps the first ones and
+/// counts the rest with those the cluster already left out. (IKR-B78)
+#[test]
+fn an_overlong_unplaced_list_is_cut_here_and_the_rest_counted() {
+    let mut said = status(true, &[]);
+    said.unplaced = vec![
+        proto::VmDemand {
+            vcpus: 1,
+            mem_mib: 512,
+        };
+        controller_api::UNPLACED_CARRIED_MAX + 3
+    ];
+    said.unplaced_omitted = 2;
+
+    let facts = ClusterFacts::of(&said);
+
+    assert_eq!(facts.unplaced.len(), controller_api::UNPLACED_CARRIED_MAX);
+    assert_eq!(facts.unplaced_omitted, 5);
+}
+
 /// Only a complete image inventory can prove that a path image is absent.
 /// Older peers, unreadable directories and reports without inventories contribute
 /// no negative evidence.

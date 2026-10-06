@@ -2082,23 +2082,19 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
     out
 }
 
-/// How many unplaced demands one status carries. The cloud copies the list
-/// whole onto its Cluster object, every write of which is all of it; a
-/// cluster with more cloud VMs than this waiting for a node has no room to
-/// offer anyway.
-const UNPLACED_CARRIED_MAX: usize = 128;
-
 /// What each cloud VM held here without a node asks for, at most
-/// [`UNPLACED_CARRIED_MAX`] of them, and how many more there are. A
+/// [`controller_api::UNPLACED_CARRIED_MAX`] of them, and how many more there are. A
 /// cluster-local VM is this cluster's own: the cloud neither places it nor
 /// can wait for it. (IKR-B78)
 fn report_unplaced(vms: &[Vm]) -> (Vec<proto::VmDemand>, u32) {
     let demand =
         controller_api::unplaced_demand(vms.iter().filter(|v| v.metadata.managed_by_cloud()));
-    let omitted = demand.len().saturating_sub(UNPLACED_CARRIED_MAX);
+    let omitted = demand
+        .len()
+        .saturating_sub(controller_api::UNPLACED_CARRIED_MAX);
     let carried = demand
         .into_iter()
-        .take(UNPLACED_CARRIED_MAX)
+        .take(controller_api::UNPLACED_CARRIED_MAX)
         .map(|c| proto::VmDemand {
             vcpus: c.vcpus,
             mem_mib: c.mem_mib,
@@ -2917,7 +2913,7 @@ mod tests {
     #[test]
     fn only_the_clouds_unplaced_vms_travel_up_and_at_most_so_many() {
         let mut vms = vec![vm("local", None, VmPhaseKind::Pending)];
-        vms.extend((0..UNPLACED_CARRIED_MAX + 2).map(|i| {
+        vms.extend((0..controller_api::UNPLACED_CARRIED_MAX + 2).map(|i| {
             vm(
                 &format!("cloud-{i}"),
                 Some(&format!("uid-{i}")),
@@ -2927,7 +2923,7 @@ mod tests {
 
         let (carried, omitted) = report_unplaced(&vms);
 
-        assert_eq!(carried.len(), UNPLACED_CARRIED_MAX);
+        assert_eq!(carried.len(), controller_api::UNPLACED_CARRIED_MAX);
         assert_eq!(omitted, 2, "the cluster-local vm is not counted");
     }
 

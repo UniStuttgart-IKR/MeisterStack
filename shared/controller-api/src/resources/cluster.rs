@@ -50,6 +50,13 @@ pub struct ClusterCapacity {
     pub capabilities: Vec<String>,
 }
 
+/// How many unplaced demands one cluster status carries, and the cloud keeps:
+/// it copies the list onto its Cluster object, every write of which is all of
+/// it. A cluster with more cloud VMs than this waiting for a node offers no
+/// room anyway, and says how many more there are (`unplaced_omitted`). The
+/// sender keeps to it and the receiver holds it to it. (IKR-B78)
+pub const UNPLACED_CARRIED_MAX: usize = 128;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterStatus {
@@ -83,8 +90,8 @@ pub struct ClusterStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<NodeSummary>,
     /// What each cloud VM the cluster holds without a node asks for: room no
-    /// node's bound sum carries yet. At most as many as one status carries;
-    /// see `unplaced_omitted`. Empty from a cluster that predates the field.
+    /// node's bound sum carries yet. At most [`UNPLACED_CARRIED_MAX`]; see
+    /// `unplaced_omitted`. Empty from a cluster that predates the field.
     /// (IKR-B78)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unplaced: Vec<crate::Capacity>,

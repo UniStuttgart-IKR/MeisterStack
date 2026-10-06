@@ -203,6 +203,7 @@ pub(super) struct ClusterFacts {
 
 impl ClusterFacts {
     pub(super) fn of(status: &ClusterStatus) -> Self {
+        let (unplaced, unplaced_omitted) = unplaced_kept(status);
         Self {
             ready: status.nodes_ready,
             total: status.nodes_total,
@@ -214,15 +215,8 @@ impl ClusterFacts {
             // follow and the same rule the tier below follows about what an
             // agent reported.
             nodes: status.nodes.iter().map(node_summary).collect(),
-            unplaced: status
-                .unplaced
-                .iter()
-                .map(|d| controller_api::Capacity {
-                    vcpus: d.vcpus,
-                    mem_mib: d.mem_mib,
-                })
-                .collect(),
-            unplaced_omitted: status.unplaced_omitted,
+            unplaced,
+            unplaced_omitted,
             capacity: status.capacity.clone(),
         }
     }
@@ -265,6 +259,25 @@ impl ClusterFacts {
             status.capacity.capabilities = cap.capabilities.clone();
         }
     }
+}
+
+/// What waits at the cluster for a node, as this cloud keeps it: at most
+/// [`controller_api::UNPLACED_CARRIED_MAX`] demands, and every one past them
+/// counted with those the cluster already left out. A cluster that sends more
+/// does not get them onto the Cluster object, every write of which is all of
+/// it. (IKR-B78)
+fn unplaced_kept(status: &ClusterStatus) -> (Vec<controller_api::Capacity>, u32) {
+    let kept: Vec<controller_api::Capacity> = status
+        .unplaced
+        .iter()
+        .take(controller_api::UNPLACED_CARRIED_MAX)
+        .map(|d| controller_api::Capacity {
+            vcpus: d.vcpus,
+            mem_mib: d.mem_mib,
+        })
+        .collect();
+    let cut = u32::try_from(status.unplaced.len() - kept.len()).unwrap_or(u32::MAX);
+    (kept, status.unplaced_omitted.saturating_add(cut))
 }
 
 /// What the cluster says about ITSELF, written when it is news.
