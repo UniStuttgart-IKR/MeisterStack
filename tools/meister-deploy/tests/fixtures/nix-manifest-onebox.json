@@ -335,6 +335,7 @@
         "meister-agent.service",
         "meister-cloud-controller.service",
         "meister-cluster-controller.service",
+        "meister-guest-guard.service",
         "nix-daemon.service",
         "nscd.service",
         "prometheus.service",
@@ -464,6 +465,7 @@
       "units": [
         "dbus.service",
         "meister-agent.service",
+        "meister-guest-guard.service",
         "nix-daemon.service",
         "nscd.service",
         "sshd.service",
@@ -567,6 +569,7 @@
       "units": [
         "dbus.service",
         "meister-agent.service",
+        "meister-guest-guard.service",
         "nix-daemon.service",
         "nscd.service",
         "sshd.service",
