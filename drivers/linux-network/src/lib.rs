@@ -15,6 +15,7 @@ pub mod router;
 
 use futures::TryStreamExt;
 use std::net::Ipv4Addr;
+use std::path::Path;
 
 use agent_api::networking::{
     self, BridgeDriver, NetworkError, Nic, NicDriver, NicId, NicSpec, RouterId, RouterSpec,
@@ -107,6 +108,34 @@ fn check_overlay_name(vni: u32) -> networking::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Where the kernel keeps IPv6's settings, per link. Absent when the kernel runs without IPv6.
+const IPV6_CONF: &str = "/proc/sys/net/ipv6/conf";
+
+/// Whether this kernel runs IPv6 at all; booted with `ipv6.disable=1` it does not.
+pub(crate) fn kernel_has_ipv6() -> bool {
+    Path::new(IPV6_CONF).is_dir()
+}
+
+/// Turn the host's IPv6 off on a link this driver made for guests' or tenants' frames
+/// (IKR-B77).
+///
+/// With IPv6 on, the host gives the link a link-local address and sends router solicitations
+/// and MLD reports through it: into every tenant overlay, which VXLAN carries on to other
+/// hosts, showing tenants the host's interfaces and MACs. The guests' own IPv6 is bridged and
+/// stays as it is. Called before the link first goes up, so that it never has an address, and
+/// on every ensure, which mends links made before.
+pub(crate) async fn host_ipv6_off(link: &str) -> networking::Result<()> {
+    if !kernel_has_ipv6() {
+        return Ok(());
+    }
+    let switch = Path::new(IPV6_CONF).join(link).join("disable_ipv6");
+    tokio::fs::write(&switch, b"1").await.map_err(|e| {
+        NetworkError::Backend(
+            anyhow::Error::new(e).context(format!("turning the host's IPv6 off on {link}")),
+        )
+    })
 }
 
 /// Map the lower 24 VNI bits to an administratively scoped IPv4 multicast group.
@@ -376,6 +405,34 @@ impl LinuxNetworkDriver {
         self.vxlan.as_ref().map(|v| v.mtu)
     }
 
+    /// Make sure a bridge for guests' or tenants' frames exists and is up, with the host's IPv6
+    /// off before it first comes up (IKR-B77). Returns its index.
+    pub(crate) async fn ensure_wire_bridge(
+        &self,
+        name: &str,
+        mtu: Option<u32>,
+    ) -> networking::Result<u32> {
+        if self.link_index(name).await?.is_none() {
+            info!(bridge = %name, mtu, "creating bridge");
+            let mut bridge = LinkBridge::new(name);
+            if let Some(mtu) = mtu {
+                bridge = bridge.mtu(mtu);
+            }
+            self.handle
+                .link()
+                .add(bridge.build())
+                .execute()
+                .await
+                .map_err(|e| NetworkError::Backend(e.into()))?;
+        }
+        let index = self.link_index(name).await?.ok_or_else(|| {
+            NetworkError::Backend(anyhow::anyhow!("bridge {name} vanished after create"))
+        })?;
+        host_ipv6_off(name).await?;
+        self.set_up(index).await?;
+        Ok(index)
+    }
+
     async fn set_up(&self, index: u32) -> networking::Result<()> {
         self.handle
             .link()
@@ -487,22 +544,7 @@ impl BridgeDriver for LinuxNetworkDriver {
         check_overlay_name(vni)?;
 
         let bridge = overlay_bridge(vni);
-        match self.link_index(&bridge).await? {
-            Some(index) => self.set_up(index).await?,
-            None => {
-                info!(bridge = %bridge, mtu = cfg.mtu, "creating tenant bridge");
-                self.handle
-                    .link()
-                    .add(LinkBridge::new(&bridge).mtu(cfg.mtu).build())
-                    .execute()
-                    .await
-                    .map_err(|e| NetworkError::Backend(e.into()))?;
-            }
-        }
-        let bridge_index = self.link_index(&bridge).await?.ok_or_else(|| {
-            NetworkError::Backend(anyhow::anyhow!("bridge {bridge} vanished after create"))
-        })?;
-        self.set_up(bridge_index).await?;
+        let bridge_index = self.ensure_wire_bridge(&bridge, Some(cfg.mtu)).await?;
 
         let device = overlay_device(vni);
         if self.link_index(&device).await?.is_none() {
@@ -515,12 +557,12 @@ impl BridgeDriver for LinuxNetworkDriver {
                     cfg.uplink
                 ))
             })?;
+            // Made down: it comes up below, once the host's IPv6 is off on it.
             let mut builder = LinkVxlan::new(&device, vni)
                 .dev(uplink)
                 .port(VXLAN_PORT)
                 // Leave source-port selection and checksum policy at their kernel defaults.
-                .mtu(cfg.mtu)
-                .up();
+                .mtu(cfg.mtu);
             if cfg.evpn {
                 // EVPN uses the uplink address as VTEP identity and does not join a multicast group.
                 let local = self.link_address(uplink).await?.ok_or_else(|| {
@@ -555,6 +597,7 @@ impl BridgeDriver for LinuxNetworkDriver {
                 "vxlan device {device} vanished after create"
             ))
         })?;
+        host_ipv6_off(&device).await?;
         self.handle
             .link()
             .set(
@@ -706,6 +749,7 @@ impl NicDriver for LinuxNetworkDriver {
             NetworkError::Backend(anyhow::anyhow!("tap {tap} vanished after create"))
         })?;
         debug!(tap = %tap, "tap created");
+        host_ipv6_off(&tap).await?;
 
         let mtu = self.overlay_mtu(spec);
         let mut set = LinkUnspec::new_with_index(tap_index)

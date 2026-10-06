@@ -20,7 +20,9 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 
-use agent_api::networking::{BridgeDriver, NatKind, NatRule, RouterId, RouterPhase, RouterSpec};
+use agent_api::networking::{
+    BridgeDriver, NatKind, NatRule, NicDriver, NicId, NicSpec, RouterId, RouterPhase, RouterSpec,
+};
 use meister_linux_network_driver::{
     LinuxNetworkDriver, VxlanConfig,
     nftables::NftConfig,
@@ -83,6 +85,14 @@ fn in_netns(netns: &str, args: &[&str]) -> String {
 
 fn sysctl(netns: &str, key: &str) -> String {
     in_netns(netns, &["sysctl", "-n", key]).trim().to_string()
+}
+
+/// Whether the host's IPv6 is off on a link of this namespace, as the kernel says.
+fn host_ipv6_disabled(link: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{link}/disable_ipv6"))
+        .unwrap_or_else(|e| panic!("the IPv6 switch of {link}: {e}"))
+        .trim()
+        == "1"
 }
 
 /// One test at a time in this kernel: a sweep removes every router namespace its driver holds
@@ -484,5 +494,74 @@ async fn a_router_whose_rules_fail_is_left_silent_not_active() {
         .await
         .expect("the same router, rules accepted");
     assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "0");
+    d.destroy_router(&id).await.expect("the router goes");
+}
+
+/// IKR-B77: the host's IPv6 is off on every link the driver makes for guests' and tenants'
+/// frames, and in a router's namespace, so the host sends nothing of its own into them.
+#[tokio::test]
+#[ignore = "needs its own network and mount namespace; see the module note"]
+async fn the_host_speaks_no_ipv6_on_the_wires_it_builds() {
+    const THIRD: (&str, &str, &str) = ("ex3", "upl3", "pxlink3");
+    const THIRD_VNI: u32 = 10_009;
+    let _kernel = KERNEL.lock().await;
+    let state = tempfile::Builder::new()
+        .prefix("ms-neutron-agent-b77-")
+        .tempdir()
+        .expect("a state directory");
+    let (physnet, uplink, given_away) = THIRD;
+    for link in [uplink, given_away] {
+        ip(&["link", "add", link, "type", "dummy"]);
+        ip(&["link", "set", link, "up"]);
+    }
+    let d = driver_on(state.path(), "nft", THIRD);
+    d.ensure_physnet(physnet, given_away)
+        .await
+        .expect("the interface was given away");
+    let id = RouterId::from_u128(0x6b00_0004);
+    d.ensure_router(&spec_on(physnet, THIRD_VNI, id, true))
+        .await
+        .expect("a router");
+    let nic = NicId::from_u128(0x77);
+    let tap = d
+        .create(
+            &nic,
+            &NicSpec {
+                bridge: "unused".into(),
+                mac: "52:54:00:00:00:77".parse().expect("a mac"),
+                vxlan_id: Some(THIRD_VNI),
+                physnet: None,
+                floating_ips: Vec::new(),
+                routed_subnets: Vec::new(),
+            },
+        )
+        .await
+        .expect("a tap on the tenant's wire")
+        .tap_name;
+
+    for link in [
+        tap,
+        format!("meister-vx{THIRD_VNI}"),
+        format!("mvx{THIRD_VNI}"),
+        provider_bridge(physnet),
+        veth_external(&id),
+        veth_internal(&id),
+    ] {
+        assert!(host_ipv6_disabled(&link), "{link} has the host's IPv6 on");
+        assert!(
+            !ip(&["-6", "-o", "addr", "show", "dev", &link]).contains("inet6"),
+            "{link} has an IPv6 address"
+        );
+    }
+    let netns = router_netns(&id);
+    for leg in ["ext", "int"] {
+        assert_eq!(
+            sysctl(&netns, &format!("net.ipv6.conf.{leg}.disable_ipv6")),
+            "1",
+            "the router's {leg} leg"
+        );
+    }
+
+    NicDriver::destroy(&d, &nic).await.expect("the tap goes");
     d.destroy_router(&id).await.expect("the router goes");
 }

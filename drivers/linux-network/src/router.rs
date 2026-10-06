@@ -433,6 +433,20 @@ impl crate::LinuxNetworkDriver {
         .map(|_| ())
     }
 
+    /// Turn IPv6 off in a router's namespace, for the legs to come and the ones it has (IKR-B77).
+    /// A router speaks IPv4 only, and with IPv6 on its legs would send router solicitations and
+    /// MLD reports onto the provider network and into the tenant's overlay.
+    async fn netns_ipv6_off(&self, netns: &str) -> networking::Result<()> {
+        if !crate::kernel_has_ipv6() {
+            return Ok(());
+        }
+        for scope in ["default", "all"] {
+            let key = format!("net.ipv6.conf.{scope}.disable_ipv6");
+            self.netns_sysctl(netns, &key, "1").await?;
+        }
+        Ok(())
+    }
+
     /// Read a sysctl inside a router's namespace.
     async fn netns_sysctl_value(&self, netns: &str, key: &str) -> networking::Result<String> {
         let value = self
@@ -718,10 +732,7 @@ impl crate::LinuxNetworkDriver {
         }
 
         let bridge = provider_bridge(name);
-        networking::BridgeDriver::ensure(self, &bridge).await?;
-        let bridge_index = self.link_index(&bridge).await?.ok_or_else(|| {
-            NetworkError::Backend(anyhow::anyhow!("bridge {bridge} vanished after create"))
-        })?;
+        let bridge_index = self.ensure_wire_bridge(&bridge, None).await?;
         self.enslave(index, bridge_index).await?;
         info!(bridge = %bridge, "provider network ready: the interface is the bridge's now");
         Ok(bridge)
@@ -783,6 +794,7 @@ impl crate::LinuxNetworkDriver {
         // every locally originated probe need it.
         self.ip_again(&["-n", &netns, "link", "set", "lo", "up"])
             .await;
+        self.netns_ipv6_off(&netns).await?;
         // Legs created below are born silent, so a new router answers ARP only once the last
         // step of a complete pass activates it (R2-1).
         self.netns_sysctl(
@@ -814,6 +826,7 @@ impl crate::LinuxNetworkDriver {
             let host_index = self.link_index(&host).await?.ok_or_else(|| {
                 NetworkError::Backend(anyhow::anyhow!("veth {host} vanished after create"))
             })?;
+            crate::host_ipv6_off(&host).await?;
             let bridge_index = self
                 .link_index(bridge)
                 .await?
