@@ -4468,6 +4468,15 @@ mod tests {
         ProcessState::Running { start }
     }
 
+    /// pid 1 runs beside this process. A lock that names pid 1 alone cannot
+    /// be told from its holder, so it counts as running.
+    fn pid_1_runs() -> ProcessTable {
+        ProcessTable {
+            boot: "b-1",
+            running: vec![(7, running(5000)), (1, running(1))],
+        }
+    }
+
     #[test]
     fn a_lock_whose_holder_still_runs_is_not_taken_over() {
         let kernel = ProcessTable {
@@ -4552,10 +4561,10 @@ mod tests {
         let files = host();
         let runner = StrictFake::new();
         let clock = clock();
-        let helper = helper(&runner, &files, &clock);
+        let kernel = pid_1_runs();
+        let helper = helper(&runner, &files, &clock).with_processes(&kernel);
         let path = deciding_path(&helper);
         files.create_dir_all(&helper.txn_dir()).unwrap();
-        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
         files
             .write_atomic(&path, b"revert pid 1 at 2026-09-22 11:00:00 UTC", 0o600)
             .unwrap();
@@ -4737,9 +4746,9 @@ mod tests {
         let files = host();
         let quiet = StrictFake::new();
         let clock = clock();
-        let helper = helper(&quiet, &files, &clock);
+        let kernel = pid_1_runs();
+        let helper = helper(&quiet, &files, &clock).with_processes(&kernel);
         files.create_dir_all(&helper.txn_dir()).unwrap();
-        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
         files
             .write_atomic(
                 &helper.txn_dir().join("d1.deciding"),
