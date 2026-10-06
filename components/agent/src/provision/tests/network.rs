@@ -550,13 +550,13 @@ async fn the_last_prefix_taken_from_a_running_vm_leaves_its_tap_as_the_document_
     assert!(held_subnets(&store, &id).is_empty());
 }
 
-/// A NIC readdressed by a re-send on one node is guarded with exactly the nft rules a node that
-/// creates its tap from the re-sent document alone builds, whatever the first node held
+/// A NIC readdressed by a re-send on one node hands the network driver exactly the spec a node
+/// that creates its tap from the re-sent document alone hands it, whatever the first node held
 /// before: the guard is the document's, never a node's, so an evacuation or a re-create on
-/// another node changes nothing about it. (NL5-2)
+/// another node changes nothing about it. Decided at the driver seam; a driver renders one
+/// spec one way. (NL5-2, RR5-10)
 #[tokio::test]
 async fn a_readdressed_tap_is_guarded_as_a_tap_made_from_the_same_document_elsewhere() {
-    let pool = common::net::Ipv4Ranges::parse(&["10.255.0.0/16".to_string()]).expect("a pool");
     for (held, sent) in [
         (&[KEPT, TAKEN][..], &[KEPT][..]),
         (&[TAKEN][..], &[][..]),
@@ -585,18 +585,11 @@ async fn a_readdressed_tap_is_guarded_as_a_tap_made_from_the_same_document_elsew
             .await
             .expect("the tap is made from the document");
 
-        let rules = |spec: &NicSpec| {
-            linux_network_driver::nftables::ruleset("msk0", spec, &pool).expect("a ruleset")
-        };
         let swapped = net_here.guards_updated.lock().unwrap().clone();
         let created = net_elsewhere.taps_created.lock().unwrap().clone();
         assert_eq!(swapped.len(), 1, "{held:?} -> {sent:?}: {swapped:?}");
         assert_eq!(created.len(), 1, "{held:?} -> {sent:?}: {created:?}");
-        assert_eq!(
-            rules(&swapped[0].1),
-            rules(&created[0].1),
-            "{held:?} -> {sent:?}"
-        );
+        assert_eq!(swapped[0].1, created[0].1, "{held:?} -> {sent:?}");
     }
 }
 

@@ -23,7 +23,7 @@ pub enum NetworkError {
 
 pub type Result<T> = std::result::Result<T, NetworkError>;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NicSpec {
     pub bridge: String,
     pub mac: MacAddr,
