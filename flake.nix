@@ -209,6 +209,22 @@
               inherit nixpkgs lib pkgs system self;
             };
 
+          # Check store-built provider initialization without configuration rendering.
+          provider-opennebula-reads-its-context =
+            import ./nix/tests/provider-opennebula-reads-its-context.nix {
+              inherit nixpkgs lib pkgs system self;
+            };
+
+          # The roles reach the legacy boot renderer as MEISTER_ROLE in context.env.
+          roles-context-env = import ./nix/tests/roles-context-env.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
+          # The binaries accept every config file these modules render.
+          services-check-config = import ./nix/tests/services-check-config.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # Check that disabling NVMe/TCP removes its advertised backends.
           no-fabric-no-claim = import ./nix/tests/no-fabric-no-claim.nix {
             inherit nixpkgs lib pkgs system self;
