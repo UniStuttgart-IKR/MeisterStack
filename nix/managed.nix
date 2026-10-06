@@ -177,9 +177,6 @@ in
     # to prevent competing writers during activation and rollback.
     networking.resolvconf.enable =
       lib.mkIf (ms.context.providerScript != "") (lib.mkDefault false);
-    # Start the provider unit when configured, without enabling a boot renderer.
-    meisterstack.observability.enable = lib.mkDefault false;
-
     # Include deployment helpers used remotely over SSH, in addition to the
     # role daemons named by service units.
     environment.systemPackages = [ ms.package ];

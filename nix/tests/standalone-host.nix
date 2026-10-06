@@ -37,6 +37,25 @@ let
       accepted (cluster { });
     "a cluster whose chain was emptied is refused" =
       refusesWith "auth.chain is empty" (cluster { meisterstack.cluster.settings.auth.chain = [ ]; });
+
+    "a host with a role runs no log collector unless asked" =
+      !(cluster { }).services.alloy.enable;
+    "the host's own Alloy keeps its config path" =
+      (cluster { services.alloy.enable = true; }).services.alloy.configPath == "/etc/alloy";
+    "asking for the collector beside the host's own Alloy is refused" =
+      refusesWith "services.alloy itself" (cluster {
+        services.alloy.enable = true;
+        meisterstack.observability.enable = true;
+      });
+    "asking for the collector beside a host default for Alloy is refused" =
+      refusesWith "services.alloy itself" (cluster {
+        services.alloy.enable = lib.mkDefault true;
+        meisterstack.observability.enable = true;
+      });
+    "asked for alone, the collector reads the stack's config" =
+      let c = cluster { meisterstack.observability.enable = true; }; in
+      accepted c && c.services.alloy.enable
+      && c.services.alloy.configPath == "${c.meisterstack.configDir}/alloy.alloy";
   };
 
   broken = lib.attrNames (lib.filterAttrs (_: holds: !holds) expectations);
