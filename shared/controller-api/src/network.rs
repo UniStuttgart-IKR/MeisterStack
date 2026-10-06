@@ -301,11 +301,7 @@ pub fn inside_address_refusal(router: &Router, internal: &str) -> Option<String>
         return Some(format!("{internal:?} is not an ipv4 address"));
     };
     let inside = &router.spec.internal_addr;
-    let own = inside
-        .split('/')
-        .next()
-        .and_then(|a| a.parse::<Ipv4Addr>().ok());
-    let (Some(own), Ok(prefix)) = (own, inside.parse::<common::net::Ipv4Range>()) else {
+    let Ok(Some((own, prefix))) = crate::address_space::inside_address(router) else {
         return Some(format!(
             "router {name} has no inside prefix ({inside:?}) to place {internal} in"
         ));
@@ -841,6 +837,16 @@ mod tests {
         assert!(away.contains("10.42.0.1/24"), "{away}");
         r.spec.internal_addr.clear();
         let unknown = inside_address_refusal(&r, "10.42.0.9").expect("nothing to check against");
+        assert!(unknown.contains("no inside prefix"), "{unknown}");
+    }
+
+    /// An inside address without its prefix length names no prefix a guest could be on: it is
+    /// read as `address_space::inside_address` reads it for the source allowlist. (RR6-6)
+    #[test]
+    fn an_inside_address_without_a_prefix_length_places_no_guest() {
+        let mut r = router("acme-out");
+        r.spec.internal_addr = "10.42.0.1".into();
+        let unknown = inside_address_refusal(&r, "10.42.0.1").expect("no prefix to place it in");
         assert!(unknown.contains("no inside prefix"), "{unknown}");
     }
 

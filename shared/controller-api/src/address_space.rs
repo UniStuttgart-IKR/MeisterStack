@@ -80,26 +80,33 @@ pub fn provider_wires(networks: &[ProviderNetwork]) -> Vec<(String, Ipv4Range)> 
         .collect()
 }
 
-/// The prefix `router`'s inside address is on (`10.30.0.1/24` is on 10.30.0.0/24): `None` for
-/// a router that names no inside address, and why not when `spec.internalAddr` is not an
-/// address with its prefix length. (NL6-1)
-pub fn inside_prefix(router: &Router) -> std::result::Result<Option<Ipv4Range>, String> {
+/// The address `router` holds on its inside and the prefix it is on (`10.30.0.1/24` is
+/// 10.30.0.1 on 10.30.0.0/24): `None` for a router that names no inside address, and why not
+/// when `spec.internalAddr` is not an address with its prefix length. The one reader of
+/// `spec.internalAddr`, for what may be sent from behind the router and for what may be
+/// translated into it. (NL6-1, RR6-6)
+pub fn inside_address(
+    router: &Router,
+) -> std::result::Result<Option<(Ipv4Addr, Ipv4Range)>, String> {
     let inside = router.spec.internal_addr.as_str();
     if inside.is_empty() {
         return Ok(None);
     }
-    let names_a_host = inside
+    let host = inside
         .split_once('/')
-        .is_some_and(|(host, _)| host.trim().parse::<Ipv4Addr>().is_ok());
-    if !names_a_host {
+        .and_then(|(host, _)| host.trim().parse::<Ipv4Addr>().ok());
+    let Some(host) = host else {
         return Err(format!(
             "{inside:?} is not an address with its prefix length, like 10.30.0.1/24"
         ));
-    }
-    inside
-        .parse::<Ipv4Range>()
-        .map(Some)
-        .map_err(|e| e.to_string())
+    };
+    let prefix = inside.parse::<Ipv4Range>().map_err(|e| e.to_string())?;
+    Ok(Some((host, prefix)))
+}
+
+/// The prefix `router`'s inside address is on: `inside_address` without the address.
+pub fn inside_prefix(router: &Router) -> std::result::Result<Option<Ipv4Range>, String> {
+    Ok(inside_address(router)?.map(|(_, prefix)| prefix))
 }
 
 /// `range` as the CIDR it is, or as a run of addresses where it is none.
