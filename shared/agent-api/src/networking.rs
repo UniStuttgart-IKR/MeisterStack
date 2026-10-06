@@ -67,6 +67,14 @@ pub trait NicDriver: Send + Sync {
     async fn destroy(&self, id: &NicId) -> Result<()>;
     async fn get(&self, id: &NicId) -> Result<Nic>;
 
+    /// Bring the source-address guard of the existing NIC `id` to `spec`: its wiring and MAC
+    /// as created, its address lists as a re-sent create names them. The old rules give way
+    /// to the new ones in one step, so no frame passes the tap between the two (NL4-1). Only
+    /// the guard changes. `NicNotFound` when the tap is not there. No default: a driver that
+    /// guards taps and kept the old lists would leave a guest sending from addresses taken
+    /// away from it.
+    async fn update_guard(&self, id: &NicId, spec: &NicSpec) -> Result<()>;
+
     /// Remove stale per-tap host state, such as nftables chains, using the
     /// agent's persisted live-tap inventory at startup. Default: no extra state.
     async fn reap(&self, _live_taps: &[String]) {}
@@ -410,6 +418,9 @@ mod tests {
             unreachable!("this fixture is about the bridge half")
         }
         async fn get(&self, _id: &NicId) -> Result<Nic> {
+            unreachable!("this fixture is about the bridge half")
+        }
+        async fn update_guard(&self, _id: &NicId, _spec: &NicSpec) -> Result<()> {
             unreachable!("this fixture is about the bridge half")
         }
     }

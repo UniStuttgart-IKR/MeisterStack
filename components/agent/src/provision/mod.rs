@@ -188,7 +188,14 @@ impl Provisioner {
         })
     }
 
-    /// Provision a VM or apply the volume diff to an existing record.
+    /// Apply what a re-sent create may change on an existing VM: the NICs' address guards
+    /// first, so that narrowing one never waits on a volume, then the referenced volumes.
+    pub async fn sync_in_place(&self, id: &VmId, wanted: &AgentVmSpec) -> Result<()> {
+        self.sync_nic_addresses(id, wanted).await?;
+        self.sync_volumes(id, wanted).await
+    }
+
+    /// Provision a VM, or apply a re-sent spec in place to an existing record.
     ///
     /// Only controller-managed records are eligible for desired-state orphan
     /// cleanup. An unreadable existing row refuses creation to preserve ownership
@@ -209,10 +216,10 @@ impl Provisioner {
             );
         }
         if let Some(mut existing) = self.store.get(&id)? {
-            info!(desired = ?desired, "vm record exists, applying the volume diff");
+            info!(desired = ?desired, "vm record exists, applying the re-sent spec in place");
             existing.desired = desired;
             self.store.put(&id, &existing)?;
-            return self.sync_volumes(&id, &spec).await;
+            return self.sync_in_place(&id, &spec).await;
         }
 
         self.check_device_admission(&id, &spec).await?;

@@ -22,12 +22,13 @@ impl Agent {
         };
 
         if self.store.get(&id)?.is_some() {
-            // For known VMs, synchronize secondary referenced volumes and apply the
-            // desired state through the lifecycle path, including stop grace handling.
+            // For known VMs, bring the NICs' address guards and the secondary referenced
+            // volumes to the spec, and apply the desired state through the lifecycle path,
+            // including stop grace handling.
             self.claim(&id).await?;
             {
                 let _guard = self.ops.lock().await;
-                self.provisioner.sync_volumes(&id, &spec).await?;
+                self.provisioner.sync_in_place(&id, &spec).await?;
             }
             return self.set_desired(id, desired).await.map(|_| ());
         }

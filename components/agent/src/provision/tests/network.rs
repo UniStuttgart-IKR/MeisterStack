@@ -3,9 +3,13 @@
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
 //! The overlay's user count, which is read off the records rather than
-//! kept.
+//! kept, and the address guards a re-sent spec moves (NL4-1).
 
 use super::*;
+use agent_api::networking::{NetworkError, NicId, NicSpec};
+
+/// How the fake answers `update_guard` instead of swapping the guard.
+type GuardRefusal = fn(&NicId) -> NetworkError;
 
 /// Record NIC and overlay operations together to verify cross-resource teardown order.
 #[derive(Default)]
@@ -15,6 +19,10 @@ struct RecordingNet {
     /// What the teardown said this overlay was called, per removal — the
     /// record's own answer, or `None` where no record wrote one down.
     overlays_named: std::sync::Mutex<Vec<Option<String>>>,
+    /// Every guard swapped, with the spec it was built from, in order.
+    guards_updated: std::sync::Mutex<Vec<(NicId, NicSpec)>>,
+    /// `Some` refuses every guard swap with the error it makes.
+    guard_refusal: std::sync::Mutex<Option<GuardRefusal>>,
 }
 
 #[async_trait::async_trait]
@@ -51,6 +59,16 @@ impl agent_api::networking::NicDriver for RecordingNet {
             // therefore knows nothing.
             mac: None,
         })
+    }
+    async fn update_guard(&self, id: &NicId, spec: &NicSpec) -> agent_api::networking::Result<()> {
+        if let Some(refuse) = *self.guard_refusal.lock().unwrap() {
+            return Err(refuse(id));
+        }
+        self.guards_updated
+            .lock()
+            .unwrap()
+            .push((*id, spec.clone()));
+        Ok(())
     }
 }
 
@@ -287,4 +305,213 @@ fn a_record_this_build_cannot_read_still_holds_the_wire_open() {
         1,
         "and of every other wire, because nobody can say it is not"
     );
+}
+
+// --- a re-sent spec's addresses on a VM that exists (NL4-1) ------------------
+
+const KEPT: &str = "10.7.1.0/24";
+const TAKEN: &str = "10.7.2.0/24";
+
+/// A provisioner whose network driver is `net`, over `store`.
+fn provisioner_on(
+    root: &std::path::Path,
+    store: Arc<crate::store::Store>,
+    net: Arc<RecordingNet>,
+) -> Provisioner {
+    Provisioner::new(
+        store,
+        Drivers {
+            confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+            hypervisor: Some(Arc::new(EmptyHypervisor)),
+            hypervisor_name: Some("empty".into()),
+            storage: std::collections::HashMap::new(),
+            networking: Some(net.clone()),
+            bridge: Some(net),
+            announcer: None,
+            devices: std::collections::HashMap::new(),
+        },
+        Arc::new(crate::images::Cache::new(root.join("images"))),
+        root.join("images"),
+        root.join("run"),
+        "br0".to_string(),
+        None,
+        None,
+    )
+}
+
+/// A running VM with one tap whose guard allows `subnets`, stored, and its id.
+fn running_vm_allowing(store: &crate::store::Store, subnets: &[&str]) -> (VmId, VmRecord) {
+    let (id, mut record) = overlay_vm(10_400);
+    record.spec.nics[0].spec.routed_subnets = subnets.iter().map(|s| s.to_string()).collect();
+    store.put(&id, &record).expect("a record");
+    (id, record)
+}
+
+/// The spec of `record` re-sent with its one NIC allowing `subnets`.
+fn resent_allowing(record: &VmRecord, subnets: &[&str]) -> AgentVmSpec {
+    let mut spec = record.spec.clone();
+    spec.nics[0].spec.routed_subnets = subnets.iter().map(|s| s.to_string()).collect();
+    spec
+}
+
+fn held_subnets(store: &crate::store::Store, id: &VmId) -> Vec<String> {
+    store
+        .get(id)
+        .expect("a read")
+        .expect("the record")
+        .spec
+        .nics[0]
+        .spec
+        .routed_subnets
+        .clone()
+}
+
+/// A subnet the re-sent spec no longer names leaves the running tap's guard at once, and the
+/// record with it, so a later start does not let it back in.
+#[tokio::test]
+async fn a_subnet_taken_from_a_running_vm_leaves_its_tap_guard_and_its_record() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT, TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent_allowing(&record, &[KEPT]))
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
+    assert_eq!(updated[0].0, record.spec.nics[0].id);
+    assert_eq!(updated[0].1.routed_subnets, [KEPT]);
+    assert_eq!(held_subnets(&store, &id), [KEPT]);
+}
+
+/// A subnet the re-sent spec adds is let through the running tap's guard at once.
+#[tokio::test]
+async fn a_subnet_given_to_a_running_vm_is_let_through_its_tap_guard() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT]);
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent_allowing(&record, &[KEPT, TAKEN]))
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
+    assert_eq!(updated[0].1.routed_subnets, [KEPT, TAKEN]);
+    assert_eq!(held_subnets(&store, &id), [KEPT, TAKEN]);
+}
+
+/// A floating address taken away is a change to the guard as much as a subnet is.
+#[tokio::test]
+async fn a_floating_address_taken_from_a_running_vm_leaves_its_tap_guard() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, mut record) = overlay_vm(10_401);
+    record.spec.nics[0].spec.floating_ips = vec!["10.255.0.7".into()];
+    store.put(&id, &record).expect("a record");
+    let mut resent = record.spec.clone();
+    resent.nics[0].spec.floating_ips.clear();
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
+    assert!(updated[0].1.floating_ips.is_empty(), "{updated:?}");
+}
+
+/// Re-sending what the VM already has swaps no guard; a re-send is idempotent.
+#[tokio::test]
+async fn a_resent_spec_with_the_same_addresses_swaps_no_guard() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT, TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &record.spec)
+        .await
+        .expect("nothing to do is done");
+
+    assert!(net.guards_updated.lock().unwrap().is_empty());
+}
+
+/// Only the address lists follow a re-sent NIC: the guard keeps pinning the MAC the guest was
+/// created with, which is the MAC it still sends from.
+#[tokio::test]
+async fn a_resent_nic_keeps_the_mac_it_was_created_with_and_takes_only_its_addresses() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT, TAKEN]);
+    let mut resent = resent_allowing(&record, &[KEPT]);
+    resent.nics[0].spec.mac = "52:54:00:00:00:99".parse().expect("a mac");
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated[0].1.mac, record.spec.nics[0].spec.mac);
+    assert_eq!(updated[0].1.routed_subnets, [KEPT]);
+    let held = store.get(&id).expect("a read").expect("the record");
+    assert_eq!(held.spec.nics[0].spec.mac, record.spec.nics[0].spec.mac);
+}
+
+/// A guard the driver refuses leaves the record on the old lists, so the next re-send sees the
+/// difference again and tries again, instead of the record claiming a guard the tap lacks.
+#[tokio::test]
+async fn a_guard_the_driver_refuses_leaves_the_record_on_the_old_addresses_for_the_retry() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT, TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+    *net.guard_refusal.lock().unwrap() =
+        Some(|_| NetworkError::Backend(anyhow!("nft refused the ruleset")));
+    let provisioner = provisioner_on(temp.path(), store.clone(), net.clone());
+    let resent = resent_allowing(&record, &[KEPT]);
+
+    let refused = provisioner
+        .sync_in_place(&id, &resent)
+        .await
+        .expect_err("a refused guard is the caller's error");
+    assert!(
+        format!("{refused:#}").contains("nft refused the ruleset"),
+        "{refused:#}"
+    );
+    assert_eq!(held_subnets(&store, &id), [KEPT, TAKEN]);
+
+    *net.guard_refusal.lock().unwrap() = None;
+    provisioner
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("the retry takes it in");
+    assert_eq!(held_subnets(&store, &id), [KEPT]);
+}
+
+/// A NIC whose tap is not on the host has no guard to swap; the record takes the new lists,
+/// and they are what its next start guards it with.
+#[tokio::test]
+async fn a_nic_without_a_tap_takes_the_new_addresses_into_the_record_alone() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[KEPT, TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+    *net.guard_refusal.lock().unwrap() = Some(|nic| NetworkError::NicNotFound(*nic));
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent_allowing(&record, &[KEPT]))
+        .await
+        .expect("a missing tap is not a failure");
+
+    assert_eq!(held_subnets(&store, &id), [KEPT]);
 }

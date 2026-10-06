@@ -330,7 +330,9 @@ impl LinuxNetworkDriver {
         })
     }
 
-    fn tap_name(id: &NicId) -> String {
+    /// The tap NIC `id` hangs on, and so the name its guard chain is hooked to. Public for
+    /// the netns tests, as `router::router_netns` is.
+    pub fn tap_name(id: &NicId) -> String {
         format!("msk{}", &id.simple().to_string()[..8])
     }
 
@@ -903,6 +905,19 @@ impl NicDriver for LinuxNetworkDriver {
     /// guests still running on them.
     async fn mend_existing_links(&self) -> networking::Result<Vec<String>> {
         host_ipv6_off_where_still_on().await
+    }
+
+    #[instrument(skip_all, fields(nic_id = %id))]
+    async fn update_guard(&self, id: &NicId, spec: &NicSpec) -> networking::Result<()> {
+        let tap = Self::tap_name(id);
+        // nft would refuse a chain hooked to a device that is not there, in its own words;
+        // the caller needs to know the NIC is gone, not that a script failed.
+        if self.link_index(&tap).await?.is_none() {
+            return Err(NetworkError::NicNotFound(*id));
+        }
+        // The same script as at create: one nft transaction that flushes the chain and adds
+        // the new rules, so a frame meets the old guard or the new one, never neither.
+        self.nft.guard(&tap, spec, &self.guarded).await
     }
 
     #[instrument(level = "trace", skip_all, fields(nic_id = %id))]
