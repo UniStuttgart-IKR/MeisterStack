@@ -212,29 +212,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
-    /// Delegate arguments to the separate meister-deploy binary
-    Deploy {
-        /// Everything after `deploy`, handed to `meister-deploy` unchanged
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-}
-
-/// Hand the whole invocation to `meister-deploy`: next to this binary first
-/// (a checkout's `target/release` holds both), then PATH.
-fn exec_deploy(args: &[String]) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let sibling = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("meister-deploy")))
-        .filter(|p| p.is_file());
-    let program = sibling.unwrap_or_else(|| "meister-deploy".into());
-    let err = std::process::Command::new(&program).args(args).exec();
-    anyhow::bail!(
-        "cannot run {}: {err}. It is a second binary of this workspace: \
-         `cargo build --release -p meister-deploy` builds it next to this one",
-        program.display()
-    )
 }
 
 /// Server-side event filters.
@@ -1173,11 +1150,6 @@ async fn run() -> Result<()> {
         tolerate_missing_credential: matches!(cli.cmd, Cmd::Login(_)),
     };
 
-    // The fleet tool uses its own inventory and does not resolve a CLI target.
-    if let Cmd::Deploy { args } = &cli.cmd {
-        return exec_deploy(args);
-    }
-
     match &cli.cmd {
         // Direct agent commands bypass control-plane discovery.
         Cmd::Agent { cmd } => {
@@ -1367,7 +1339,7 @@ async fn dispatch(ctx: &Ctx<'_>, cmd: &Cmd, raw: &bytes::Bytes) -> Result<()> {
         Cmd::ApiResources => generic::api_resources(ctx, raw),
         Cmd::Whoami => generic::whoami(ctx).await,
         // Handled before the discovery, in `run`.
-        Cmd::Agent { .. } | Cmd::Login(_) | Cmd::Deploy { .. } => {
+        Cmd::Agent { .. } | Cmd::Login(_) => {
             unreachable!("dispatched above")
         }
     }
