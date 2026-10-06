@@ -109,7 +109,7 @@ pub(super) async fn create_routed_subnet(
             controller_api::RoutedSubnetSpec {
                 // The stored form is the canonical one, so two admins who wrote
                 // `10.7.1.0/24` and `10.7.1.7/24` end up with the same object.
-                cidr: cidr.to_cidr().unwrap_or_else(|| cidr.to_string()),
+                cidr: controller_api::address_space::cidr_of(&cidr),
                 // What the block was really cut with, and not what the client
                 // asked for: on the named road a client asks for nothing at
                 // all, and the field came back absent for ever (tofu). It is

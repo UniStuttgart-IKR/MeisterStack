@@ -14,9 +14,8 @@ use std::net::Ipv4Addr;
 use common::net::{Ipv4Range, Ipv4Ranges};
 
 use crate::floating::{all_pools, all_subnets, occupied};
-use crate::object::Resource;
 use crate::resources::{FloatingPool, ProviderNetwork, RoutedSubnet, Router, Tenant};
-use crate::store::{EtcdStore, Result, StoreError};
+use crate::store::{EtcdStore, Result};
 
 /// What a prefix a tenant's guests send from may not overlap, each named for a refusal: every
 /// floating pool, every other tenant's routed subnet, and the routed pools subnets are cut
@@ -144,6 +143,10 @@ pub fn prefix_beyond_own(
     Ok(Some(prefix))
 }
 
+/// What a claim that did not decode costs: the address space it holds cannot be told.
+const UNTOLD: &str =
+    "the address space they claim cannot be told; refusing rather than letting a prefix onto it";
+
 /// The address space claimed in a cloud, read together so that one judgement is made from one
 /// picture of it: the floating pools, the routed subnets, the tenants' networks, the provider
 /// networks' wires, and the routed pools from the cloud config.
@@ -162,8 +165,8 @@ impl ClaimedSpace {
         Ok(Self {
             pools: all_pools(store).await?,
             subnets: all_subnets(store).await?,
-            tenants: all_decoded::<Tenant>(store).await?,
-            provider_networks: all_decoded::<ProviderNetwork>(store).await?,
+            tenants: store.list_complete(UNTOLD).await?,
+            provider_networks: store.list_complete(UNTOLD).await?,
             routed_pools,
         })
     }
@@ -254,19 +257,6 @@ fn covered_by_any<'a>(entries: impl IntoIterator<Item = &'a String>, prefix: &Ip
         .into_iter()
         .filter_map(|entry| entry.parse::<Ipv4Range>().ok())
         .any(|range| range.covers(prefix))
-}
-
-/// Every `T`, or none at all when some did not decode.
-async fn all_decoded<T: Resource>(store: &EtcdStore) -> Result<Vec<T>> {
-    let (objects, keys) = store.list_counted::<T>().await?;
-    if objects.len() != keys {
-        return Err(StoreError::Invalid(format!(
-            "some {} objects did not decode, so the address space they claim cannot be told; \
-             refusing rather than letting a prefix onto it",
-            T::RESOURCE
-        )));
-    }
-    Ok(objects)
 }
 
 #[cfg(test)]

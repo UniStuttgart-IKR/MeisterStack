@@ -235,13 +235,13 @@ pub(super) async fn network_prefixes_taken(
     st: &ApiState,
     except: Option<&str>,
 ) -> Result<Vec<(String, common::net::Ipv4Range)>, ApiError> {
-    let (tenants, keys) = st.store.list_counted::<Tenant>().await?;
-    if tenants.len() != keys {
-        return Err(conflict(
-            "cannot tell which prefixes the tenants' networks hold (some tenant objects did not \
-             decode); refusing rather than overlapping one",
-        ));
-    }
+    let tenants: Vec<Tenant> = st
+        .store
+        .list_complete(
+            "which prefixes the tenants' networks hold cannot be told; refusing rather than \
+             overlapping one",
+        )
+        .await?;
     Ok(controller_api::address_space::tenant_networks(
         &tenants, except,
     ))

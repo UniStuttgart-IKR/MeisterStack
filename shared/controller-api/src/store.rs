@@ -226,6 +226,22 @@ impl EtcdStore {
         Ok((Self::decode_range(resp.kvs()), resp.kvs().len()))
     }
 
+    /// Every `T`, or none at all when some did not decode: a decision made on a list that is
+    /// not all of them could hand out what a missing object holds. List and count come from
+    /// one response (`list_counted`), so an object written or deleted in between cannot pass
+    /// for one that did not decode. `stake` says what deciding on part of the list would have
+    /// cost, for the refusal.
+    pub async fn list_complete<T: Resource>(&self, stake: &str) -> Result<Vec<T>> {
+        let (objects, keys) = self.list_counted::<T>().await?;
+        if objects.len() != keys {
+            return Err(StoreError::Invalid(format!(
+                "some {} objects did not decode, so {stake}",
+                T::RESOURCE
+            )));
+        }
+        Ok(objects)
+    }
+
     /// Two listings at one etcd revision, in one transaction. Separate lists can straddle a
     /// bind-then-release and count a guest nowhere; capacity checks need one view (R3-F05).
     pub async fn list2<A: Resource, B: Resource>(&self) -> Result<(Vec<A>, Vec<B>)> {

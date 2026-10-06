@@ -74,15 +74,12 @@ fn addresses(ips: &[FloatingIp]) -> BTreeSet<Ipv4Addr> {
 /// decode: a range claim's question after its write runs exactly while the
 /// other claim writes or takes itself back.
 pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
-    let (ips, keys) = store.list_counted::<FloatingIp>().await?;
-    if ips.len() != keys {
-        return Err(StoreError::Invalid(
-            "some floatingip objects did not decode, so which addresses are taken cannot be \
-             established; refusing rather than handing out one twice"
-                .into(),
-        ));
-    }
-    Ok(ips)
+    store
+        .list_complete(
+            "which addresses are taken cannot be established; refusing rather than handing out \
+             one twice",
+        )
+        .await
 }
 
 /// Count reservations within both tenant and pool, keeping public and private
@@ -341,28 +338,22 @@ pub fn cut_subnet(
 /// and same reason as `all_reservations`, with the overlap check at stake
 /// instead of the address.
 pub async fn all_subnets(store: &EtcdStore) -> Result<Vec<RoutedSubnet>> {
-    let (subnets, keys) = store.list_counted::<RoutedSubnet>().await?;
-    if subnets.len() != keys {
-        return Err(StoreError::Invalid(
-            "some routedsubnet objects did not decode, so an overlap check cannot be made; \
-             refusing rather than cutting a subnet on top of another one"
-                .into(),
-        ));
-    }
-    Ok(subnets)
+    store
+        .list_complete(
+            "an overlap check cannot be made; refusing rather than cutting a subnet on top of \
+             another one",
+        )
+        .await
 }
 
 /// Every floating pool, with the same guard.
 pub async fn all_pools(store: &EtcdStore) -> Result<Vec<FloatingPool>> {
-    let (pools, keys) = store.list_counted::<FloatingPool>().await?;
-    if pools.len() != keys {
-        return Err(StoreError::Invalid(
-            "some floatingpool objects did not decode; refusing rather than allocating out of \
-             a list that is not all of them"
-                .into(),
-        ));
-    }
-    Ok(pools)
+    store
+        .list_complete(
+            "the pools are not all known; refusing rather than allocating out of a list that is \
+             not all of them",
+        )
+        .await
 }
 
 // --- injection --------------------------------------------------------------

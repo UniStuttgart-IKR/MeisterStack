@@ -1205,7 +1205,8 @@ async fn a_tenants_unchanged_network_prefixes_are_not_judged_again() {
 }
 
 /// A floating pool is refused while a tenant does not decode: which prefixes its network holds
-/// cannot be told, and the pool could land on them. (RR5-3)
+/// cannot be told, and the pool could land on them. (RR5-3) The answer is the one an
+/// undecodable pool or subnet gets (422), not a `Conflict` a PATCH would run again. (RR6-5)
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]
 async fn a_floating_pool_is_refused_while_a_tenant_does_not_decode() {
@@ -1226,7 +1227,7 @@ async fn a_floating_pool_is_refused_while_a_tenant_does_not_decode() {
         .expect("no pool over a tenant list that is not all of them");
     assert_eq!(
         refused.status(),
-        StatusCode::CONFLICT,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "{}",
         refused.message()
     );
