@@ -163,6 +163,11 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # The agent unit's sandbox keeps what the agent's work depends on.
+          agent-unit-sandbox = import ./nix/tests/agent-unit-sandbox.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # Every host binds its metrics where the fleet's Prometheus scrapes them.
           scrape-targets = import ./nix/tests/scrape-targets.nix {
             inherit nixpkgs lib pkgs system self;

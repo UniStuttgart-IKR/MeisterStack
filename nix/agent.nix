@@ -16,6 +16,8 @@ let
 
   unprivileged = cfg.agent.unprivileged;
   capabilities = cfg.agent.capabilities;
+  # Whether the agent can mount(2): a router's `ip netns` pin and an NFS volume are mounts.
+  mounts = !unprivileged || lib.elem "CAP_SYS_ADMIN" capabilities;
   volumes = cfg.agent.volumes;
 
   # Keep VM records and disks on the same persistent volume root.
@@ -501,14 +503,21 @@ in
           RestartSec = 2;
           Environment = "RUST_LOG=info";
 
-          # Limit access to home directories while retaining host devices and the
-          # network operations required by the agent.
-          ProtectHome = true;
           # Allow netlink for link, route, and nftables configuration.
           RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK";
-          # Keep shared mount propagation so network-namespace pins created by the
-          # agent remain visible to host ip-netns commands despite its filesystem sandbox.
-          MountFlags = "shared";
+
+          # No mount namespace of its own for an agent that mounts (IKR-B69). Every path
+          # sandbox (ProtectHome, ProtectSystem, PrivateTmp, ReadOnlyPaths, InaccessiblePaths,
+          # ...) gives the unit a private mount namespace that systemd makes a slave of the
+          # host's, and MountFlags=shared does not undo that: the `ip netns` pins of the
+          # tenant routers and the NFS mounts the agent makes never reach the host, and die
+          # with the namespace on every restart or crash, taking the routers with them. For a
+          # root agent ProtectHome was no boundary anyway: CAP_SYS_ADMIN enters PID 1's mount
+          # namespace.
+        } // lib.optionalAttrs (!mounts) {
+          # An agent that cannot mount makes no mount the host has to see, and cannot leave
+          # its namespace: for it ProtectHome is a boundary and costs nothing.
+          ProtectHome = true;
         } // lib.optionalAttrs unprivileged {
           # Optional unprivileged agent: explicit capabilities and device access.
           User = "meister";
