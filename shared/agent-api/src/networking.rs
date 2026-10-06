@@ -174,6 +174,8 @@ pub trait BridgeDriver: Send + Sync {
     /// shutdown and by the dead man to stop stale ARP and routing activity
     /// before another gateway takes over. A later `EnsureRouter` can reactivate
     /// the retained router. Best effort; the outcome names failed routers (R3-F06).
+    /// An active router no other node can take over (`RouterSpec::sole_gateway`)
+    /// keeps answering, and the outcome names it kept (IKR-B76).
     async fn fall_silent(&self) -> Result<Silencing> {
         Ok(Silencing::default())
     }
@@ -184,10 +186,13 @@ pub trait BridgeDriver: Send + Sync {
 pub struct Silencing {
     pub silenced: Vec<RouterId>,
     pub failed: Vec<RouterId>,
+    /// Active routers left answering because no other node can be made active for them.
+    pub kept: Vec<RouterId>,
 }
 
 impl Silencing {
-    /// Every router this pass looked at is now silent; vacuously true when there was none.
+    /// Every router this pass looked at is now silent, or was kept answering on purpose;
+    /// vacuously true when there was none.
     pub fn complete(&self) -> bool {
         self.failed.is_empty()
     }
@@ -288,6 +293,12 @@ pub struct RouterSpec {
     /// Whether this router answers ARP and advertises routes. Inactive routers
     /// retain prepared namespaces, links, addresses and rules for activation.
     pub active: bool,
+    /// No other node of the cluster claims this router's provider network, whether alive or
+    /// not: none can be made active while this one is cut off from its controller, so the dead
+    /// man keeps an active router answering instead of silencing it for nothing (IKR-B76).
+    /// Absent in records and commands from before, which keeps the dead man silencing it.
+    #[serde(default)]
+    pub sole_gateway: bool,
 }
 
 /// Driver-observed router state used for reports and route announcements.
@@ -415,6 +426,7 @@ mod tests {
             nats: Vec::new(),
             routed_subnets: Vec::new(),
             active: true,
+            sole_gateway: false,
         }
     }
 

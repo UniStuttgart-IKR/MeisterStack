@@ -115,6 +115,7 @@ fn spec_on(physnet: &str, vni: u32, id: RouterId, active: bool) -> RouterSpec {
         ],
         routed_subnets: vec!["10.7.2.0/24".into()],
         active,
+        sole_gateway: false,
     }
 }
 

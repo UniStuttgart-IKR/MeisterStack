@@ -2044,6 +2044,30 @@ fn a_planned_router_carries_resolved_facts_and_not_object_names() {
     assert_eq!(plan.nodes, ["gw-1"]);
     assert_eq!(plan.active.as_deref(), Some("gw-1"));
     assert!(plan.release.is_empty());
+    assert!(plan.sole_gateway, "no other node claims ext");
+}
+
+/// IKR-B76: a gateway that is down when the plan is made is no standby of it, and can still
+/// be the active one of the next plan; the router is not its node's alone.
+#[test]
+fn a_router_with_a_gateway_down_elsewhere_is_not_its_nodes_alone() {
+    let field = [
+        gateway_node("gw-1", &["ext"], true),
+        gateway_node("gw-2", &["ext"], false),
+    ];
+    let plan = plan_router(
+        &ready_router("acme-out"),
+        &[provider("ext", "ext")],
+        &Default::default(),
+        &field,
+    )
+    .expect("a plan");
+    assert_eq!(
+        plan.nodes,
+        ["gw-1"],
+        "the down gateway is planned for nothing"
+    );
+    assert!(!plan.sole_gateway);
 }
 
 /// A node that is up and fell off the priority list is TOLD; one that fell

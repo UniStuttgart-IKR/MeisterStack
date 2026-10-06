@@ -108,6 +108,7 @@ pub(crate) fn plan_router(
         ));
     }
     let active = network::active_node(&nodes, &fit).map(str::to_string);
+    let sole_gateway = network::sole_gateway(&network.spec.physnet, candidates);
     // Release nodes excluded from the new plan when they are reachable anywhere
     // in the cluster. Dispatch forwards through sibling-held sessions.
     // Use `alive`, not scheduling eligibility: cordoned or unhealthy nodes still
@@ -131,6 +132,7 @@ pub(crate) fn plan_router(
         nodes,
         active,
         release,
+        sole_gateway,
     })
 }
 
@@ -508,6 +510,7 @@ impl RouterSink for crate::dispatch::Dispatch {
                 internal_addr: router.internal_addr,
                 nats,
                 active: router.active,
+                sole_gateway: router.sole_gateway,
             },
         )
         .await

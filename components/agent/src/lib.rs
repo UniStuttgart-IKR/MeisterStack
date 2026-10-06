@@ -871,7 +871,7 @@ async fn wait_out_the_backoff(
             warn!(deadline = ?ROUTER_DEAD_MAN,
                   "no controller has answered for longer than the dead man's deadline; this \
                    node stops answering for its routers' addresses before the cluster can give \
-                   them to a standby");
+                   them to a standby, except where no other node can be made active");
             tried_this_round = true;
             *silenced = stop_speaking_for_every_router(bridge).await;
         }
@@ -1322,10 +1322,12 @@ mod tests {
             Ok(agent_api::networking::Silencing {
                 silenced: vec![a],
                 failed: vec![b],
+                kept: Vec::new(),
             }),
             Ok(agent_api::networking::Silencing {
                 silenced: vec![a, b],
                 failed: Vec::new(),
+                kept: Vec::new(),
             }),
         ]);
 
@@ -1364,10 +1366,12 @@ mod tests {
             Ok(agent_api::networking::Silencing {
                 silenced: vec![a],
                 failed: vec![b],
+                kept: Vec::new(),
             }),
             Ok(agent_api::networking::Silencing {
                 silenced: vec![a, b],
                 failed: Vec::new(),
+                kept: Vec::new(),
             }),
         ]);
         // Start past the dead-man deadline so the first iteration falls silent.

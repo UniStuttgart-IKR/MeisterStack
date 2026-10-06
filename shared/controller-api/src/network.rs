@@ -48,6 +48,23 @@ pub fn gateway_candidates<'a>(
     fit
 }
 
+/// Whether at most one node of the cluster claims `physnet`, counting every node the
+/// inventory holds: alive or not, cordoned or not, refused or not (IKR-B76).
+///
+/// Then no node but the one carrying a router can be made active for it, and that node's dead
+/// man, which silences a router so that another node may take its addresses over, would cut
+/// the tenants off and protect nothing. The planned nodes are not the measure: a gateway that
+/// was down, cordoned or refused when the plan was made can be the active one of the next plan,
+/// made while the old node is cut off and still answering. What is left is a node that comes
+/// to claim the physnet while the active one is cut off, which takes an operator.
+pub fn sole_gateway(physnet: &str, candidates: &[Candidate]) -> bool {
+    candidates
+        .iter()
+        .filter(|c| common::capability::gateway_physnets(&c.catalogue).contains(&physnet))
+        .count()
+        <= 1
+}
+
 /// Retain eligible existing placements in order, then fill remaining
 /// slots from candidates. Avoid rebalancing a working gateway merely to
 /// reduce load; rebuilding loses connection state. Each node appears once.
@@ -281,6 +298,8 @@ pub struct RouterPlan {
     /// Nodes that hold this router and should let go of it: they fell off the
     /// list, or the router is on its way out and the list is empty.
     pub release: Vec<String>,
+    /// No node of the cluster but one claims this router's physnet. See `sole_gateway`.
+    pub sole_gateway: bool,
 }
 
 /// What a backend says is true after it tried.
@@ -438,6 +457,7 @@ impl RouterPlan {
                 })
                 .collect(),
             active,
+            sole_gateway: self.sole_gateway,
         }
     }
 }
@@ -540,6 +560,27 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// IKR-B76: a router is its node's alone when no other node of the cluster claims the
+    /// physnet, however unusable that other node is right now.
+    #[test]
+    fn a_gateway_is_sole_only_when_no_other_node_claims_the_wire_at_all() {
+        let mut cordoned = gateway("gw-cordoned", &["ext"], true);
+        cordoned.schedulable = false;
+        let alone = [
+            gateway("gw-1", &["ext"], true),
+            gateway("gw-dmz", &["dmz"], true),
+        ];
+        assert!(sole_gateway("ext", &alone));
+        for other in [gateway("gw-down", &["ext"], false), cordoned] {
+            let field = [gateway("gw-1", &["ext"], true), other];
+            assert!(
+                !sole_gateway("ext", &field),
+                "{} can be made active while gw-1 is cut off",
+                field[1].name
+            );
+        }
     }
 
     /// Least loaded first, ties by name — so three leaderless replicas
@@ -749,6 +790,7 @@ mod tests {
             nodes: vec!["gw-1".into()],
             active: Some("gw-1".into()),
             release: Vec::new(),
+            sole_gateway: true,
         };
         let wire = plan.ensure_for(true);
         assert_eq!(wire.id, "uid-1", "a node keys a router by uid, not by name");
@@ -760,6 +802,10 @@ mod tests {
             "OVN's spelling, unchanged"
         );
         assert!(!plan.ensure_for(false).active);
+        assert!(
+            wire.sole_gateway,
+            "the node's dead man reads it off the record"
+        );
     }
 
     /// A sink that remembers what it was told, and can be made to refuse.
@@ -808,6 +854,7 @@ mod tests {
             nodes: nodes.iter().map(|n| n.to_string()).collect(),
             active: active.map(str::to_string),
             release: release.iter().map(|n| n.to_string()).collect(),
+            sole_gateway: false,
         }
     }
 

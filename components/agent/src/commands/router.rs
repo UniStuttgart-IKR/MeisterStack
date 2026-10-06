@@ -47,6 +47,7 @@ pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> 
         nats,
         routed_subnets,
         active: r.active,
+        sole_gateway: r.sole_gateway,
     })
 }
 
@@ -143,6 +144,7 @@ mod tests {
             internal_addr: "10.7.1.1/24".into(),
             nats: Vec::new(),
             active: true,
+            sole_gateway: false,
         }
     }
 
@@ -166,6 +168,16 @@ mod tests {
         assert_eq!(spec.internal_addr, "10.7.1.1/24");
         assert!(spec.active);
         assert!(spec.nats.is_empty() && spec.routed_subnets.is_empty());
+        assert!(!spec.sole_gateway);
+    }
+
+    /// IKR-B76: the controller's word that no other node can take the router over reaches the
+    /// driver, whose dead man reads it off the record.
+    #[test]
+    fn a_sole_gateway_reaches_the_driver() {
+        let mut m = message();
+        m.sole_gateway = true;
+        assert!(router_spec(m).expect("a well-formed message").sole_gateway);
     }
 
     /// OVN's two kinds, spelled the way the contract spells them.

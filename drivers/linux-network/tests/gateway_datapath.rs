@@ -158,6 +158,7 @@ fn spec(id: RouterId, active: bool) -> RouterSpec {
         ],
         routed_subnets: Vec::new(),
         active,
+        sole_gateway: false,
     }
 }
 

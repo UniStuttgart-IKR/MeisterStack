@@ -81,6 +81,9 @@ pub enum NodeCommand {
         internal_addr: String,
         nats: Vec<controller_api::NatRule>,
         active: bool,
+        /// Absent from a replica that predates it, which keeps the node's dead man silencing.
+        #[serde(default)]
+        sole_gateway: bool,
     },
     /// Let go of one router: the netns, both legs and the rules.
     #[serde(rename_all = "camelCase")]
@@ -150,6 +153,7 @@ impl NodeCommand {
                 internal_addr,
                 nats,
                 active,
+                sole_gateway,
             } => command::Op::EnsureRouter(proto::EnsureRouter {
                 id,
                 physnet,
@@ -166,6 +170,7 @@ impl NodeCommand {
                     })
                     .collect(),
                 active,
+                sole_gateway,
             }),
             Self::DestroyRouter { id } => command::Op::DestroyRouter(proto::DestroyRouter { id }),
             Self::ForgetVolume { id } => command::Op::ForgetVolume(proto::ForgetVolume { id }),
@@ -597,5 +602,19 @@ mod tests {
                 .is_err(),
             "and the one command that would destroy the disk is not on this wire"
         );
+    }
+
+    /// IKR-B76: a router command forwarded by a replica that predates `soleGateway` is read as
+    /// not sole, which keeps the node's dead man silencing the router as it did.
+    #[test]
+    fn a_router_command_without_the_sole_gateway_word_keeps_the_dead_man_silencing() {
+        let older = r#"{"command":"ensureRouter","id":"uid-1","physnet":"ext",
+            "externalAddr":"198.51.100.10/24","externalGateway":"198.51.100.1","vni":10007,
+            "internalAddr":"10.42.0.1/24","nats":[],"active":true}"#;
+        let command = serde_json::from_str::<NodeCommand>(older).expect("an older command");
+        let command::Op::EnsureRouter(router) = command.into_op() else {
+            panic!("an ensure-router");
+        };
+        assert!(router.active && !router.sole_gateway);
     }
 }

@@ -408,6 +408,12 @@ message EnsureRouter {
   string internal_addr = 6;
   repeated NatRule nats = 7;
   bool active = 8;
+  // No other node of the cluster claims this router's physnet, whether alive,
+  // cordoned or refused: none can be made active while this one is cut off,
+  // so the node's dead man keeps an active router answering instead of
+  // silencing it for nothing. False, which an older controller sends, keeps
+  // the dead man silencing it.
+  bool sole_gateway = 9;
 }
 
 // Rule kind: snat, dnat_and_snat or routed. For snat, empty logical_ip means

@@ -638,6 +638,7 @@ mod tests {
             nats,
             routed_subnets: Vec::new(),
             active: true,
+            sole_gateway: false,
         }
     }
 

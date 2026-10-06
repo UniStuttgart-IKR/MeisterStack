@@ -1024,7 +1024,7 @@ impl crate::LinuxNetworkDriver {
     }
 
     /// Silence every router namespace on this node, from the kernel's list as well as the
-    /// records (R2-1, R3-F06, R3-F07).
+    /// records (R2-1, R3-F06, R3-F07), except the active ones no other node can take over.
     ///
     /// The kernel is the truth here: a namespace with no record, with one that says standby or
     /// with one that does not parse can still answer ARP. So every live `meister-rt-` namespace
@@ -1032,16 +1032,30 @@ impl crate::LinuxNetworkDriver {
     /// saying active is rewritten standby so the announcement pass withdraws it. Failures are
     /// named per router so the dead man retries; a pass that could not list the namespaces or
     /// the records is an error, after everything it could reach was silenced.
+    ///
+    /// The silence exists so that another node can be made active without two answering for
+    /// one address. A record that says active and sole gateway names a router for which no
+    /// other node of the cluster claims the provider network at all: silencing it protects
+    /// nothing and cuts every tenant behind it off, so it keeps answering (IKR-B76).
     #[instrument(skip_all)]
     pub(crate) async fn fall_silent_impl(&self) -> networking::Result<networking::Silencing> {
         let dir = self.gateway()?.state_dir.clone();
         let live = self.netns_present().await;
         let records = record_files(&dir).await;
-        let (routers, unnamed) = silencing_targets(
+        let (mut routers, unnamed) = silencing_targets(
             records.as_deref().unwrap_or_default(),
             live.as_deref().unwrap_or_default(),
         );
-        let mut outcome = networking::Silencing::default();
+        let kept = Self::routers_nobody_takes_over(records.as_deref().unwrap_or_default()).await;
+        routers.retain(|id| !kept.contains(id));
+        let mut outcome = networking::Silencing {
+            kept: kept.into_iter().collect(),
+            ..Default::default()
+        };
+        if !outcome.kept.is_empty() {
+            info!(kept = ?outcome.kept,
+                  "these routers keep answering: no other node can be made active for them");
+        }
         for id in routers {
             match self
                 .silence_netns_and_record(&dir, id, live.as_deref().ok())
@@ -1060,6 +1074,24 @@ impl crate::LinuxNetworkDriver {
         records?;
         unnamed?;
         Ok(outcome)
+    }
+
+    /// The active routers whose records say that no other node can take them over (IKR-B76).
+    /// A record that does not parse says nothing of the kind, and its router is silenced.
+    async fn routers_nobody_takes_over(records: &[PathBuf]) -> BTreeSet<RouterId> {
+        let mut kept = BTreeSet::new();
+        for path in records {
+            let Some(id) = Self::record_id(path) else {
+                continue;
+            };
+            if let Ok(record) = Self::read_record(path).await
+                && record.spec.active
+                && record.spec.sole_gateway
+            {
+                kept.insert(id);
+            }
+        }
+        kept
     }
 
     /// Silence one router: its namespace unless the kernel's list proves it absent, and its
@@ -1305,6 +1337,7 @@ mod tests {
             nats: Vec::new(),
             routed_subnets: Vec::new(),
             active,
+            sole_gateway: false,
         }
     }
 
@@ -1848,6 +1881,64 @@ exit 0
 
         assert_eq!(outcome.silenced, [standby.id]);
         assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
+    }
+
+    /// IKR-B76: an active router no other node of the cluster can take over keeps answering
+    /// and keeps its active record: silencing it would cut its tenants off for nothing.
+    #[tokio::test]
+    async fn an_active_router_nobody_else_can_take_over_keeps_answering() {
+        let temp = tempfile::tempdir().expect("a state directory");
+        let dir = temp.path();
+        let log = dir.join("ip.log");
+        let sole = RouterSpec {
+            sole_gateway: true,
+            ..spec(true)
+        };
+        let netns = router_netns(&sole.id);
+        let path = write_record(dir, &sole);
+        let d = fake_driver(
+            dir,
+            &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
+        );
+
+        let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+        assert_eq!(outcome.kept, [sole.id]);
+        assert!(outcome.silenced.is_empty() && outcome.complete());
+        assert!(silenced_legs(&log, &netns).is_empty());
+        assert!(
+            read_spec(&path).active,
+            "and it still announces its addresses"
+        );
+    }
+
+    /// A sole gateway's router that is not active, and one whose record does not say sole
+    /// gateway, are silenced as every router was before IKR-B76.
+    #[tokio::test]
+    async fn only_an_active_sole_gateway_record_keeps_its_router_answering() {
+        for kept_back in [
+            RouterSpec {
+                sole_gateway: true,
+                ..spec(false)
+            },
+            spec(true),
+        ] {
+            let temp = tempfile::tempdir().expect("a state directory");
+            let dir = temp.path();
+            let log = dir.join("ip.log");
+            let netns = router_netns(&kept_back.id);
+            write_record(dir, &kept_back);
+            let d = fake_driver(
+                dir,
+                &logging_ip(&log, std::slice::from_ref(&netns), &ROUTER_LEGS, None),
+            );
+
+            let outcome = d.fall_silent_impl().await.expect("a silencing pass");
+
+            assert!(outcome.kept.is_empty(), "{kept_back:?}");
+            assert_eq!(outcome.silenced, [kept_back.id]);
+            assert_eq!(silenced_legs(&log, &netns), ROUTER_LEGS);
+        }
     }
 
     /// A silenced router's record says standby afterwards, so it announces nothing and its
