@@ -190,10 +190,18 @@ RTX2070-4Q      1     4096        768       3328         16         50          
         }
     }
 
-    /// The operator's sentence keeps everything the helper said.
+    /// A select that failed is refused with the helper's own reason, which
+    /// the operator's sentence keeps whole.
     #[test]
     fn the_operator_hears_what_vgpuprofile_said() {
-        let said = refused(SAID_FOR_9Q).to_string();
+        use std::os::unix::process::ExitStatusExt;
+        let out = Finished {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: SAID_FOR_9Q.as_bytes().to_vec(),
+        };
+        let said = from_select("9Q", &out).expect_err("exit 1").to_string();
+        assert!(said.contains("no type or size \"9Q\""), "{said}");
         assert!(said.contains("board: \"GeForce RTX 2070\""), "{said}");
     }
 

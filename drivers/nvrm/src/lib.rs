@@ -1135,21 +1135,6 @@ mod tests {
         );
     }
 
-    /// A failed resolution carries the helper's own reason from stderr.
-    #[test]
-    fn a_failed_resolution_says_what_vgpuprofile_said() {
-        use std::os::unix::process::ExitStatusExt;
-        let out = bounded::Finished {
-            status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: Vec::new(),
-            stderr: b"vgpuprofile: no type or size \"9Q\" on this card. It offers:\n".to_vec(),
-        };
-        let said = vgpu::from_select("9Q", &out)
-            .expect_err("exit 1")
-            .to_string();
-        assert!(said.contains("no type or size \"9Q\""), "{said}");
-    }
-
     /// Extra environment variables cannot override typed admission settings;
     /// unreserved backend knobs still pass through.
     #[test]
@@ -1240,14 +1225,7 @@ mod tests {
     /// Admission size and emitted environment values come from the same parameters.
     #[test]
     fn the_admitted_budget_is_the_started_budget() {
-        let vgpu = VgpuType {
-            vgpu_type: "RTX2070-4Q".into(),
-            profile_mib: 4096,
-            fb_mib: 2816,
-            max_instance: 2,
-            encoder_cap: 50,
-            available_mib: 8192,
-        };
+        let vgpu = resolved("RTX2070-4Q", 4096, 2);
         let value = |env: &[(String, String)], k: &str| {
             env.iter()
                 .find(|(ek, _)| ek == k)
@@ -1309,21 +1287,20 @@ mod tests {
 
     #[test]
     fn vgpu_resolution_lands_in_env() {
-        let vgpu = VgpuType {
-            vgpu_type: "RTX2070-4Q".into(),
-            profile_mib: 4096,
-            fb_mib: 2816,
-            max_instance: 2,
-            encoder_cap: 50,
-            available_mib: 8192,
-        };
+        let vgpu = resolved("RTX2070-4Q", 4096, 2);
         let env = NvrmDriver::backend_env(&NvrmParams::default(), Some(&vgpu))
             .expect("nothing argues with anything");
-        let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("LEA_VGPU_TYPE"), Some("RTX2070-4Q"));
-        assert_eq!(get("LEA_VGPU_PROFILE_MIB"), Some("4096"));
-        assert_eq!(get("LEA_VGPU_FB_MIB"), Some("2816"));
-        assert_eq!(get("LEA_VGPU_ENCODER_CAP"), Some("50"));
+        let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
+        assert_eq!(get("LEA_VGPU_TYPE"), Some(vgpu.vgpu_type.clone()));
+        assert_eq!(
+            get("LEA_VGPU_PROFILE_MIB"),
+            Some(vgpu.profile_mib.to_string())
+        );
+        assert_eq!(get("LEA_VGPU_FB_MIB"), Some(vgpu.fb_mib.to_string()));
+        assert_eq!(
+            get("LEA_VGPU_ENCODER_CAP"),
+            Some(vgpu.encoder_cap.to_string())
+        );
     }
 
     /// A driver under `root` whose `8q` and `1q` profiles are already
