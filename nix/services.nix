@@ -246,12 +246,7 @@ in
     ports = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf (lib.types.either lib.types.int lib.types.str));
       readOnly = true;
-      default = {
-        cloud = { api = 3000; grpc = 50050; metrics = 9100; };
-        cluster = { api = 3001; grpc = 50051; metrics = 9101; };
-        agent = { metrics = 9102; migration = "49000-49099"; };
-        etcd = { client = 2379; peer = 2380; };
-      };
+      default = (import ./lib/ports.nix).roles;
       description = ''
         The ports this stack listens on, per role — to be READ, not set.
 

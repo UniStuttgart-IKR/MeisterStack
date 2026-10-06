@@ -12,6 +12,7 @@ let
 
   pki = config.meisterstack.pki.dir;
   state = "/var/lib/meister-data/addons";
+  ports = (import ./lib/ports.nix).addons;
 
   # Fixed names for addon credentials in the runtime PKI directory.
   adminPassword = "${pki}/addons-admin";
@@ -19,7 +20,7 @@ let
   garageEnv = "${pki}/addons-garage.env";
 
   # Kanidm exposes one issuer per OAuth2 client; inventory derives this same URL.
-  origin = "https://${cfg.fqdn}:8443";
+  origin = "https://${cfg.fqdn}:${toString ports.kanidm}";
 
   # Bind persistent state onto each service module's expected path. DynamicUser
   # services use /var/lib/private so the public symlink remains available.
@@ -127,7 +128,7 @@ in
       serverSettings = {
         domain = cfg.fqdn;
         inherit origin;
-        bindaddress = "0.0.0.0:8443";
+        bindaddress = "0.0.0.0:${toString ports.kanidm}";
         # Load credentials through systemd so Kanidm can read private key copies
         # without broadening permissions on the original PEM files.
         tls_chain = "/run/credentials/kanidm.service/tls-chain";
@@ -142,7 +143,7 @@ in
       provision = {
         enable = true;
         # Provision through loopback to avoid depending on external name resolution.
-        instanceUrl = "https://localhost:8443";
+        instanceUrl = "https://localhost:${toString ports.kanidm}";
         acceptInvalidCerts = true;
         # Give the post-start provisioner its own readable credential copy.
         idmAdminPasswordFile = "/run/credentials/kanidm.service/idm-admin";
@@ -270,7 +271,7 @@ in
       enable = true;
       configuration = {
         auth_enabled = false;
-        server.http_listen_port = 3100;
+        server.http_listen_port = ports.loki;
         server.grpc_listen_port = 9096;
         common = {
           path_prefix = "/var/lib/loki";
@@ -306,7 +307,7 @@ in
           grpc_listen_port = 9095;
         };
         distributor.receivers.otlp.protocols = {
-          grpc.endpoint = "0.0.0.0:4317";
+          grpc.endpoint = "0.0.0.0:${toString ports.otlp}";
           http.endpoint = "0.0.0.0:4318";
         };
         storage.trace = {
@@ -362,7 +363,7 @@ in
             name = "Loki";
             type = "loki";
             uid = "meister-loki";
-            url = "http://127.0.0.1:3100";
+            url = "http://127.0.0.1:${toString ports.loki}";
             jsonData.derivedFields = [{
               # Match the flattened span trace-ID field for a Tempo link.
               name = "TraceID";
