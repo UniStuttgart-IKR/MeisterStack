@@ -26,6 +26,7 @@ fn driver(root: &Path, binary: PathBuf, timeout: Duration) -> InputDriver {
     InputDriver::new(InputDriverConfig {
         binary,
         run_dir: root.join("run"),
+        log_dir: root.join("logs"),
         socket_timeout: timeout,
         vmm_user: None,
         evdev: vec!["/dev/null".into(), "/dev/zero".into(), root.join("event")],
@@ -210,6 +211,7 @@ async fn a_node_with_no_listed_inputs_offers_none() {
     let driver = InputDriver::new(InputDriverConfig {
         binary: std::env::current_exe().unwrap(),
         run_dir: temp.path().join("run"),
+        log_dir: temp.path().join("logs"),
         socket_timeout: Duration::from_millis(1),
         vmm_user: None,
         evdev: Vec::new(),

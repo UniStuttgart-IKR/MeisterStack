@@ -218,7 +218,11 @@ pub const DEFAULT_SOCKET_TIMEOUT_MS: u64 = 5000;
 pub struct NvrmDriverConfig {
     pub binary: PathBuf,
     pub vgpuprofile_bin: PathBuf,
+    /// The backends' sockets. Handed to `vmm_user` when one is set.
     pub run_dir: PathBuf,
+    /// The backends' logs: the agent's alone, outside `run_dir`; see
+    /// [`backend::create_log_dir`].
+    pub log_dir: PathBuf,
     pub socket_timeout: Duration,
     /// Optional VRAM budget over the nvrm devices of every vm on record on
     /// this node, running or stopped.
@@ -250,6 +254,7 @@ pub struct NvrmDriver {
 impl NvrmDriver {
     pub fn new(config: NvrmDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
+        backend::create_log_dir(&config.log_dir).map_err(|e| DeviceError::Backend(e.into()))?;
         if !config.binary.exists() {
             return Err(DeviceError::Backend(anyhow::anyhow!(
                 "vhost-user-nvrm binary not found at {}",
@@ -385,7 +390,7 @@ impl NvrmDriver {
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        paths::log_file(&self.config.run_dir, id)
+        paths::log_file(&self.config.log_dir, id)
     }
 
     fn attachment(socket: PathBuf, pid: u32) -> DeviceAttachment {
@@ -935,6 +940,7 @@ mod tests {
             binary: PathBuf::from("/nonexistent/vhost-user-nvrm"),
             vgpuprofile_bin: PathBuf::from("/nonexistent/vgpuprofile"),
             run_dir: PathBuf::from("/nonexistent/run"),
+            log_dir: PathBuf::from("/nonexistent/logs"),
             socket_timeout: Duration::from_millis(DEFAULT_SOCKET_TIMEOUT_MS),
             vram_budget_mib: None,
             vgpu_host_reserve_mib: None,
@@ -1219,16 +1225,21 @@ mod tests {
         assert_eq!(get("LEA_VGPU_ENCODER_CAP"), Some("50"));
     }
 
-    /// A driver over `run_dir` whose `8q` and `1q` profiles are already
+    /// A driver under `root` whose `8q` and `1q` profiles are already
     /// resolved against the fixture card. Built without asking the host
     /// anything, as `new` would after resolving them.
-    fn driver_in(run_dir: &Path) -> NvrmDriver {
-        NvrmDriver::assemble(node_in(run_dir), the_card())
+    fn driver_in(root: &Path) -> NvrmDriver {
+        NvrmDriver::assemble(node_in(root), the_card())
     }
 
-    fn node_in(run_dir: &Path) -> NvrmDriverConfig {
+    /// A node whose run and log directories are made under `root`, side by
+    /// side, as the agent lays them out.
+    fn node_in(root: &Path) -> NvrmDriverConfig {
         let mut config = node(serde_json::json!({}));
-        config.run_dir = run_dir.to_path_buf();
+        config.run_dir = root.join("run");
+        config.log_dir = root.join("logs");
+        std::fs::create_dir_all(&config.run_dir).expect("a run dir");
+        backend::create_log_dir(&config.log_dir).expect("a log dir");
         config.vgpu_host_reserve_mib = Some(1024);
         config.profiles.insert("8q".into(), configured("8Q"));
         config.profiles.insert("1q".into(), configured("1Q"));
@@ -1309,52 +1320,49 @@ mod tests {
         assert!(!said.contains(&gone.vm.to_string()), "{said}");
     }
 
-    /// R2-1: the run directory is the backend user's to write, and files at
-    /// the paths claim records once had are read by nobody. A FIFO there does
-    /// not hang admission or teardown, a symlink is not followed, and a forged
-    /// claim neither frees nor fills the card.
+    /// R2-1: the run directory is the backend user's to write. A link or a
+    /// FIFO that user plants at a device's log path, the old one beside the
+    /// socket or the one in the agent's log directory, is neither written
+    /// through nor waited on when the device is created or destroyed.
     #[tokio::test]
-    async fn files_at_the_old_claim_paths_neither_block_nor_change_admission() {
+    async fn files_planted_at_a_devices_log_paths_are_neither_followed_nor_waited_on() {
         let dir = run_dir();
-        let elsewhere = run_dir();
-        let (fifo_owner, forged_owner) = (DeviceId::new_v4(), DeviceId::new_v4());
-        let at = |id: &DeviceId, extension: &str| dir.path().join(format!("{id}.{extension}"));
-        nix::unistd::mkfifo(
-            &at(&fifo_owner, "claim"),
-            nix::sys::stat::Mode::from_bits_truncate(0o600),
-        )
-        .expect("a fifo");
-        let target = elsewhere.path().join("victim");
-        std::fs::write(&target, b"untouched").expect("a file to aim at");
-        std::os::unix::fs::symlink(&target, at(&fifo_owner, "claim.tmp")).expect("a symlink");
-        std::fs::write(
-            at(&forged_owner, "claim"),
-            br#"{"pid":1,"claim":{"mib":0,"vgpu_type":null,"card_mib":null}}"#,
-        )
-        .expect("a forged claim");
+        let driver = driver_over(dir.path(), BINDS);
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").expect("a file to aim at");
+        let fifo = |path: &Path| {
+            nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))
+                .expect("a fifo")
+        };
+        let link = |path: &Path| std::os::unix::fs::symlink(&victim, path).expect("a link");
+        let (one, other) = (DeviceId::new_v4(), DeviceId::new_v4());
+        let beside_socket = |id: &DeviceId| driver.config.run_dir.join(format!("{id}.log"));
+        fifo(&beside_socket(&one));
+        link(&driver.log_path(&one));
+        link(&beside_socket(&other));
+        fifo(&driver.log_path(&other));
 
-        let driver = driver_in(dir.path());
-        let bounded = |work| tokio::time::timeout(Duration::from_secs(10), work);
-        let (one_1q, one_8q) = (requested(profiled("1q")), requested(profiled("8q")));
-        let held = [recorded(profiled("8q"))];
-        bounded(driver.admit(&one_1q, &held))
-            .await
-            .expect("admission does not wait on a fifo")
-            .expect_err("a forged empty claim does not free the card");
-        bounded(driver.admit(&one_8q, &[]))
-            .await
-            .expect("admission does not wait on a fifo")
-            .expect("nor does anything in the directory fill it");
-
-        let attachment = NvrmDriver::attachment(at(&fifo_owner, "sock"), u32::MAX);
-        bounded(driver.destroy(&fifo_owner, &attachment))
-            .await
-            .expect("teardown does not wait on a fifo")
-            .expect("destroyed");
+        let bound = Duration::from_secs(10);
+        for id in [one, other] {
+            let device = tokio::time::timeout(bound, driver.create(&id, &profiled("1q"), None))
+                .await
+                .expect("create does not wait on a fifo")
+                .expect("created");
+            assert!(
+                std::fs::symlink_metadata(driver.log_path(&id))
+                    .expect("a log")
+                    .is_file(),
+                "the log is a file of the agent's"
+            );
+            tokio::time::timeout(bound, driver.destroy(&id, &device.attachment))
+                .await
+                .expect("teardown does not wait on a fifo")
+                .expect("destroyed");
+        }
         assert_eq!(
-            std::fs::read(&target).expect("still there"),
+            std::fs::read(&victim).expect("still there"),
             b"untouched",
-            "no write went through the symlink"
+            "no write went through a link"
         );
     }
 
@@ -1403,10 +1411,9 @@ mod tests {
         let started = dir.path().join("started");
         nix::unistd::mkfifo(&started, nix::sys::stat::Mode::from_bits_truncate(0o600))
             .expect("a fifo");
-        let mut config = node_in(&dir.path().join("run"));
+        let mut config = node_in(dir.path());
         config.binary = never_ready_backend(dir.path(), &started);
         config.socket_timeout = Duration::from_secs(600);
-        std::fs::create_dir_all(&config.run_dir).expect("a run dir");
         let driver = NvrmDriver::assemble(config, the_card());
         let (id, spec) = (DeviceId::new_v4(), profiled("1q"));
 
@@ -1541,10 +1548,9 @@ mod tests {
     fn driver_over(dir: &Path, body: &str) -> NvrmDriver {
         let binary = dir.join("vhost-user-nvrm");
         executable(&binary, &format!("#!/bin/sh\n{body}\n"));
-        let mut config = node_in(&dir.join("run"));
+        let mut config = node_in(dir);
         config.binary = binary;
         config.socket_timeout = Duration::from_secs(30);
-        std::fs::create_dir_all(&config.run_dir).expect("a run dir");
         NvrmDriver::assemble(config, the_card())
     }
 

@@ -68,7 +68,11 @@ fn crosvm_params_json(params: &GpuParams) -> device::Result<String> {
 
 pub struct CrosvmGpuDriverConfig {
     pub crosvm_bin: PathBuf,
+    /// The backends' sockets. Handed to `vmm_user` when one is set.
     pub run_dir: PathBuf,
+    /// The backends' logs: the agent's alone, outside `run_dir`; see
+    /// [`backend::create_log_dir`].
+    pub log_dir: PathBuf,
     pub defaults: GpuParams,
     pub profiles: HashMap<String, serde_json::Value>,
     pub socket_timeout: Duration,
@@ -87,6 +91,7 @@ pub struct CrosvmGpuDriver {
 impl CrosvmGpuDriver {
     pub fn new(config: CrosvmGpuDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
+        backend::create_log_dir(&config.log_dir).map_err(|e| DeviceError::Backend(e.into()))?;
 
         for (name, overrides) in &config.profiles {
             Self::merge_params(&config.defaults, Some(overrides), None).map_err(|e| {
@@ -116,7 +121,7 @@ impl CrosvmGpuDriver {
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        self.config.run_dir.join(format!("{id}.log"))
+        self.config.log_dir.join(format!("{id}.log"))
     }
 
     fn merge_params(
@@ -325,10 +330,11 @@ mod tests {
         refuse_operator_only_params(&serde_json::json!({})).expect("nothing set");
     }
 
-    fn driver(run_dir: &std::path::Path) -> CrosvmGpuDriver {
+    fn driver(root: &std::path::Path) -> CrosvmGpuDriver {
         CrosvmGpuDriver::new(CrosvmGpuDriverConfig {
             crosvm_bin: PathBuf::from("/nonexistent/crosvm"),
-            run_dir: run_dir.to_path_buf(),
+            run_dir: root.join("run"),
+            log_dir: root.join("logs"),
             defaults: GpuParams::default(),
             profiles: HashMap::new(),
             socket_timeout: Duration::from_millis(100),

@@ -462,6 +462,7 @@ fn build_crosvm_gpu(
     let driver = CrosvmGpuDriver::new(crosvm_gpu_driver::CrosvmGpuDriverConfig {
         crosvm_bin: g.binary.clone(),
         run_dir: cfg.paths.run_dir.join("gpu"),
+        log_dir: backend_log_dir(cfg, DRIVER_CROSVM_GPU),
         defaults: g.defaults.clone(),
         profiles: g.profiles.clone(),
         socket_timeout: Duration::from_millis(g.socket_timeout_ms),
@@ -481,6 +482,7 @@ fn build_nvrm(
         binary: n.binary.clone(),
         vgpuprofile_bin: n.vgpuprofile.clone(),
         run_dir: cfg.paths.run_dir.join("nvrm"),
+        log_dir: backend_log_dir(cfg, DRIVER_NVRM),
         socket_timeout: Duration::from_millis(n.socket_timeout_ms),
         vram_budget_mib: n.vram_budget_mib,
         vgpu_host_reserve_mib: n.vgpu_host_reserve_mib,
@@ -504,6 +506,7 @@ fn build_input(
     let driver = InputDriver::new(input_driver::InputDriverConfig {
         binary: i.binary.clone(),
         run_dir: cfg.paths.run_dir.join(DRIVER_INPUT),
+        log_dir: backend_log_dir(cfg, DRIVER_INPUT),
         socket_timeout: Duration::from_millis(i.socket_timeout_ms),
         vmm_user: vmm_user(cfg)?,
         evdev: i.evdev.clone(),
@@ -522,6 +525,13 @@ fn build_vfio(
         return Ok(None);
     }
     Ok(Some(Arc::new(VfioPciDriver::new(inventory)?)))
+}
+
+/// Where a device driver's backends log: beside the run directories and not
+/// in one, because a run directory goes to the vmm user and this one stays
+/// the agent's (the drivers make it 0700 and refuse a link in its place).
+fn backend_log_dir(cfg: &AgentConfig, driver: &str) -> std::path::PathBuf {
+    cfg.paths.run_dir.join("backend-logs").join(driver)
 }
 
 /// Resolve the configured backend user during driver construction.

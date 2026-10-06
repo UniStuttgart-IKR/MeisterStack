@@ -35,7 +35,11 @@ pub struct InputParams {
 
 pub struct InputDriverConfig {
     pub binary: PathBuf,
+    /// The backends' sockets. Handed to `vmm_user` when one is set.
     pub run_dir: PathBuf,
+    /// The backends' logs: the agent's alone, outside `run_dir`; see
+    /// [`backend::create_log_dir`].
+    pub log_dir: PathBuf,
     pub socket_timeout: Duration,
     pub vmm_user: Option<agent_api::VmmUser>,
     /// The host input nodes an operator lets vms take, as a spec must name
@@ -54,6 +58,7 @@ pub struct InputDriver {
 impl InputDriver {
     pub fn new(config: InputDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
+        backend::create_log_dir(&config.log_dir).map_err(|e| DeviceError::Backend(e.into()))?;
         if !config.binary.exists() {
             return Err(DeviceError::Backend(anyhow::anyhow!(
                 "vhost-device-input binary not found at {}",
@@ -82,7 +87,7 @@ impl InputDriver {
     }
 
     fn log_path(&self, id: &DeviceId) -> PathBuf {
-        self.config.run_dir.join(format!("{id}.log"))
+        self.config.log_dir.join(format!("{id}.log"))
     }
 
     /// The host node a spec asks for, if the operator listed it. The path is

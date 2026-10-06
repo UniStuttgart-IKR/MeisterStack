@@ -70,6 +70,7 @@ fn node(
         input_driver::InputDriver::new(input_driver::InputDriverConfig {
             binary: from_env("MEISTER_INPUT_BACKEND"),
             run_dir: root.join("run").join("input"),
+            log_dir: root.join("run").join("backend-logs").join("input"),
             socket_timeout: Duration::from_millis(input_driver::DEFAULT_SOCKET_TIMEOUT_MS),
             vmm_user: None,
             evdev: vec![from_env("MEISTER_INPUT_DEVICE")],

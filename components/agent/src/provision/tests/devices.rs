@@ -56,6 +56,7 @@ async fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built(
             input_driver::InputDriver::new(input_driver::InputDriverConfig {
                 binary: std::env::current_exe().expect("this test binary"),
                 run_dir: root.join("run").join("input"),
+                log_dir: root.join("run").join("backend-logs").join("input"),
                 socket_timeout: std::time::Duration::from_millis(1),
                 vmm_user: None,
                 evdev: vec![NODE_A.into(), NODE_B.into()],
