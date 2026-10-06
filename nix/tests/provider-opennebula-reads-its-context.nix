@@ -54,14 +54,14 @@ let
     # W1: the default is a reading of what the host says, not a constant.
     ++ lib.optional withStatic.meisterstack.provider.opennebula.network
       ("a host that names a static address for eth0 still has "
-        + "provider.opennebula.network on by default: two owners for one "
-        + "interface")
+      + "provider.opennebula.network on by default: two owners for one "
+      + "interface")
     ++ lib.optional (lib.filter (a: !a.assertion) withStatic.assertions != [ ])
       "a store-built host with a static address and a provider does not evaluate"
     ++ lib.optional (!withoutStatic.meisterstack.provider.opennebula.network)
       ("a host that names NO address has provider.opennebula.network off: "
-        + "then nothing configures the interface and the VM comes up "
-        + "unreachable");
+      + "then nothing configures the interface and the VM comes up "
+      + "unreachable");
 in
 pkgs.runCommand "provider-opennebula-reads-its-context" { } (
   if bad == [ ] then ''

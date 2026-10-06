@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Build the workspace's runtime, CLI, and deployment binaries together, sharing
-# one Cargo lockfile and vendored dependency set.
+# Build the workspace's runtime and CLI binaries together, sharing one Cargo
+# lockfile and vendored dependency set.
 { lib, rustPlatform, protobuf }:
 
 let
@@ -20,9 +20,6 @@ let
       (root + "/shared")
       (root + "/components")
       (root + "/drivers")
-      (root + "/tools/meister-deploy")
-      # The deployment tool embeds the operator template with include_str!.
-      (root + "/templates/operator")
     ];
   };
 
@@ -49,18 +46,16 @@ rustPlatform.buildRustPackage {
     "meister-cluster-controller"
     "-p"
     "meister-cli"
-    "-p"
-    "meister-deploy"
   ];
 
   # Hardware and service integration tests run separately from this package build.
   doCheck = false;
 
   # Do not embed a commit revision: unrelated commits should not alter binaries.
-  # Manifests identify the deployment source separately.
+  # A deployment records the source revision separately.
 
   meta = {
-    description = "The MeisterStack control plane: agent, both controllers, the cli and meister-deploy";
+    description = "The MeisterStack control plane: agent, both controllers and the cli";
     license = lib.licenses.mit;
     # `nix run` is for a person at a shell; the daemons are started by units by path.
     mainProgram = "meister";

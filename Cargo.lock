@@ -1243,24 +1243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meister-deploy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "meister-pki",
- "nix 0.31.3",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "toml",
- "uuid",
-]
-
-[[package]]
 name = "meister-filesystem-driver"
 version = "0.1.0"
 dependencies = [

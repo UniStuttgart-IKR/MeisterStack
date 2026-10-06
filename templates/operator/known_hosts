@@ -1,3 +1,0 @@
-# SPDX-License-Identifier: MIT
-# Public SSH host keys, populated after verifying fingerprints through a trusted channel.
-# Do not treat an unverified ssh-keyscan response as enrollment evidence.

@@ -15,10 +15,12 @@ let
   # Render inventory context defaults with the roles selected for this host.
   env = { MEISTER_NODE_ID = config.networking.hostName; } // ms.context.defaults;
 
-  rendered = import ./lib/render.nix {
-    inherit lib;
-    cloudAuth = ms.cloud.authFragments;
-  } env;
+  rendered = import ./lib/render.nix
+    {
+      inherit lib;
+      cloudAuth = ms.cloud.authFragments;
+    }
+    env;
 
   # Turn MEISTER_HOSTS entries into host-file mappings for local name resolution.
   hostEntries =
@@ -31,8 +33,9 @@ let
         else { name = builtins.head f; value = builtins.tail f; };
     in
     if ms.context.defaults ? MEISTER_HOSTS then
-      builtins.listToAttrs (lib.filter (p: p != null)
-        (map pair (lib.splitString "," ms.context.defaults.MEISTER_HOSTS)))
+      builtins.listToAttrs
+        (lib.filter (p: p != null)
+          (map pair (lib.splitString "," ms.context.defaults.MEISTER_HOSTS)))
     else { };
 in
 {

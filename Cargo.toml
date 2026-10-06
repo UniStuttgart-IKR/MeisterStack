@@ -4,7 +4,6 @@ members = [
 	"shared/*",
 	"components/*",
 	"drivers/*",
-	"tools/meister-deploy",
 ]
 
 [workspace.package]
