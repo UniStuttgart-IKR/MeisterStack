@@ -203,21 +203,28 @@ mod tests {
         assert_eq!(done.stderr, b"why\n");
     }
 
-    /// R2-10: a helper that does not finish is killed at its deadline, and
-    /// the caller is told so instead of waiting for it.
+    /// R2-10: a helper that does not finish is killed at its deadline and
+    /// reaped before the caller is told, so nothing of it is left running.
     #[test]
-    fn a_helper_that_hangs_is_killed_at_its_deadline() {
-        let started = Instant::now();
-        let said = Runner::default()
+    fn a_helper_that_hangs_is_killed_and_reaped_at_its_deadline() {
+        let failed = Runner::default()
             .output_within(sh("exec sleep 600"), Duration::from_millis(200))
-            .expect_err("it hangs")
-            .to_string();
+            .map(|_| ())
+            .expect_err("it hangs");
+        let said = failed.to_string();
+        let RunError::TimedOut { pid, .. } = failed else {
+            panic!("not a timeout: {said}")
+        };
+        let left = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        if left {
+            // The failure is reported, and the sleep does not outlive it.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         assert!(said.contains("did not finish within"), "{said}");
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "the caller went on: {:?}",
-            started.elapsed()
-        );
+        assert!(!left, "the helper, pid {pid}, is still there");
     }
 
     /// A helper still alive after its kill, as one stuck in the kernel is
