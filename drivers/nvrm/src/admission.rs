@@ -75,7 +75,8 @@ fn refuse_instance_overflow(live: &[&Claim], vgpu: Option<&VgpuType>) -> device:
         .count() as u64;
     if same_type >= vgpu.max_instance {
         return Err(DeviceError::InvalidSpec(format!(
-            "vGPU type {} allows {} instance(s) on this card, {} already active",
+            "vGPU type {} allows {} instance(s) on this card, {} already admitted on this node \
+             (running or stopped)",
             vgpu.vgpu_type, vgpu.max_instance, same_type
         )));
     }
@@ -166,8 +167,8 @@ fn refuse_budget_overrun(
     match budget {
         Some(budget) if used.saturating_add(wants) > budget => {
             Err(DeviceError::InvalidSpec(format!(
-                "vram budget exceeded: {used} MiB active + {wants} MiB requested > \
-                 {budget} MiB (device {id})"
+                "vram budget exceeded: {used} MiB admitted on this node (running or stopped) \
+                 + {wants} MiB requested > {budget} MiB (device {id})"
             )))
         }
         Some(_) => Ok(()),
@@ -362,7 +363,12 @@ pub(crate) mod tests {
     fn without_a_vgpu_type_the_card_rule_does_not_apply() {
         refuse_card_overcommit(&[&capped(6000)], &capped(6000), &device())
             .expect("no card size to measure against");
-        refuse_budget_overrun(&[&capped(6000)], &capped(6000), Some(8192), &device())
-            .expect_err("but a budget still holds");
+        let said = refuse_budget_overrun(&[&capped(6000)], &capped(6000), Some(8192), &device())
+            .expect_err("but a budget still holds")
+            .to_string();
+        assert!(
+            said.contains("6000 MiB admitted on this node (running or stopped)"),
+            "{said}"
+        );
     }
 }

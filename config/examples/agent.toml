@@ -254,9 +254,9 @@ default_bridge = "meister_br0"
 # vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
 # Under a budget every nvrm device needs a VRAM limit (a cap, a profile
 # size or a vgpu_type); one without could exceed it alone and is refused.
-# Without either, overcommit is only warned about. Admission counts the
-# devices of every vm this node has a record of, running or stopped: a
-# stopped vm keeps its share.
+# Without either, nothing caps the sum; the agent notes it at debug level
+# only. Admission counts the devices of every vm this node has a record of,
+# running or stopped: a stopped vm keeps its share.
 #vram_budget_mib = 8192
 
 # The host's share of the card in MiB that vgpuprofile subtracts before it

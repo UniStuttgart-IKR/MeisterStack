@@ -86,8 +86,8 @@ vgpuprofile = "./bin/vgpuprofile"
 # vgpu_type beside them (a size of its own is vgpu_type = "<N>M").
 # Under a budget every nvrm device needs a VRAM limit (a cap, a profile
 # size or a vgpu_type); one without could exceed it alone and is refused.
-# Without either, overcommit is only warned about. Every vm on record
-# counts, running or stopped.
+# Without either, nothing caps the sum; the agent notes it at debug level
+# only. Every vm on record counts, running or stopped.
 # vram_budget_mib = 8192               # optional; unset = no node budget beyond the card rule above
 
 # The host's share of the card in MiB that vgpuprofile subtracts before it
