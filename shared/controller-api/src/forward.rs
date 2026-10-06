@@ -110,7 +110,7 @@ pub async fn ask(sibling: &Sibling, endpoint: &str, path: &str) -> anyhow::Resul
         bail!(
             "the replica at {endpoint} answered {}: {}",
             answer.status,
-            said(&answer.body)
+            refusal_in(&answer.body).message
         );
     }
     Ok(answer.body)
@@ -196,16 +196,23 @@ async fn relay_once(
     Ok(Answer { status, body })
 }
 
-/// The `message` of this API's `Status` refusal, or the body as it stands
-/// when it is not one.
-fn said(body: &Bytes) -> String {
+/// The `message` and `reason` of this API's `Status` refusal, or the body as
+/// it stands and no reason when it is not one.
+///
+/// Both halves of a forward read a sibling's refusal with this. A read needs
+/// only the message; a forwarded write also needs the reason, so that a
+/// node's typed refusal (`CannotServe`, `CannotSend`) survives the hop as a
+/// word rather than as prose.
+pub fn refusal_in(body: &Bytes) -> crate::Refusal {
     #[derive(serde::Deserialize)]
-    struct Refusal {
+    struct Status {
         message: String,
+        #[serde(default)]
+        reason: String,
     }
-    match serde_json::from_slice::<Refusal>(body) {
-        Ok(r) => r.message,
-        Err(_) => String::from_utf8_lossy(body).trim().to_string(),
+    match serde_json::from_slice::<Status>(body) {
+        Ok(status) => crate::Refusal::new(status.message, status.reason),
+        Err(_) => crate::Refusal::plain(String::from_utf8_lossy(body).trim()),
     }
 }
 
@@ -335,6 +342,36 @@ mod tests {
             SIBLING_TIMEOUT,
             "and it waited exactly the budget, not the kernel's"
         );
+    }
+
+    /// What a replica's REST edge answers a refused forward with, read back
+    /// the way both halves of a forward read it: the node's word stays a word.
+    #[tokio::test]
+    async fn a_sibling_refusal_keeps_its_reason_across_the_hop() {
+        use axum::response::IntoResponse;
+        let answered = crate::ApiError::new(
+            hyper::StatusCode::CONFLICT,
+            crate::CANNOT_SEND,
+            "vm uid-1 has 1 device(s) (crosvm-gpu)",
+        )
+        .into_response();
+        let body = answered.into_body().collect().await.unwrap().to_bytes();
+
+        let refusal = refusal_in(&body);
+
+        assert_eq!(refusal.reason, crate::CANNOT_SEND);
+        assert_eq!(refusal.message, "vm uid-1 has 1 device(s) (crosvm-gpu)");
+    }
+
+    /// A body that is not this API's refusal (a proxy's page, a peer that
+    /// predates the envelope) is the sentence as it stands, with no word
+    /// invented for it.
+    #[test]
+    fn a_body_that_is_not_a_refusal_is_read_as_it_stands() {
+        let refusal = refusal_in(&Bytes::from_static(b" 502 Bad Gateway\n"));
+
+        assert_eq!(refusal.message, "502 Bad Gateway");
+        assert_eq!(refusal.reason, "");
     }
 
     /// A needle is a string somebody typed, and it travels in a query.

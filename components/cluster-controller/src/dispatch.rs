@@ -279,7 +279,7 @@ impl Dispatch {
                     // rejection back as the node said it — so collapsing this
                     // into "the forward failed" would lose the only thing
                     // worth reading.
-                    let refusal = refusal_in(&answer.body);
+                    let refusal = controller_api::forward::refusal_in(&answer.body);
                     if TYPED_REFUSALS.contains(&refusal.reason.as_str()) {
                         return Err(anyhow::Error::new(refusal).context(format!(
                             "the replica at {endpoint} answered {}",
@@ -318,22 +318,6 @@ fn typed_refusal(e: &anyhow::Error) -> Option<(&'static str, &controller_api::Re
         .into_iter()
         .find(|word| *word == refusal.reason)?;
     Some((word, refusal))
-}
-
-/// The `message` and `reason` of this API's refusal, or the body as it stands
-/// and no reason when it is not one. The read half of the same forward has
-/// this; a write needs it for exactly the same reason.
-fn refusal_in(body: &bytes::Bytes) -> controller_api::Refusal {
-    #[derive(serde::Deserialize)]
-    struct Status {
-        message: String,
-        #[serde(default)]
-        reason: String,
-    }
-    match serde_json::from_slice::<Status>(body) {
-        Ok(status) => controller_api::Refusal::new(status.message, status.reason),
-        Err(_) => controller_api::Refusal::plain(String::from_utf8_lossy(body).trim()),
-    }
 }
 
 /// Serve a sibling-forwarded command with second-hop forwarding disabled.
