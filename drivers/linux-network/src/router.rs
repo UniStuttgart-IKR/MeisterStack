@@ -765,8 +765,11 @@ impl crate::LinuxNetworkDriver {
         Self::store_record(&g.state_dir, spec).await?;
 
         // Activation last: a new or standby router starts answering ARP only after its rules
-        // and its active record are in place. A router that was active already keeps answering
-        // throughout a pass that ensures it again, failed steps included (R2-1).
+        // and its active record are in place. A router that was active already is never
+        // silenced by a pass that ensures it again, failed steps included (R2-1). It does not
+        // answer throughout, though: the flush above takes its addresses, and the routes over
+        // them, until they are set again, for a moment on every pass and until a retry when an
+        // add or the default route fails (NL2-3).
         if spec.active {
             self.activate(&netns, spec, recorded_active).await?;
         }
