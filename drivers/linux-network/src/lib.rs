@@ -661,6 +661,14 @@ impl BridgeDriver for LinuxNetworkDriver {
         }
     }
 
+    async fn silence_router(&self, id: &RouterId) -> networking::Result<()> {
+        // A node with no gateway slot never built a router, so none of them answers here.
+        match self.gateway.is_some() {
+            true => self.silence_router_impl(id).await,
+            false => Ok(()),
+        }
+    }
+
     async fn fall_silent(&self) -> networking::Result<networking::Silencing> {
         // A node with no gateway slot holds no router and has nothing to stop
         // saying — the same answer `sweep_routers` gives one line up.

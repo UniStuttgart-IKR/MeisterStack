@@ -50,10 +50,37 @@ pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> 
     })
 }
 
+/// Silence the router a demotion names, by its id alone (NL2-2).
+///
+/// Everything else in the command can be refused (a NAT kind from a newer controller, a
+/// provider network this node no longer serves), and a refused demotion would leave the old
+/// namespace answering ARP for an address the controller has made active on another node. Only
+/// an id that does not parse names no namespace. A node without a bridge driver built none.
+async fn silence_demoted(
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
+    id: &str,
+) -> anyhow::Result<()> {
+    let Some(bridge) = bridge else {
+        return Ok(());
+    };
+    let id: RouterId = id.parse().context("router id")?;
+    bridge
+        .silence_router(&id)
+        .await
+        .with_context(|| format!("silencing router {id} ahead of its demotion"))
+}
+
 impl Agent {
-    /// Validate the provider-network capability, then ensure the router under
-    /// the operations lock. Repeated ensure requests also update active/standby state.
+    /// Silence a demotion first, then validate the provider-network capability and ensure the
+    /// router under the operations lock. Repeated ensure requests also update active/standby
+    /// state.
     pub(super) async fn handle_ensure_router(&self, r: proto::EnsureRouter) -> anyhow::Result<()> {
+        // Before the command is read any further: see `silence_demoted`. The driver's own pass
+        // silences a demotion again as its first step.
+        if !r.active {
+            let _guard = self.ops.lock().await;
+            silence_demoted(self.reconciler.drivers().bridge.as_deref(), &r.id).await?;
+        }
         let spec = router_spec(r)?;
         cannot_serve(self.network.validate_router(&spec.physnet))?;
         let bridge = cannot_serve(
@@ -182,5 +209,71 @@ mod tests {
         let mut m = message();
         m.id = "not-a-uuid".into();
         assert!(router_spec(m).is_err());
+    }
+
+    /// A bridge that records which routers it was told to silence, or refuses to.
+    #[derive(Default)]
+    struct SilencingBridge {
+        silenced: std::sync::Mutex<Vec<RouterId>>,
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::networking::BridgeDriver for SilencingBridge {
+        async fn ensure(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn ensure_address(
+            &self,
+            _name: &str,
+            _addr: std::net::IpAddr,
+            _prefix_len: u8,
+        ) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn destroy(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn silence_router(&self, id: &RouterId) -> agent_api::networking::Result<()> {
+            if self.refuse {
+                return Err(agent_api::networking::NetworkError::Backend(anyhow!(
+                    "permission denied"
+                )));
+            }
+            self.silenced.lock().unwrap().push(*id);
+            Ok(())
+        }
+    }
+
+    /// A demotion this agent cannot read is silenced all the same, by its id (NL2-2).
+    #[tokio::test]
+    async fn a_demotion_the_agent_refuses_to_read_is_silenced_all_the_same() {
+        let mut m = message();
+        m.active = false;
+        m.nats = vec![nat("dnat-and-snat", "203.0.113.55", "10.7.1.9")];
+        let bridge = SilencingBridge::default();
+
+        silence_demoted(Some(&bridge), &m.id)
+            .await
+            .expect("silenced");
+
+        assert!(router_spec(m.clone()).is_err(), "the rest of it is refused");
+        let id: RouterId = m.id.parse().unwrap();
+        assert_eq!(*bridge.silenced.lock().unwrap(), [id]);
+    }
+
+    /// A demotion that cannot be silenced goes no further: the error is the answer (NL2-2).
+    #[tokio::test]
+    async fn a_demotion_that_cannot_be_silenced_is_an_error() {
+        let bridge = SilencingBridge {
+            refuse: true,
+            ..Default::default()
+        };
+
+        let err = silence_demoted(Some(&bridge), &message().id)
+            .await
+            .expect_err("a router that may still answer is not demoted");
+
+        assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
     }
 }

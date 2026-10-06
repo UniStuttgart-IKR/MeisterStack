@@ -161,6 +161,15 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Silence one router without destroying its namespace: it stops answering ARP and stops
+    /// claiming to be active, so it announces nothing. Used ahead of a demotion, before the rest
+    /// of the command is read, so a command this node refuses cannot leave the old router
+    /// answering (NL2-2). An absent router is silent already; the default builds no router and
+    /// has none to silence.
+    async fn silence_router(&self, _id: &RouterId) -> Result<()> {
+        Ok(())
+    }
+
     /// Silence all local routers without destroying their namespaces. Used on
     /// shutdown and by the dead man to stop stale ARP and routing activity
     /// before another gateway takes over. A later `EnsureRouter` can reactivate
@@ -445,6 +454,17 @@ mod tests {
         assert!(
             NoGatewaySlot
                 .destroy_router(&RouterId::from_u128(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A driver that builds no router has none answering, so silencing one is done (NL2-2).
+    #[tokio::test]
+    async fn silencing_a_router_that_was_never_built_is_done_and_not_refused() {
+        assert!(
+            NoGatewaySlot
+                .silence_router(&RouterId::from_u128(1))
                 .await
                 .is_ok()
         );

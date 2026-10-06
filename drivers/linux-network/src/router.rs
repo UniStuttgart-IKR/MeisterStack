@@ -606,10 +606,12 @@ impl crate::LinuxNetworkDriver {
         // A name whose namespace cannot be entered is taken back first, so that what follows
         // sees the namespace that is really there.
         self.clear_dead_netns(&netns).await;
-        // A demotion silences the old namespace before anything that can fail: a pass stopping
-        // halfway would leave it answering ARP for an address the controller has made active on
-        // another node (N2). Its record says standby from here on, so a pass that stops later
-        // no longer lists the router active nor announces it (NL2-1).
+        // A demotion silences the old namespace before anything else in this pass can fail: a
+        // pass stopping halfway would leave it answering ARP for an address the controller has
+        // made active on another node (N2). A caller that refuses the command before this pass
+        // silences the router through `silence_router` (NL2-2). Its record says standby from
+        // here on, so a pass that stops later no longer lists the router active nor announces
+        // it (NL2-1).
         if !spec.active {
             self.silence_router_impl(&spec.id).await?;
         }
@@ -914,7 +916,10 @@ impl crate::LinuxNetworkDriver {
         );
         let mut outcome = networking::Silencing::default();
         for id in routers {
-            match self.silence_router(&dir, id, live.as_deref().ok()).await {
+            match self
+                .silence_netns_and_record(&dir, id, live.as_deref().ok())
+                .await
+            {
                 Ok(()) => outcome.silenced.push(id),
                 Err(e) => {
                     warn!(router = %id, error = %format!("{e:#}"),
@@ -932,7 +937,7 @@ impl crate::LinuxNetworkDriver {
 
     /// Silence one router: its namespace unless the kernel's list proves it absent, and its
     /// record if that still says active. Both are tried; the first failure is the answer.
-    async fn silence_router(
+    async fn silence_netns_and_record(
         &self,
         dir: &Path,
         id: RouterId,
@@ -992,7 +997,8 @@ impl crate::LinuxNetworkDriver {
     pub(crate) async fn silence_router_impl(&self, id: &RouterId) -> networking::Result<()> {
         let dir = &self.gateway()?.state_dir;
         let live = self.netns_present().await;
-        self.silence_router(dir, *id, live.as_deref().ok()).await?;
+        self.silence_netns_and_record(dir, *id, live.as_deref().ok())
+            .await?;
         live.map(|_| ())
     }
 
