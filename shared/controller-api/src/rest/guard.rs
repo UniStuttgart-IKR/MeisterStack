@@ -409,9 +409,15 @@ impl Caller {
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Authenticator order; defaults to mtls then bearer, omitting unconfigured links.
-    /// An empty resulting chain allows anonymous access. First rejection ends the
-    /// chain, so order matters when a request carries multiple credentials.
+    /// An empty resulting chain is refused unless `anonymous` is set. First rejection
+    /// ends the chain, so order matters when a request carries multiple credentials.
     pub chain: Option<Vec<String>>,
+    /// Admit every request without credentials. Only valid when no authenticator
+    /// is configured, and off by default: an empty chain serves anybody as an
+    /// administrator, so it has to be asked for rather than fallen into by a
+    /// configuration that forgot its client CA.
+    #[serde(default)]
+    pub anonymous: bool,
     /// File containing a static development/bootstrap token without built-in expiry
     /// or rotation. Replacing the credential requires operational management.
     pub bearer_token_file: Option<std::path::PathBuf>,
@@ -492,6 +498,7 @@ impl Tier {
 
 /// Resolve authenticator configuration without file or network access.
 /// Default chains omit unconfigured links; explicit unusable links are errors.
+/// An empty chain needs `auth.anonymous`, and that flag needs an empty chain.
 /// Session-serving processes must meet the mTLS requirement. File readability,
 /// file contents and provider discovery are checked during actual construction.
 pub fn check_chain(
@@ -558,9 +565,28 @@ pub fn check_chain(
     }
     // Last, so that a chain naming a link it cannot build hears about THAT
     // first: "no bearer_token_file" is a sentence about one line of the
-    // config, and this one is about the whole shape of it.
+    // config, and these two are about the whole shape of it.
     mtls_or_no_peers(&names, explicit, serves_sessions)?;
+    anonymous_only_when_asked(&built, cfg.anonymous)?;
     Ok(built)
+}
+
+/// Refuse an empty chain that nobody asked for, and a request for anonymous
+/// access beside authenticators that would never let it happen.
+pub(super) fn anonymous_only_when_asked(built: &[&str], anonymous: bool) -> Result<()> {
+    match (built.is_empty(), anonymous) {
+        (true, false) => anyhow::bail!(
+            "no authenticator is configured, so every request would be served anonymously \
+             and with every permission. Configure one (client_ca for mtls, [auth.oidc], or \
+             auth.bearer_token_file), or write `anonymous = true` under [auth] for a \
+             throwaway local controller."
+        ),
+        (false, true) => anyhow::bail!(
+            "auth.anonymous = true, and the chain still builds {built:?}: a request without \
+             credentials would be refused anyway. Remove one of the two."
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Load files and construct the authenticators selected by `check_chain`.

@@ -931,7 +931,7 @@ async fn the_discovery_route_answers_a_caller_that_has_no_credential() {
 #[test]
 fn a_chain_names_the_links_it_actually_built() {
     assert_eq!(
-        build_chain(&cfg(""), None, None, Tier::Cloud, false)
+        build_chain(&cfg("anonymous = true"), None, None, Tier::Cloud, false)
             .unwrap()
             .describe(),
         "none"
@@ -1065,16 +1065,31 @@ fn an_envelope_naming_another_kind_is_refused() {
     assert!(check_envelope(&counter).is_err());
 }
 
-/// The default: an `[auth]` table that configures nothing builds nothing,
-/// and nothing is the anonymous mode.
+/// An `[auth]` table that configures nothing would build nothing, and an
+/// empty chain serves everybody: that is a start-up error, not a mode.
 #[test]
-fn an_auth_table_with_nothing_in_it_is_still_anonymous() {
-    let chain = build_chain(&cfg(""), None, None, Tier::Cloud, false).unwrap();
+fn an_auth_table_with_nothing_in_it_is_refused() {
+    let err = build_chain(&cfg(""), None, None, Tier::Cloud, false).unwrap_err();
+    assert!(err.to_string().contains("anonymous = true"), "{err}");
+}
+
+/// The anonymous mode exists, and only for whoever writes it down.
+#[test]
+fn anonymous_access_is_built_only_when_asked_for() {
+    let chain = build_chain(&cfg("anonymous = true"), None, None, Tier::Cloud, false).unwrap();
     assert!(chain.is_empty());
     assert_eq!(
         chain.authenticate(&AuthRequest::default()).unwrap(),
         Authenticated::Anonymous
     );
+}
+
+/// Anonymous access beside a link that refuses credential-less requests is
+/// two answers to one question, and neither may win silently.
+#[test]
+fn asking_for_anonymous_access_beside_an_authenticator_is_refused() {
+    let err = check_chain(&cfg("anonymous = true"), true, Tier::Cloud, false).unwrap_err();
+    assert!(err.to_string().contains("mtls"), "it names the link: {err}");
 }
 
 /// A chain that names a door it cannot shut is an operator who believes
@@ -1128,9 +1143,9 @@ fn a_chain_without_mtls_is_a_startup_error_where_there_are_peers() {
     assert_eq!(chain.describe(), "bearer");
 
     // And a DEFAULTED chain is never this error: it names mtls already,
-    // and it drops the link when there is no CA — which is the anonymous
-    // lab that has always worked.
-    assert!(build_chain(&cfg(""), None, None, Tier::Cloud, true).is_ok());
+    // and it drops the link when there is no CA — which leaves the explicitly
+    // anonymous controller.
+    assert!(build_chain(&cfg("anonymous = true"), None, None, Tier::Cloud, true).is_ok());
     let _ = std::fs::remove_file(&token);
 }
 

@@ -158,6 +158,11 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # A host without nix/managed.nix gets defaults that fail closed.
+          standalone-host = import ./nix/tests/standalone-host.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # A managed host's units name the store, never /opt.
           managed-uses-the-package = import ./nix/tests/managed-uses-the-package.nix {
             inherit nixpkgs lib pkgs system self;

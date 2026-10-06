@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+# Evaluate hosts that import nixosModules.services without nix/managed.nix,
+# the way an existing NixOS configuration does. Each expectation names one
+# default that has to fail closed on such a host.
+{ nixpkgs, lib, pkgs, system, self }:
+let
+  # A host that is valid apart from what the modules under test contribute,
+  # so that every failed assertion is one of ours.
+  probe = modules: (nixpkgs.lib.nixosSystem {
+    modules = [
+      self.nixosModules.services
+      {
+        nixpkgs.hostPlatform = system;
+        fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+        boot.loader.grub.device = "nodev";
+        system.stateVersion = "25.11";
+      }
+    ] ++ modules;
+  }).config;
+
+  failedAssertions = c: map (a: a.message) (lib.filter (a: !a.assertion) c.assertions);
+  refusesWith = needle: c: lib.any (lib.hasInfix needle) (failedAssertions c);
+  accepted = c: failedAssertions c == [ ];
+
+  cloud = extra: probe [{ meisterstack.roles = [ "cloud" ]; } extra];
+  cluster = extra: probe [{ meisterstack.roles = [ "cluster" ]; } extra];
+
+  expectations = {
+    "a cloud that names no authenticator is refused" =
+      refusesWith "names no authenticator" (cloud { });
+    "a cloud that names its chain is accepted" =
+      accepted (cloud { meisterstack.cloud.settings.auth.chain = [ "mtls" ]; });
+    "a cluster names mtls without being asked" =
+      accepted (cluster { });
+    "a cluster whose chain was emptied is refused" =
+      refusesWith "auth.chain is empty" (cluster { meisterstack.cluster.settings.auth.chain = [ ]; });
+  };
+
+  broken = lib.attrNames (lib.filterAttrs (_: holds: !holds) expectations);
+in
+pkgs.runCommand "standalone-host" { } (
+  if broken == [ ] then ''
+    ${lib.concatMapStrings (e: "echo ${lib.escapeShellArg "ok   ${e}"}\n") (lib.attrNames expectations)}
+    touch $out
+  '' else ''
+    ${lib.concatMapStrings (e: "echo ${lib.escapeShellArg "FAIL ${e}"}\n") broken}
+    echo "-> a host without nix/managed.nix got a default that does not fail closed"
+    exit 1
+  ''
+)

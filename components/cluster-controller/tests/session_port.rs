@@ -68,7 +68,8 @@ fn a_session_port_it_cannot_bind_is_not_a_ready_replica() {
              listen_api = \"127.0.0.1:{api}\"\n\
              listen_session = \"{session}\"\n\
              etcd_endpoints = \"{}\"\n\
-             etcd_prefix = \"/session-port-test/{}\"\n",
+             etcd_prefix = \"/session-port-test/{}\"\n\
+             [auth]\nanonymous = true\n",
             etcd(),
             std::process::id()
         ),
