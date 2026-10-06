@@ -400,6 +400,21 @@ pub fn inject_nic_list(spec: &mut serde_json::Value, field: &str, values: &[Stri
     touched
 }
 
+/// `spec` without the address lists of its NICs: what of a VM's NICs holds
+/// still while the addresses it may use come and go. A tenant's floating
+/// addresses and routed subnets change while its VMs exist, and the cloud
+/// sends the lists as they are now with every hand-down.
+pub fn without_nic_lists(spec: &serde_json::Value) -> serde_json::Value {
+    let mut out = spec.clone();
+    if let Some(nics) = out.get_mut("nics").and_then(|n| n.as_array_mut()) {
+        for nic in nics.iter_mut().filter_map(|n| n.as_object_mut()) {
+            nic.remove(NIC_FLOATING_IPS);
+            nic.remove(NIC_ROUTED_SUBNETS);
+        }
+    }
+    out
+}
+
 /// The NIC field the addresses a VM may claim travel in.
 pub const NIC_FLOATING_IPS: &str = "floating_ips";
 /// And the one its tenant's own subnets travel in.
@@ -722,5 +737,27 @@ mod tests {
             0
         );
         assert_eq!(none, serde_json::json!({ "vcpus": 2 }));
+    }
+
+    /// The address lists come off every NIC, and nothing else does: not the
+    /// wire a NIC is on, and not a VM without NICs.
+    #[test]
+    fn without_nic_lists_takes_the_addresses_and_leaves_the_wires() {
+        let spec = serde_json::json!({
+            "vcpus": 2,
+            "nics": [
+                { "vxlan_id": 10_007, "floating_ips": ["10.255.0.7"], "routed_subnets": ["10.7.1.0/24"] },
+                { "physnet": "ext" }
+            ]
+        });
+        assert_eq!(
+            without_nic_lists(&spec),
+            serde_json::json!({
+                "vcpus": 2,
+                "nics": [ { "vxlan_id": 10_007 }, { "physnet": "ext" } ]
+            })
+        );
+        let bare = serde_json::json!({ "vcpus": 2 });
+        assert_eq!(without_nic_lists(&bare), bare);
     }
 }

@@ -952,14 +952,24 @@ fn refuse_unless_ours(current: &Vm, c: &proto::CreateVm) -> anyhow::Result<()> {
 }
 
 /// Detect spec changes and allow only referenced-disk hot-plug after the boot
-/// entry, using the same shape rule as both REST APIs. Reject other changes
-/// rather than acknowledging a spec this tier did not store.
+/// entry, using the same shape rule as both REST APIs, and new NIC address
+/// lists. Reject other changes rather than acknowledging a spec this tier did
+/// not store.
+///
+/// The address lists are the cloud's word as of this send (`bind_nics`): a
+/// tenant's floating addresses and routed subnets move while its VMs exist.
+/// Held to the lists it was created with, every later send of the VM was
+/// refused, and its stop, its disks and its labels with it. The lists are
+/// taken with the send; a running VM's tap takes them when its node next
+/// provisions it (`floating::inject_nic_list`). (Nachlese NL2-C1)
 fn shape_moved(current: &Vm, spec: &VmSpec, name: &str) -> anyhow::Result<bool> {
     let moved = current.spec.vm != spec.vm;
-    if moved && !controller_api::vm_shape_unchanged(&current.spec.vm, &spec.vm) {
+    let fixed = controller_api::floating::without_nic_lists;
+    if moved && !controller_api::vm_shape_unchanged(&fixed(&current.spec.vm), &fixed(&spec.vm)) {
         bail!(
             "vm {name} arrived with a spec.vm that is not the stored one plus appended volume \
-             references; the shape of a vm is fixed once it exists"
+             references and the addresses its nics may use; the shape of a vm is fixed once it \
+             exists"
         );
     }
     Ok(moved)
@@ -1005,7 +1015,7 @@ fn note_drift(
     placement_moved: bool,
 ) {
     if shape_moved {
-        info!(vm = %name, "spec.vm volumes updated from the cloud");
+        info!(vm = %name, "spec.vm volumes or nic addresses updated from the cloud");
     } else if evacuation_moved {
         info!(vm = %name, evacuation = spec.evacuation.as_str(),
               "evacuation policy updated from the cloud");
@@ -2811,6 +2821,95 @@ mod tests {
                 .await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// A cloud VM `run_strategy`, on the tenant overlay, with the floating addresses `floating`.
+    fn floating_on(run_strategy: &str, floating: &[&str]) -> proto::CreateVm {
+        proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": run_strategy,
+                "vm": { "vcpus": 1, "nics": [{}] },
+            })
+            .to_string(),
+            ..create(Some(10_007), floating, &["10.7.1.0/24"])
+        }
+    }
+
+    /// A floating address that moved after the VM was made does not make every later send of
+    /// it a new shape: the send is taken, its stop arrives, and the NIC carries the addresses
+    /// as the cloud sent them now — a released one included. (Nachlese NL2-C1)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_with_other_floating_addresses_is_taken_with_its_stop() {
+        let store = crate::test_etcd::fresh_store("nl2-c1-test").await;
+        handle_create(&store, floating_on("Running", &["10.255.0.7"]), "")
+            .await
+            .expect("created");
+        let before: Vm = store.get("web-1").await.expect("the cloud's vm");
+
+        handle_create(&store, floating_on("Stopped", &["10.255.0.9"]), "")
+            .await
+            .expect("the send is taken");
+
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Stopped
+        );
+        assert_eq!(
+            after.spec.vm["nics"][0]["floating_ips"],
+            serde_json::json!(["10.255.0.9"])
+        );
+        assert_eq!(after.metadata.generation, before.metadata.generation + 1);
+
+        handle_create(&store, floating_on("Stopped", &[]), "")
+            .await
+            .expect("the release is taken");
+        let released: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert!(released.spec.vm["nics"][0].get("floating_ips").is_none());
+        assert_eq!(
+            released.spec.vm["nics"][0]["routed_subnets"],
+            serde_json::json!(["10.7.1.0/24"])
+        );
+    }
+
+    /// The address lists are all that may move with them: a send that also adds a NIC is
+    /// refused, and the stored VM keeps its addresses. (Nachlese NL2-C1)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_resend_with_other_addresses_and_another_nic_is_refused() {
+        let store = crate::test_etcd::fresh_store("nl2-c1-test").await;
+        handle_create(&store, floating_on("Running", &["10.255.0.7"]), "")
+            .await
+            .expect("created");
+        let two_nics = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": "Stopped",
+                "vm": { "vcpus": 1, "nics": [{}, {}] },
+            })
+            .to_string(),
+            ..floating_on("Stopped", &["10.255.0.9"])
+        };
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, two_nics, "")
+                .await
+                .expect_err("a nic more")
+        );
+
+        assert!(why.contains("shape of a vm is fixed"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("the cloud's vm");
+        assert_eq!(
+            after.spec.vm["nics"][0]["floating_ips"],
+            serde_json::json!(["10.255.0.7"])
+        );
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Running
+        );
     }
 
     /// Only the cloud's VMs waiting for a node travel up, and no more of them than one status
