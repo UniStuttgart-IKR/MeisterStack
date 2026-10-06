@@ -17,7 +17,6 @@ use agent_api::device::{
     self, ClaimedDevice, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec,
     PartitionSpec,
 };
-use anyhow::Context;
 use backend::{Backend, BackendIo, BackendKind};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
@@ -31,6 +30,7 @@ mod vgpu;
 
 use admission::{Claim, Wanted};
 use ledger::{Existing, Ledger, Reservation};
+use vgpu::ResolveError;
 pub use vgpu::VgpuType;
 
 /// VIRTIO_ID_NVRM, the device type Leandro's guest module binds to.
@@ -408,11 +408,17 @@ impl NvrmDriver {
         if let Some(vgpu) = cached {
             return Ok(Some(vgpu));
         }
-        // Per-VM params may name a type no profile pre-resolved.
+        // Per-VM params may name a type no profile pre-resolved. What the
+        // helper said describes the host (its card, its memory, its driver),
+        // so it goes to the agent log; the caller, maybe a tenant, hears
+        // which types there are.
         let reserve = self.config.host_reserve()?;
         let resolved = resolve_vgpu_type_async(&self.config.vgpuprofile_bin, reserve, vtype)
             .await
-            .map_err(|e| DeviceError::InvalidSpec(format!("{e:#}")))?;
+            .map_err(|e| {
+                warn!(vgpu_type = %vtype, error = %e, "a requested vGPU type did not resolve");
+                DeviceError::InvalidSpec(e.for_tenant(vtype))
+            })?;
         self.vgpu_cache
             .lock()
             .await
@@ -539,13 +545,20 @@ fn host_checks() {
 
 /// Resolve a type against the card, within [`VGPUPROFILE_DEADLINE`]. The
 /// helper returns KEY=VALUE records on stdout and diagnostics on stderr.
-fn resolve_vgpu_type(bin: &Path, host_reserve_mib: u64, vtype: &str) -> anyhow::Result<VgpuType> {
+fn resolve_vgpu_type(
+    bin: &Path,
+    host_reserve_mib: u64,
+    vtype: &str,
+) -> Result<VgpuType, ResolveError> {
     let out = bounded::output_within(
         vgpuprofile_select(bin, host_reserve_mib, vtype),
         VGPUPROFILE_DEADLINE,
     )
-    .with_context(|| format!("running {}", bin.display()))?;
-    vgpu_from_output(vtype, &out)
+    .map_err(|source| ResolveError::Run {
+        bin: bin.to_path_buf(),
+        source,
+    })?;
+    vgpu::from_select(vtype, &out)
 }
 
 /// The same off the runtime's workers, so a slow card stalls no other task.
@@ -553,11 +566,11 @@ async fn resolve_vgpu_type_async(
     bin: &Path,
     host_reserve_mib: u64,
     vtype: &str,
-) -> anyhow::Result<VgpuType> {
+) -> Result<VgpuType, ResolveError> {
     let (bin, vtype) = (bin.to_path_buf(), vtype.to_string());
     tokio::task::spawn_blocking(move || resolve_vgpu_type(&bin, host_reserve_mib, &vtype))
         .await
-        .context("the task asking vgpuprofile")?
+        .map_err(|e| ResolveError::Task(e.to_string()))?
 }
 
 /// `vgpuprofile --select <type>` with the node's host reserve and none of the
@@ -575,32 +588,6 @@ fn vgpuprofile_select(bin: &Path, host_reserve_mib: u64, vtype: &str) -> std::pr
 /// nothing that could steer it.
 fn inherited_env() -> impl Iterator<Item = (String, String)> {
     std::env::vars().filter(|(k, _)| k == "PATH" || k == "HOME")
-}
-
-fn vgpu_from_output(vtype: &str, out: &bounded::Finished) -> anyhow::Result<VgpuType> {
-    if !out.status.success() {
-        anyhow::bail!(
-            "vgpuprofile --select {vtype} failed ({}): {}",
-            out.status,
-            stderr_excerpt(&out.stderr)
-        );
-    }
-    vgpu::parse_vgpu_select(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// The start of what the helper wrote to stderr, which is where its reason
-/// is: a driver-version panic, or the types the card does offer.
-fn stderr_excerpt(stderr: &[u8]) -> String {
-    const LIMIT: usize = 2048;
-    let said = String::from_utf8_lossy(stderr);
-    let said = said.trim();
-    if said.is_empty() {
-        return "it wrote nothing to stderr".into();
-    }
-    match said.char_indices().nth(LIMIT) {
-        Some((cut, _)) => format!("{}...", &said[..cut]),
-        None => said.to_string(),
-    }
 }
 
 #[async_trait::async_trait]
@@ -1050,7 +1037,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"vgpuprofile: no type or size \"9Q\" on this card. It offers:\n".to_vec(),
         };
-        let said = vgpu_from_output("9Q", &out)
+        let said = vgpu::from_select("9Q", &out)
             .expect_err("exit 1")
             .to_string();
         assert!(said.contains("no type or size \"9Q\""), "{said}");
@@ -1669,5 +1656,32 @@ mod tests {
             "{said}"
         );
         assert!(!exists(pid), "the backend it spawned was stopped");
+    }
+
+    /// SEC-8: a tenant who asks for a type the card does not offer hears
+    /// which types it does, and none of what `vgpuprofile` said about the
+    /// host's card, memory and driver; that goes to the agent log.
+    #[tokio::test]
+    async fn a_tenant_asking_for_an_unknown_type_hears_only_the_types_on_offer() {
+        let dir = run_dir();
+        let helper = dir.path().join("vgpuprofile");
+        let script = format!(
+            "#!/bin/sh\ncat >&2 <<'SAID'\n{}SAID\nexit 1\n",
+            vgpu::tests::SAID_FOR_9Q
+        );
+        executable(&helper, &script);
+        let mut config = node_in(dir.path());
+        config.vgpuprofile_bin = helper;
+        let driver = NvrmDriver::assemble(config, the_card());
+
+        let spec = mediated(serde_json::json!({ "vgpu_type": "9Q" }));
+        let said = driver
+            .admit(&requested(spec), &[])
+            .await
+            .expect_err("no such type")
+            .to_string();
+        assert!(said.contains("RTX2070-2Q"), "{said}");
+        assert!(!said.contains("board"), "{said}");
+        assert!(!said.contains("MiB"), "{said}");
     }
 }
