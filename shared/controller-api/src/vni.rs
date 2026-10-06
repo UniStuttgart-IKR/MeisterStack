@@ -133,30 +133,49 @@ const WIRE_FIELDS: [&str; 2] = ["physnet", "bridge"];
 /// to choose. Empty and null say nothing, as for `physnet_of`. A VM without
 /// a tenant is the operator's own, and the caller does not ask then.
 pub fn check_tenant_nics(vm: &serde_json::Value) -> std::result::Result<(), ApiError> {
+    match own_wires(vm).first() {
+        Some(wire) => Err(invalid_field(
+            &format!("spec.vm.nics[{}].{}", wire.nic, wire.field),
+            format!(
+                "spec.vm.nics[{}].{} is not a tenant's to set: a tenant's vm hangs on its own \
+                 overlay, and a provider network or a host bridge is shared with everybody on it",
+                wire.nic, wire.field
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One wire a NIC picks for itself: which NIC, by which field, and the name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnWire<'a> {
+    pub nic: usize,
+    pub field: &'static str,
+    pub name: &'a str,
+}
+
+/// Every wire the VM's NICs pick for themselves, NIC by NIC: what
+/// [`check_tenant_nics`] refuses a tenant, as a list two specs can be
+/// compared by. Empty and null pick nothing.
+pub fn own_wires(vm: &serde_json::Value) -> Vec<OwnWire<'_>> {
     let nics = vm
         .get("nics")
         .and_then(|n| n.as_array())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    for (i, nic) in nics.iter().enumerate() {
+    let mut wires = Vec::new();
+    for (nic, entry) in nics.iter().enumerate() {
         for field in WIRE_FIELDS {
-            let named = nic
+            if let Some(name) = entry
                 .get(field)
                 .and_then(|v| v.as_str())
-                .is_some_and(|v| !v.is_empty());
-            if named {
-                return Err(invalid_field(
-                    &format!("spec.vm.nics[{i}].{field}"),
-                    format!(
-                        "spec.vm.nics[{i}].{field} is not a tenant's to set: a tenant's vm \
-                         hangs on its own overlay, and a provider network or a host bridge is \
-                         shared with everybody on it"
-                    ),
-                ));
+                .filter(|v| !v.is_empty())
+            {
+                wires.push(OwnWire { nic, field, name });
             }
         }
     }
-    Ok(())
+    wires
 }
 
 #[cfg(test)]

@@ -823,15 +823,19 @@ async fn handle_create(
         (Err(e), _) => return Err(e.into()),
     };
     refuse_unless_ours(&current, &c)?;
-    if let Some(why) = own_wire {
-        // Kept only by a VM that already hangs on it: a wire the stored VM
-        // does not have is a new one, and refused like a new VM.
-        if controller_api::vni::check_tenant_nics(&current.spec.vm).is_ok() {
-            bail!("{why}");
-        }
-        note_own_wire_kept(store, &current, &why).await;
+    // Kept only by a VM that already hangs on exactly these wires: any other
+    // is a new one, and refused like a new VM — whatever the shape rule says.
+    if let Some(why) = &own_wire
+        && controller_api::vni::own_wires(&current.spec.vm)
+            != controller_api::vni::own_wires(&spec.vm)
+    {
+        bail!("{why}");
     }
     let shape_moved = shape_moved(&current, &spec, &c.name)?;
+    // Said only of a re-send this tier takes: a refused one kept nothing.
+    if let Some(why) = own_wire {
+        note_own_wire_kept(store, &current, &why).await;
+    }
     // `evacuation` drifts like `runStrategy` does and for the same reason:
     // both are the owner's INTENT, both are mutable at the cloud's edge, and
     // this session is the only way either reaches the tier that acts on it.
@@ -2737,6 +2741,55 @@ mod tests {
             "{}",
             said.spec.message
         );
+    }
+
+    /// A VM stored before the rule with its own wire does not take another by a re-send, and is
+    /// not said to have kept one: the refusal kept nothing. (IKR-B67)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_stored_wire_resent_as_another_is_refused_and_not_said_kept() {
+        let store = crate::test_etcd::fresh_store("b67-test").await;
+        let c = on_its_own_wire("Running");
+        let spec: VmSpec = serde_json::from_str(&c.spec_json).unwrap();
+        let stored = store
+            .create(&declared_for_cloud(&c, &spec, ""))
+            .await
+            .expect("a vm from before the rule");
+        let elsewhere = proto::CreateVm {
+            spec_json: serde_json::json!({
+                "tenant": "acme",
+                "runStrategy": "Stopped",
+                "vm": { "vcpus": 1, "nics": [{ "physnet": "other" }] },
+            })
+            .to_string(),
+            ..create(Some(10_007), &[], &[])
+        };
+
+        let why = format!(
+            "{:#}",
+            handle_create(&store, elsewhere, "")
+                .await
+                .expect_err("a tap on another wire")
+        );
+
+        assert!(why.contains("nics[0].physnet"), "{why}");
+        let after: Vm = store.get("web-1").await.expect("still there");
+        assert_eq!(after.spec.vm["nics"][0]["physnet"], "ext");
+        assert_eq!(
+            after.spec.run_strategy,
+            controller_api::RunStrategy::Running
+        );
+        assert!(matches!(
+            store
+                .get::<controller_api::Event>(&events::name_of(
+                    Vm::KIND,
+                    &stored.metadata.uid,
+                    "web-1",
+                    events::reason::TENANT_WIRE_KEPT,
+                ))
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]
