@@ -1094,7 +1094,8 @@ message CreateVm {
   // tenant's network (declared on the tenant, and behind each of its routers).
   // The name is the one the field had before the network's prefixes went into
   // it. Empty means the cloud knows no prefix for the VM; its taps are then
-  // guarded against the floating pool only.
+  // kept off the node's guarded ranges (the floating and routed pools) where
+  // the node has them, and otherwise pinned by MAC only.
   repeated string routed_subnets = 6;
   // The cloud VM's metadata.labels. The cluster stores them on its copy, so a
   // spec.antiAffinity term of another cloud VM finds this one on its node; the

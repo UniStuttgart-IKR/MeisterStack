@@ -23,8 +23,11 @@ pub(super) struct Addresses {
     /// the name the wire had before the network's own prefixes went into it; a field of their
     /// own would be dropped by a cluster or refused by an agent of the release before.
     pub(super) source_prefixes: Vec<String>,
-    /// The objects the two lists above were read out of, each with the
-    /// generation it carried at that moment.
+    /// The FloatingIp and RoutedSubnet objects the two lists above were read
+    /// out of, each with the generation it carried at that moment. The
+    /// prefixes declared on the tenant and those behind its routers are in
+    /// `source_prefixes` too, but neither the Tenant nor a Router is carried
+    /// or stamped: whether a change of theirs reached a node is not recorded.
     ///
     /// The generation is captured HERE and not read again at stamping time,
     /// and that is the whole honesty of the field: an assign that lands

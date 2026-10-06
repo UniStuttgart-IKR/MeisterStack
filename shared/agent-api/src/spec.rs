@@ -137,10 +137,15 @@ pub struct NewNic {
     /// in standalone specs.
     #[serde(default)]
     pub vxlan_id: Option<u32>,
-    /// Floating addresses and routed tenant subnets, defaulting to empty.
+    /// Floating addresses reserved for the VM, defaulting to empty.
     /// Controllers may inject them; standalone specs may supply them directly.
     #[serde(default)]
     pub floating_ips: Vec<String>,
+    /// The prefixes the guest may send from, defaulting to empty: its tenant's
+    /// routed subnets and the prefixes of its tenant's network, declared on the
+    /// tenant and behind each of its routers. Controllers may inject them;
+    /// standalone specs may supply them directly. See
+    /// `crate::networking::NicSpec::routed_subnets`.
     #[serde(default)]
     pub routed_subnets: Vec<String>,
     /// Direct provider-network name, mutually exclusive with vxlan_id.

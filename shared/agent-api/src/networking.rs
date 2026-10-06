@@ -42,9 +42,10 @@ pub struct NicSpec {
     /// floating addresses and the unspecified address. Empty says the
     /// controller knows no address space for the NIC (a tenant that declares
     /// no network prefix and has no router and no routed subnet, a VM of no
-    /// tenant, a standalone spec that names none): the tap is then only kept
-    /// off the floating pool, a known limit until the stack hands out overlay
-    /// addresses itself (IPAM).
+    /// tenant, a standalone spec that names none): the tap is then kept off
+    /// the node's guarded ranges, the cloud's floating and routed pools, where
+    /// the node has them, and otherwise pinned by MAC only; a known limit
+    /// until the stack hands out overlay addresses itself (IPAM).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
     /// Provider physnet for a direct guest connection. Mutually exclusive
