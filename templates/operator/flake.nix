@@ -15,8 +15,13 @@
     # Use the stack's disko input for installation layouts.
     disko.follows = "meisterstack/disko";
 
-    # Optional GPU input; CPU-only fleets do not need it.
-    # leandro.url = "github:…/Leandro";
+    # Optional GPU input; CPU-only fleets do not need it. Pin <rev> to the Leandro revision
+    # that patches/README.md of the meisterstack input names: its cloud-hypervisor patch
+    # series is the one this stack carries, both ends of the vhost-user channel must be on it,
+    # and mkFleet refuses a leandro input on another series. Leandro tracks nixos-26.05 and
+    # this template nixos-25.11, so do not add `follows` (the line below) before moving
+    # nixpkgs to 26.05: it would build Leandro against a nixpkgs it was not written for.
+    # leandro.url = "github:UniStuttgart-IKR/Leandro/<rev>";
     # leandro.inputs.nixpkgs.follows = "nixpkgs";
   };
 

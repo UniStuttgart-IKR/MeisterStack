@@ -7,13 +7,16 @@
 # not test the actual GPU package build or hardware.
 { nixpkgs, lib, pkgs, system, self }:
 let
+  inherit (import ./lib.nix { inherit lib; }) require tagOf failedOf failsOnly;
+
   profileOf = leandro:
     import ../../templates/operator/profiles/compute-gpu-pro6000.nix {
       inherit lib leandro system;
     };
 
-  # A host that carries a card, as small as a host of this fleet can be.
-  hostWith = leandro: (nixpkgs.lib.nixosSystem {
+  # A host that carries a card, as small as a host of this fleet can be. `extra` are the
+  # rest of the host's modules: its driver, its CPU and whatever a case needs.
+  hostWith = leandro: extra: (nixpkgs.lib.nixosSystem {
     modules = [
       {
         nixpkgs.hostPlatform = system;
@@ -31,23 +34,71 @@ let
         meisterstack.managed.trustedPublicKeys = [ "gpu-probe:not-a-real-key" ];
       }
       (profileOf leandro)
-    ];
+    ] ++ extra;
   }).config;
 
+  # What the host's own modules provide: the open driver with the persistence daemon, and
+  # the CPU (every GPU host of the IKR fleet is AMD).
+  driver = {
+    services.xserver.videoDrivers = [ "nvidia" ];
+    hardware.nvidia.open = true;
+    hardware.nvidia.nvidiaPersistenced = true;
+    # Evaluating the driver's own module reads its package's metadata, and the licence
+    # check refuses that for unfree packages. Nothing here is built or fetched.
+    nixpkgs.config.allowUnfreePredicate = pkg:
+      builtins.elem (lib.getName pkg) [ "nvidia-x11" "nvidia-settings" "nvidia-persistenced" ];
+  };
+  amd = { hardware.cpu.amd.updateMicrocode = true; };
+  intel = { hardware.cpu.intel.updateMicrocode = true; };
+
   # What the `leandro` input looks like from this profile's point of view:
-  # two outputs, two binaries. Two trivial scripts because the check is about
-  # the SHAPE of the configuration — which keys, pointing where — and
-  # building an NVIDIA driver stack to find that out would be an afternoon
-  # for a question a store path already answers.
+  # two outputs, two binaries, and the DRIVER_VERSION file of its source tree.
+  # Two trivial scripts because the check is about the SHAPE of the
+  # configuration — which keys, pointing where — and building an NVIDIA driver
+  # stack to find that out would be an afternoon for a question a store path
+  # already answers.
   stub = {
+    outPath = ./leandro-stub;
     packages.${system} = {
       vhost-user-nvrm = pkgs.writeShellScriptBin "vhost-user-nvrm" "exit 0";
       leandro = pkgs.writeShellScriptBin "vgpuprofile" "exit 0";
     };
   };
 
-  without = hostWith null;
-  with' = hostWith stub;
+  # The stub's driver version, pinned the way the profile's message tells an operator to.
+  # Only the version is read: nothing is fetched or built, so the hashes are placeholders.
+  stubDriverVersion = lib.fileContents ./leandro-stub/DRIVER_VERSION;
+  pinnedDriver = { config, ... }: {
+    hardware.nvidia.package = config.boot.kernelPackages.nvidiaPackages.mkDriver {
+      version = stubDriverVersion;
+      sha256_64bit = lib.fakeHash;
+      openSha256 = lib.fakeHash;
+      settingsSha256 = lib.fakeHash;
+      persistencedSha256 = lib.fakeHash;
+    };
+  };
+
+  without = hostWith null [ driver amd ];
+  with' = hostWith stub [ driver amd pinnedDriver ];
+  # nixpkgs' default driver, which is not the version the stub targets.
+  unpinnedHost = hostWith stub [ driver amd ];
+
+  # The kernel parameters of a host as one string, padded so a parameter is matched whole.
+  paramsOf = c: " ${lib.concatStringsSep " " c.boot.kernelParams} ";
+
+  # The cases of the profile's own assertions, told apart by their tags (./lib.nix).
+  intelHost = hostWith null [ driver intel ];
+  unknownHost = hostWith null [ driver ];
+  forcedIntel = hostWith null [ driver { meisterstack.gpuProfile.iommuVendor = "intel"; } ];
+  noDriverHost = hostWith null [ amd ];
+  closedHost = hostWith null [ driver amd { hardware.nvidia.open = lib.mkForce false; } ];
+  noPersistenceHost = hostWith null [ driver amd { hardware.nvidia.nvidiaPersistenced = lib.mkForce false; } ];
+  migHost = hostWith null [
+    driver
+    amd
+    { systemd.services.nvidia-mig-setup = { script = "true"; wantedBy = [ "multi-user.target" ]; }; }
+  ];
+
   tomlOf = c: c.environment.etc."meisterstack/agent.toml".source;
 in
 pkgs.runCommand "gpu-profile" { } ''
@@ -59,12 +110,13 @@ pkgs.runCommand "gpu-profile" { } ''
   fi
   # The machine half is unconditional: the card is bound to vfio whether or
   # not anything hands it to a guest.
-  ${lib.concatMapStrings (p: ''
-    echo ${lib.escapeShellArg p} | grep -qx ${lib.escapeShellArg p}
-  '') without.boot.kernelParams}
-  case " ${lib.concatStringsSep " " without.boot.kernelParams} " in
+  case "${paramsOf without}" in
     *" iommu=pt "*) ;;
     *) echo "-> the profile did not turn the IOMMU on"; exit 1 ;;
+  esac
+  # AMD host: the vendor-neutral switch and nothing Intel-specific.
+  case "${paramsOf without}" in
+    *intel_iommu*) echo "-> an AMD host got an Intel IOMMU parameter"; exit 1 ;;
   esac
   case " ${lib.concatStringsSep " " without.boot.kernelModules} " in
     *" vfio-pci "*) ;;
@@ -73,9 +125,22 @@ pkgs.runCommand "gpu-profile" { } ''
   # And it says so, once, where an operator sees it. The host carries other
   # warnings of its own (the agent's `network-online.target` ordering, 1A
   # §8 point 5), so what is asked for is THIS one and not an empty list.
-  ${lib.optionalString (!(lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) without.warnings)) ''
-    echo "-> a fleet with no GPU stack got no warning about it"; exit 1
-  ''}
+  ${require (lib.any (w: tagOf w == "no-gpu-backend") without.warnings)
+    "a fleet with no GPU stack got no warning about it"}
+
+  # The profile's assertions: a host that meets them has none failed, and each way of not
+  # meeting one fails exactly that one.
+  ${require (failedOf without == [ ]) "a complete GPU host failed: ${lib.concatStringsSep " | " (failedOf without)}"}
+  ${require (lib.hasInfix " intel_iommu=on " (paramsOf intelHost) && failedOf intelHost == [ ])
+    "an Intel GPU host did not get intel_iommu=on, or failed an assertion"}
+  ${require (lib.hasInfix " intel_iommu=on " (paramsOf forcedIntel) && failedOf forcedIntel == [ ])
+    "iommuVendor = intel did not select the Intel parameter"}
+  ${require (failsOnly unknownHost "iommu-vendor") "a host of unknown CPU vendor was not refused"}
+  ${require (failsOnly noDriverHost "driver") "a host without the NVIDIA driver was not refused with just that"}
+  ${require (failsOnly closedHost "open-modules") "the closed kernel module was not refused"}
+  ${require (failsOnly noPersistenceHost "persistenced") "a host without nvidia-persistenced was not refused"}
+  ${require (failsOnly migHost "mig") "a host with MIG units was not refused"}
+  echo "  ok   vendor-neutral IOMMU switch and the five assertions"
 
   echo "== with it"
   cat ${tomlOf with'}
@@ -89,10 +154,12 @@ pkgs.runCommand "gpu-profile" { } ''
     || { echo "-> the agent refuses the configuration this profile produced"; exit 1; }
   ${pkgs.meisterstack}/bin/meister-agent --check-config --config ${tomlOf without} \
     || { echo "-> the agent refuses the configuration a CPU-only fleet produced"; exit 1; }
-  ${lib.optionalString (lib.any (w: lib.hasInfix "compute-gpu-pro6000" w) with'.warnings) ''
-    echo "-> a fleet WITH the GPU stack was warned about not having it"
-    exit 1
-  ''}
-  echo "  ok   both branches of the template's GPU profile parse"
+  ${require (failedOf with' == [ ]) "a GPU host on the stack's driver version failed: ${lib.concatStringsSep " | " (failedOf with')}"}
+  ${require (unpinnedHost.hardware.nvidia.package.version != stubDriverVersion)
+    "nixpkgs' default driver is the stub's version, so the mismatch case shows nothing"}
+  ${require (failsOnly unpinnedHost "driver-version") "a host on another driver version than the GPU stack's was not refused"}
+  ${require (!(lib.any (w: tagOf w == "no-gpu-backend") with'.warnings))
+    "a fleet WITH the GPU stack was warned about not having it"}
+  echo "  ok   both branches of the template's GPU profile parse, the driver version is pinned"
   touch $out
 ''

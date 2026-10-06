@@ -60,6 +60,35 @@ let
   # Reuse one instantiated package set across the fleet.
   platform = { nixpkgs.pkgs = pkgs; };
 
+  # The leandro input's vhost-user-nvrm and this stack's cloud-hypervisor negotiate a
+  # shared-memory window only when both are built from the same patch series. Which Leandro
+  # revision that is, patches/README.md says; a fleet pinned to another one is refused here
+  # instead of booting GPU guests that never get a window.
+  patchSeries = import ./leandro-series.nix { inherit lib; };
+  seriesDirs = {
+    leandroPatchDir = "${leandro}/patches";
+    patchDir = ../../patches;
+  };
+  leandroSeriesDrift =
+    if leandro == null then [ ] else patchSeries.driftedPatches seriesDirs;
+  upstreamedOwnPatches =
+    if leandro == null || leandroSeriesDrift != [ ] then [ ]
+    else patchSeries.upstreamedOwnPatches seriesDirs;
+  leandroSeries = {
+    assertions = [{
+      assertion = leandroSeriesDrift == [ ];
+      message = "[leandro-series] the cloud-hypervisor patches of the leandro input differ "
+        + "from MeisterStack's patches/ (${patchSeries.describeDrift leandroSeriesDrift}). "
+        + "Pin leandro to the revision MeisterStack's patches/README.md names, or move "
+        + "patches/ to the revision of the input: the GPU backend and the hypervisor "
+        + "negotiate a shared-memory window only on the same series.";
+    }];
+    warnings = lib.optional (upstreamedOwnPatches != [ ])
+      ("[leandro-series] the leandro input carries ${lib.concatStringsSep ", " upstreamedOwnPatches} "
+        + "with the same bytes as MeisterStack's patches/; it is upstream now, so it can be "
+        + "dropped from `ownPatches` in nix/lib/leandro-series.nix.");
+  };
+
   # Import the selected layout and disko only for hosts with an install table.
   layoutFor = id:
     let h = inv.hosts.${id}; in
@@ -77,6 +106,7 @@ let
   modulesFor = id:
     [
       platform
+      leandroSeries
       ../services.nix
       ../managed.nix
       {
