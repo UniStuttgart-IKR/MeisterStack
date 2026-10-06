@@ -47,6 +47,11 @@ const NOFILE_LIMIT: u64 = 65536;
 /// Extra backend variables may not override these prefixes.
 const PROTECTED_ENV: [&str; 4] = ["LD_", "PATH", "HOME", "NVIDIA_"];
 
+/// The most MiB whose bytes a u64 still counts. The backend refuses a larger
+/// VRAM setting (Leandro vram.rs `decide`), and `vgpuprofile` would shift a
+/// larger host reserve into bytes unchecked.
+const MAX_MIB: u64 = u64::MAX >> 20;
+
 /// What the backend reserves from `vram_profile_mib` when no
 /// `vram_reserve_mib` is set (Leandro vram.rs `DEFAULT_RESERVATION_MIB`).
 const BACKEND_DEFAULT_RESERVE_MIB: u64 = 256;
@@ -149,6 +154,7 @@ impl NvrmParams {
     }
 
     fn validate(&self) -> device::Result<()> {
+        self.refuse_sizes_out_of_range()?;
         self.refuse_two_vram_policies()?;
         self.refuse_unusable_reserve()?;
         self.refuse_reserved_env()
@@ -186,6 +192,16 @@ impl NvrmParams {
             )));
         }
         Ok(())
+    }
+
+    fn refuse_sizes_out_of_range(&self) -> device::Result<()> {
+        [
+            ("vram_limit_mib", self.vram_limit_mib),
+            ("vram_profile_mib", self.vram_profile_mib),
+            ("vram_reserve_mib", self.vram_reserve_mib),
+        ]
+        .into_iter()
+        .try_for_each(|(name, mib)| refuse_beyond_byte_range(name, mib))
     }
 
     /// Checked with the rest of the configuration so a node config naming a
@@ -307,6 +323,7 @@ impl NvrmDriverConfig {
     /// Check the defaults, every profile layered over them, and that a host
     /// reserve is configured once any of them names a vGPU type.
     fn validate(&self) -> device::Result<()> {
+        refuse_beyond_byte_range("vgpu_host_reserve_mib", self.vgpu_host_reserve_mib)?;
         self.defaults
             .validate()
             .map_err(|e| DeviceError::InvalidSpec(format!("nvrm defaults are invalid: {e}")))?;
@@ -506,6 +523,16 @@ impl NvrmDriver {
             env.push((k.clone(), v.clone()));
         }
         Ok(env)
+    }
+}
+
+/// Refuse a size in MiB whose bytes a u64 cannot count; see [`MAX_MIB`].
+fn refuse_beyond_byte_range(name: &str, mib: Option<u64>) -> device::Result<()> {
+    match mib {
+        Some(mib) if mib > MAX_MIB => Err(DeviceError::InvalidSpec(format!(
+            "{name} = {mib} MiB is more than a byte count can hold; at most {MAX_MIB}"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -993,6 +1020,28 @@ mod tests {
     fn with_profile(mut node: NvrmDriverConfig, name: &str, vgpu_type: &str) -> NvrmDriverConfig {
         node.profiles.insert(name.into(), configured(vgpu_type));
         node
+    }
+
+    /// Sizes whose bytes would not fit a u64 are refused, as the backend
+    /// refuses them, and so is such a host reserve, which vgpuprofile would
+    /// shift into bytes unchecked.
+    #[test]
+    fn sizes_beyond_the_byte_range_are_refused() {
+        for key in ["vram_limit_mib", "vram_profile_mib", "vram_reserve_mib"] {
+            let params = p(serde_json::json!({ key: MAX_MIB + 1 }));
+            let said = params.validate().expect_err("too large").to_string();
+            assert!(said.contains(key), "{said}");
+        }
+        p(serde_json::json!({ "vram_limit_mib": MAX_MIB }))
+            .validate()
+            .expect("the largest that fits");
+
+        let node = NvrmDriverConfig {
+            vgpu_host_reserve_mib: Some(MAX_MIB + 1),
+            ..node(serde_json::json!({}))
+        };
+        let said = node.validate().expect_err("too large").to_string();
+        assert!(said.contains("vgpu_host_reserve_mib"), "{said}");
     }
 
     /// IKR-B15: a node that configures a vGPU type must fix the host's share

@@ -112,7 +112,7 @@ fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> devic
             without_a_type(untyped)
         )));
     }
-    let used: u64 = live.iter().map(|c| c.mib).sum();
+    let used = total_mib(live);
     if used.saturating_add(want.mib) > card {
         return Err(DeviceError::InvalidSpec(format!(
             "the card offers {card} MiB to guests: {used} MiB admitted + {} MiB requested \
@@ -121,6 +121,12 @@ fn refuse_card_overcommit(live: &[&Claim], want: &Claim, id: &DeviceId) -> devic
         )));
     }
     Ok(())
+}
+
+/// The claims' sizes together. A size comes from a node's configuration or
+/// from `vgpuprofile`, so the sum saturates rather than wrap or panic.
+fn total_mib(claims: &[&Claim]) -> u64 {
+    claims.iter().map(|c| c.mib).fold(0, u64::saturating_add)
 }
 
 fn without_a_type(claim: &Claim) -> &'static str {
@@ -155,7 +161,7 @@ fn refuse_budget_overrun(
     if let Some(budget) = budget {
         refuse_unbounded_under_budget(live, want, budget, id)?;
     }
-    let used: u64 = live.iter().map(|c| c.mib).sum();
+    let used = total_mib(live);
     let wants = want.mib;
     match budget {
         Some(budget) if used.saturating_add(wants) > budget => {
@@ -166,7 +172,7 @@ fn refuse_budget_overrun(
         }
         Some(_) => Ok(()),
         None => {
-            if used + wants > 0 {
+            if used.saturating_add(wants) > 0 {
                 debug!(
                     used_mib = used,
                     requested_mib = wants,
@@ -334,6 +340,21 @@ pub(crate) mod tests {
             .expect_err("the budget is all taken")
             .to_string();
         assert!(said.contains("counts as all of it"), "{said}");
+    }
+
+    /// Sizes that would overflow a sum saturate and are refused, instead of
+    /// wrapping round to a small number that fits.
+    #[test]
+    fn sums_too_large_to_count_are_refused_not_wrapped() {
+        let huge = capped(u64::MAX);
+        refuse_budget_overrun(&[&huge, &capped(2)], &capped(1), Some(1024), &device())
+            .expect_err("more than any budget");
+        refuse_budget_overrun(&[&huge, &capped(2)], &capped(1), None, &device())
+            .expect("without a budget only noted");
+        let q1 = resolved("RTX2070-1Q", 1024, 8);
+        let typed_huge = Claim::new(u64::MAX, Some(&q1));
+        refuse_card_overcommit(&[&typed_huge, &typed(&q1)], &typed(&q1), &device())
+            .expect_err("more than the card");
     }
 
     /// Without any vGPU type the card size is unknown; only the budget applies.
