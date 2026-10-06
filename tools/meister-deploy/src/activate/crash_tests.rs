@@ -143,13 +143,15 @@ trait Scenario {
     fn successors(&self) -> Vec<Self::Successor>;
     /// What comes after the crash, its effects through `cut`. Its processes
     /// take pids from `first_pid` on: every recovery is a new incarnation.
+    /// Answers with what the successors answered that the model does not
+    /// allow.
     fn recover(
         &self,
         world: &Self::World,
         by: Self::Successor,
         cut: &Arc<CutPoint>,
         first_pid: u32,
-    );
+    ) -> Vec<Breach>;
     /// I-A1 and I-A2, on the host `by` recovered.
     fn settled(&self, world: &Self::World, by: Self::Successor, seen: &Self::Seen) -> Vec<Breach>;
     fn snapshot(&self, world: &Self::World) -> Self::Snapshot;
@@ -190,17 +192,18 @@ fn crashed_at<S: Scenario>(scenario: &S, k: usize, n: usize) -> S::World {
     world
 }
 
-/// Recover uncut and judge the result, then recover once more (I-A5).
+/// Recover uncut and judge the answers and the result, then recover once
+/// more (I-A5).
 fn settle<S: Scenario>(
     scenario: &S,
     world: &S::World,
     by: S::Successor,
     seen: &S::Seen,
 ) -> Vec<Breach> {
-    scenario.recover(world, by, &CutPoint::new(), 20);
-    let mut breaches = scenario.settled(world, by, seen);
+    let mut breaches = scenario.recover(world, by, &CutPoint::new(), 20);
+    breaches.extend(scenario.settled(world, by, seen));
     let before = scenario.snapshot(world);
-    scenario.recover(world, by, &CutPoint::new(), 30);
+    breaches.extend(scenario.recover(world, by, &CutPoint::new(), 30));
     let after = scenario.snapshot(world);
     if after != before {
         breaches.push(Breach::of(
@@ -250,13 +253,15 @@ fn every_crash_during_recovery<S: Scenario>(scenario: &S) -> Vec<Found> {
         for by in scenario.successors() {
             let m = {
                 let (world, cut) = (crashed_at(scenario, k, n), CutPoint::new());
-                scenario.recover(&world, by, &cut, 10);
+                // `settle` judges this same recovery's answers.
+                let _ = scenario.recover(&world, by, &cut, 10);
                 cut.trace().len()
             };
             for j in 0..m {
                 let (world, cut) = (crashed_at(scenario, k, n), CutPoint::new());
                 cut.arm_after(j);
-                scenario.recover(&world, by, &cut, 10);
+                // Nobody hears what a recovery that died answered.
+                let _ = scenario.recover(&world, by, &cut, 10);
                 assert_fired(&cut, j, m);
                 let (mut breaches, seen) = scenario.frozen(&world);
                 breaches.extend(settle(scenario, &world, by, &seen));

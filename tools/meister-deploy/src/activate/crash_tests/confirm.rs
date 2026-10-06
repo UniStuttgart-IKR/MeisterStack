@@ -133,12 +133,6 @@ impl Host {
         TxnRecord::from_json(std::str::from_utf8(&bytes).ok()?, "the model").ok()
     }
 
-    fn listed(&self) -> bool {
-        let me = FakeProcesses(9);
-        let status = helper(self, &self.files, &self.clock, &me).status();
-        status.is_ok_and(|s| s.open_txns.iter().any(|t| t.id == ID))
-    }
-
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             files: self.files.contents_under("/"),
@@ -184,8 +178,6 @@ impl Runner for Host {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
         let out = match (cmd.program.as_str(), args.as_slice()) {
-            // uname(1); `status` asks on its way past.
-            ("uname", ["-r"]) => Output::stdout("6.12.41\n"),
             ("nix-env", ["-p", _, "--set", system]) => self.set_profile(system)?,
             // systemd-run(1) `--on-active`: a transient timer.
             ("systemd-run", _) => {
@@ -212,32 +204,33 @@ impl Runner for Host {
 
 /// The dead man: an armed timer elapses once (systemd.timer(5)) and runs
 /// `revert --by-timer` with the unit's reason.
-fn timer_fires(host: &Host, cut: &Arc<CutPoint>, me: &dyn Processes) {
+fn timer_fires(host: &Host, cut: &Arc<CutPoint>, me: &dyn Processes) -> Result<()> {
     let armed = std::mem::replace(&mut host.machine.borrow_mut().timer_active, false);
-    if armed {
-        let because = Some("nobody confirmed this activation before its deadline");
-        host.through(cut, me, |helper| {
-            let _ = helper.revert(ID, because, RevertAsker::Deadline);
-        });
+    if !armed {
+        return Ok(());
     }
+    let because = Some("nobody confirmed this activation before its deadline");
+    host.through(cut, me, |helper| {
+        helper.revert(ID, because, RevertAsker::Deadline).map(drop)
+    })
 }
 
 /// A resumed run (`receipt::next_step`, `Executor::resume_point`): pending
 /// or confirming is confirmed when the host runs what it should, and taken
 /// back when it does not; anything else is `VerifyOnly`, `RolledBack` or a
 /// person's.
-fn resume(host: &Host, cut: &Arc<CutPoint>, me: &dyn Processes) {
-    let Some(record) = host.record() else { return };
+fn resume(host: &Host, cut: &Arc<CutPoint>, me: &dyn Processes) -> Result<()> {
+    let Some(record) = host.record() else {
+        return Ok(());
+    };
     let ready = host.machine.borrow().running == record.desired;
-    host.through(cut, me, |helper| {
-        let _ = match record.state {
-            TxnState::Pending | TxnState::Confirming if ready => helper.confirm(ID),
-            TxnState::Pending | TxnState::Confirming => {
-                helper.revert(ID, Some("not ready"), RevertAsker::Operator)
-            }
-            _ => return,
-        };
-    });
+    host.through(cut, me, |helper| match record.state {
+        TxnState::Pending | TxnState::Confirming if ready => helper.confirm(ID).map(drop),
+        TxnState::Pending | TxnState::Confirming => helper
+            .revert(ID, Some("not ready"), RevertAsker::Operator)
+            .map(drop),
+        _ => Ok(()),
+    })
 }
 
 /// O0: a host moved off its previous system has a record, and an open record
@@ -252,8 +245,19 @@ fn unguarded(host: &Host) -> Option<String> {
     (moved && unguarded).then(|| format!("{} on a moved host with no timer", record.state_word()))
 }
 
-/// I-A1 and I-A2 on the recovered host.
-fn judged(host: &Host, intent_persisted: bool) -> Vec<Breach> {
+/// The one end each order of successors leaves on a host that runs what
+/// it should: a resume confirms, and a timer that comes first takes back
+/// what nobody had begun to confirm. A transaction left `confirming`,
+/// `reverting` or `inconsistent` here is one a recovery could not finish.
+fn the_end(by: ConfirmSuccessor, intent_persisted: bool) -> (TxnState, &'static str) {
+    match by {
+        ConfirmSuccessor::TimerFirst if !intent_persisted => (TxnState::Reverted, PREV),
+        ConfirmSuccessor::TimerFirst | ConfirmSuccessor::ResumeFirst => (TxnState::Confirmed, TOP),
+    }
+}
+
+/// I-A1 and I-A2 on the host `by` recovered.
+fn judged(host: &Host, by: ConfirmSuccessor, intent_persisted: bool) -> Vec<Breach> {
     let Some(record) = host.record() else {
         return vec![Breach::of(Invariant::IA1, "the record is gone")];
     };
@@ -263,22 +267,16 @@ fn judged(host: &Host, intent_persisted: bool) -> Vec<Breach> {
         ..
     } = host.machine.borrow().clone();
     let profile = host.profile().unwrap_or_default();
-    let on = |system: &str| running == system && profile == system;
-    let listed = host.listed();
-    let fits = match record.state {
-        TxnState::Confirmed => on(TOP),
-        TxnState::Reverted => on(PREV),
-        // No dead man on purpose: the timer leaves an intent alone.
-        TxnState::Confirming | TxnState::Reverting | TxnState::Inconsistent => listed,
-        TxnState::Pending | TxnState::Staged => listed && (timer_active || on(PREV)),
-    };
+    let (end, system) = the_end(by, intent_persisted);
     let mut breaches = Vec::new();
-    if !fits {
+    if record.state != end || running != system || profile != system {
         breaches.push(Breach::of(
             Invariant::IA1,
             format!(
-                "{} with running {running}, profile {profile}, timer {timer_active}",
-                record.state_word()
+                "{} with running {running}, profile {profile}, timer {timer_active}, where \
+                 {by:?} ends {} on {system}",
+                record.state_word(),
+                end.as_str_lower()
             ),
         ));
     }
@@ -340,22 +338,38 @@ impl Scenario for Confirm {
         vec![ConfirmSuccessor::TimerFirst, ConfirmSuccessor::ResumeFirst]
     }
 
-    fn recover(&self, host: &Host, by: ConfirmSuccessor, cut: &Arc<CutPoint>, first_pid: u32) {
+    /// The host runs what it should, so a resume confirms, and the
+    /// deadline's revert leaves an intent alone: no successor has a reason
+    /// to fail.
+    fn recover(
+        &self,
+        host: &Host,
+        by: ConfirmSuccessor,
+        cut: &Arc<CutPoint>,
+        first_pid: u32,
+    ) -> Vec<Breach> {
         let (first, second) = (FakeProcesses(first_pid), FakeProcesses(first_pid + 1));
-        match by {
-            ConfirmSuccessor::TimerFirst => {
-                timer_fires(host, cut, &first);
-                resume(host, cut, &second);
-            }
-            ConfirmSuccessor::ResumeFirst => {
-                resume(host, cut, &first);
-                timer_fires(host, cut, &second);
-            }
-        }
+        let answers = match by {
+            ConfirmSuccessor::TimerFirst => [
+                ("the timer", timer_fires(host, cut, &first)),
+                ("the resume", resume(host, cut, &second)),
+            ],
+            ConfirmSuccessor::ResumeFirst => [
+                ("the resume", resume(host, cut, &first)),
+                ("the timer", timer_fires(host, cut, &second)),
+            ],
+        };
+        answers
+            .into_iter()
+            .filter_map(|(who, answer)| {
+                let e = answer.err()?;
+                Some(Breach::of(Invariant::IA1, format!("{who} failed: {e:#}")))
+            })
+            .collect()
     }
 
-    fn settled(&self, host: &Host, _: ConfirmSuccessor, intent_persisted: &bool) -> Vec<Breach> {
-        judged(host, *intent_persisted)
+    fn settled(&self, host: &Host, by: ConfirmSuccessor, intent_persisted: &bool) -> Vec<Breach> {
+        judged(host, by, *intent_persisted)
     }
 
     fn snapshot(&self, host: &Host) -> Snapshot {
@@ -372,7 +386,8 @@ fn every_crash_in_confirm_finishes_not_reverts() {
     let left: Vec<usize> = (0..=n)
         .filter(|&k| {
             let host = crashed_at(&Confirm, k, n);
-            Confirm.recover(&host, ConfirmSuccessor::TimerFirst, &CutPoint::new(), 2);
+            // Its answers were judged above; here only what it leaves counts.
+            let _ = Confirm.recover(&host, ConfirmSuccessor::TimerFirst, &CutPoint::new(), 2);
             host.lock_leftovers() > 0
         })
         .collect();
@@ -415,8 +430,11 @@ fn a_recycled_pid_does_not_keep_a_dead_holders_lock() {
     // the machine back.
     let n = trace_of(&Confirm).len();
     let host = crashed_at(&Confirm, 2, n);
-    timer_fires(&host, &CutPoint::new(), &Recycled(2));
-    resume(&host, &CutPoint::new(), &Recycled(3));
+    timer_fires(&host, &CutPoint::new(), &Recycled(2)).expect("the deadline decides");
+    resume(&host, &CutPoint::new(), &Recycled(3)).expect("a reverted record is left alone");
     assert_eq!(host.record().map(|r| r.state), Some(TxnState::Reverted));
-    assert_eq!(judged(&host, false), Vec::new());
+    assert_eq!(
+        judged(&host, ConfirmSuccessor::TimerFirst, false),
+        Vec::new()
+    );
 }

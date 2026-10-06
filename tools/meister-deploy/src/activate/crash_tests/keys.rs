@@ -206,12 +206,27 @@ impl Scenario for KeyRotation {
         }
     }
 
-    fn recover(&self, files: &MemFiles, by: KeySuccessor, cut: &Arc<CutPoint>, first_pid: u32) {
+    /// A successor finishes, or refuses and changes nothing: a verb whose
+    /// layout is already behind it refuses. Where it ends is `settled`'s.
+    fn recover(
+        &self,
+        files: &MemFiles,
+        by: KeySuccessor,
+        cut: &Arc<CutPoint>,
+        first_pid: u32,
+    ) -> Vec<Breach> {
         let verb = match by {
             KeySuccessor::RunAgain => self.verb,
             KeySuccessor::TakeBack => KeyVerb::Revert,
         };
-        let _ = verb.run(&CutFiles(files, cut.clone()), first_pid);
+        let before = on_disk(files);
+        match verb.run(&CutFiles(files, cut.clone()), first_pid) {
+            Err(e) if on_disk(files) != before => vec![Breach::of(
+                Invariant::IA1,
+                format!("keys {verb:?} failed half way: {e:#}"),
+            )],
+            _ => Vec::new(),
+        }
     }
 
     /// I-A1: the pair in use and the status this successor ends with, and
