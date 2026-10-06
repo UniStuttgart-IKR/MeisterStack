@@ -2908,15 +2908,97 @@ fn naming_data(mut vm: Vm) -> Vm {
     vm
 }
 
-/// The volume `data`, claimed by the VM `t`, open on a node and stored. Open, so that a release
-/// shows as `claimantGone` instead of letting the claim fall at once.
-/// The volume `data`, claimed by the VM `t` whose object is `uid` (IKR-B81).
+/// The volume `data`, claimed by the VM `t` whose object is `uid` (IKR-B81), open on a node and
+/// stored. Open, so that a release shows as `claimantGone` instead of letting the claim fall at
+/// once.
 async fn data_claimed_by_t(store: &EtcdStore, uid: &str) -> Volume {
     let mut volume = controller_api::resources::new_volume("data", Default::default());
     volume.status.attached_to = Some("t".into());
     volume.status.attached_uid = Some(uid.into());
     volume.status.open_on = vec!["agent-1".into()];
     store.create(&volume).await.expect("the claimed volume")
+}
+
+/// `data` on the shared pool `nfs`, at home on agent-1 and Ready there, claimed by the VM `t`
+/// whose object is `uid`, and open on `open_on`.
+async fn shared_data_held_by(store: &EtcdStore, uid: &str, open_on: &[&str]) -> Volume {
+    let mut nfs = pool("nfs", "nfs", &[]);
+    nfs.status.locality = Some(Locality::Shared);
+    store.create(&nfs).await.expect("the shared pool");
+    let mut volume = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            pool: "nfs".into(),
+            ..Default::default()
+        },
+    );
+    volume.status.node = Some("agent-1".into());
+    volume.status.attached_to = Some("t".into());
+    volume.status.attached_uid = Some(uid.into());
+    volume.status.open_on = open_on.iter().map(|n| n.to_string()).collect();
+    volume.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    volume.settle(Utc::now());
+    store.create(&volume).await.expect("the claimed volume")
+}
+
+/// A VM made again under the claimant's name, on another node, does not move the claimant's
+/// shared disk record after it: the claim is checked before the record follows. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_on_another_node_does_not_move_the_claimants_record() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1"]).await;
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    let held = hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("the disk is the claimant's");
+
+    assert!(format!("{held:#}").contains("held by t"), "{held:#}");
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
+    assert_eq!(data.status.attached_uid.as_deref(), Some("uid-claimant"));
+}
+
+/// The same for the other re-point: the namesake's node having the disk open does not make the
+/// record its. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_namesake_whose_node_has_the_disk_open_does_not_repoint_it() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    shared_data_held_by(&store, "uid-claimant", &["agent-1", "agent-2"]).await;
+    let namesake = store
+        .create(&naming_data(bound_to(Some("agent-2"))))
+        .await
+        .expect("a vm of the same name on agent-2");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-2"]);
+
+    hold_volumes(
+        &quiet_pass(&store, &registry, &connected),
+        &namesake,
+        "agent-2",
+    )
+    .await
+    .expect_err("the disk is the claimant's");
+
+    let data: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(data.status.node.as_deref(), Some("agent-1"));
 }
 
 /// A VM recreated under the same name after the listing survives the old one's teardown,

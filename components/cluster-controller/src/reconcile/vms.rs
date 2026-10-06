@@ -611,6 +611,13 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
     let migrating = crate::migration::migration_in_flight(p.store, vm).await?;
     for name in vm.spec.referenced_volumes() {
         let mut volume: Volume = p.store.get(&name).await?;
+        // Whose disk it is before anything moves it: both re-points below
+        // write the record's home, and another VM's record is not this VM's
+        // to move, whatever their names. (IKR-B81)
+        if !may_carry(&volume.status, vm) {
+            let holder = volume.status.attached_to.clone().unwrap_or_default();
+            return wait_for_holder(p, vm, &name, &holder).await;
+        }
         // The node this vm is on already HAS the disk open — which today
         // happens exactly one way: a live migration put it there, the record
         // still calls the source home, and the source is on its way out.
@@ -622,10 +629,19 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         {
             let from = volume.status.node.clone().unwrap_or_default();
             let uid = volume.metadata.uid.clone();
+            let mut carried = false;
             volume = p
                 .store
-                .mutate_if::<Volume, _>(&name, &uid, |v| v.status.node = Some(node.to_string()))
+                .mutate_if::<Volume, _>(&name, &uid, |v| {
+                    carried = may_carry(&v.status, vm);
+                    if carried {
+                        v.status.node = Some(node.to_string());
+                    }
+                })
                 .await?;
+            if !carried {
+                anyhow::bail!("volume {name} was claimed while its record was being moved");
+            }
             info!(volume = %name, from = %from, to = node,
                   "the vm's node already has the volume open; the record moves with it");
         }
@@ -645,11 +661,18 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             );
             if travels {
                 let from = volume.status.node.clone().unwrap_or_default();
+                let mut carried = false;
                 p.store
                     .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
-                        follow_vm(v, &vm.metadata.name, node)
+                        carried = may_carry(&v.status, vm);
+                        if carried {
+                            follow_vm(v, &vm.metadata.name, node);
+                        }
                     })
                     .await?;
+                if !carried {
+                    anyhow::bail!("volume {name} was claimed while its record was being moved");
+                }
                 info!(volume = %name, from = %from, to = node,
                       "the record follows the vm; the bytes stay where they are");
                 anyhow::bail!("volume {name} is being re-opened on {node}");
@@ -678,16 +701,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
                 // machine has opened it.
                 continue;
             }
-            Some(holder) => {
-                // The claim is somebody else's, and since D4 it may still be
-                // standing after that somebody has gone: it falls when no Vm
-                // object carries it AND no machine reports the bytes open
-                // (`volume_claim_holds`). So the wait gets a word of its own
-                // — nothing here will ever take a disk off its holder, and an
-                // operator has to be able to see who has it.
-                note_vm_held(p, vm, &name, holder).await?;
-                anyhow::bail!("volume {name} is held by {holder}");
-            }
+            Some(holder) => return wait_for_holder(p, vm, &name, holder).await,
             None => {}
         }
         // The one exception to `AccessMode`, enforced where the second entry
@@ -724,6 +738,23 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Whether `vm` may move this volume's record to its node: nobody holds the
+/// volume, or the claim is this VM's own as `held_by` reads it.
+fn may_carry(status: &controller_api::VolumeStatus, vm: &Vm) -> bool {
+    status.attached_to.is_none() || status.held_by(&vm.metadata.name, &vm.metadata.uid)
+}
+
+/// The claim is somebody else's, and since D4 it may still be standing after
+/// that somebody has gone: it falls when no Vm object carries it AND no
+/// machine reports the bytes open (`volume_claim_holds`). So the wait gets a
+/// word of its own — nothing here will ever take a disk off its holder, and an
+/// operator has to be able to see who has it. Always an error: the dispatch
+/// stops here.
+async fn wait_for_holder(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyhow::Result<()> {
+    note_vm_held(p, vm, volume, holder).await?;
+    anyhow::bail!("volume {volume} is held by {holder}")
 }
 
 /// Record VolumeHeld separately from VolumeNotReady: another VM's claim must
