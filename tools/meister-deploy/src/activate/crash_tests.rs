@@ -150,8 +150,8 @@ trait Scenario {
         cut: &Arc<CutPoint>,
         first_pid: u32,
     );
-    /// I-A1 and I-A2, on the recovered host.
-    fn settled(&self, world: &Self::World, seen: &Self::Seen) -> Vec<Breach>;
+    /// I-A1 and I-A2, on the host `by` recovered.
+    fn settled(&self, world: &Self::World, by: Self::Successor, seen: &Self::Seen) -> Vec<Breach>;
     fn snapshot(&self, world: &Self::World) -> Self::Snapshot;
 }
 
@@ -198,7 +198,7 @@ fn settle<S: Scenario>(
     seen: &S::Seen,
 ) -> Vec<Breach> {
     scenario.recover(world, by, &CutPoint::new(), 20);
-    let mut breaches = scenario.settled(world, seen);
+    let mut breaches = scenario.settled(world, by, seen);
     let before = scenario.snapshot(world);
     scenario.recover(world, by, &CutPoint::new(), 30);
     let after = scenario.snapshot(world);

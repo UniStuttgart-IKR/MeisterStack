@@ -140,6 +140,30 @@ impl KeyRotation {
         };
         KeyRotation { verb, from }
     }
+
+    /// Whether a key file is no longer where the verb found it.
+    fn moved(&self, files: &MemFiles) -> bool {
+        files.contents_under(DEFAULT_PKI_DIR) != (self.from)().contents_under(DEFAULT_PKI_DIR)
+    }
+
+    /// The pair in use and the status each successor ends with. Taken back
+    /// before it moved a file, a switch is still the rotation it was:
+    /// `keys revert` has nothing to put back, and the prepared pair waits.
+    fn ends(&self, by: KeySuccessor, moved: bool) -> &'static [(Pair, KeysState)] {
+        match (self.verb, by) {
+            (KeyVerb::Switch, KeySuccessor::RunAgain) => &[(Pair::New, KeysState::Switched)],
+            (KeyVerb::Switch, KeySuccessor::TakeBack) if !moved => &[
+                (Pair::Old, KeysState::Reverted),
+                (Pair::Old, KeysState::Overlap),
+            ],
+            (KeyVerb::Switch, KeySuccessor::TakeBack) | (KeyVerb::Revert, _) => {
+                &[(Pair::Old, KeysState::Reverted)]
+            }
+            (KeyVerb::Remove, KeySuccessor::RunAgain) => &[(Pair::New, KeysState::Confirmed)],
+            // Not a successor of a removal: nothing it leaves is an end.
+            (KeyVerb::Remove, KeySuccessor::TakeBack) => &[],
+        }
+    }
 }
 
 /// What comes after a crash in a key verb.
@@ -153,7 +177,8 @@ enum KeySuccessor {
 
 impl Scenario for KeyRotation {
     type World = MemFiles;
-    type Seen = ();
+    /// A key file had moved off where the verb found it.
+    type Seen = bool;
     type Successor = KeySuccessor;
     type Snapshot = BTreeMap<PathBuf, Vec<u8>>;
 
@@ -165,13 +190,13 @@ impl Scenario for KeyRotation {
         self.verb.run(&CutFiles(files, cut.clone()), 1).map(drop)
     }
 
-    fn frozen(&self, files: &MemFiles) -> (Vec<Breach>, ()) {
+    fn frozen(&self, files: &MemFiles) -> (Vec<Breach>, bool) {
         let breaches = [status_is_false(files), remove_takes_the_last_pair(files)]
             .into_iter()
             .flatten()
             .map(|detail| Breach::of(Invariant::O0, detail))
             .collect();
-        (breaches, ())
+        (breaches, self.moved(files))
     }
 
     fn successors(&self) -> Vec<KeySuccessor> {
@@ -189,24 +214,21 @@ impl Scenario for KeyRotation {
         let _ = verb.run(&CutFiles(files, cut.clone()), first_pid);
     }
 
-    /// I-A1: a whole pair in use, and a status that says which and is true.
-    /// A layout only a person can resolve is not an end state.
-    fn settled(&self, files: &MemFiles, _: &()) -> Vec<Breach> {
+    /// I-A1: the pair in use and the status this successor ends with, and
+    /// a status that is true. A layout only a person can resolve is not an
+    /// end state.
+    fn settled(&self, files: &MemFiles, by: KeySuccessor, moved: &bool) -> Vec<Breach> {
         let state = keys_state(files);
         let in_use = pair_at(files, None);
-        let ends = matches!(
-            (in_use, state),
-            (Some(Pair::New), KeysState::Switched | KeysState::Confirmed)
-                | (Some(Pair::Old), KeysState::Reverted | KeysState::Overlap)
-        );
+        let ends = self.ends(by, *moved);
         let mut breaches: Vec<Breach> = status_is_false(files)
             .into_iter()
             .map(|detail| Breach::of(Invariant::IA1, detail))
             .collect();
-        if !ends {
+        if !in_use.is_some_and(|pair| ends.contains(&(pair, state))) {
             breaches.push(Breach::of(
                 Invariant::IA1,
-                format!("{in_use:?} in use, status {state}"),
+                format!("{in_use:?} in use, status {state}, where {by:?} ends at {ends:?}"),
             ));
         }
         breaches

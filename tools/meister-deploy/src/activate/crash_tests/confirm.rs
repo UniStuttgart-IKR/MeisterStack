@@ -354,7 +354,7 @@ impl Scenario for Confirm {
         }
     }
 
-    fn settled(&self, host: &Host, intent_persisted: &bool) -> Vec<Breach> {
+    fn settled(&self, host: &Host, _: ConfirmSuccessor, intent_persisted: &bool) -> Vec<Breach> {
         judged(host, *intent_persisted)
     }
 
