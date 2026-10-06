@@ -197,6 +197,11 @@
           vm-guest-guard = import ./nix/tests/guest-guard.nix {
             inherit nixpkgs lib pkgs system self;
           };
+          # The same beside a NixOS nftables firewall that flushes the ruleset.
+          vm-guest-guard-nftables = import ./nix/tests/guest-guard.nix {
+            inherit nixpkgs lib pkgs system self;
+            hostRunsNftables = true;
+          };
 
           # Exercise standalone socket access and a nested guest.
           vm-single-node = import ./nix/tests/single-node.nix {

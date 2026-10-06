@@ -86,7 +86,28 @@ let
     "an agent keeps guests from opening connections to the host" =
       let c = agent { }; in
       c.meisterstack.agent.guestGuard.enable
-      && builtins.elem "meister-agent.service" c.systemd.services.meister-guest-guard.requiredBy;
+      && builtins.elem "multi-user.target" c.systemd.services.meister-guest-guard.wantedBy;
+    "an agent waits for the guard and does not follow its stop or restart" =
+      let
+        c = agent { };
+        unit = c.systemd.services.meister-agent;
+        guard = "meister-guest-guard.service";
+      in
+      builtins.elem guard unit.after && builtins.elem guard unit.wants
+      && unit.serviceConfig.ExecStartPre != [ ]
+      && !(builtins.elem guard (unit.requires ++ unit.requisite ++ unit.bindsTo))
+      && c.systemd.services.meister-guest-guard.requiredBy == [ ]
+      && c.systemd.services.meister-guest-guard.partOf == [ ];
+    "where NixOS runs nftables, the host's firewall carries the guard" =
+      let
+        c = agent { networking.nftables.enable = true; };
+        unit = c.systemd.services.meister-agent;
+      in
+      c.networking.nftables.tables ? meister-guest-guard
+      && !(c.systemd.services ? meister-guest-guard)
+      && builtins.elem "nftables.service" unit.after
+      && !(builtins.elem "nftables.service" (unit.wants ++ unit.requires ++ unit.requisite))
+      && c.systemd.services.nftables.serviceConfig.ExecStopPost != [ ];
   };
 
   broken = lib.attrNames (lib.filterAttrs (_: holds: !holds) expectations);

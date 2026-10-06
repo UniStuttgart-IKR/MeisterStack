@@ -6,23 +6,60 @@
 # network namespace on the default bridge. The guest must not open
 # connections to the host over IPv4 or IPv6, except to a port the host lists,
 # and the host must still reach the guest.
-{ nixpkgs, lib, pkgs, system, self }:
+#
+# With `hostRunsNftables` the host runs a NixOS nftables firewall with a
+# ruleset of its own, which flushes the whole ruleset on every load: the
+# guard has to survive that firewall's reload, restart and stop, and the
+# agent must not be stopped or restarted by any of them.
+{ nixpkgs, lib, pkgs, system, self, hostRunsNftables ? false }:
+let
+  # The unit wiring is under test, not the agent: a process that stays up
+  # shows whether systemd stopped or restarted the unit.
+  agentStandIn = pkgs.writeShellScriptBin "meister-agent" "exec sleep infinity";
+  loader = if hostRunsNftables then "nftables.service" else "meister-guest-guard.service";
+in
 pkgs.testers.runNixOSTest {
-  name = "meister-guest-guard";
+  name = "meister-guest-guard${lib.optionalString hostRunsNftables "-nftables"}";
   nodes.host = { pkgs, ... }: {
     imports = [ self.nixosModules.services ];
     meisterstack.roles = [ "agent" ];
+    meisterstack.autostart = true;
+    meisterstack.binDir = "${agentStandIn}/bin";
     meisterstack.agent.frr.enable = false;
     meisterstack.agent.nvmeTcp.enable = false;
     meisterstack.agent.volumes.device = null;
     meisterstack.agent.guestGuard.allowedTCPPorts = [ 8081 ];
-    # Ports the guard must keep closed although the host's firewall is off.
+    # The agent waits for a CA before it starts; its contents do not matter here.
+    systemd.tmpfiles.rules = [
+      "d /opt/meisterstack/pki 0755 root root -"
+      "f /opt/meisterstack/pki/ca.crt 0644 root root -"
+    ];
+    # Ports the guard must keep closed although the host's firewall lets
+    # everything in.
     networking.firewall.enable = false;
+    networking.nftables = lib.mkIf hostRunsNftables {
+      enable = true;
+      ruleset = ''
+        table inet host-own {
+          chain input {
+            type filter hook input priority filter + 10; policy accept;
+            counter
+          }
+        }
+      '';
+    };
     environment.systemPackages = [ pkgs.netcat-openbsd pkgs.python3 ];
   };
   testScript = ''
-    host.wait_for_unit("meister-guest-guard.service")
+    host.wait_for_unit("meister-agent.service")
     host.succeed("nft list table inet meister-guest-guard")
+
+    def agent_pid():
+        pid = host.succeed("systemctl show -P MainPID meister-agent.service").strip()
+        assert pid != "0", "the agent is not running"
+        return pid
+
+    agent_before = agent_pid()
 
     # What the agent builds for a NIC on the default bridge, with the host
     # address the fleet profile used to set on it.
@@ -47,6 +84,12 @@ pkgs.testers.runNixOSTest {
         "ip -6 -o addr show dev meister_br0 scope link | awk '{print $4}' | cut -d/ -f1"
     ).strip()
 
+    def guests_shut_out_and_agent_untouched():
+        host.succeed("nft list table inet meister-guest-guard")
+        host.succeed("ip netns exec guest nc -z -w 2 10.42.0.1 8081")
+        host.fail("ip netns exec guest nc -z -w 2 10.42.0.1 8080")
+        assert agent_pid() == agent_before, "the agent was stopped or restarted"
+
     # Each refusal follows an allowed connection over the same path, so a
     # refusal is the guard's and not a path that does not work at all.
     with subtest("a port the host lists is open to guests, over IPv4 and IPv6"):
@@ -68,14 +111,46 @@ pkgs.testers.runNixOSTest {
     with subtest("the host still reaches the guest"):
         host.succeed("(ip netns exec guest python3 -m http.server --bind 10.42.0.5 9000 >/dev/null 2>&1 &)")
         host.wait_until_succeeds("nc -z -w 2 10.42.0.5 9000")
+  '' + (if hostRunsNftables then ''
 
-    with subtest("stopping the guard leaves the guests shut out"):
+    with subtest("the host's firewall loads the guard; there is no unit of its own"):
+        host.succeed("nft list table inet host-own")
+        host.fail("systemctl cat meister-guest-guard.service")
+
+    for verb in ("reload", "restart"):
+        with subtest(f"a {verb} of the host's firewall keeps the guard and the agent"):
+            host.succeed(f"systemctl {verb} nftables.service")
+            host.succeed("nft list table inet host-own")
+            guests_shut_out_and_agent_untouched()
+
+    with subtest("stopping the host's firewall leaves the guests shut out and the agent running"):
+        host.succeed("systemctl stop nftables.service")
+        host.fail("nft list table inet host-own")
+        guests_shut_out_and_agent_untouched()
+
+    with subtest("starting it again brings its own rules back beside the guard"):
+        host.succeed("systemctl start nftables.service")
+        host.succeed("nft list table inet host-own")
+        guests_shut_out_and_agent_untouched()
+  '' else ''
+
+    with subtest("restarting the guard leaves the agent running"):
+        host.succeed("systemctl restart meister-guest-guard.service")
+        guests_shut_out_and_agent_untouched()
+
+    with subtest("stopping the guard leaves the guests shut out and the agent running"):
         host.succeed("systemctl stop meister-guest-guard.service")
-        host.succeed("nft list table inet meister-guest-guard")
-        host.fail("ip netns exec guest nc -z -w 2 10.42.0.1 8080")
+        guests_shut_out_and_agent_untouched()
+  '') + ''
 
     with subtest("without the table the same connection goes through"):
+        # Its loader is up and has nothing left to do, so only the table is missing.
+        host.succeed("systemctl start ${loader}")
         host.succeed("nft delete table inet meister-guest-guard")
         host.succeed("ip netns exec guest nc -z -w 2 10.42.0.1 8080")
+
+    with subtest("and the agent does not start without it"):
+        host.fail("systemctl restart meister-agent.service")
+        host.fail("systemctl is-active meister-agent.service")
   '';
 }
