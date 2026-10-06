@@ -55,7 +55,7 @@ pub(crate) async fn would_place(
         let name = cluster.metadata.name.clone();
         let rooms = rooms_of(
             &cluster,
-            &unreported_on(store, &name, &vms).await?,
+            &unreported_on(store, &name, &vms).await,
             overcommit,
         );
         let connected = cluster.status.connected
@@ -174,7 +174,7 @@ impl Ledger {
 
     /// The rooms of `cluster`'s nodes this pass; none for a cluster this
     /// pass did not list.
-    fn rooms(&self, cluster: &str) -> &[NodeRoom] {
+    pub(super) fn rooms(&self, cluster: &str) -> &[NodeRoom] {
         self.nodes.get(cluster).map_or(&[], Vec::as_slice)
     }
 }
@@ -182,12 +182,11 @@ impl Ledger {
 /// The rooms of `cluster`'s nodes as this cloud measures them: what it
 /// reported, less what it holds without a node, and less each VM this cloud
 /// bound to it that it has not reported yet. Neither is in any node's bound
-/// sum yet. The VMs not reported yet are `unreported`, each booked by what it
-/// asks of a node, the same rule [`pick_cluster`] booked it by when it bound
-/// it: so every pass assumes the same node for it. (IKR-B78)
+/// sum yet. The VMs not reported yet are `unreported`, each booked as
+/// [`Booking`] says. (IKR-B78)
 pub(super) fn rooms_of(
     cluster: &Cluster,
-    unreported: &[Wanted],
+    unreported: &[Booking],
     overcommit: Overcommit,
 ) -> Vec<NodeRoom> {
     let mut rooms =
@@ -201,7 +200,7 @@ pub(super) fn rooms_of(
         return rooms;
     }
     for vm in unreported {
-        vm.node.debit(&mut rooms);
+        vm.debit(&mut rooms);
     }
     rooms
 }
@@ -213,24 +212,62 @@ pub(super) fn unreported<'a>(cluster: &'a str, vms: &'a [Vm]) -> impl Iterator<I
     })
 }
 
-/// What each VM bound to `cluster` and not reported by it yet asks of a node:
-/// the [`Wanted`] `pick_cluster` booked it by. A VM whose volumes cannot be
-/// asked about any more (gone, not Ready) is booked by its own asks alone: it
-/// still lands on a node, and leaving it out would count its room as free.
+/// How each VM bound to `cluster` and not reported by it yet is booked on its
+/// nodes. One VM's volumes that cannot be read do not stop the pass: it
+/// measures every cluster before it places any VM, so a store error here
+/// would hold every placement back.
 pub(super) async fn unreported_on<'a>(
     store: &EtcdStore,
     cluster: &'a str,
     vms: &'a [Vm],
-) -> anyhow::Result<Vec<Wanted<'a>>> {
+) -> Vec<Booking<'a>> {
     let mut out = Vec::new();
     for vm in unreported(cluster, vms) {
-        out.push(
-            wanted(store, vm)
-                .await?
-                .unwrap_or_else(|_| Wanted::of(vm, None, None)),
-        );
+        out.push(booking_of(vm, wanted(store, vm).await));
     }
-    Ok(out)
+    out
+}
+
+/// How a VM bound to a cluster and not reported by it yet takes room off that
+/// cluster's nodes.
+pub(super) enum Booking<'a> {
+    /// On the node [`pick_cluster`] booked it on when it bound it, by the
+    /// same [`Wanted`].
+    Where(Wanted<'a>),
+    /// Its volumes cannot be asked about now (gone, not Ready, or not
+    /// readable), so which node it lands on is not known: on every node its
+    /// own asks allow. Booked on one of them, the others would count its room
+    /// as free; left out, all of them would.
+    Anywhere(Wanted<'a>),
+}
+
+impl Booking<'_> {
+    /// Take the VM's size off `rooms` as this booking says.
+    fn debit(&self, rooms: &mut [NodeRoom]) {
+        match self {
+            Booking::Where(wanted) => {
+                wanted.node.debit(rooms);
+            }
+            Booking::Anywhere(wanted) => wanted.node.debit_each(rooms),
+        }
+    }
+}
+
+/// How `vm` is booked, given what asking for its [`Wanted`] answered. A
+/// store error is said here, once per pass, and not passed on.
+pub(super) fn booking_of<'a>(
+    vm: &'a Vm,
+    answer: anyhow::Result<OrSentence<Wanted<'a>>>,
+) -> Booking<'a> {
+    match answer {
+        Ok(Ok(wanted)) => Booking::Where(wanted),
+        Ok(Err(_)) => Booking::Anywhere(Wanted::of(vm, None, None)),
+        Err(e) => {
+            warn!(vm = %vm.metadata.name, error = format!("{e:#}"),
+                  "reading this vm's volumes failed; booking it on every node it may be on");
+            Booking::Anywhere(Wanted::of(vm, None, None))
+        }
+    }
 }
 
 /// Whether `cluster` has said anything about this VM: from then on it counts

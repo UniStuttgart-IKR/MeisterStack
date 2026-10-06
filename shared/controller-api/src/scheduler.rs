@@ -643,16 +643,33 @@ impl NodeDemand<'_> {
         true
     }
 
+    /// Take this VM's size off EVERY node that takes it: for a VM whose node
+    /// is not known, so that none of the nodes it may be on counts its room
+    /// as free. No node keeps more room than [`debit`](Self::debit) would
+    /// have left it, whichever node the VM is really on.
+    pub fn debit_each(&self, rooms: &mut [NodeRoom]) {
+        for room in rooms
+            .iter_mut()
+            .filter(|r| r.takes(self.size) && self.wants(r))
+        {
+            room.room = room.room.minus(self.size);
+        }
+    }
+
     /// Of the nodes that take this VM, the one with the most room.
     fn node_for(&self, rooms: &[NodeRoom]) -> Option<usize> {
-        roomiest(rooms, self.size, |r| {
-            selects(self.selector, &r.node.labels)
-                && self
-                    .allowed
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.iter().any(|a| a == &r.node.name))
-                && crate::resources::accepts_class(&r.node.accepts, self.class)
-        })
+        roomiest(rooms, self.size, |r| self.wants(r))
+    }
+
+    /// Whether this VM may run on `r`, room aside: its selector, the
+    /// locality of its volumes and its class.
+    fn wants(&self, r: &NodeRoom) -> bool {
+        selects(self.selector, &r.node.labels)
+            && self
+                .allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|a| a == &r.node.name))
+            && crate::resources::accepts_class(&r.node.accepts, self.class)
     }
 }
 
@@ -693,6 +710,11 @@ impl NodeRoom {
                 .iter()
                 .any(crate::NodeCondition::vetoes_placement)
     }
+
+    /// Usable, and with room for `size` left.
+    fn takes(&self, size: Capacity) -> bool {
+        self.usable() && size.fits_in(self.room)
+    }
 }
 
 /// The rooms of one cluster's nodes, less `unplaced`: what VMs ask for that
@@ -719,18 +741,18 @@ pub fn node_rooms(
     rooms
 }
 
-/// Of the usable rooms `takes` accepts and `size` fits in, the one with the
+/// Of the rooms that take `size` and that `wants` accepts, the one with the
 /// most room — memory first, then vCPUs, then the name, so two passes over
 /// one report assume the same.
 fn roomiest(
     rooms: &[NodeRoom],
     size: Capacity,
-    takes: impl Fn(&NodeRoom) -> bool,
+    wants: impl Fn(&NodeRoom) -> bool,
 ) -> Option<usize> {
     rooms
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.usable() && takes(r) && size.fits_in(r.room))
+        .filter(|(_, r)| r.takes(size) && wants(r))
         .max_by(|(_, a), (_, b)| {
             (a.room.mem_mib, a.room.vcpus)
                 .cmp(&(b.room.mem_mib, b.room.vcpus))
@@ -3522,6 +3544,37 @@ mod tests {
         assert!(four_gib.debit(&mut ledger));
         assert!(!four_gib.met_by_a_node(&ledger));
         assert!(!four_gib.debit(&mut ledger), "no node takes the second");
+    }
+
+    /// A VM whose node is not known takes its room off every node it may be
+    /// on, and off none it may not: not one its selector misses, and not one
+    /// it does not fit.
+    #[test]
+    fn a_vm_whose_node_is_not_known_takes_its_room_off_every_node_it_may_be_on() {
+        let ssd: BTreeMap<String, String> = [("disk".to_string(), "ssd".to_string())]
+            .into_iter()
+            .collect();
+        let four_gib = NodeDemand {
+            selector: &ssd,
+            allowed: None,
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 4096,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut full = summary("c", true, true, &[("disk", "ssd")]);
+        full.bound_mem_mib = 6144;
+        let mut ledger = rooms(&[
+            summary("a", true, true, &[("disk", "ssd")]),
+            summary("b", true, true, &[("disk", "sata")]),
+            full,
+        ]);
+
+        four_gib.debit_each(&mut ledger);
+
+        let left: Vec<u64> = ledger.iter().map(|r| r.room.mem_mib).collect();
+        assert_eq!(left, [4096, 8192, 2048]);
     }
 
     /// What a cluster holds unplaced, and what is bound there unreported, comes

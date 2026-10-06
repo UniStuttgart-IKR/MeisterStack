@@ -1107,6 +1107,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "etcd-client",
  "http-body-util",
  "hyper",
  "hyper-util",

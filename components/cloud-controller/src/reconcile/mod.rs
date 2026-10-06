@@ -421,7 +421,7 @@ async fn expire_and_collect_clusters(
         let name = cluster.metadata.name.clone();
         let rooms = rooms_of(
             &cluster,
-            &unreported_on(store, &name, vms).await?,
+            &unreported_on(store, &name, vms).await,
             overcommit,
         );
         let heard = beats.get(&name).copied();

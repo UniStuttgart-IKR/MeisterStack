@@ -963,8 +963,8 @@ fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
 /// `rooms_of` with each unreported VM booked by its own asks, as
 /// `unreported_on` books a VM without volumes.
 fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
-    let booked: Vec<Wanted> = unreported(&cluster.metadata.name, vms)
-        .map(|v| Wanted::of(v, None, None))
+    let booked: Vec<Booking> = unreported(&cluster.metadata.name, vms)
+        .map(|v| Booking::Where(Wanted::of(v, None, None)))
         .collect();
     rooms_of(cluster, &booked, Overcommit::default())
 }
@@ -1094,15 +1094,65 @@ fn a_cluster_whose_unplaced_list_was_cut_short_offers_no_room() {
     assert!(!Wanted::of(&asking(512), None, None).served_by("ikr-netlab", &rooms));
 }
 
+/// A VM bound but not reported yet whose volumes cannot be read right now
+/// takes its room off every node it may be on, as one whose volume is gone:
+/// which of them it lands on is not known.
+#[test]
+fn a_vm_whose_volumes_cannot_be_read_takes_room_off_every_node_it_may_be_on() {
+    let mut sent = asking(3072);
+    sent.spec.cluster_name = Some("ikr-netlab".into());
+    let unreadable = booking_of(
+        &sent,
+        Err(anyhow::anyhow!("invalid object: does not parse")),
+    );
+    let gone = booking_of(
+        &sent,
+        Ok(Err("volume data does not exist here any more".into())),
+    );
+    for booked in [unreadable, gone] {
+        let left: Vec<u64> = rooms_of(&netlab(4096), &[booked], Overcommit::default())
+            .iter()
+            .map(|r| r.room.mem_mib)
+            .collect();
+        assert_eq!(left, [1024, 1024]);
+    }
+}
+
 // --- IKR-B81: a write lands on the object that was judged -------------------
 
-/// A store under a fresh prefix of the test etcd (`MEISTER_TEST_ETCD`).
-async fn test_store(area: &str) -> EtcdStore {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into());
-    EtcdStore::connect(&[endpoint], &format!("/{area}/{}", uuid::Uuid::new_v4()))
+/// The test etcd (`MEISTER_TEST_ETCD`).
+fn test_etcd() -> String {
+    std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into())
+}
+
+/// A fresh prefix of the test etcd for `area`, and a store under it.
+async fn test_area(area: &str) -> (EtcdStore, String) {
+    let prefix = format!("/{area}/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[test_etcd()], &prefix)
         .await
-        .expect("an etcd to talk to")
+        .expect("an etcd to talk to");
+    (store, prefix)
+}
+
+/// A store under a fresh prefix of the test etcd.
+async fn test_store(area: &str) -> EtcdStore {
+    test_area(area).await.0
+}
+
+/// A record of kind `T` called `name` under `prefix` that no reader can parse,
+/// written past the store, which only writes what parses. The key is the
+/// store's own layout.
+async fn unparsable<T: Resource>(prefix: &str, name: &str) {
+    let mut etcd = etcd_client::Client::connect([test_etcd()], None)
+        .await
+        .expect("an etcd to talk to");
+    etcd.put(
+        format!("{prefix}/registry/{}/{name}", T::RESOURCE),
+        "{not json",
+        None,
+    )
+    .await
+    .expect("the record");
 }
 
 /// `netlab(mem_mib)`, connected and heard from now, in `store`.
@@ -1141,6 +1191,43 @@ async fn a_preview_says_what_the_pass_would_decide() {
         preview(asking(4096)).await,
         node_level_reason(&asking(4096), 1).1
     );
+}
+
+/// One bound, unreported VM whose volume record does not parse takes its
+/// room off every node it may be on, and the pass still measures the
+/// cluster: one VM's unreadable volume does not stop the pass for every
+/// other VM.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_unreadable_volume_of_one_vm_does_not_stop_the_pass() {
+    let (store, prefix) = test_area("unreadable-test").await;
+    connected_netlab(&store, 4096).await;
+    unparsable::<controller_api::Volume>(&prefix, "lost-disk").await;
+    let bound = |name: &str, mem_mib: u64| {
+        let mut v = asking(mem_mib);
+        v.metadata.name = name.into();
+        v.spec.cluster_name = Some("ikr-netlab".into());
+        v
+    };
+    let mut broken = bound("broken", 1024);
+    broken.spec.vm["volumes"] = serde_json::json!([{ "volume": "lost-disk" }]);
+    let vms = [broken, bound("fine", 2048)];
+
+    let ledger = expire_and_collect_clusters(
+        &store,
+        &sessions(&["ikr-netlab"]),
+        &vms,
+        Overcommit::default(),
+    )
+    .await
+    .expect("the pass measures the clusters");
+
+    let left: Vec<u64> = ledger
+        .rooms("ikr-netlab")
+        .iter()
+        .map(|r| r.room.mem_mib)
+        .collect();
+    assert_eq!(left, [1024, 3072]);
 }
 
 /// What a dispatch carried is stamped onto the reservation it was read from,
