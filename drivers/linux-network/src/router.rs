@@ -644,8 +644,8 @@ impl crate::LinuxNetworkDriver {
         // every locally originated probe need it.
         self.ip_again(&["-n", &netns, "link", "set", "lo", "up"])
             .await;
-        // Legs created below are born silent: only the last step of a complete pass lets an
-        // active router answer, so a pass that fails midway leaves no answering namespace (R2-1).
+        // Legs created below are born silent, so a new router answers ARP only once the last
+        // step of a complete pass activates it (R2-1).
         self.netns_sysctl(
             &netns,
             "net.ipv4.conf.default.arp_ignore",
@@ -693,7 +693,8 @@ impl crate::LinuxNetworkDriver {
             }
             self.ip(&["-n", &netns, "link", "set", leg, "up"]).await?;
         }
-        // A standby falls silent before it is given anything to answer for.
+        // A standby's legs, old ones and any created above, are silent before they are given
+        // an address.
         if !spec.active {
             self.set_arp_mode(&netns, false).await?;
         }
@@ -760,8 +761,9 @@ impl crate::LinuxNetworkDriver {
         // half-built router for ever.
         Self::store_record(&g.state_dir, spec).await?;
 
-        // Activation last, after the rules and the record: no namespace answers ARP without
-        // its NAT or before its record says active (R2-1).
+        // Activation last: a new or standby router starts answering ARP only after its rules
+        // and its active record are in place. A router that was active already keeps answering
+        // throughout a pass that ensures it again, failed steps included (R2-1).
         if spec.active {
             self.activate(&netns, spec, recorded_active).await?;
         }
@@ -979,7 +981,7 @@ impl crate::LinuxNetworkDriver {
     }
 
     /// Silence a router namespace if the kernel lists it. One that is not listed has nothing to
-    /// silence; legs a later pass creates are born silent.
+    /// silence; legs the pass creates later are born silent.
     async fn silence_if_present(&self, netns: &str) -> networking::Result<()> {
         match self.netns_present().await?.iter().any(|n| n == netns) {
             true => self.silence_legs(netns).await,
