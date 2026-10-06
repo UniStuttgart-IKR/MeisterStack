@@ -53,6 +53,11 @@ let
     "a root agent has no mount namespace of its own" = !(ownMountNamespace root);
     "an unprivileged agent that may mount has none either" =
       !(ownMountNamespace unprivilegedMounting);
+    "an agent given CAP_SYS_ADMIN in another spelling has none either" =
+      lib.all (spelling: !(ownMountNamespace (agentUnit {
+        meisterstack.agent.unprivileged = true;
+        meisterstack.agent.capabilities = [ "CAP_NET_ADMIN" spelling ];
+      }))) [ "cap_sys_admin" "Cap_Sys_Admin" "21" "~CAP_NET_RAW" ];
     "an agent that cannot mount keeps the home directories closed" =
       computeOnly.ProtectHome or false;
     "a setting nobody has read up counts as a mount namespace of its own" =

@@ -17,7 +17,12 @@ let
   unprivileged = cfg.agent.unprivileged;
   capabilities = cfg.agent.capabilities;
   # Whether the agent can mount(2): a router's `ip netns` pin and an NFS volume are mounts.
-  mounts = !unprivileged || lib.elem "CAP_SYS_ADMIN" capabilities;
+  # systemd takes a capability in any case, as its number, or a whole list inverted with
+  # `~`, so only canonical names without CAP_SYS_ADMIN are known not to mount; any other
+  # spelling counts as mounting, which costs ProtectHome and never the routers.
+  knownNotToMount = capability:
+    builtins.match "CAP_[A-Z0-9_]+" capability != null && capability != "CAP_SYS_ADMIN";
+  mounts = !unprivileged || !(lib.all knownNotToMount capabilities);
   volumes = cfg.agent.volumes;
 
   # Keep VM records and disks on the same persistent volume root.
