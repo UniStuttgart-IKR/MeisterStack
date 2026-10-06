@@ -1119,8 +1119,8 @@ async fn handle_create_router(store: &EtcdStore, c: proto::CreateRouter) -> anyh
         serde_json::from_str(&c.spec_json).context("invalid spec_json")?;
     mirror_network(store, &c).await?;
 
-    let nats = cloud_nats(&c)?;
     let mut router = Router::declare(&c.name, spec.clone());
+    let nats = cloud_nats(&c, &router)?;
     router.metadata.mark_managed_by_cloud(&c.uid);
     stamp_resolved(&mut router, &c, &nats);
     match store.create(&router).await {
@@ -1178,12 +1178,30 @@ fn stamp_resolved(router: &mut Router, c: &proto::CreateRouter, nats: &[controll
 /// refused rather than defaulted, because a NAT rule this tier cannot spell
 /// would reach a node as a rule it cannot render, and the honest place to
 /// find that out is the hop where the word arrives.
-fn cloud_nats(c: &proto::CreateRouter) -> anyhow::Result<Vec<controller_api::NatRule>> {
+///
+/// A floating address is refused, too, unless its inside end is a guest on
+/// `router`'s own inside prefix. The cloud renders only such rules; a cloud
+/// from before that rule must not get a public address DNATed into another
+/// tenant's prefix through this hop. (IKR-B68)
+fn cloud_nats(
+    c: &proto::CreateRouter,
+    router: &Router,
+) -> anyhow::Result<Vec<controller_api::NatRule>> {
     c.nats
         .iter()
         .map(|r| {
             let kind = controller_api::NatKind::parse(&r.kind)
                 .with_context(|| format!("router {}: unknown nat kind {:?}", c.name, r.kind))?;
+            if kind == controller_api::NatKind::DnatAndSnat
+                && let Some(why) =
+                    controller_api::network::inside_address_refusal(router, &r.logical_ip)
+            {
+                bail!(
+                    "router {}: floating address {} refused: {why}",
+                    c.name,
+                    r.external_ip
+                );
+            }
             Ok(controller_api::NatRule {
                 kind,
                 external_ip: r.external_ip.clone(),
@@ -2167,11 +2185,10 @@ mod tests {
             announced: vec!["10.43.0.0/24".into()],
         };
 
-        let nats = cloud_nats(&command).expect("a kind this tier knows");
-        assert_eq!(nats[0].kind, controller_api::NatKind::DnatAndSnat);
-
         let spec: controller_api::RouterSpec = serde_json::from_str(&command.spec_json).unwrap();
         let mut router = Router::declare("lab-out", spec);
+        let nats = cloud_nats(&command, &router).expect("a kind this tier knows");
+        assert_eq!(nats[0].kind, controller_api::NatKind::DnatAndSnat);
         router.metadata.mark_managed_by_cloud("u-7");
         stamp_resolved(&mut router, &command, &nats);
         assert_eq!(router.status.external_addr, "10.128.1.200/24");
@@ -2187,7 +2204,7 @@ mod tests {
             }],
             ..command.clone()
         };
-        let e = cloud_nats(&nonsense).expect_err("an unknown kind");
+        let e = cloud_nats(&nonsense, &router).expect_err("an unknown kind");
         assert!(format!("{e:#}").contains("masquerade"), "{e:#}");
 
         // And back up: `active` is whether a machine is really forwarding,
@@ -3282,6 +3299,35 @@ mod tests {
             store.get::<controller_api::Secret>("db").await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// IKR-B68 at this hop: a floating address whose inside end is not a
+    /// guest on the router's own inside prefix is refused, whatever the cloud
+    /// sent; one inside it passes, and a routed prefix is no such address.
+    #[test]
+    fn a_floating_address_outside_the_routers_prefix_is_refused_here() {
+        let router = Router::declare(
+            "lab-out",
+            controller_api::RouterSpec {
+                internal_addr: "10.42.0.1/24".into(),
+                ..Default::default()
+            },
+        );
+        let carrying = |kind: &str, logical_ip: &str| proto::CreateRouter {
+            name: "lab-out".into(),
+            nats: vec![proto::NatRule {
+                kind: kind.into(),
+                external_ip: "10.128.1.201".into(),
+                logical_ip: logical_ip.into(),
+            }],
+            ..Default::default()
+        };
+        let e = cloud_nats(&carrying("dnat_and_snat", "10.43.0.5"), &router)
+            .expect_err("another prefix");
+        assert!(format!("{e:#}").contains("10.128.1.201"), "{e:#}");
+        assert!(cloud_nats(&carrying("dnat_and_snat", "10.42.0.1"), &router).is_err());
+        assert!(cloud_nats(&carrying("dnat_and_snat", "10.42.0.9"), &router).is_ok());
+        assert!(cloud_nats(&carrying("routed", "10.43.0.0/24"), &router).is_ok());
     }
 
     /// The router the delete names goes: the guard is not a wall. (NL2-6)
