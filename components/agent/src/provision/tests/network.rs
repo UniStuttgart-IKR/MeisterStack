@@ -355,6 +355,11 @@ fn resent_allowing(record: &VmRecord, subnets: &[&str]) -> AgentVmSpec {
 }
 
 fn held_subnets(store: &crate::store::Store, id: &VmId) -> Vec<String> {
+    held_nic(store, id).routed_subnets
+}
+
+/// The record's spec of the VM's one NIC.
+fn held_nic(store: &crate::store::Store, id: &VmId) -> NicSpec {
     store
         .get(id)
         .expect("a read")
@@ -362,7 +367,6 @@ fn held_subnets(store: &crate::store::Store, id: &VmId) -> Vec<String> {
         .spec
         .nics[0]
         .spec
-        .routed_subnets
         .clone()
 }
 
@@ -514,4 +518,83 @@ async fn a_nic_without_a_tap_takes_the_new_addresses_into_the_record_alone() {
         .expect("a missing tap is not a failure");
 
     assert_eq!(held_subnets(&store, &id), [KEPT]);
+}
+
+/// The last subnet a re-send takes from a running VM leaves its tap on an allowlist of no
+/// subnet, not on the pool ban, which would let the subnet just taken back in with every other
+/// source outside the floating pool; the record keeps it so for the tap's next create.
+#[tokio::test]
+async fn the_last_subnet_taken_from_a_running_vm_closes_its_allowlist_instead_of_opening_the_guard()
+{
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent_allowing(&record, &[]))
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
+    assert!(updated[0].1.routed_subnets.is_empty(), "{updated:?}");
+    assert!(
+        updated[0].1.address_space_known && updated[0].1.sources_allowlisted(),
+        "the tap stays on an allowlist, now of no subnet: {updated:?}"
+    );
+    let held = held_nic(&store, &id);
+    assert!(
+        held.routed_subnets.is_empty() && held.sources_allowlisted(),
+        "and the record says so for the next start: {held:?}"
+    );
+}
+
+/// Once the last subnet is gone, re-sending a spec without one swaps no guard again: the
+/// allowlist the record keeps is what the empty list means for this NIC from then on.
+#[tokio::test]
+async fn a_resent_spec_still_without_a_subnet_leaves_the_closed_allowlist_alone() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, record) = running_vm_allowing(&store, &[TAKEN]);
+    let net = Arc::new(RecordingNet::default());
+    let provisioner = provisioner_on(temp.path(), store.clone(), net.clone());
+    let resent = resent_allowing(&record, &[]);
+    provisioner
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("the last subnet is taken");
+
+    provisioner
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("nothing to do is done");
+
+    assert_eq!(net.guards_updated.lock().unwrap().len(), 1);
+    assert!(held_nic(&store, &id).sources_allowlisted());
+}
+
+/// A NIC that never had a routed subnet stays on the pool ban when its floating addresses
+/// change: nothing ever wrote its address space down, and an allowlist would cut its guest
+/// off from the addresses it uses.
+#[tokio::test]
+async fn a_nic_that_never_had_a_subnet_stays_on_the_pool_ban_when_its_floating_addresses_change() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
+    let (id, mut record) = overlay_vm(10_402);
+    record.spec.nics[0].spec.floating_ips = vec!["10.255.0.7".into()];
+    store.put(&id, &record).expect("a record");
+    let mut resent = record.spec.clone();
+    resent.nics[0].spec.floating_ips.clear();
+    let net = Arc::new(RecordingNet::default());
+
+    provisioner_on(temp.path(), store.clone(), net.clone())
+        .sync_in_place(&id, &resent)
+        .await
+        .expect("the re-sent spec is taken in");
+
+    let updated = net.guards_updated.lock().unwrap().clone();
+    assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
+    assert!(!updated[0].1.sources_allowlisted(), "{updated:?}");
+    assert!(!held_nic(&store, &id).address_space_known);
 }

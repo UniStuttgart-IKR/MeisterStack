@@ -36,8 +36,9 @@ pub struct NicSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub floating_ips: Vec<String>,
     /// Tenant routed subnets used for tap source-address allowlists. Empty
-    /// subnets retain the guard against unassigned floating-pool addresses;
-    /// nonempty subnets permit those prefixes and assigned floating addresses.
+    /// subnets retain the guard against unassigned floating-pool addresses,
+    /// unless `address_space_known` says otherwise; nonempty subnets permit
+    /// those prefixes and assigned floating addresses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
     /// Provider physnet for a direct guest connection. Mutually exclusive
@@ -45,6 +46,27 @@ pub struct NicSpec {
     /// overlay-or-default-bridge path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physnet: Option<String>,
+    /// The tap's sources stay on an allowlist with `routed_subnets` empty: the
+    /// guest may send from its floating addresses and the unspecified address,
+    /// and from no tenant subnet. An empty list alone reads as an address space
+    /// nobody wrote down, guarded only against the floating pool; so when a
+    /// re-send takes the last subnet from a NIC whose guard is an allowlist,
+    /// the agent sets this, and taking the subnet away narrows the guard
+    /// instead of opening it (NL4-1). The agent's own: no spec on the wire
+    /// carries it. Kept in the VM record, so the tap's next create guards it
+    /// the same, and never cleared while the record lives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub address_space_known: bool,
+}
+
+impl NicSpec {
+    /// Whether the tap guard holds this NIC's IPv4 sources to an allowlist of
+    /// its routed subnets, its floating addresses and the unspecified address,
+    /// rather than only banning the floating pool. A provider NIC is pinned by
+    /// its MAC alone and never is.
+    pub fn sources_allowlisted(&self) -> bool {
+        self.physnet.is_none() && (self.address_space_known || !self.routed_subnets.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

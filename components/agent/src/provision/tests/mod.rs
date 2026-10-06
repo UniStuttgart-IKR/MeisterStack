@@ -221,6 +221,7 @@ fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
         physnet: None,
         floating_ips: Vec::new(),
         routed_subnets: Vec::new(),
+        address_space_known: false,
     };
     let mut spec = spec(1, 256, vec![]);
     spec.nics = vec![crate::types::NicWithId {
