@@ -91,7 +91,10 @@ pub(super) async fn delete_user(
 ) -> Result<controller_api::Removed, ApiError> {
     let user: User = st.store.get(&name).await?;
     let live = user.status.live(Utc::now()).count();
-    st.store.delete::<User>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<User>(&name, &user.metadata.resource_version)
+        .await?;
     info!(user = %name, live_certificates = live, "user deleted");
     Ok(
         controller_api::removed(User::KIND, &name, controller_api::Removal::Gone)

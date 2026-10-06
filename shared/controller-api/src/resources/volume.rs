@@ -270,6 +270,13 @@ pub struct VolumeStatus {
     /// VM holding the volume within its tenant, or None when unclaimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<String>,
+    /// The uid of the VM object in `attachedTo`: the claim belongs to that
+    /// object and not to whatever carries its name later (IKR-B81). None on a
+    /// claim written before claims carried a uid; such a claim is nobody's
+    /// to adopt by name, and the claimant pass binds it or lets it fall. The
+    /// cloud tier mirrors only the name and leaves this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_uid: Option<String>,
     /// Observed backend size in GiB, rounded up from bytes. Zero means unmeasured. This can lag
     /// requested spec.sizeGib while a resize is in progress.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -306,6 +313,23 @@ pub struct VolumeStatus {
 }
 
 impl VolumeStatus {
+    /// Whether the claim on this volume is the VM object `uid`'s. A claim with
+    /// no uid is nobody's for this question; see `attached_uid`.
+    pub fn claimed_by(&self, uid: &str) -> bool {
+        self.attached_to.is_some() && self.attached_uid.as_deref() == Some(uid)
+    }
+
+    /// Whether the VM `name`/`uid` may let go of this claim or carry it along:
+    /// by uid, or — for a claim from before claims carried a uid — by the name
+    /// it was written under, which is the only VM it can be from. Taking a
+    /// claim (`claimed_by`) never accepts a name.
+    pub fn held_by(&self, name: &str, uid: &str) -> bool {
+        match self.attached_uid.as_deref() {
+            Some(held) => held == uid,
+            None => self.attached_to.as_deref() == Some(name),
+        }
+    }
+
     /// Record a node-reported open attachment, retaining sorted set semantics.
     /// Return whether it changed so unchanged reports do not create revisions.
     /// Only the volume status report owns this observation; command dispatch
@@ -922,6 +946,34 @@ mod claim_tests {
             !held.status.claimant_gone,
             "the fact goes with the claim it was about"
         );
+    }
+
+    /// IKR-B81: a claim is the claimant OBJECT's. Its uid answers "is this
+    /// mine", a claim from before claims carried one answers no to every
+    /// VM, and the uid goes with the claim when it falls.
+    #[test]
+    fn a_claim_is_the_claimant_objects_and_falls_with_its_uid() {
+        let mut held = attached();
+        assert!(
+            !held.status.claimed_by("u-web-1"),
+            "no uid: nobody's to adopt"
+        );
+        assert!(
+            held.status.held_by("web-1", "u-web-1-again"),
+            "but its own vm, by the name it was written under, may let go of it"
+        );
+        held.status.attached_uid = Some("u-web-1".into());
+        assert!(held.status.claimed_by("u-web-1"));
+        assert!(!held.status.held_by("web-1", "u-web-1-again"));
+        assert!(
+            !held.status.claimed_by("u-web-1-again"),
+            "the same name, another vm"
+        );
+
+        held.status.claimant_gone = true;
+        held.status.open_on.clear();
+        held.settle(at(10));
+        assert_eq!(held.status.attached_uid, None);
     }
 
     /// A reschedule of the SAME VM keeps the claim, and keeps it for free:

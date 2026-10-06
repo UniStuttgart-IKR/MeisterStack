@@ -584,7 +584,7 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     let carried = book.for_vm(&owned("web", Some("acme"))).carried;
     let mut names: Vec<_> = carried
         .iter()
-        .map(|(resource, name, generation)| (*resource, name.as_str(), *generation))
+        .map(|c| (c.resource, c.name.as_str(), c.generation))
         .collect();
     names.sort();
     assert_eq!(
@@ -611,7 +611,11 @@ fn a_dispatch_stamps_the_addresses_it_carried_and_no_others() {
     // which is what a routed subnet IS — it reaches a node inside some
     // VM's create or it reaches none.
     let idle = book.for_vm(&owned("idle", Some("acme"))).carried;
-    assert_eq!(idle, [("routedsubnets", "acme-net".to_string(), 5)]);
+    let idle: Vec<_> = idle
+        .iter()
+        .map(|c| (c.resource, c.name.as_str(), c.generation))
+        .collect();
+    assert_eq!(idle, [("routedsubnets", "acme-net", 5)]);
 }
 
 /// The generation is read when the command is BUILT and never again.
@@ -636,7 +640,7 @@ fn what_is_stamped_is_what_the_command_carried_and_not_what_is_stored_after() {
     assert!(
         carried
             .iter()
-            .all(|(resource, _, generation)| *resource != "floatingips" || *generation == 2),
+            .all(|c| c.resource != "floatingips" || c.generation == 2),
         "the command still carries what it was built with"
     );
 }
@@ -820,14 +824,7 @@ fn only_a_dispatch_after_the_intent_counts_as_told() {
 #[tokio::test]
 #[ignore = "needs an etcd; see api::admission_tests"]
 async fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
-    let endpoint =
-        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into());
-    let store = EtcdStore::connect(
-        &[endpoint],
-        &format!("/placement-test/{}", uuid::Uuid::new_v4()),
-    )
-    .await
-    .expect("an etcd to talk to");
+    let store = test_store("placement-test").await;
     let node = |name: &str| controller_api::NodeSummary {
         name: name.into(),
         ready: true,
@@ -865,4 +862,79 @@ async fn a_cluster_is_offered_only_where_one_node_can_take_the_vm() {
     let (category, sentence) = node_level_reason(&asking(4096), 1);
     assert_eq!(category, controller_api::PendingReason::NoCapacity);
     assert!(sentence.contains("4096 MiB"), "{sentence}");
+}
+
+// --- IKR-B81: a write lands on the object that was judged -------------------
+
+/// A store under a fresh prefix of the test etcd (`MEISTER_TEST_ETCD`).
+async fn test_store(area: &str) -> EtcdStore {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".into());
+    EtcdStore::connect(&[endpoint], &format!("/{area}/{}", uuid::Uuid::new_v4()))
+        .await
+        .expect("an etcd to talk to")
+}
+
+/// What a dispatch carried is stamped onto the reservation it was read from,
+/// not onto one released and reserved again under the same address since.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_stamp_for_an_old_reservation_leaves_the_new_one_alone() {
+    let store = test_store("stamp-test").await;
+    let reservation = || {
+        controller_api::FloatingIp::declare(
+            "198.51.100.9",
+            controller_api::FloatingIpSpec {
+                tenant: "acme".into(),
+                address: "198.51.100.9".into(),
+                ..Default::default()
+            },
+        )
+    };
+    let old = store.create(&reservation()).await.expect("the old one");
+    let carried = Carried {
+        resource: controller_api::FloatingIp::RESOURCE,
+        name: old.metadata.name.clone(),
+        uid: old.metadata.uid.clone(),
+        generation: old.metadata.generation,
+    };
+    store
+        .delete::<controller_api::FloatingIp>("198.51.100.9")
+        .await
+        .expect("released");
+    store.create(&reservation()).await.expect("reserved again");
+
+    stamp_addresses(&store, &[carried]).await;
+
+    let new: controller_api::FloatingIp = store.get("198.51.100.9").await.expect("the new one");
+    assert_eq!(
+        new.status.observed_generation, 0,
+        "nothing travelled for it"
+    );
+}
+
+/// The teardown of a VM that was never placed deletes that VM and not one
+/// made under its name since.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_teardown_judged_on_an_old_vm_leaves_the_recreated_one() {
+    let store = test_store("teardown-test").await;
+    let unplaced = || {
+        let mut v = vm();
+        v.spec.cluster_name = None;
+        v.metadata.deletion_timestamp = Some(Utc::now());
+        v
+    };
+    let old = store.create(&unplaced()).await.expect("the old vm");
+    store.delete::<Vm>("t").await.expect("it goes");
+    let mut fresh = vm();
+    fresh.spec.cluster_name = None;
+    let fresh = store.create(&fresh).await.expect("a new vm of that name");
+
+    teardown(&store, &crate::session::SessionRegistry::new(), &old, "")
+        .await
+        .expect("a pass");
+
+    let still: Vm = store.get("t").await.expect("the new vm");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
 }

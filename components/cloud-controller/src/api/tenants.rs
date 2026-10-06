@@ -156,7 +156,7 @@ pub(super) async fn delete_tenant(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: Tenant = st.store.get(&name).await?;
+    let current: Tenant = st.store.get(&name).await?;
 
     let users = st.store.list::<User>().await?;
     // `list` drops what it cannot decode, and a dropped user is a membership
@@ -190,7 +190,10 @@ pub(super) async fn delete_tenant(
     if let Some(why) = tenant_still_holds(&name, &users, &vms, &ips, &subnets) {
         return Err(conflict(why));
     }
-    st.store.delete::<Tenant>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<Tenant>(&name, &current.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         Tenant::KIND,
         &name,

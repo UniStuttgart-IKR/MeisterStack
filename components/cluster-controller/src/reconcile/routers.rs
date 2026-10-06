@@ -304,7 +304,7 @@ async fn ensure_nats(pass: &Pass<'_>, router: Router) -> anyhow::Result<Router> 
     let name = router.metadata.name.clone();
     Ok(pass
         .store
-        .mutate::<Router, _>(&name, |r| {
+        .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
             r.status.nats = nats.clone();
             r.status.announced = announced.clone();
         })
@@ -366,7 +366,7 @@ async fn note(
         )
     });
     pass.store
-        .mutate::<Router, _>(&name, |r| {
+        .mutate_if::<Router, _>(&name, &router.metadata.uid, |r| {
             r.status.reported = Some(said.clone());
             r.status.observed_generation = generation;
             if let Some((nodes, active, refused, releasing)) = &placement {

@@ -88,7 +88,7 @@ pub(super) async fn drain_node(p: &Pass<'_>, node: &str, vms: &[Vm]) -> anyhow::
             // operator's behalf because that is what a drain IS.
             controller_api::drain::Verdict::Reschedule => {
                 p.store
-                    .mutate::<Vm, _>(&name, |v| v.spec.node_name = None)
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.spec.node_name = None)
                     .await?;
                 events::record(
                     p.store,
@@ -107,7 +107,7 @@ pub(super) async fn drain_node(p: &Pass<'_>, node: &str, vms: &[Vm]) -> anyhow::
             // happens here; `evacuate` carries it from there.
             controller_api::drain::Verdict::Restart => {
                 p.store
-                    .mutate::<Vm, _>(&name, |v| {
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                         v.status.evacuating = Some(controller_api::Evacuating {
                             from: node.to_string(),
                             step: controller_api::EvacuationStep::Stopping

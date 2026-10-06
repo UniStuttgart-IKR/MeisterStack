@@ -81,7 +81,7 @@ pub(super) async fn delete_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: StoragePool = st.store.get(&name).await?;
+    let current: StoragePool = st.store.get(&name).await?;
     let held: Vec<String> = st
         .store
         .list::<Volume>()
@@ -96,7 +96,10 @@ pub(super) async fn delete_storage_pool(
             held.join(", ")
         )));
     }
-    st.store.delete::<StoragePool>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<StoragePool>(&name, &current.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         StoragePool::KIND,
         &name,

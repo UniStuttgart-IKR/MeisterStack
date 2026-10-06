@@ -910,6 +910,10 @@ message CreateVmMigration {
   // Whose guest this is. Carried and not enforced at the cluster, the same
   // rule `CreateVm` follows: the cluster keeps no directory.
   string tenant = 4;
+  // The cloud vm's uid. The cluster moves only the copy that carries it as
+  // its cloud uid: a cluster-local vm of the same name is not the cloud's to
+  // move. Empty, from a cloud older than the field, is refused.
+  string vm_uid = 5;
 }
 
 // Release the cluster's volume object without deprovisioning backend data.

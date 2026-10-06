@@ -453,7 +453,7 @@ pub(super) async fn drain_cluster(
             }
             controller_api::drain::Verdict::Reschedule => {
                 store
-                    .mutate::<Vm, _>(&name, |v| v.spec.cluster_name = None)
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.spec.cluster_name = None)
                     .await?;
                 events::record(
                     store,
@@ -473,7 +473,7 @@ pub(super) async fn drain_cluster(
             }
             controller_api::drain::Verdict::Restart => {
                 store
-                    .mutate::<Vm, _>(&name, |v| {
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                         v.status.evacuating = Some(controller_api::Evacuating {
                             from: cluster.to_string(),
                             step: controller_api::EvacuationStep::Stopping
@@ -643,7 +643,7 @@ pub(super) async fn evacuate(
     let name = vm.metadata.name.clone();
     if cluster != mark.from {
         store
-            .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+            .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
             .await?;
         events::record(
             store,
@@ -679,7 +679,7 @@ pub(super) async fn evacuate(
                 return Ok(());
             }
             store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     v.spec.cluster_name = None;
                     v.status.evacuating = Some(controller_api::Evacuating {
                         from: mark.from.clone(),
@@ -697,7 +697,7 @@ pub(super) async fn evacuate(
         // honest; looping is not.
         Some(controller_api::EvacuationStep::Moving) => {
             store
-                .mutate::<Vm, _>(&name, |v| v.status.evacuating = None)
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.status.evacuating = None)
                 .await?;
             warn!(vm = %name, cluster, "evacuation came back to the same cluster; giving it up");
             Ok(())
@@ -743,7 +743,7 @@ pub(super) async fn dispatch_create(
     match registry.send_command(cluster, traceparent, op).await {
         Ok(Ack::Acked(_)) => {
             store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     // The generation this command carried down. Everything
                     // below is a guess about what the cluster will do with
                     // it; this is the one thing we KNOW, because we sent it.
@@ -778,7 +778,7 @@ pub(super) async fn dispatch_create(
             let msg = refusal.message;
             warn!(cluster, error = %msg, "cluster refused the create");
             store
-                .mutate::<Vm, _>(&name, |v| {
+                .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                     v.status.reported = Some(controller_api::VmReported::here(
                         VmPhaseKind::Failed,
                         controller_api::VmReason::Refused,
@@ -816,9 +816,13 @@ pub(super) async fn teardown(
     let uid = vm.metadata.uid.clone();
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        // Never placed anywhere: there is nothing to tear down.
-        store.delete::<Vm>(&name).await?;
-        info!("vm deleted (never placed)");
+        // Never placed anywhere: there is nothing to tear down. The VM that
+        // was judged, at its revision; one bound or made again under the name
+        // since is decided next pass. (IKR-B81)
+        let never_placed = |v: &Vm| v.is_deleting() && v.spec.cluster_name.is_none();
+        if controller_api::deletion::finish_delete(store, vm, never_placed).await? {
+            info!("vm deleted (never placed)");
+        }
         return Ok(());
     };
 
@@ -840,7 +844,7 @@ pub(super) async fn teardown(
         {
             Ok(Ack::Acked(_)) => {
                 store
-                    .mutate::<Vm, _>(&name, |v| {
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
                         v.status.observed_at = Some(Utc::now());
                     })
                     .await?;
@@ -863,8 +867,10 @@ pub(super) async fn teardown(
         debug!(cluster = %cluster, "waiting for a status younger than what we already know");
         return Ok(());
     }
-    store.delete::<Vm>(&name).await?;
-    info!(cluster = %cluster, "vm deleted");
+    // On the revision whose absence from the report was judged. (IKR-B81)
+    if controller_api::deletion::finish_delete(store, vm, Vm::is_deleting).await? {
+        info!(cluster = %cluster, "vm deleted");
+    }
     Ok(())
 }
 

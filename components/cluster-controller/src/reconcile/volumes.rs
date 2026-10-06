@@ -164,7 +164,7 @@ pub(super) async fn write_pool_status(
                       "storage pool locality"),
     }
     store
-        .mutate::<StoragePool, _>(&pool.metadata.name, |p| {
+        .mutate_if::<StoragePool, _>(&pool.metadata.name, &pool.metadata.uid, |p| {
             p.status.locality = locality;
             p.status.disagreement = disagreement.clone();
         })
@@ -217,33 +217,85 @@ pub(super) async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Record whether the named VM still claims this volume.
+/// Record whether the VM object that claims this volume still does.
 /// Deleting VMs no longer count as claimants, but node open-handle reports must
 /// also clear before the derived attachment claim is released.
 async fn note_claimant(p: &Pass<'_>, volume: &Volume, vms: &[Vm]) -> anyhow::Result<()> {
     let Some(holder) = volume.status.attached_to.as_deref() else {
         return Ok(());
     };
-    let gone = !vms.iter().any(|vm| {
-        vm.metadata.name == holder
-            && vm.metadata.deletion_timestamp.is_none()
+    let verdict = claimant_verdict(volume, vms);
+    if volume.status.claimant_gone == verdict.gone && verdict.bind.is_none() {
+        return Ok(());
+    }
+    let claim = (
+        volume.status.attached_to.clone(),
+        volume.status.attached_uid.clone(),
+    );
+    p.store
+        .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
+            // The claim this verdict was made about, or nothing: a claim taken
+            // or bound since is the next pass's to judge.
+            if (v.status.attached_to.clone(), v.status.attached_uid.clone()) != claim {
+                return;
+            }
+            v.status.claimant_gone = verdict.gone;
+            if let Some(uid) = &verdict.bind {
+                v.status.attached_uid = Some(uid.clone());
+            }
+        })
+        .await?;
+    if verdict.gone {
+        info!(volume = %volume.metadata.name, holder,
+              "the claimant is gone; the claim falls when no node reports the bytes open");
+    }
+    Ok(())
+}
+
+/// What the claimant pass concludes about one volume's claim.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ClaimantVerdict {
+    /// No live VM object holds the claim any more.
+    pub(super) gone: bool,
+    /// A claim from before claims carried a uid, bound to the one VM object
+    /// that carries the name and still refers to the volume. (IKR-B81)
+    pub(super) bind: Option<String>,
+}
+
+/// Judge a claim by the uid it carries. A claim without one is bound to the
+/// live VM of its name that refers to the volume — names are unique at any
+/// one moment — unless it has already been found gone: a gone claim is never
+/// handed to a VM made under the name since, it falls and is taken afresh.
+pub(super) fn claimant_verdict(volume: &Volume, vms: &[Vm]) -> ClaimantVerdict {
+    let claims = |vm: &&Vm| {
+        vm.metadata.deletion_timestamp.is_none()
             && vm
                 .spec
                 .referenced_volumes()
                 .iter()
                 .any(|named| named == &volume.metadata.name)
-    });
-    if volume.status.claimant_gone == gone {
-        return Ok(());
+    };
+    match volume.status.attached_uid.as_deref() {
+        Some(uid) => ClaimantVerdict {
+            gone: !vms.iter().filter(claims).any(|vm| vm.metadata.uid == uid),
+            bind: None,
+        },
+        None if volume.status.claimant_gone => ClaimantVerdict {
+            gone: true,
+            bind: None,
+        },
+        None => {
+            let holder = volume.status.attached_to.as_deref();
+            let named = vms
+                .iter()
+                .filter(claims)
+                .find(|vm| Some(vm.metadata.name.as_str()) == holder);
+            ClaimantVerdict {
+                gone: named.is_none(),
+                bind: named.map(|vm| vm.metadata.uid.clone()),
+            }
+        }
     }
-    p.store
-        .mutate::<Volume, _>(&volume.metadata.name, |v| v.status.claimant_gone = gone)
-        .await?;
-    if gone {
-        info!(volume = %volume.metadata.name, holder,
-              "the claimant is gone; the claim falls when no node reports the bytes open");
-    }
-    Ok(())
 }
 
 /// The node's word for "these bytes do not exist any more".
@@ -354,7 +406,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
     // controller between the two halves loses nothing.
     if volume.status.untold_gib < volume.spec.size_gib {
         p.store
-            .mutate::<Volume, _>(&name, |v| {
+            .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                 v.status.untold_gib = v.status.untold_gib.max(v.spec.size_gib);
             })
             .await?;
@@ -381,7 +433,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
             let message = format!("{e:#}");
             warn!(volume = %name, node, error = %message, "the backend did not grow");
             p.store
-                .mutate::<Volume, _>(&name, |v| {
+                .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                     // Not the node's word: the node never got the command.
                     // Two of the old assignments said "Reported" about a
                     // session failure, and this was one of them — the
@@ -426,7 +478,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         let message = guest_not_told(volume.spec.size_gib, &format!("{e:#}"));
         warn!(volume = %name, node = %vm_node, "{message}");
         p.store
-            .mutate::<Volume, _>(&name, |v| {
+            .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                 // The sentence, onto the word that is already there. The
                 // bytes ARE what the node last said they are — the resize
                 // grew them — and what is missing is one notification, so the
@@ -453,7 +505,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
 async fn told(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
     let size = volume.spec.size_gib;
     p.store
-        .mutate::<Volume, _>(&volume.metadata.name, |v| {
+        .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
             if v.status.untold_gib <= size {
                 v.status.untold_gib = 0;
             }
@@ -479,7 +531,7 @@ pub(super) async fn provision_volume(
         // not a wait — the same shape as a snapshot that is gone.
         warn!(volume = %name, %why, "provision cannot start");
         p.store
-            .mutate::<Volume, _>(&name, |v| {
+            .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                 v.status.reported = Some(controller_api::VolumeReported::here(
                     VolumePhaseKind::Failed,
                     controller_api::VolumeReason::SourceMissing,
@@ -512,7 +564,7 @@ pub(super) async fn provision_volume(
                 let message = format!("snapshot {named} does not exist here any more");
                 warn!(volume = %name, %message, "provision cannot start");
                 p.store
-                    .mutate::<Volume, _>(&name, |v| {
+                    .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                         v.status.reported = Some(controller_api::VolumeReported::here(
                             VolumePhaseKind::Failed,
                             controller_api::VolumeReason::SourceMissing,
@@ -565,7 +617,7 @@ pub(super) async fn provision_volume(
         let message = format!("{e:#}");
         warn!(volume = %name, node, error = %message, "provision could not be delivered");
         p.store
-            .mutate::<Volume, _>(&name, |v| {
+            .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
                 if v.status.phase().kind() == VolumePhaseKind::Provisioning {
                     v.status.reported = Some(controller_api::VolumeReported::here(
                         VolumePhaseKind::Failed,
@@ -584,7 +636,7 @@ pub(super) async fn provision_volume(
     // volume in the estate read `generation 1, observed 0` for ever.
     let dispatched = volume.metadata.generation;
     p.store
-        .mutate::<Volume, _>(&name, |v| {
+        .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
             v.status.observed_generation = v.status.observed_generation.max(dispatched);
         })
         .await?;
@@ -619,7 +671,7 @@ pub(super) async fn requeue_volume(
     let name = volume.metadata.name.clone();
     let kicked = p
         .store
-        .mutate::<Volume, _>(&name, |v| {
+        .mutate_if::<Volume, _>(&name, &volume.metadata.uid, |v| {
             v.status.requeue_attempts = v.status.requeue_attempts.saturating_add(1);
             v.status.last_requeue = Some(now);
             // Back to a wait, and the failure that got it here is forgotten:
@@ -835,7 +887,7 @@ pub(super) async fn note_volume_releasing(
         return Ok(());
     }
     p.store
-        .mutate::<Volume, _>(&volume.metadata.name, |v| {
+        .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
             // The one place that knows WHO is holding it — the sentence names
             // the vm or the snapshot, and the snapshot is an object the
             // derivation may not read — so the one place that writes the
@@ -970,7 +1022,7 @@ pub(super) async fn note_pending(
         return Ok(());
     }
     p.store
-        .mutate::<Volume, _>(&volume.metadata.name, |v| {
+        .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
             v.status.reported = Some(controller_api::VolumeReported::here(
                 VolumePhaseKind::Pending,
                 controller_api::VolumeReason::Unplaced,

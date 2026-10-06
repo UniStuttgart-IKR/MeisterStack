@@ -523,9 +523,12 @@ pub(super) async fn delete_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    refuse_if_cloud_owned(&st.store.get::<Vm>(&name).await?)?;
+    let current: Vm = st.store.get(&name).await?;
+    refuse_if_cloud_owned(&current)?;
+    // On the VM that passed the guard: one the cloud made under the name
+    // since is the cloud's to delete, not this edge's. (IKR-B81)
     st.store
-        .mutate::<Vm, _>(&name, |v| {
+        .mutate_if::<Vm, _>(&name, &current.metadata.uid, |v| {
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }

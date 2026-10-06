@@ -151,7 +151,9 @@ async fn forget_router_refusals(store: &EtcdStore, node: &str) {
     {
         let name = router.metadata.name.clone();
         match store
-            .mutate::<controller_api::Router, _>(&name, |r| r.status.refused.retain(|n| n != node))
+            .mutate_if::<controller_api::Router, _>(&name, &router.metadata.uid, |r| {
+                r.status.refused.retain(|n| n != node)
+            })
             .await
         {
             Ok(_) => info!(router = %name, node, "a new session; asking this node again"),

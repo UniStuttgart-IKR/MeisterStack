@@ -872,8 +872,10 @@ pub(super) async fn delete_vm(
     let current: Vm = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(current.spec.tenant.as_deref()), Verb::Write)?;
+    // On the object whose tenant was checked: one deleted and made again
+    // under the name since is somebody else's. (IKR-B81)
     st.store
-        .mutate::<Vm, _>(&name, |v| {
+        .mutate_if::<Vm, _>(&name, &current.metadata.uid, |v| {
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }

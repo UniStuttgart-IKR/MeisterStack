@@ -130,7 +130,7 @@ pub(super) async fn note_pending(
         return Ok(());
     }
     store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             // Its own fact, exactly as one tier down: this pass says why a VM
             // is WAITING and does not decide what the VM is doing. See
             // `settle_vm`, which reads it only where a wait is what the VM is

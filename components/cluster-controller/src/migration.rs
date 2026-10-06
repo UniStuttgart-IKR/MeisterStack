@@ -250,6 +250,7 @@ pub async fn start_from_the_cloud(
     store: &EtcdStore,
     name: &str,
     vm: &str,
+    cloud_uid: &str,
     target_node: Option<&str>,
 ) -> anyhow::Result<()> {
     // The vm has to be one of ours, and saying so here is what makes the
@@ -259,6 +260,15 @@ pub async fn start_from_the_cloud(
         .get(vm)
         .await
         .map_err(|e| anyhow::anyhow!("vm {vm} is not on this cluster: {e}"))?;
+    // And it has to be the cloud's object, not one that carries its name: a
+    // cluster-local vm, or the copy of another cloud vm, is not the cloud's
+    // to move. (IKR-B81)
+    if guest.metadata.cloud_uid() != Some(cloud_uid) {
+        return Err(controller_api::Refused::invalid(format!(
+            "vm {vm} on this cluster is not the cloud's vm {cloud_uid}"
+        ))
+        .into());
+    }
     // A cloud's command does not pass the REST edge, so the REST edge's whole
     // refusal is asked here: instance-store disks, node-local volumes,
     // devices, nowhere to go. (IKR-B72)
@@ -1384,11 +1394,16 @@ fn close_volumes_at(vm: &Vm, node: &str) {
 
 /// Move referenced volume homes that still name the source to the destination.
 /// Failures are logged after the migration succeeds; there is no retry here.
+/// Only a volume this guest holds (`VolumeStatus::held_by`): a volume made under a
+/// referenced name since, or held by another object, is not this migration's to
+/// move. (IKR-B81)
 async fn move_volume_home(store: &EtcdStore, vm: &Vm, from: &str, to: &str) {
     for name in vm.spec.referenced_volumes() {
         let moved = store
             .mutate::<Volume, _>(&name, |v| {
-                if v.status.node.as_deref() == Some(from) {
+                if v.status.node.as_deref() == Some(from)
+                    && v.status.held_by(&vm.metadata.name, &vm.metadata.uid)
+                {
                     v.status.node = Some(to.to_string());
                 }
             })

@@ -612,7 +612,7 @@ pub(super) async fn note_vm_pending(
         return Ok(());
     }
     p.store
-        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+        .mutate_if::<Vm, _>(&vm.metadata.name, &vm.metadata.uid, |v| {
             // Its own fact, and that is what keeps the old sentence true:
             // this pass says why a VM is WAITING, it does not decide what the
             // VM is doing. `settle_vm` reads it only where a wait is what the

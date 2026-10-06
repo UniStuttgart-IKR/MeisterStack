@@ -2910,9 +2910,11 @@ fn naming_data(mut vm: Vm) -> Vm {
 
 /// The volume `data`, claimed by the VM `t`, open on a node and stored. Open, so that a release
 /// shows as `claimantGone` instead of letting the claim fall at once.
-async fn data_claimed_by_t(store: &EtcdStore) -> Volume {
+/// The volume `data`, claimed by the VM `t` whose object is `uid` (IKR-B81).
+async fn data_claimed_by_t(store: &EtcdStore, uid: &str) -> Volume {
     let mut volume = controller_api::resources::new_volume("data", Default::default());
     volume.status.attached_to = Some("t".into());
+    volume.status.attached_uid = Some(uid.into());
     volume.status.open_on = vec!["agent-1".into()];
     store.create(&volume).await.expect("the claimed volume")
 }
@@ -2932,7 +2934,7 @@ async fn a_vm_recreated_under_the_same_name_survives_the_old_teardown() {
         .create(&naming_data(bound_to(None)))
         .await
         .expect("a new vm under the same name");
-    data_claimed_by_t(&store).await;
+    data_claimed_by_t(&store, &fresh.metadata.uid).await;
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
@@ -2956,7 +2958,7 @@ async fn a_vm_torn_down_as_listed_lets_go_of_its_volumes() {
         .create(&naming_data(deleting_vm()))
         .await
         .expect("a deleting vm");
-    data_claimed_by_t(&store).await;
+    data_claimed_by_t(&store, &listed.metadata.uid).await;
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
@@ -3198,4 +3200,128 @@ async fn an_unchanged_resting_router_is_carried_down_once() {
         .expect("a pass");
     }
     assert_eq!(*heard.0.lock().unwrap(), vec!["gw-1".to_string()]);
+}
+
+// --- IKR-B81: a volume claim is the claimant object's ---------------------
+
+/// A VM `name` with uid `uid`, referring to the volume `data` or not.
+fn claimant(name: &str, uid: &str, refers: bool) -> Vm {
+    let disks = if refers {
+        serde_json::json!({ "volumes": [{ "volume": "data" }] })
+    } else {
+        serde_json::json!({})
+    };
+    let mut vm = controller_api::resources::new_vm(
+        name,
+        controller_api::VmSpec {
+            vm: disks,
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    vm.metadata.uid = uid.into();
+    vm
+}
+
+/// The volume `data`, claimed by `web` with the uid `uid` (or none).
+fn claimed(uid: Option<&str>, gone: bool) -> Volume {
+    let mut v = controller_api::resources::new_volume("data", Default::default());
+    v.status.attached_to = Some("web".into());
+    v.status.attached_uid = uid.map(str::to_string);
+    v.status.claimant_gone = gone;
+    v
+}
+
+#[test]
+fn a_claim_is_judged_by_the_uid_it_carries_and_not_by_the_name() {
+    let v = claimed(Some("u-1"), false);
+    let held = |gone| ClaimantVerdict { gone, bind: None };
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-2", true)]),
+        held(true),
+        "the same name, another vm"
+    );
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-1", true)]),
+        held(false)
+    );
+    assert_eq!(
+        claimant_verdict(&v, &[claimant("web", "u-1", false)]),
+        held(true),
+        "the claimant no longer refers to it"
+    );
+}
+
+/// A claim written before claims carried a uid is bound to the live VM of its
+/// name once, and a claim already found gone is never handed to a VM made
+/// under the name since.
+#[test]
+fn a_claim_from_before_uids_is_bound_once_and_never_revived_by_a_name() {
+    let live = [claimant("web", "u-1", true)];
+    assert_eq!(
+        claimant_verdict(&claimed(None, false), &live),
+        ClaimantVerdict {
+            gone: false,
+            bind: Some("u-1".into())
+        }
+    );
+    assert_eq!(
+        claimant_verdict(&claimed(None, true), &live),
+        ClaimantVerdict {
+            gone: true,
+            bind: None
+        }
+    );
+    assert!(claimant_verdict(&claimed(None, false), &[]).gone);
+}
+
+/// A VM made again under the name of the one that holds a disk does not take
+/// the disk: it waits for that claim to fall.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_made_again_under_a_name_does_not_take_the_old_ones_disk() {
+    let store = crate::test_etcd::fresh_store("claim-test").await;
+    let mut data = claimed(Some("u-old"), false);
+    data.status.node = Some("agent-1".into());
+    data.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    data.settle(Utc::now());
+    store.create(&data).await.expect("the volume");
+    let mut web = claimant("web", "u-new", true);
+    web.spec.node_name = Some("agent-1".into());
+    let web = store.create(&web).await.expect("the new web");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&["agent-1"]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    let why = hold_volumes(&pass, &web, "agent-1")
+        .await
+        .expect_err("held by the old web");
+    assert!(format!("{why:#}").contains("held by"), "{why:#}");
+    let still: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(still.status.attached_uid.as_deref(), Some("u-old"));
+}
+
+/// The teardown of an old incarnation leaves the claim of the VM that now
+/// carries its name alone.
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_release_by_an_old_vm_leaves_the_new_ones_claim() {
+    let store = crate::test_etcd::fresh_store("claim-test").await;
+    store
+        .create(&claimed(Some("u-new"), false))
+        .await
+        .expect("the volume");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+    let pass = quiet_pass(&store, &registry, &connected);
+
+    release_named_volumes(&pass, &claimant("web", "u-old", true), &["data".into()]).await;
+
+    let still: Volume = store.get("data").await.expect("the volume");
+    assert!(!still.status.claimant_gone, "u-new still holds it");
 }

@@ -92,7 +92,7 @@ pub(super) async fn delete_provider_network(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: ProviderNetwork = st.store.get(&name).await?;
+    let current: ProviderNetwork = st.store.get(&name).await?;
     let on_it: Vec<String> = st
         .store
         .list::<controller_api::Router>()
@@ -108,7 +108,10 @@ pub(super) async fn delete_provider_network(
             on_it.join(", ")
         )));
     }
-    st.store.delete::<ProviderNetwork>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<ProviderNetwork>(&name, &current.metadata.resource_version)
+        .await?;
     info!(network = %name, "provider network deleted");
     Ok(controller_api::removed(
         ProviderNetwork::KIND,
@@ -220,7 +223,10 @@ pub(super) async fn delete_router(
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
     let current: controller_api::Router = st.store.get(&name).await?;
-    st.store.delete::<controller_api::Router>(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<controller_api::Router>(&name, &current.metadata.resource_version)
+        .await?;
     info!(router = %name, node = %current.status.active_node, "router deleted");
     Ok(controller_api::removed(
         controller_api::Router::KIND,

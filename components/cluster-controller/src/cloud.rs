@@ -827,7 +827,7 @@ async fn handle_create(
     {
         return Ok(());
     }
-    write_drift(store, &c, &spec).await?;
+    write_drift(store, &current, &c, &spec).await?;
     note_drift(
         &c.name,
         &spec,
@@ -923,10 +923,17 @@ fn shape_moved(current: &Vm, spec: &VmSpec, name: &str) -> anyhow::Result<bool> 
     Ok(moved)
 }
 
-/// The fields that may drift, onto the stored object.
-async fn write_drift(store: &EtcdStore, c: &proto::CreateVm, spec: &VmSpec) -> anyhow::Result<()> {
+/// The fields that may drift, onto the object `refuse_unless_ours` judged and
+/// no other: one recreated under the name since is not this command's.
+/// (IKR-B81)
+async fn write_drift(
+    store: &EtcdStore,
+    current: &Vm,
+    c: &proto::CreateVm,
+    spec: &VmSpec,
+) -> anyhow::Result<()> {
     store
-        .mutate::<Vm, _>(&c.name, |v| {
+        .mutate_if::<Vm, _>(&c.name, &current.metadata.uid, |v| {
             v.spec.run_strategy = spec.run_strategy;
             v.spec.evacuation = spec.evacuation;
             v.spec.class = spec.class.clone();
@@ -1021,8 +1028,9 @@ async fn handle_create_secret(store: &EtcdStore, c: proto::CreateSecret) -> anyh
         // this tier cannot tell "rotated" from "re-sealed" without the key.
         return Ok(());
     }
+    // On the copy whose owner was just checked. (IKR-B81)
     store
-        .mutate::<controller_api::Secret, _>(&c.name, |v| {
+        .mutate_if::<controller_api::Secret, _>(&c.name, &current.metadata.uid, |v| {
             v.spec.data = secret.spec.data.clone();
             v.spec.tenant = secret.spec.tenant.clone();
             v.spec.description = secret.spec.description.clone();
@@ -1145,8 +1153,9 @@ async fn handle_create_router(store: &EtcdStore, c: proto::CreateRouter) -> anyh
     if settled {
         return Ok(());
     }
+    // On the router whose owner was just checked. (IKR-B81)
     store
-        .mutate::<Router, _>(&c.name, |r| {
+        .mutate_if::<Router, _>(&c.name, &current.metadata.uid, |r| {
             r.spec = spec.clone();
             stamp_resolved(r, &c, &nats);
         })
@@ -1211,8 +1220,11 @@ async fn mirror_network(store: &EtcdStore, c: &proto::CreateRouter) -> anyhow::R
     if current.spec == spec {
         return Ok(());
     }
+    // On the mirror that was just found to be the cloud's. (IKR-B81)
     store
-        .mutate::<ProviderNetwork, _>(&c.network_name, |n| n.spec = spec.clone())
+        .mutate_if::<ProviderNetwork, _>(&c.network_name, &current.metadata.uid, |n| {
+            n.spec = spec.clone()
+        })
         .await?;
     info!(network = %c.network_name, "the cloud's provider network moved");
     Ok(())
@@ -1312,8 +1324,9 @@ async fn handle_create_volume(store: &EtcdStore, c: proto::CreateVolume) -> anyh
     // was decided once, at both tiers, and is left as it is.
     let cloud = &volume.spec;
     if cloud.size_gib > current.spec.size_gib {
+        // On the volume whose owner was just checked. (IKR-B81)
         store
-            .mutate::<Volume, _>(&c.name, |v| {
+            .mutate_if::<Volume, _>(&c.name, &current.metadata.uid, |v| {
                 grow_to_cloud_size(v, cloud);
             })
             .await?;
@@ -1390,13 +1403,7 @@ async fn handle_destroy_snapshot(
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<controller_api::VolumeSnapshot, _>(&d.name, |s| {
-            if s.metadata.deletion_timestamp.is_none() {
-                s.metadata.deletion_timestamp = Some(Utc::now());
-            }
-        })
-        .await?;
+    mark_for_teardown(store, &current, &d.uid).await?;
     info!(snapshot = %d.name, "marked for teardown by the cloud");
     Ok(())
 }
@@ -1418,13 +1425,7 @@ async fn handle_destroy_volume(store: &EtcdStore, d: proto::DestroyVolume) -> an
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<Volume, _>(&d.name, |v| {
-            if v.metadata.deletion_timestamp.is_none() {
-                v.metadata.deletion_timestamp = Some(Utc::now());
-            }
-        })
-        .await?;
+    mark_for_teardown(store, &current, &d.uid).await?;
     info!(volume = %d.name, "marked for teardown by the cloud");
     Ok(())
 }
@@ -1508,28 +1509,34 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
     Ok(())
 }
 
-/// Mark the VM a cloud destroy was judged against for teardown, under the uid it was judged at,
-/// never whatever its name names by the time of the write (NL3-3).
+/// Mark the object a cloud destroy was judged against for teardown — a VM, a volume, a
+/// snapshot — under the uid it was judged at, never whatever its name names by the time of the
+/// write (NL3-3, IKR-B81).
 ///
-/// A VM that went, became another cloud object's or was marked by someone else in between
+/// An object that went, became another cloud object's or was marked by someone else in between
 /// leaves the destroy nothing to do. One that is still the cloud's and unmarked is an error the
 /// cloud retries.
-async fn mark_for_teardown(store: &EtcdStore, checked: &Vm, cloud_uid: &str) -> anyhow::Result<()> {
-    let the_clouds = |v: &Vm| v.metadata.cloud_uid() == Some(cloud_uid);
+async fn mark_for_teardown<T: controller_api::Resource>(
+    store: &EtcdStore,
+    checked: &T,
+    cloud_uid: &str,
+) -> anyhow::Result<()> {
+    let the_clouds = |v: &T| v.metadata().cloud_uid() == Some(cloud_uid);
+    let meta = checked.metadata();
     let mut marked = false;
     let written = store
-        .mutate_if::<Vm, _>(&checked.metadata.name, &checked.metadata.uid, |v| {
+        .mutate_if::<T, _>(&meta.name, &meta.uid, |v| {
             marked = the_clouds(v);
-            if marked && v.metadata.deletion_timestamp.is_none() {
-                v.metadata.deletion_timestamp = Some(Utc::now());
+            if marked && v.metadata().deletion_timestamp.is_none() {
+                v.metadata_mut().deletion_timestamp = Some(Utc::now());
             }
         })
         .await;
     match written {
         Ok(_) if marked => Ok(()),
         Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
-            let done = |v: &Vm| !the_clouds(v) || v.is_deleting();
-            answer_unwritten(store, &checked.metadata.name, done, "marked for teardown").await
+            let done = |v: &T| !the_clouds(v) || v.metadata().deletion_timestamp.is_some();
+            answer_unwritten(store, &meta.name, done, "marked for teardown").await
         }
         Err(e) => Err(e.into()),
     }
@@ -1754,9 +1761,16 @@ async fn handle_create_vm_migration(
     if m.vm.is_empty() {
         bail!("create_vm_migration without a vm to move");
     }
+    if m.vm_uid.is_empty() {
+        bail!(
+            "create_vm_migration without the vm's uid; a cloud that does not say which vm it \
+             means does not get one moved by its name"
+        );
+    }
     // `m.tenant` is the cloud's say and not this tier's to record: whose a
     // migration is follows the guest (`start_from_the_cloud`).
-    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, migration_target(&m)).await
+    crate::migration::start_from_the_cloud(store, &m.name, &m.vm, &m.vm_uid, migration_target(&m))
+        .await
 }
 
 /// Where the cloud asked the guest to go, or `None` for "the cluster
@@ -2958,6 +2972,7 @@ mod tests {
             vm: "web-1".into(),
             target_node: target.into(),
             tenant: "acme".into(),
+            vm_uid: "uid-web-1".into(),
         };
         // proto3 has no absent string, so empty IS "did not say" — and the
         // difference between `--to agent-3` and no `--to` at all is this line.
@@ -2993,6 +3008,20 @@ mod tests {
                 .expect_err("nothing to move")
         );
         assert!(why.contains("vm to move"), "{why}");
+
+        // IKR-B81: a cloud that does not say which vm it means gets none moved
+        // by its name.
+        let uidless = proto::CreateVmMigration {
+            vm_uid: String::new(),
+            ..ask("")
+        };
+        let why = format!(
+            "{:#}",
+            handle_create_vm_migration(&store, uidless)
+                .await
+                .expect_err("which vm?")
+        );
+        assert!(why.contains("uid"), "{why}");
     }
 
     /// IKR-B72: a migrate asked for at the cloud meets the REST edge's whole refusal, with its
@@ -3032,6 +3061,7 @@ mod tests {
                 vm: name.into(),
                 target_node: String::new(),
                 tenant: "acme".into(),
+                vm_uid: name.into(),
             };
             let err = handle_create_vm_migration(&store, ask)
                 .await
@@ -3327,6 +3357,60 @@ mod tests {
         let moved: Vm = store.get("web-1").await.expect("the cloud's vm");
         assert_eq!(moved.spec.node_selector["network-node"], "cobra2");
         assert_eq!(moved.metadata.cloud_uid(), Some("uid-1"), "the marks stay");
+    }
+
+    /// IKR-B81: a volume destroy judged on a record that was replaced under the same name
+    /// leaves the new record unmarked, as a VM destroy does (NL3-3).
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_volume_destroy_judged_on_an_old_record_leaves_the_recreated_one_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = store
+            .create(&cloud_volume("data", Some("u-1"), VolumePhaseKind::Ready))
+            .await
+            .expect("the cloud's volume");
+        store.delete::<Volume>("data").await.expect("it goes");
+        store
+            .create(&cloud_volume("data", Some("u-2"), VolumePhaseKind::Ready))
+            .await
+            .expect("another cloud volume of that name");
+
+        mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a destroy done");
+
+        let still: Volume = store.get("data").await.expect("the new volume");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+        assert!(!still.is_deleting());
+    }
+
+    /// IKR-B81: a migrate from the cloud moves the cloud's vm and not a
+    /// cluster-local one that carries its name.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_cloud_migration_does_not_move_a_cluster_local_vm_of_the_same_name() {
+        let store = crate::test_etcd::fresh_store("cloud-migration-test").await;
+        let mut local = vm("web-1", None, VmPhaseKind::Running);
+        local.spec.node_name = Some("manacor".into());
+        store.create(&local).await.expect("the cluster's own vm");
+        let ask = proto::CreateVmMigration {
+            name: "web-1-move".into(),
+            vm: "web-1".into(),
+            target_node: String::new(),
+            tenant: "acme".into(),
+            vm_uid: "uid-cloud-web-1".into(),
+        };
+
+        let why = handle_create_vm_migration(&store, ask)
+            .await
+            .expect_err("not the cloud's to move");
+        assert!(format!("{why:#}").contains("not the cloud's"), "{why:#}");
+        assert!(
+            store
+                .get::<controller_api::VmMigration>("web-1-move")
+                .await
+                .is_err()
+        );
     }
 
     /// The running VM `t`, stored as the cloud's object `cloud_uid`.

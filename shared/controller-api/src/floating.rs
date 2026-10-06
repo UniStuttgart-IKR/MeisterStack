@@ -215,7 +215,10 @@ pub async fn allocate(
                 if within_quota(&after, tenant, &pool.metadata.name, quota) {
                     return Ok(created);
                 }
-                if let Err(e) = store.delete::<FloatingIp>(&address.to_string()).await {
+                // The reservation this call made, by its uid and revision: one
+                // released and reserved again by somebody else in between is
+                // theirs. (IKR-B81)
+                if let Err(e) = crate::deletion::finish_delete(store, &created, |_| true).await {
                     // Failed rollback leaves an over-quota reservation requiring operator release;
                     // no reconciler repairs it automatically.
                     error!(

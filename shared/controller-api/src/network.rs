@@ -186,6 +186,9 @@ pub async fn settle_external_addr(
     network: &ProviderNetwork,
 ) -> crate::store::Result<Router> {
     let name = router.metadata.name.clone();
+    // The router this pass judged and no other: a name deleted and made again
+    // since is another router's address to decide. (IKR-B81)
+    let uid = router.metadata.uid.clone();
     let mut router = router;
     for _ in 0..2 {
         let routers = store.list::<Router>().await?;
@@ -194,7 +197,7 @@ pub async fn settle_external_addr(
             AddressClaim::Take(address) => {
                 let taken = address.clone();
                 router = store
-                    .mutate::<Router, _>(&name, |r| r.status.external_addr = taken.clone())
+                    .mutate_if::<Router, _>(&name, &uid, |r| r.status.external_addr = taken.clone())
                     .await?;
                 tracing::info!(router = %name, address = %address, "external address cut");
             }
@@ -204,7 +207,7 @@ pub async fn settle_external_addr(
                 tracing::warn!(router = %name, address = %lost, lost_to = %to,
                                "lost the claim on this external address, taking it back");
                 router = store
-                    .mutate::<Router, _>(&name, |r| r.status.external_addr.clear())
+                    .mutate_if::<Router, _>(&name, &uid, |r| r.status.external_addr.clear())
                     .await?;
                 break;
             }

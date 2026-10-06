@@ -131,8 +131,11 @@ pub(super) async fn delete_csr(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: CertificateSigningRequest = st.store.get(&name).await?;
-    st.store.delete::<CertificateSigningRequest>(&name).await?;
+    let current: CertificateSigningRequest = st.store.get(&name).await?;
+    // The revision that was judged, not whatever the name names by now. (IKR-B81)
+    st.store
+        .delete_if::<CertificateSigningRequest>(&name, &current.metadata.resource_version)
+        .await?;
     Ok(controller_api::removed(
         CertificateSigningRequest::KIND,
         &name,
@@ -254,8 +257,11 @@ pub(super) async fn approve_and_sign(
     // Expired entries go at the same moment: the list is there to say what
     // credentials exist, and one that has died is history rather than a
     // credential. Without this the object grows for ever.
+    // On the user that was judged: a user deleted and made again under the
+    // name in between is somebody else, and does not get this credential on
+    // its record. (IKR-B81)
     st.store
-        .mutate::<User, _>(&user.metadata.name, |u| {
+        .mutate_if::<User, _>(&user.metadata.name, &user.metadata.uid, |u| {
             u.status.certificates.retain(|c| c.not_after > now);
             u.status.certificates.push(record.clone());
         })
