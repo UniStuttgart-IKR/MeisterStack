@@ -50,25 +50,57 @@ pub(crate) fn overlay_users(store: &Store, vni: u32, except: &VmId) -> Result<us
     Ok(users)
 }
 
+// The three helpers below split a NicSpec into its wiring, which stays as created, and its
+// address lists, which follow a re-send. Each names every field without `..`, so a field
+// NicSpec gains does not compile until it is placed on one side, instead of being compared
+// by neither and kept from the old record by `readdressed` without anyone deciding so.
+
 /// Whether a guest behind `wanted` may send from exactly the addresses `held` allows.
 fn same_addresses(held: &NicSpec, wanted: &NicSpec) -> bool {
-    held.floating_ips == wanted.floating_ips && held.routed_subnets == wanted.routed_subnets
+    let NicSpec {
+        floating_ips,
+        routed_subnets,
+        bridge: _,
+        mac: _,
+        vxlan_id: _,
+        physnet: _,
+    } = held;
+    *floating_ips == wanted.floating_ips && *routed_subnets == wanted.routed_subnets
 }
 
 /// Whether `wanted` hangs the NIC on the same wire with the same MAC as `held`.
 fn same_wiring(held: &NicSpec, wanted: &NicSpec) -> bool {
-    held.bridge == wanted.bridge
-        && held.mac == wanted.mac
-        && held.vxlan_id == wanted.vxlan_id
-        && held.physnet == wanted.physnet
+    let NicSpec {
+        bridge,
+        mac,
+        vxlan_id,
+        physnet,
+        floating_ips: _,
+        routed_subnets: _,
+    } = held;
+    *bridge == wanted.bridge
+        && *mac == wanted.mac
+        && *vxlan_id == wanted.vxlan_id
+        && *physnet == wanted.physnet
 }
 
 /// `held` as it was created, with the address lists of `wanted`.
 fn readdressed(held: &NicSpec, wanted: &NicSpec) -> NicSpec {
+    let NicSpec {
+        bridge,
+        mac,
+        vxlan_id,
+        physnet,
+        floating_ips: _,
+        routed_subnets: _,
+    } = held;
     NicSpec {
+        bridge: bridge.clone(),
+        mac: *mac,
+        vxlan_id: *vxlan_id,
+        physnet: physnet.clone(),
         floating_ips: wanted.floating_ips.clone(),
         routed_subnets: wanted.routed_subnets.clone(),
-        ..held.clone()
     }
 }
 
