@@ -218,7 +218,7 @@ pub async fn allocate(
                 // The reservation this call made, by its uid and revision: one
                 // released and reserved again by somebody else in between is
                 // theirs. (IKR-B81)
-                if let Err(e) = crate::deletion::finish_delete(store, &created, |_| true).await {
+                if let Err(e) = crate::deletion::take_back_created(store, &created).await {
                     // Failed rollback leaves an over-quota reservation requiring operator release;
                     // no reconciler repairs it automatically.
                     error!(

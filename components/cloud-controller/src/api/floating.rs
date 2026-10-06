@@ -417,7 +417,7 @@ pub(super) async fn collisions(
 /// back after somebody else took it would be their object. (IKR-B81)
 pub(super) async fn take_back<T: Resource>(st: &ApiState, created: &T, kind: &str) {
     let name = created.metadata().name.as_str();
-    if let Err(e) = controller_api::deletion::finish_delete(&st.store, created, |_| true).await {
+    if let Err(e) = controller_api::deletion::take_back_created(&st.store, created).await {
         error!(name, kind, error = %format!("{e:#}"),
                "could not take back an object that lost its claim; it now overlaps another \
                 one and has to be deleted by hand");

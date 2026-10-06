@@ -55,6 +55,26 @@ pub async fn finish_delete<T: Resource>(
     Ok(false)
 }
 
+/// Take back an object this call created, by its uid and revision: the rollback of a create
+/// that lost a race. Unlike a reconcile delete it has no next pass, so the created object still
+/// standing after [`finish_delete`] gave up is an error and never a quiet `false`. Gone, or
+/// another object under the name by now, is a rollback done.
+pub async fn take_back_created<T: Resource>(store: &EtcdStore, created: &T) -> Result<()> {
+    if finish_delete(store, created, |_| true).await? {
+        return Ok(());
+    }
+    let name = &created.metadata().name;
+    match store.get::<T>(name).await {
+        Err(StoreError::NotFound(_)) => Ok(()),
+        Ok(current) if current.metadata().uid != created.metadata().uid => Ok(()),
+        Ok(_) => Err(StoreError::Conflict(format!(
+            "{}/{name} kept changing while it was taken back and is still there",
+            T::RESOURCE
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
 /// Take `finalizer` off the object `checked` names, judged again on the revision being written.
 ///
 /// Under `checked`'s uid, so a name recreated since the listing is refused, and only while

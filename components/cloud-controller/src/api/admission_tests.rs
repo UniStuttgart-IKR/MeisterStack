@@ -840,3 +840,53 @@ async fn a_floating_address_is_bound_only_to_its_tenants_router_and_inside_prefi
     .expect_err("re-pointed at b's router");
     assert_eq!(err.field(), Some("spec.router"));
 }
+
+/// A rollback takes back the object its create made. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module doc"]
+async fn a_take_back_removes_what_the_create_made() {
+    let st = replica(&fresh_prefix("take-back")).await;
+    let created = st
+        .store
+        .create(&StoragePool::declare("spare", StoragePoolSpec::default()))
+        .await
+        .expect("the create that lost its race");
+
+    controller_api::deletion::take_back_created(&st.store, &created)
+        .await
+        .expect("taken back");
+
+    assert!(matches!(
+        st.store.get::<StoragePool>("spare").await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A rollback leaves what somebody else made under the name since, and that is
+/// a rollback done, not an error. (IKR-B81)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module doc"]
+async fn a_take_back_leaves_an_object_made_again_under_the_name() {
+    let st = replica(&fresh_prefix("take-back")).await;
+    let created = st
+        .store
+        .create(&StoragePool::declare("spare", StoragePoolSpec::default()))
+        .await
+        .expect("the create that lost its race");
+    st.store
+        .delete::<StoragePool>("spare")
+        .await
+        .expect("it went");
+    let theirs = st
+        .store
+        .create(&StoragePool::declare("spare", StoragePoolSpec::default()))
+        .await
+        .expect("somebody else's");
+
+    controller_api::deletion::take_back_created(&st.store, &created)
+        .await
+        .expect("nothing of ours is left");
+
+    let stays: StoragePool = st.store.get("spare").await.expect("theirs stays");
+    assert_eq!(stays.metadata.uid, theirs.metadata.uid);
+}
