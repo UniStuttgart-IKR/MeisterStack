@@ -457,20 +457,24 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
             )
             .await?;
     }
-    // Let go of what this VM was holding, in the same breath the object goes.
+    // The VM that was judged, on the revision it was judged at: one recreated under the same
+    // name since the listing is a new VM and is left alone (NL2-6).
+    if !deletion::finish_delete(p.store, vm, |v: &Vm| v.is_deleting()).await? {
+        return Ok(());
+    }
+    info!("vm deleted");
+    // Let go of what this VM was holding once this call has removed it, and not before: a
+    // claim names the VM, not its uid, so a teardown that lost the name to a newer VM would
+    // release the newer one's claims (NL3-1). A crash between the two is answered by
+    // `note_claimant`, which finds no VM of this name holding the volume.
     //
     // The node has been told to tear down and has acked being told; whether
     // it has finished detaching is its own business and this tier cannot
     // wait for it, because the object is what would have carried the wait and
-    // the object is going. The gap that leaves is covered where it has to be:
+    // the object is gone. The gap that leaves is covered where it has to be:
     // the node refuses to deprovision a volume it still has open, so a delete
     // arriving in the window is answered and retried rather than obeyed.
     release_volumes(p, vm).await;
-    // The VM that was judged, on the revision it was judged at: one recreated under the same
-    // name since the listing is a new VM and is left alone (NL2-6).
-    if deletion::finish_delete(p.store, vm, |v: &Vm| v.is_deleting()).await? {
-        info!("vm deleted");
-    }
     Ok(())
 }
 

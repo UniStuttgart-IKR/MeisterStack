@@ -2900,18 +2900,37 @@ fn deleting_vm() -> Vm {
     vm
 }
 
-/// A VM recreated under the same name after the listing survives the old one's teardown.
-/// (NL2-6)
+/// `vm` with a spec that names the volume `data`.
+fn naming_data(mut vm: Vm) -> Vm {
+    vm.spec.vm = serde_json::json!({ "volumes": [{ "volume": "data" }] });
+    vm
+}
+
+/// The volume `data`, claimed by the VM `t`, open on a node and stored. Open, so that a release
+/// shows as `claimantGone` instead of letting the claim fall at once.
+async fn data_claimed_by_t(store: &EtcdStore) -> Volume {
+    let mut volume = controller_api::resources::new_volume("data", Default::default());
+    volume.status.attached_to = Some("t".into());
+    volume.status.open_on = vec!["agent-1".into()];
+    store.create(&volume).await.expect("the claimed volume")
+}
+
+/// A VM recreated under the same name after the listing survives the old one's teardown,
+/// and so does its claim on a volume both of them name. (NL2-6, NL3-1)
 #[tokio::test]
 #[ignore = "needs an etcd; see crate::test_etcd"]
 async fn a_vm_recreated_under_the_same_name_survives_the_old_teardown() {
     let store = crate::test_etcd::fresh_store("reconcile-test").await;
-    let listed = store.create(&deleting_vm()).await.expect("the old vm");
+    let listed = store
+        .create(&naming_data(deleting_vm()))
+        .await
+        .expect("the old vm");
     store.delete::<Vm>("t").await.expect("the old vm goes");
     let fresh = store
-        .create(&bound_to(None))
+        .create(&naming_data(bound_to(None)))
         .await
         .expect("a new vm under the same name");
+    data_claimed_by_t(&store).await;
     let registry = SessionRegistry::new();
     let connected = sessions(&[]);
 
@@ -2921,6 +2940,34 @@ async fn a_vm_recreated_under_the_same_name_survives_the_old_teardown() {
 
     let still: Vm = store.get("t").await.expect("the new vm");
     assert_eq!(still.metadata.uid, fresh.metadata.uid);
+    let claimed: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(claimed.status.attached_to.as_deref(), Some("t"));
+    assert!(!claimed.status.claimant_gone, "the new vm's claim stands");
+}
+
+/// A VM torn down as listed lets go of the volumes it named once it is gone. (NL3-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_torn_down_as_listed_lets_go_of_its_volumes() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    let listed = store
+        .create(&naming_data(deleting_vm()))
+        .await
+        .expect("a deleting vm");
+    data_claimed_by_t(&store).await;
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    tear_down(&quiet_pass(&store, &registry, &connected), &listed, "")
+        .await
+        .expect("the teardown");
+
+    let released: Volume = store.get("data").await.expect("the volume");
+    assert_eq!(released.status.attached_to.as_deref(), Some("t"));
+    assert!(
+        released.status.claimant_gone,
+        "the claim falls once the bytes are closed"
+    );
 }
 
 /// The listed VM itself still goes: the guard is a guard, not a wall. (NL2-6)
