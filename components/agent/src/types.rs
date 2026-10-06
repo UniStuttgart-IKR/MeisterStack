@@ -368,7 +368,6 @@ impl TryFrom<proto::NicSpec> for NicWithId {
                 physnet: None,
                 floating_ips: Vec::new(),
                 routed_subnets: Vec::new(),
-                address_space_known: false,
             },
         })
     }
@@ -594,9 +593,6 @@ fn nics_with_ids(
                     physnet: n.physnet,
                     floating_ips: n.floating_ips,
                     routed_subnets: n.routed_subnets,
-                    // A new NIC's address space is what its lists say; only a re-send that
-                    // takes its last subnet sets this (NL4-1).
-                    address_space_known: false,
                 },
             })
         })
@@ -911,38 +907,40 @@ mod tests {
         assert_eq!(spec.nics[0].spec.routed_subnets, ["10.7.1.0/24"]);
     }
 
-    /// Whether a NIC's address space is known is the agent's own record of what a re-send took
-    /// away (NL4-1); a spec on the wire that claims it is refused rather than believed.
+    /// Whether a tap's sources are on an allowlist is read off the NIC's document: a prefix in
+    /// it puts them there, none leaves the pool ban, and a provider NIC is pinned by its MAC
+    /// whatever it names. (NL5-2)
     #[test]
-    fn a_spec_on_the_wire_cannot_say_a_nics_address_space_is_known() {
-        let doc = r#"{"vcpus":1,"memory_mib":256,
-                      "boot":{"kind":"firmware","firmware":"fw"},
-                      "volumes":[{"size_bytes":1}],
-                      "nics":[{"address_space_known":true}]}"#;
-        let refused = serde_json::from_str::<NewVmSpec>(doc).expect_err("not a wire field");
-        assert!(
-            refused.to_string().contains("address_space_known"),
-            "{refused}"
+    fn a_nics_guard_is_read_off_its_document() {
+        let nic = |json: &str| serde_json::from_str::<NicSpec>(json).expect("a nic");
+        let prefixed = nic(
+            r#"{"bridge":"br0","mac":"52:54:00:00:00:01","vxlan_id":10007,
+                               "routed_subnets":["10.30.0.0/24"]}"#,
         );
+        assert!(prefixed.sources_allowlisted());
+        let bare = nic(r#"{"bridge":"br0","mac":"52:54:00:00:00:01","vxlan_id":10007}"#);
+        assert!(!bare.sources_allowlisted());
+        let provider = nic(
+            r#"{"bridge":"br0","mac":"52:54:00:00:00:01","physnet":"ext",
+                               "routed_subnets":["10.30.0.0/24"]}"#,
+        );
+        assert!(!provider.sources_allowlisted());
     }
 
-    /// A record keeps a NIC whose last subnet was taken on its allowlist across a restart.
+    /// A record from a build that kept a word of its own about a NIC's address space still
+    /// reads, and the word is gone: its tap is guarded by its lists, as on every other node,
+    /// and the record is written back without it. (NL5-2)
     #[test]
-    fn a_record_keeps_a_nics_known_address_space() {
+    fn a_record_with_the_retired_address_space_word_reads_and_follows_its_lists() {
         let written = r#"{"bridge":"br0","mac":"52:54:00:00:00:01","vxlan_id":10007,
                           "address_space_known":true}"#;
-        let nic: NicSpec = serde_json::from_str(written).unwrap();
-        let again: NicSpec = serde_json::from_value(serde_json::to_value(&nic).unwrap()).unwrap();
-        assert!(again.address_space_known && again.sources_allowlisted());
-    }
-
-    /// A record written before the field existed reads as an address space nobody wrote down,
-    /// guarded as it was when it was written.
-    #[test]
-    fn a_record_from_before_the_field_reads_as_an_unknown_address_space() {
-        let older = r#"{"bridge":"br0","mac":"52:54:00:00:00:01","vxlan_id":10007}"#;
-        let nic: NicSpec = serde_json::from_str(older).unwrap();
-        assert!(!nic.address_space_known && !nic.sources_allowlisted());
+        let nic: NicSpec = serde_json::from_str(written).expect("the record reads");
+        assert!(
+            !nic.sources_allowlisted(),
+            "no prefix in the document, no allowlist"
+        );
+        let again = serde_json::to_value(&nic).expect("a record");
+        assert!(again.get("address_space_known").is_none(), "{again}");
     }
 
     #[test]

@@ -533,7 +533,6 @@ async fn the_host_speaks_no_ipv6_on_the_wires_it_builds() {
                 physnet: None,
                 floating_ips: Vec::new(),
                 routed_subnets: Vec::new(),
-                address_space_known: false,
             },
         )
         .await

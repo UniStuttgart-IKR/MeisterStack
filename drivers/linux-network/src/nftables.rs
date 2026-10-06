@@ -69,9 +69,7 @@ pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String
     let subnets = Ipv4Ranges::parse(&spec.routed_subnets)?;
 
     if spec.sources_allowlisted() {
-        // 3. The tenant's address space is known, so say exactly what it is. That may be no
-        //    subnet at all, once a re-send took the last one away: the allowlist then holds the
-        //    floating addresses and the unspecified source, and the guard stays closed (NL4-1).
+        // 3. The tenant's address space is known, so say exactly what it is.
         let allowed = [&subnets, &floating]
             .into_iter()
             .filter(|ranges| !ranges.is_empty())
@@ -414,15 +412,6 @@ mod tests {
             vxlan_id: None,
             floating_ips: floating.iter().map(|s| s.to_string()).collect(),
             routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
-            address_space_known: false,
-        }
-    }
-
-    /// `spec(floating, &[])` of a NIC whose last routed subnet a re-send took away.
-    fn subnets_taken(floating: &[&str]) -> NicSpec {
-        NicSpec {
-            address_space_known: true,
-            ..spec(floating, &[])
         }
     }
 
@@ -552,53 +541,6 @@ mod tests {
         assert!(!script.contains("pool-ip"), "{script}");
     }
 
-    /// A NIC whose last routed subnet was taken keeps an allowlist, of its floating addresses
-    /// and the unspecified source and of no subnet, instead of falling back to the pool ban,
-    /// which would let every source outside the pool through. (NL4-1)
-    #[test]
-    fn a_nic_whose_last_subnet_was_taken_keeps_a_closed_allowlist() {
-        let script = ruleset(
-            "msk0",
-            &subnets_taken(&["10.255.0.7"]),
-            &pool(&["10.255.0.0/16"]),
-        )
-        .unwrap();
-        let listed = rules(&script);
-        assert_eq!(listed.len(), 3, "{script}");
-        assert_eq!(
-            listed[1],
-            "meta protocol ip ip saddr != { 10.255.0.7, 0.0.0.0 } counter drop comment \"src-ip\""
-        );
-        assert_eq!(
-            listed[2],
-            "meta protocol arp arp saddr ip != { 10.255.0.7, 0.0.0.0 } counter drop \
-             comment \"src-arp\""
-        );
-        assert!(!script.contains("pool-ip"), "{script}");
-    }
-
-    /// Without floating addresses or a pool on the node, the same NIC may send from the
-    /// unspecified source alone; it does not fall back to its MAC pin and nothing else. (NL4-1)
-    #[test]
-    fn a_nic_whose_last_subnet_was_taken_stays_closed_on_a_node_without_a_pool() {
-        let script = ruleset("msk0", &subnets_taken(&[]), &Ipv4Ranges::default()).unwrap();
-        let listed = rules(&script);
-        assert_eq!(listed.len(), 3, "{script}");
-        assert_eq!(
-            listed[1],
-            "meta protocol ip ip saddr != { 0.0.0.0 } counter drop comment \"src-ip\""
-        );
-    }
-
-    /// A provider NIC is pinned by its MAC alone, whatever the agent kept of its address space.
-    #[test]
-    fn a_provider_nic_is_not_put_on_an_allowlist_by_a_known_address_space() {
-        let mut provider = subnets_taken(&[]);
-        provider.physnet = Some("ext".into());
-        let script = ruleset("msk0", &provider, &pool(&["10.255.0.0/16"])).unwrap();
-        assert_eq!(rules(&script).len(), 1, "{script}");
-    }
-
     /// Allow initial DHCP and ARP probes before a guest has an address.
     #[test]
     fn a_guest_may_always_speak_before_it_has_an_address() {
@@ -624,7 +566,6 @@ mod tests {
                 &pool(&["10.255.0.0/16"]),
             )
             .unwrap(),
-            ruleset("msk0", &subnets_taken(&[]), &Ipv4Ranges::default()).unwrap(),
         ] {
             for rule in rules(&script).iter().filter(|r| r.contains("drop")) {
                 assert!(rule.contains("counter "), "uncounted drop: {rule}");

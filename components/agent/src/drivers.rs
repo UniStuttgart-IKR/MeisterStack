@@ -1249,7 +1249,6 @@ mod tests {
                 physnet: None,
                 floating_ips: Vec::new(),
                 routed_subnets: Vec::new(),
-                address_space_known: false,
             },
         }
     }

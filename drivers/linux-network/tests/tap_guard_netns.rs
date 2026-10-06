@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Change the address guard of a tap a guest is using, and check what passes (NL4-1).
+//! Change the address guard of a tap a guest is using, and check what passes (NL4-1, NL5).
 //!
 //! Requires `ip`, `nft`, `ping`, and isolated network and mount namespaces:
 //!
@@ -31,8 +31,10 @@ struct Site {
     guest: &'static str,
     /// The subnet a test takes from the guest.
     taken: Subnet,
-    /// A second subnet the guest has an address in: kept throughout, or never given.
+    /// A second subnet the guest has an address in, kept throughout.
     other: Subnet,
+    /// A third the guest has an address in and is never allowed to send from.
+    never: Subnet,
 }
 
 /// A subnet, with the host's and the guest's address in it.
@@ -56,8 +58,15 @@ const ONE_OF_TWO_TAKEN: Site = Site {
         host: "10.7.1.1",
         guest: "10.7.1.9",
     },
+    never: Subnet {
+        cidr: "10.7.5.0/24",
+        host: "10.7.5.1",
+        guest: "10.7.5.9",
+    },
 };
-const LAST_TAKEN: Site = Site {
+/// A tenant guest addressed out of its network's prefix (`other`), with a routed subnet
+/// (`taken`) beside it.
+const ROUTER_GONE: Site = Site {
     nic: NicId::from_u128(0x4c40_0003 << 96),
     bridge: "msguard1",
     guest: "ms-guarded1",
@@ -70,6 +79,11 @@ const LAST_TAKEN: Site = Site {
         cidr: "10.7.3.0/24",
         host: "10.7.3.1",
         guest: "10.7.3.9",
+    },
+    never: Subnet {
+        cidr: "10.7.6.0/24",
+        host: "10.7.6.1",
+        guest: "10.7.6.9",
     },
 };
 const GUEST_MAC: &str = "52:54:00:00:4c:01";
@@ -155,19 +169,10 @@ fn allowing(site: &Site, subnets: &[&str]) -> NicSpec {
         physnet: None,
         floating_ips: Vec::new(),
         routed_subnets: subnets.iter().map(|s| s.to_string()).collect(),
-        address_space_known: false,
     }
 }
 
-/// The guest's NIC as the agent readdresses it when a re-send takes its last subnet away.
-fn no_subnet_left(site: &Site) -> NicSpec {
-    NicSpec {
-        address_space_known: true,
-        ..allowing(site, &[])
-    }
-}
-
-/// The host's bridge with an address in both subnets, and the guest behind `tap` on it.
+/// The host's bridge with an address in each subnet, and the guest behind `tap` on it.
 fn host_and_guest(site: &Site, tap: &str) {
     ip(&["link", "add", site.bridge, "type", "bridge"]);
     ip(&["link", "set", site.bridge, "up"]);
@@ -181,7 +186,7 @@ fn host_and_guest(site: &Site, tap: &str) {
         &["ip", "link", "set", "eth0", "address", GUEST_MAC],
     );
     inside(site.guest, &["ip", "link", "set", "eth0", "up"]);
-    for subnet in [&site.taken, &site.other] {
+    for subnet in [&site.taken, &site.other, &site.never] {
         let prefix = subnet.cidr.split_once('/').expect("a prefix").1;
         ip(&[
             "addr",
@@ -258,40 +263,49 @@ async fn a_subnet_taken_from_a_running_tap_is_dropped_and_one_given_back_passes(
     take_down(&site, &d, &nic).await;
 }
 
-/// The last subnet taken from a running guest is dropped at its tap like any other: the guard
-/// stays an allowlist, now of no subnet, and does not fall back to the pool ban, which on a
-/// node without a floating pool lets every source through. (NL4-1)
+/// A tenant guest whose router and routed subnet go keeps sending from its network's prefix,
+/// which the document goes on naming because the tenant declares it (NL5-1); the routed subnet
+/// is dropped at its tap from the moment the guard is updated, and a source the guest was never
+/// given stays dropped: the guard follows the document and does not open. (NL5)
 #[tokio::test]
 #[ignore = "needs its own network and mount namespace; see the module note"]
-async fn the_last_subnet_taken_from_a_running_tap_is_dropped_and_the_guard_stays_closed() {
-    let site = LAST_TAKEN;
+async fn a_guest_keeps_its_network_prefix_when_its_router_and_routed_subnet_go() {
+    let site = ROUTER_GONE;
     let d = driver();
     let nic = site.nic;
     let tap = LinuxNetworkDriver::tap_name(&nic);
     host_and_guest(&site, &tap);
-    d.create(&nic, &allowing(&site, &[site.taken.cidr]))
+    // With the router there, its inside prefix and the tenant's declared one are one entry.
+    d.create(&nic, &allowing(&site, &[site.other.cidr, site.taken.cidr]))
         .await
         .expect("the guest's link is on the bridge and guarded");
+    assert!(reaches(&site, &site.other), "its network's prefix passes");
+    assert!(reaches(&site, &site.taken), "and so does its routed subnet");
     assert!(
-        reaches(&site, &site.taken),
-        "its one subnet passes at first"
+        !reaches(&site, &site.never),
+        "a source it was never given does not"
     );
 
-    d.update_guard(&nic, &no_subnet_left(&site))
+    // The re-send after the router and the routed subnet went names the declared prefix alone.
+    d.update_guard(&nic, &allowing(&site, &[site.other.cidr]))
         .await
-        .expect("the guard takes the last subnet away");
+        .expect("the guard follows the document");
     let before = source_drops(&tap);
     assert!(
         !reaches(&site, &site.taken),
-        "a source in the last subnet taken away is dropped at the tap"
+        "a source in the routed subnet taken away is dropped at the tap"
     );
     assert!(
         source_drops(&tap) > before,
         "by the source-address rule, which counted it"
     );
     assert!(
-        !reaches(&site, &site.other),
-        "and so is a source the guest was never given: the guard did not open"
+        reaches(&site, &site.other),
+        "the guest goes on sending from its network's prefix, east-west and out"
+    );
+    assert!(
+        !reaches(&site, &site.never),
+        "and a source it was never given stays dropped"
     );
 
     take_down(&site, &d, &nic).await;

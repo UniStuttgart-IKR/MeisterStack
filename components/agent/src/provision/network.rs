@@ -51,19 +51,16 @@ pub(crate) fn overlay_users(store: &Store, vni: u32, except: &VmId) -> Result<us
 }
 
 // The three helpers below split a NicSpec into its wiring, which stays as created, and its
-// addresses, which follow a re-send: the two lists, and whether the address space is known,
-// which `readdressed` derives from them and no re-send carries. Each names every field without
-// `..`, so a field NicSpec gains does not compile until it is placed on one side, instead of
-// being compared by neither and kept from the old record by `readdressed` without anyone
-// deciding so.
+// addresses, which follow a re-send: the two lists, and nothing else, since the guard is a
+// function of the document alone (NL5-2). Each names every field without `..`, so a field
+// NicSpec gains does not compile until it is placed on one side, instead of being compared by
+// neither and kept from the old record by `readdressed` without anyone deciding so.
 
 /// Whether a guest behind `wanted` may send from exactly the addresses `held` allows.
 fn same_addresses(held: &NicSpec, wanted: &NicSpec) -> bool {
     let NicSpec {
         floating_ips,
         routed_subnets,
-        // Derived from the lists, never re-sent: lists that stay as they are keep it as it is.
-        address_space_known: _,
         bridge: _,
         mac: _,
         vxlan_id: _,
@@ -81,7 +78,6 @@ fn same_wiring(held: &NicSpec, wanted: &NicSpec) -> bool {
         physnet,
         floating_ips: _,
         routed_subnets: _,
-        address_space_known: _,
     } = held;
     *bridge == wanted.bridge
         && *mac == wanted.mac
@@ -89,11 +85,10 @@ fn same_wiring(held: &NicSpec, wanted: &NicSpec) -> bool {
         && *physnet == wanted.physnet
 }
 
-/// `held` as it was created, with the address lists of `wanted`. A NIC whose guard is an
-/// allowlist keeps one when `wanted` leaves it no routed subnet: the empty list alone reads as
-/// an address space nobody wrote down, and the guard would open to every source outside the
-/// floating pool, the subnet just taken among them. Taking a subnet narrows a guard; it never
-/// opens one (NL4-1).
+/// `held` as it was created, with the address lists of `wanted`: the NIC a node that built the
+/// tap from `wanted` alone would guard, since a guard reads its mode and its sources off the
+/// lists and nothing this node remembers (NL5-2). A re-send that leaves a NIC no prefix puts
+/// its tap on the pool ban, as a create from that document does anywhere.
 fn readdressed(held: &NicSpec, wanted: &NicSpec) -> NicSpec {
     let NicSpec {
         bridge,
@@ -102,7 +97,6 @@ fn readdressed(held: &NicSpec, wanted: &NicSpec) -> NicSpec {
         physnet,
         floating_ips: _,
         routed_subnets: _,
-        address_space_known,
     } = held;
     NicSpec {
         bridge: bridge.clone(),
@@ -111,8 +105,6 @@ fn readdressed(held: &NicSpec, wanted: &NicSpec) -> NicSpec {
         physnet: physnet.clone(),
         floating_ips: wanted.floating_ips.clone(),
         routed_subnets: wanted.routed_subnets.clone(),
-        address_space_known: *address_space_known
-            || (held.sources_allowlisted() && wanted.routed_subnets.is_empty()),
     }
 }
 
@@ -145,8 +137,8 @@ impl Provisioner {
     /// in one step, then the record names the new lists, so a later start guards the same. A
     /// guard the driver refuses leaves the record on the old lists and the error with the
     /// caller, and the next re-send tries again. Only the address lists follow the spec; a
-    /// NIC's wiring stays as it was created. A tap whose sources are on an allowlist stays on
-    /// one: taking its last subnet leaves it its floating addresses, not the pool ban.
+    /// NIC's wiring stays as it was created. The guard swapped in is the one a create from the
+    /// re-sent document would build on any node.
     pub(crate) async fn sync_nic_addresses(&self, id: &VmId, wanted: &AgentVmSpec) -> Result<()> {
         let Some(mut record) = self.store.get(id)? else {
             return Ok(());

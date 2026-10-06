@@ -382,7 +382,6 @@ fn only_the_addresses_of_running_vms_are_announced_and_only_as_host_routes() {
             physnet: None,
             floating_ips: vec!["10.255.0.7".into(), "203.0.113.9".into()],
             routed_subnets: vec!["10.7.1.0/24".into()],
-            address_space_known: false,
         },
     });
     let plain = record(Desired::Running, Phase::Provisioned);

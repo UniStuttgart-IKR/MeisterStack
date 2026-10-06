@@ -19,6 +19,8 @@ struct RecordingNet {
     /// What the teardown said this overlay was called, per removal — the
     /// record's own answer, or `None` where no record wrote one down.
     overlays_named: std::sync::Mutex<Vec<Option<String>>>,
+    /// Every tap created, with the spec it was built from, in order.
+    taps_created: std::sync::Mutex<Vec<(NicId, NicSpec)>>,
     /// Every guard swapped, with the spec it was built from, in order.
     guards_updated: std::sync::Mutex<Vec<(NicId, NicSpec)>>,
     /// `Some` refuses every guard swap with the error it makes.
@@ -32,6 +34,7 @@ impl agent_api::networking::NicDriver for RecordingNet {
         id: &agent_api::networking::NicId,
         spec: &agent_api::networking::NicSpec,
     ) -> agent_api::networking::Result<agent_api::networking::Nic> {
+        self.taps_created.lock().unwrap().push((*id, spec.clone()));
         Ok(agent_api::networking::Nic {
             id: *id,
             tap_name: format!("tap{id}"),
@@ -520,12 +523,12 @@ async fn a_nic_without_a_tap_takes_the_new_addresses_into_the_record_alone() {
     assert_eq!(held_subnets(&store, &id), [KEPT]);
 }
 
-/// The last subnet a re-send takes from a running VM leaves its tap on an allowlist of no
-/// subnet, not on the pool ban, which would let the subnet just taken back in with every other
-/// source outside the floating pool; the record keeps it so for the tap's next create.
+/// The last prefix a re-send takes from a running VM leaves its tap guarded as the re-sent
+/// document says, on the pool ban, and the record with it: no node keeps an allowlist of its
+/// own for a NIC whose document names no prefix. That a tenant's guests keep their network's
+/// prefix is the controller's to send (NL5-1); this tier holds no word about it. (NL5-2)
 #[tokio::test]
-async fn the_last_subnet_taken_from_a_running_vm_closes_its_allowlist_instead_of_opening_the_guard()
-{
+async fn the_last_prefix_taken_from_a_running_vm_leaves_its_tap_as_the_document_says() {
     let temp = tempfile::tempdir().expect("a temp dir");
     let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
     let (id, record) = running_vm_allowing(&store, &[TAKEN]);
@@ -538,45 +541,66 @@ async fn the_last_subnet_taken_from_a_running_vm_closes_its_allowlist_instead_of
 
     let updated = net.guards_updated.lock().unwrap().clone();
     assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
-    assert!(updated[0].1.routed_subnets.is_empty(), "{updated:?}");
     assert!(
-        updated[0].1.address_space_known && updated[0].1.sources_allowlisted(),
-        "the tap stays on an allowlist, now of no subnet: {updated:?}"
+        updated[0].1.routed_subnets.is_empty() && !updated[0].1.sources_allowlisted(),
+        "{updated:?}"
     );
-    let held = held_nic(&store, &id);
-    assert!(
-        held.routed_subnets.is_empty() && held.sources_allowlisted(),
-        "and the record says so for the next start: {held:?}"
-    );
+    assert!(held_subnets(&store, &id).is_empty());
 }
 
-/// Once the last subnet is gone, re-sending a spec without one swaps no guard again: the
-/// allowlist the record keeps is what the empty list means for this NIC from then on.
+/// A NIC readdressed by a re-send on one node is guarded with exactly the nft rules a node that
+/// creates its tap from the re-sent document alone builds, whatever the first node held
+/// before: the guard is the document's, never a node's, so an evacuation or a re-create on
+/// another node changes nothing about it. (NL5-2)
 #[tokio::test]
-async fn a_resent_spec_still_without_a_subnet_leaves_the_closed_allowlist_alone() {
-    let temp = tempfile::tempdir().expect("a temp dir");
-    let store = Arc::new(crate::store::Store::open(&temp.path().join("a.redb")).expect("a store"));
-    let (id, record) = running_vm_allowing(&store, &[TAKEN]);
-    let net = Arc::new(RecordingNet::default());
-    let provisioner = provisioner_on(temp.path(), store.clone(), net.clone());
-    let resent = resent_allowing(&record, &[]);
-    provisioner
-        .sync_in_place(&id, &resent)
-        .await
-        .expect("the last subnet is taken");
+async fn a_readdressed_tap_is_guarded_as_a_tap_made_from_the_same_document_elsewhere() {
+    let pool = common::net::Ipv4Ranges::parse(&["10.255.0.0/16".to_string()]).expect("a pool");
+    for (held, sent) in [
+        (&[KEPT, TAKEN][..], &[KEPT][..]),
+        (&[TAKEN][..], &[][..]),
+        (&[][..], &[KEPT][..]),
+    ] {
+        let here = tempfile::tempdir().expect("a temp dir");
+        let store =
+            Arc::new(crate::store::Store::open(&here.path().join("a.redb")).expect("a store"));
+        let (id, record) = running_vm_allowing(&store, held);
+        let resent = resent_allowing(&record, sent);
+        let net_here = Arc::new(RecordingNet::default());
+        provisioner_on(here.path(), store, net_here.clone())
+            .sync_in_place(&id, &resent)
+            .await
+            .expect("the re-sent spec is taken in");
 
-    provisioner
-        .sync_in_place(&id, &resent)
-        .await
-        .expect("nothing to do is done");
+        let elsewhere = tempfile::tempdir().expect("a temp dir");
+        let store_elsewhere =
+            Arc::new(crate::store::Store::open(&elsewhere.path().join("b.redb")).expect("a store"));
+        let net_elsewhere = Arc::new(RecordingNet::default());
+        let mut fresh = record.clone();
+        fresh.spec = resent.clone();
+        fresh.nics.clear();
+        provisioner_on(elsewhere.path(), store_elsewhere, net_elsewhere.clone())
+            .attach_nics(&id, &mut fresh, &resent)
+            .await
+            .expect("the tap is made from the document");
 
-    assert_eq!(net.guards_updated.lock().unwrap().len(), 1);
-    assert!(held_nic(&store, &id).sources_allowlisted());
+        let rules = |spec: &NicSpec| {
+            linux_network_driver::nftables::ruleset("msk0", spec, &pool).expect("a ruleset")
+        };
+        let swapped = net_here.guards_updated.lock().unwrap().clone();
+        let created = net_elsewhere.taps_created.lock().unwrap().clone();
+        assert_eq!(swapped.len(), 1, "{held:?} -> {sent:?}: {swapped:?}");
+        assert_eq!(created.len(), 1, "{held:?} -> {sent:?}: {created:?}");
+        assert_eq!(
+            rules(&swapped[0].1),
+            rules(&created[0].1),
+            "{held:?} -> {sent:?}"
+        );
+    }
 }
 
-/// A NIC that never had a routed subnet stays on the pool ban when its floating addresses
-/// change: nothing ever wrote its address space down, and an allowlist would cut its guest
-/// off from the addresses it uses.
+/// A NIC whose document never names a prefix stays on the pool ban when its floating addresses
+/// change: its address space is unknown, and an allowlist would cut its guest off from the
+/// addresses it uses.
 #[tokio::test]
 async fn a_nic_that_never_had_a_subnet_stays_on_the_pool_ban_when_its_floating_addresses_change() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -596,5 +620,5 @@ async fn a_nic_that_never_had_a_subnet_stays_on_the_pool_ban_when_its_floating_a
     let updated = net.guards_updated.lock().unwrap().clone();
     assert_eq!(updated.len(), 1, "one guard swapped: {updated:?}");
     assert!(!updated[0].1.sources_allowlisted(), "{updated:?}");
-    assert!(!held_nic(&store, &id).address_space_known);
+    assert!(!held_nic(&store, &id).sources_allowlisted());
 }

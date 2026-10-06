@@ -35,10 +35,16 @@ pub struct NicSpec {
     /// Defaults to no exceptions within configured guarded ranges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub floating_ips: Vec<String>,
-    /// Tenant routed subnets used for tap source-address allowlists. Empty
-    /// subnets retain the guard against unassigned floating-pool addresses,
-    /// unless `address_space_known` says otherwise; nonempty subnets permit
-    /// those prefixes and assigned floating addresses.
+    /// The prefixes the guest may send from, as the controller sends them: its
+    /// tenant's routed subnets and the prefixes of its tenant's network. The
+    /// name is the one the field had before the network's prefixes went into
+    /// it. Nonempty puts the tap's IPv4 sources on an allowlist of these, the
+    /// floating addresses and the unspecified address. Empty says the
+    /// controller knows no address space for the NIC (a tenant that declares
+    /// no network prefix and has no router and no routed subnet, a VM of no
+    /// tenant, a standalone spec that names none): the tap is then only kept
+    /// off the floating pool, a known limit until the stack hands out overlay
+    /// addresses itself (IPAM).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
     /// Provider physnet for a direct guest connection. Mutually exclusive
@@ -46,17 +52,6 @@ pub struct NicSpec {
     /// overlay-or-default-bridge path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physnet: Option<String>,
-    /// The tap's sources stay on an allowlist with `routed_subnets` empty: the
-    /// guest may send from its floating addresses and the unspecified address,
-    /// and from no tenant subnet. An empty list alone reads as an address space
-    /// nobody wrote down, guarded only against the floating pool; so when a
-    /// re-send takes the last subnet from a NIC whose guard is an allowlist,
-    /// the agent sets this, and taking the subnet away narrows the guard
-    /// instead of opening it (NL4-1). The agent's own: no spec on the wire
-    /// carries it. Kept in the VM record, so the tap's next create guards it
-    /// the same, and never cleared while the record lives.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub address_space_known: bool,
 }
 
 impl NicSpec {
@@ -64,8 +59,12 @@ impl NicSpec {
     /// its routed subnets, its floating addresses and the unspecified address,
     /// rather than only banning the floating pool. A provider NIC is pinned by
     /// its MAC alone and never is.
+    ///
+    /// Read off this document and nothing else, so every node that builds the
+    /// tap from the same document guards it the same: no node keeps a word of
+    /// its own about a NIC's address space (NL5-2).
     pub fn sources_allowlisted(&self) -> bool {
-        self.physnet.is_none() && (self.address_space_known || !self.routed_subnets.is_empty())
+        self.physnet.is_none() && !self.routed_subnets.is_empty()
     }
 }
 

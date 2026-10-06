@@ -949,7 +949,6 @@ mod tests {
             vxlan_id,
             floating_ips: Vec::new(),
             routed_subnets: Vec::new(),
-            address_space_known: false,
         }
     }
 
