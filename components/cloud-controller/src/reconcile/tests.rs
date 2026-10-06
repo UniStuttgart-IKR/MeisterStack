@@ -980,6 +980,7 @@ fn ledger_of(cluster: &Cluster, vms: &[Vm]) -> std::sync::Mutex<Ledger> {
 /// `unreported_on` books a VM without volumes.
 fn rooms(cluster: &Cluster, vms: &[Vm]) -> Vec<NodeRoom> {
     let booked: Vec<Booking> = unreported(&cluster.metadata.name, vms)
+        .into_iter()
         .map(|v| Booking::Where(Wanted::of(v, None, None)))
         .collect();
     rooms_of(cluster, &booked, Overcommit::default())
@@ -1081,6 +1082,49 @@ fn a_vm_bound_but_not_reported_yet_is_booked_where_its_binding_booked_it() {
 
     assert_eq!(at_binding, [1024, 6144]);
     assert_eq!(next_pass, at_binding);
+}
+
+/// Two VMs bound in two passes, the later one first by name: every pass
+/// after books them in the order they were bound, and so on the nodes the
+/// passes that bound them assumed. In the order of their names the later VM
+/// took the node the earlier binding had assumed.
+#[test]
+fn vms_bound_in_two_passes_are_booked_in_the_order_they_were_bound() {
+    let mut cluster = netlab(4096);
+    cluster.status.nodes[1].mem_mib = 6144;
+    let bound = |mut v: Vm, name: &str, secs: i64| {
+        v.metadata.name = name.into();
+        v.spec.cluster_name = Some("ikr-netlab".into());
+        v.status.bound_at = Some(at(secs));
+        v
+    };
+    let left = |rooms: &[NodeRoom]| -> Vec<u64> { rooms.iter().map(|r| r.room.mem_mib).collect() };
+    let zeta = asking(2048);
+    let first = ledger_of(&cluster, &[]);
+    pick_cluster(
+        &controller_api::FirstFit,
+        &first,
+        &zeta,
+        &Wanted::of(&zeta, None, None),
+    )
+    .expect("zeta bound in the first pass");
+    let zeta = bound(zeta, "zeta", 0);
+    let alpha = asking(3072);
+    let second = ledger_of(&cluster, std::slice::from_ref(&zeta));
+    pick_cluster(
+        &controller_api::FirstFit,
+        &second,
+        &alpha,
+        &Wanted::of(&alpha, None, None),
+    )
+    .expect("alpha bound in the second pass");
+    let at_binding = left(&second.lock().unwrap().nodes["ikr-netlab"]);
+    let alpha = bound(alpha, "alpha", 5);
+
+    let third = left(&rooms(&cluster, &[alpha, zeta]));
+
+    assert_eq!(at_binding, [1024, 4096]);
+    assert_eq!(third, at_binding);
 }
 
 /// What the cluster holds without a node comes off a node before the next
@@ -1343,6 +1387,25 @@ async fn a_new_binding_drops_the_old_clusters_refusal() {
     let bound: Vm = store.get("t").await.expect("the vm");
     assert_eq!(bound.spec.cluster_name.as_deref(), Some("cluster-2"));
     assert!(bound.status.hand_down_refused.is_none());
+}
+
+/// A binding says when it was made: the order the passes after it book the
+/// VM in until its cluster reports it.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn a_binding_says_when_it_was_made() {
+    let store = test_store("rebind-test").await;
+    let mut unbound = vm();
+    unbound.spec.cluster_name = None;
+    let unbound = store.create(&unbound).await.expect("an unbound vm");
+    let before = Utc::now();
+
+    bind(&store, unbound, "cluster-1".into())
+        .await
+        .expect("bound");
+
+    let bound: Vm = store.get("t").await.expect("the vm");
+    assert!(bound.status.bound_at.is_some_and(|t| t >= before));
 }
 
 /// The teardown of a VM that was never placed deletes that VM and not one

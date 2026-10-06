@@ -183,7 +183,10 @@ impl Ledger {
 /// reported, less what it holds without a node, and less each VM this cloud
 /// bound to it that it has not reported yet. Neither is in any node's bound
 /// sum yet. The VMs not reported yet are `unreported`, each booked as
-/// [`Booking`] says. (IKR-B78)
+/// [`Booking`] says and in the order they were bound ([`unreported`]): the
+/// order the passes that bound them booked them in. While the cluster's
+/// report and the VMs' volumes say what they said then, every pass assumes
+/// the node its binding assumed for each of them. (IKR-B78)
 pub(super) fn rooms_of(
     cluster: &Cluster,
     unreported: &[Booking],
@@ -205,11 +208,21 @@ pub(super) fn rooms_of(
     rooms
 }
 
-/// The VMs bound to `cluster` that it has not reported yet.
-pub(super) fn unreported<'a>(cluster: &'a str, vms: &'a [Vm]) -> impl Iterator<Item = &'a Vm> {
-    vms.iter().filter(move |v| {
-        v.spec.cluster_name.as_deref() == Some(cluster) && !reported_by(v, cluster)
-    })
+/// The VMs bound to `cluster` that it has not reported yet, in the order
+/// they were bound: by `status.boundAt`, a binding from before the field
+/// first, and by name within one instant, which is the order a pass goes
+/// through them. Each is then booked after the VMs bound before it, as the
+/// pass that bound it booked it; in the order of the listing, a VM bound
+/// later but named first took the node an earlier binding had assumed.
+pub(super) fn unreported<'a>(cluster: &str, vms: &'a [Vm]) -> Vec<&'a Vm> {
+    let mut out: Vec<&Vm> = vms
+        .iter()
+        .filter(|v| v.spec.cluster_name.as_deref() == Some(cluster) && !reported_by(v, cluster))
+        .collect();
+    out.sort_by(|a, b| {
+        (a.status.bound_at, &a.metadata.name).cmp(&(b.status.bound_at, &b.metadata.name))
+    });
+    out
 }
 
 /// How each VM bound to `cluster` and not reported by it yet is booked on its

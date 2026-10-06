@@ -209,6 +209,9 @@ pub(super) async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Res
     // A refusal is the word of the cluster that gave it, and this binding
     // may be to another: it must not hold the first hand-down here back.
     bound.status.hand_down_refused = None;
+    // The order the next passes book it in until the cluster reports it:
+    // after every VM bound before it, as this pass booked it. See `unreported`.
+    bound.status.bound_at = Some(Utc::now());
     match store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
