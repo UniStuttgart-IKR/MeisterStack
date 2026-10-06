@@ -239,6 +239,15 @@ pub(super) async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Res
     }
 }
 
+/// Let `vm`'s binding go, and with it the time it was made: `status.boundAt`
+/// dates the binding in `spec.clusterName` and must not outlive it. Every
+/// path that lets a binding go — a drain reschedule, an evacuation, the API
+/// release — goes through here. (IKR-B78)
+pub(crate) fn release_binding(vm: &mut Vm) {
+    vm.spec.cluster_name = None;
+    vm.status.bound_at = None;
+}
+
 /// How long a cluster that answered a VM's intent is left with its answer
 /// before the same intent is sent again. A lifecycle drift stands for a whole
 /// stop grace or boot; sent every pass, each ack's write was the watch event
@@ -471,7 +480,7 @@ pub(super) async fn drain_cluster(
             }
             controller_api::drain::Verdict::Reschedule => {
                 store
-                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| v.spec.cluster_name = None)
+                    .mutate_if::<Vm, _>(&name, &vm.metadata.uid, release_binding)
                     .await?;
                 events::record(
                     store,
@@ -699,7 +708,7 @@ pub(super) async fn evacuate(
             }
             store
                 .mutate_if::<Vm, _>(&name, &vm.metadata.uid, |v| {
-                    v.spec.cluster_name = None;
+                    release_binding(v);
                     v.status.evacuating = Some(controller_api::Evacuating {
                         from: mark.from.clone(),
                         step: controller_api::EvacuationStep::Moving.as_str().to_string(),

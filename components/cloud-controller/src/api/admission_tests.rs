@@ -890,3 +890,53 @@ async fn a_take_back_leaves_an_object_made_again_under_the_name() {
     let stays: StoragePool = st.store.get("spare").await.expect("theirs stays");
     assert_eq!(stays.metadata.uid, theirs.metadata.uid);
 }
+
+// --- IKR-B78: a released binding takes the time it was made with it --------
+
+/// A client that lets a VM's binding go leaves no `boundAt` behind: the field
+/// dates a binding, and an unbound VM has none.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_binding_released_through_the_api_leaves_no_time_it_was_made() {
+    let st = cloud("release").await;
+    create_vm_as(&st, admin(), vm("placed", "a", None, 1))
+        .await
+        .expect("a vm");
+    st.store
+        .mutate::<Vm, _>("placed", |v| {
+            v.spec.cluster_name = Some("c1".into());
+            v.status.bound_at = Some(chrono::Utc::now());
+            // Nobody wants it running and it is at rest: a binding that may
+            // be let go.
+            v.spec.run_strategy = controller_api::RunStrategy::Stopped;
+            v.status.reported = Some(controller_api::VmReported::by(
+                "c1",
+                controller_api::VmPhaseKind::Stopped,
+                controller_api::VmReason::Unrecorded,
+                None,
+                chrono::Utc::now(),
+            ));
+            v.settle(chrono::Utc::now());
+        })
+        .await
+        .expect("bound, and stopped");
+
+    let mut body: Vm = st.store.get("placed").await.expect("the vm");
+    body.spec.cluster_name = None;
+    let (caller, role, tenant) = admin();
+    update_vm(
+        State(st.clone()),
+        Path("placed".to_string()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .expect("the binding is let go");
+
+    let after: Vm = st.store.get("placed").await.expect("the vm");
+    assert_eq!(after.spec.cluster_name, None);
+    assert_eq!(after.status.bound_at, None);
+}

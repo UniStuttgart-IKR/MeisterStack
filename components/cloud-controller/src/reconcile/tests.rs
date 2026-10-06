@@ -1507,6 +1507,60 @@ async fn a_binding_says_when_it_was_made() {
     assert!(bound.status.bound_at.is_some_and(|t| t >= before));
 }
 
+/// Letting a binding go takes the time it was made with it: an unbound VM
+/// carries no `boundAt` for a binding that is not there any more.
+#[test]
+fn a_released_binding_leaves_no_time_it_was_made() {
+    let mut v = vm();
+    v.status.bound_at = Some(at(10));
+
+    release_binding(&mut v);
+
+    assert_eq!(v.spec.cluster_name, None);
+    assert_eq!(v.status.bound_at, None);
+}
+
+/// An evacuation that lets the binding of its stopped VM go lets the time
+/// it was made go with it.
+#[tokio::test]
+#[ignore = "needs an etcd; see api::admission_tests"]
+async fn an_evacuation_letting_the_binding_go_leaves_no_time_it_was_made() {
+    let store = test_store("evacuation-test").await;
+    let mut stopped = vm();
+    stopped.status.bound_at = Some(at(10));
+    stopped.status.reported = Some(controller_api::VmReported::by(
+        "cluster-1",
+        VmPhaseKind::Stopped,
+        controller_api::VmReason::Unrecorded,
+        None,
+        at(20),
+    ));
+    stopped.settle(at(20));
+    stopped.status.evacuating = Some(controller_api::Evacuating {
+        from: "cluster-1".into(),
+        step: controller_api::EvacuationStep::Stopping
+            .as_str()
+            .to_string(),
+        since: at(15),
+    });
+    let stopped = store.create(&stopped).await.expect("a stopped vm");
+
+    evacuate(
+        &store,
+        &crate::session::SessionRegistry::new(),
+        &stopped,
+        "cluster-1",
+        &OnceCell::new(),
+        "",
+    )
+    .await
+    .expect("a step");
+
+    let moving: Vm = store.get("t").await.expect("the vm");
+    assert_eq!(moving.spec.cluster_name, None);
+    assert_eq!(moving.status.bound_at, None);
+}
+
 /// The teardown of a VM that was never placed deletes that VM and not one
 /// made under its name since.
 #[tokio::test]

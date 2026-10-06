@@ -842,6 +842,9 @@ pub(super) async fn update_vm(
     check_volume_refs(&st, current.spec.tenant.as_deref(), &name, &body.spec).await?;
     check_reschedule(&st, &current, &body).await?;
     body.status = current.status.clone();
+    if releasing(&current, &body).is_some() {
+        crate::reconcile::release_binding(&mut body);
+    }
     // Recalculate replacement usage under the tenant fence for updates as well
     // as creates, excluding the current VM from the existing total.
     controller_api::carry_generation(&current, &mut body)?;

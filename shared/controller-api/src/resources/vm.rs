@@ -550,9 +550,10 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hand_down_refused: Option<HandDownRefused>,
     /// When the cloud bound the VM to `spec.clusterName`. Cloud tier only,
-    /// written with the binding. Until the cluster reports the VM, placement
-    /// books it in this order, which is the order the passes that bound them
-    /// booked them in. None for a binding from before the field. (IKR-B78)
+    /// written with the binding and cleared when the binding is let go.
+    /// Until the cluster reports the VM, placement books it in this order,
+    /// which is the order the passes that bound them booked them in. None for
+    /// an unbound VM and for a binding from before the field. (IKR-B78)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_at: Option<DateTime<Utc>>,
 }
