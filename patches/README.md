@@ -23,7 +23,9 @@ paths and with the same bytes
 whose series lacks one of them, is empty or carries a patch as a link is
 refused too. That file's `ownPatches` names the patches that are this
 repository's alone, today 0004; a new patch of our own goes there as well, or
-every fleet with the `leandro` input is refused.
+every fleet with the `leandro` input is refused. Once Leandro's series carries
+one of them with the same bytes, `mkFleet` warns that it can be dropped from
+`ownPatches`; with other bytes the fleet is refused.
 
 Patch 0004 is MeisterStack's own and applies on top of them; see
 [Hardening](#hardening-patch-0004). All files are `git format-patch` output, so

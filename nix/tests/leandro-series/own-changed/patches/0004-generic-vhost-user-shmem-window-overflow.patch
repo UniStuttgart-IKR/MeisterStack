@@ -1,0 +1,2 @@
+A 0004 with other bytes than MeisterStack's patches/: nix/tests/leandro-series.nix
+expects it reported as changed. Not a patch.
