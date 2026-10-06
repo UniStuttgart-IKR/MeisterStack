@@ -393,13 +393,13 @@ impl NetworkBackend for MeisterNetwork {
                     tracing::warn!(router = %plan.name, node = %node,
                                    error = format!("{e:#}"), "node has no gateway slot");
                     out.refused.push(node.clone());
-                    out.message = Some(format!("{node}: {e}"));
+                    out.message = Some(status_line(node, &e));
                 }
                 Err(e) => {
                     tracing::debug!(router = %plan.name, node = %node,
                                     error = format!("{e:#}"), "router not carried down");
                     unreachable.push(node.clone());
-                    out.message = Some(format!("{node}: {e}"));
+                    out.message = Some(status_line(node, &e));
                 }
             }
         }
@@ -407,6 +407,13 @@ impl NetworkBackend for MeisterNetwork {
         (out.phase, out.reason) = verdict(plan, &out, &unreachable);
         out
     }
+}
+
+/// The router status line for a node that did not carry it: the whole error
+/// chain, because the node's own sentence sits under a line that only says who
+/// answered ("agent … rejected command", "the replica at … answered 409").
+fn status_line(node: &str, e: &anyhow::Error) -> String {
+    format!("{node}: {e:#}")
 }
 
 /// Derive router phase and reason from the plan, acknowledgements and failures.
@@ -841,6 +848,24 @@ mod tests {
         }
     }
 
+    /// A sink whose nodes refuse the way a session hands an agent's refusal
+    /// back: the agent's sentence under the line that says who refused.
+    struct Rejecting;
+
+    #[async_trait::async_trait]
+    impl RouterSink for Rejecting {
+        async fn ensure(&self, node: &str, _router: proto::EnsureRouter) -> anyhow::Result<()> {
+            Err(
+                anyhow::Error::new(crate::Refusal::plain("no uplink carries vni 10007"))
+                    .context(format!("agent {node} rejected command")),
+            )
+        }
+
+        async fn destroy(&self, _node: &str, _id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn plan_on(nodes: &[&str], active: Option<&str>, release: &[&str]) -> RouterPlan {
         RouterPlan {
             id: "uid-1".into(),
@@ -920,6 +945,20 @@ mod tests {
             .realise(&Recorder::default(), &plan_on(&[], None, &[]))
             .await;
         assert_eq!(out.phase, RouterPhaseKind::Pending);
+    }
+
+    /// The status says what the node said, not only that it said no: a plain
+    /// Display of the error would keep just the line naming who answered.
+    #[tokio::test]
+    async fn a_router_status_keeps_the_node_s_own_sentence() {
+        let out = MeisterNetwork
+            .realise(&Rejecting, &plan_on(&["gw-1"], Some("gw-1"), &[]))
+            .await;
+
+        assert_eq!(
+            out.message.as_deref(),
+            Some("gw-1: agent gw-1 rejected command: no uplink carries vni 10007")
+        );
     }
 
     /// The config seam, the same shape `SchedulerConfig` has: a word chooses

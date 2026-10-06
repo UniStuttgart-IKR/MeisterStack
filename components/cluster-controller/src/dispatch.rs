@@ -281,6 +281,9 @@ impl Dispatch {
                     // worth reading.
                     let refusal = controller_api::forward::refusal_in(&answer.body);
                     if TYPED_REFUSALS.contains(&refusal.reason.as_str()) {
+                        // Shaped like the local session's refusal: a line naming
+                        // who answered, over the node's typed refusal. A status
+                        // line prints the chain (`{:#}`) to keep the node's words.
                         return Err(anyhow::Error::new(refusal).context(format!(
                             "the replica at {endpoint} answered {}",
                             answer.status
@@ -507,6 +510,10 @@ mod tests {
             .expect("a typed refusal, not a sentence");
         assert_eq!(refusal.reason, controller_api::CANNOT_SEND);
         assert_eq!(refusal.message, "vm uid-1 has 1 device(s) (crosvm-gpu)");
+        assert!(
+            format!("{refused:#}").contains("vm uid-1 has 1 device(s) (crosvm-gpu)"),
+            "the node's sentence is in the chain a status line prints: {refused:#}"
+        );
         assert!(
             matches!(agent.await.unwrap(), Some(command::Op::MigrateOut(_))),
             "the source was asked"
