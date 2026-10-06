@@ -377,8 +377,11 @@ impl Scenario for Confirm {
     }
 }
 
+/// A resume finishes a confirmation wherever it died. The timer, first,
+/// takes back only one whose intent was not on the disk yet: the cuts before
+/// `confirming` is written.
 #[test]
-fn every_crash_in_confirm_finishes_not_reverts() {
+fn every_crash_in_confirm_is_finished_unless_the_timer_comes_before_its_intent() {
     assert_no_breach(&every_crash(&Confirm));
     // I-A4 counts, it does not fail: nothing removes the lock of a decision
     // that died after taking it.
