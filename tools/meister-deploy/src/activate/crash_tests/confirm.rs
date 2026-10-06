@@ -15,6 +15,8 @@ use crate::run::{Output, Policy};
 const TOP: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-box-25.11";
 const PREV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-box-25.11";
 const ID: &str = "c1";
+/// The pid `confirm` runs as when it dies.
+const DYING_PID: u32 = 1;
 
 /// What systemd and `switch-to-configuration` hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,10 @@ struct Snapshot {
 
 fn txn_path() -> PathBuf {
     PathBuf::from(format!("{DEPLOY}/txn/{ID}.json"))
+}
+
+fn lock_path() -> PathBuf {
+    PathBuf::from(format!("{DEPLOY}/txn/{ID}.deciding"))
 }
 
 /// What `activate` leaves for `confirm`: the record of a switch with a deadline.
@@ -318,7 +324,7 @@ impl Scenario for Confirm {
     }
 
     fn run(&self, host: &Host, cut: &Arc<CutPoint>) -> Result<()> {
-        host.through(cut, &FakeProcesses(1), |helper| {
+        host.through(cut, &FakeProcesses(DYING_PID), |helper| {
             helper.confirm(ID).map(drop)
         })
     }
@@ -419,7 +425,7 @@ impl Processes for Recycled {
 
     fn state_of(&self, pid: u32) -> ProcessState {
         match pid {
-            1 => ProcessState::Running { start: 99_999 },
+            DYING_PID => ProcessState::Running { start: 99_999 },
             pid if pid == self.0 => started(pid),
             _ => ProcessState::Gone,
         }
@@ -428,13 +434,26 @@ impl Processes for Recycled {
 
 #[test]
 fn a_recycled_pid_does_not_keep_a_dead_holders_lock() {
-    // Confirm dies holding the lock, before it decided anything, and its pid
-    // goes to another process: the deadline takes the lock over and takes
-    // the machine back.
-    let n = trace_of(&Confirm).len();
-    let host = crashed_at(&Confirm, 2, n);
-    timer_fires(&host, &CutPoint::new(), &Recycled(2)).expect("the deadline decides");
-    resume(&host, &CutPoint::new(), &Recycled(3)).expect("a reverted record is left alone");
+    // Confirm dies right after it took the lock, before it decided anything,
+    // and its pid goes to another process: the deadline takes the lock over
+    // and takes the machine back.
+    let trace = trace_of(&Confirm);
+    let lock = lock_path().display().to_string();
+    let took_it = trace
+        .iter()
+        .find(|op| op.what == "create_new" && op.on == lock)
+        .expect("confirm takes the decision lock");
+    let host = crashed_at(&Confirm, took_it.ordinal + 1, trace.len());
+    let held = host.files.content(lock_path()).expect("the lock is left");
+    let holder = Holder::parse(&String::from_utf8_lossy(&held)).map(|h| h.pid);
+    assert_eq!(
+        holder,
+        Some(DYING_PID),
+        "the lock names the pid that is recycled"
+    );
+
+    timer_fires(&host, &CutPoint::new(), &Recycled(20)).expect("the deadline decides");
+    resume(&host, &CutPoint::new(), &Recycled(21)).expect("a reverted record is left alone");
     assert_eq!(host.record().map(|r| r.state), Some(TxnState::Reverted));
     assert_eq!(
         judged(&host, ConfirmSuccessor::TimerFirst, false),
