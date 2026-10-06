@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Helpers of the evaluation-only checks (gpu-profile, leandro-series): they
-# decide at evaluation and the check's shell script only reports the result.
+# Helpers of the evaluation-only checks (leandro-series here, gpu-profile and
+# leandro-series in meister-deploy, which reads them as `lib.assertionTags`):
+# they decide at evaluation and the check's shell script only reports the result.
 { lib }:
 rec {
   # One shell step of a check: nothing when `ok`, else the reason and a failing exit.
