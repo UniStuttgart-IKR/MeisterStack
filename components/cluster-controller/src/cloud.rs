@@ -1003,9 +1003,36 @@ async fn handle_delete_secret(store: &EtcdStore, d: proto::DeleteSecret) -> anyh
         // same rule DestroyVolume follows.
         return Ok(());
     }
-    store.delete::<controller_api::Secret>(&d.name).await?;
+    delete_cloud_record(store, &current, &d.uid).await?;
     info!(secret = %d.name, "deleted for the cloud");
     Ok(())
+}
+
+/// Delete the record a cloud delete was judged against, on the revision it was judged at, never
+/// whatever its name names by the time of the delete (NL2-6, R3-F02).
+///
+/// A record that went, or became another object's, in between is the cloud's delete done. One
+/// that is still the cloud's is an error the cloud retries, never an ack for an object that is
+/// still here.
+async fn delete_cloud_record<T: controller_api::Resource>(
+    store: &EtcdStore,
+    checked: &T,
+    cloud_uid: &str,
+) -> anyhow::Result<()> {
+    let the_clouds = |obj: &T| obj.metadata().cloud_uid() == Some(cloud_uid);
+    if deletion::finish_delete(store, checked, the_clouds).await? {
+        return Ok(());
+    }
+    let name = &checked.metadata().name;
+    match store.get::<T>(name).await {
+        Err(StoreError::NotFound(_)) => Ok(()),
+        Ok(current) if !the_clouds(&current) => Ok(()),
+        Ok(_) => bail!(
+            "{} {name} changed while it was deleted; not deleted yet",
+            T::RESOURCE
+        ),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Mirror the provider network before creating or updating its router.
@@ -1142,7 +1169,7 @@ async fn handle_delete_router(store: &EtcdStore, d: proto::DeleteRouter) -> anyh
         warn!(router = %d.name, "delete for a name held by another router, nothing done");
         return Ok(());
     }
-    store.delete::<Router>(&d.name).await?;
+    delete_cloud_record(store, &current, &d.uid).await?;
     info!(router = %d.name, node = %current.status.active_node, "router deleted for the cloud");
     Ok(())
 }
@@ -2925,6 +2952,122 @@ mod tests {
 
         assert!(matches!(
             store.get::<Volume>("data").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// `obj` stored as the cloud's object `cloud_uid`.
+    async fn stored_for_the_cloud<T: controller_api::Resource>(
+        store: &EtcdStore,
+        mut obj: T,
+        cloud_uid: &str,
+    ) -> T {
+        obj.metadata_mut().mark_managed_by_cloud(cloud_uid);
+        store.create(&obj).await.expect("the cloud's record")
+    }
+
+    fn secret() -> controller_api::Secret {
+        controller_api::Secret::declare("db", Default::default())
+    }
+
+    fn router() -> Router {
+        Router::declare("out", Default::default())
+    }
+
+    /// A secret delete judged on a record that was replaced under the same name before the
+    /// delete leaves the new record alone. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_secret_delete_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, secret(), "u-1").await;
+        store
+            .delete::<controller_api::Secret>("db")
+            .await
+            .expect("it goes");
+        stored_for_the_cloud(&store, secret(), "u-2").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a delete done");
+
+        let still: controller_api::Secret = store.get("db").await.expect("the new record");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+    }
+
+    /// A router delete judged on a record that was replaced under the same name before the
+    /// delete leaves the new record alone. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_router_delete_judged_on_an_old_record_leaves_the_recreated_one_alone() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, router(), "u-1").await;
+        store.delete::<Router>("out").await.expect("it goes");
+        stored_for_the_cloud(&store, router(), "u-2").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a delete done");
+
+        let still: Router = store.get("out").await.expect("the new record");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+    }
+
+    /// A delete whose record was recreated for the same cloud object is not acked: that object
+    /// is still here, and the cloud retries. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_is_not_acked_while_the_clouds_object_is_still_here() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        let checked = stored_for_the_cloud(&store, secret(), "u-1").await;
+        store
+            .delete::<controller_api::Secret>("db")
+            .await
+            .expect("it goes");
+        let fresh = stored_for_the_cloud(&store, secret(), "u-1").await;
+
+        delete_cloud_record(&store, &checked, "u-1")
+            .await
+            .expect_err("the record judged is gone, the cloud's object is not");
+
+        let still: controller_api::Secret = store.get("db").await.expect("the new record");
+        assert_eq!(still.metadata.uid, fresh.metadata.uid);
+    }
+
+    /// The secret the delete names goes: the guard is not a wall. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_of_the_current_secret_removes_it() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        stored_for_the_cloud(&store, secret(), "u-1").await;
+        let delete = proto::DeleteSecret {
+            name: "db".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_delete_secret(&store, delete).await.expect("deleted");
+
+        assert!(matches!(
+            store.get::<controller_api::Secret>("db").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// The router the delete names goes: the guard is not a wall. (NL2-6)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_delete_of_the_current_router_removes_it() {
+        let store = crate::test_etcd::fresh_store("cloud-delete-test").await;
+        stored_for_the_cloud(&store, router(), "u-1").await;
+        let delete = proto::DeleteRouter {
+            name: "out".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_delete_router(&store, delete).await.expect("deleted");
+
+        assert!(matches!(
+            store.get::<Router>("out").await,
             Err(StoreError::NotFound(_))
         ));
     }

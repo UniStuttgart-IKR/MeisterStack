@@ -466,8 +466,11 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
     // the node refuses to deprovision a volume it still has open, so a delete
     // arriving in the window is answered and retried rather than obeyed.
     release_volumes(p, vm).await;
-    p.store.delete::<Vm>(&vm.metadata.name).await?;
-    info!("vm deleted");
+    // The VM that was judged, on the revision it was judged at: one recreated under the same
+    // name since the listing is a new VM and is left alone (NL2-6).
+    if deletion::finish_delete(p.store, vm, |v: &Vm| v.is_deleting()).await? {
+        info!("vm deleted");
+    }
     Ok(())
 }
 

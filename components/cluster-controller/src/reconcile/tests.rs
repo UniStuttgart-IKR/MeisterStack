@@ -2893,6 +2893,55 @@ async fn a_volume_nothing_holds_is_released_and_deleted() {
     ));
 }
 
+/// An unbound VM `t` marked for deletion, as a listing would hand it to the teardown.
+fn deleting_vm() -> Vm {
+    let mut vm = bound_to(None);
+    vm.metadata.deletion_timestamp = Some(Utc::now());
+    vm
+}
+
+/// A VM recreated under the same name after the listing survives the old one's teardown.
+/// (NL2-6)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_recreated_under_the_same_name_survives_the_old_teardown() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    let listed = store.create(&deleting_vm()).await.expect("the old vm");
+    store.delete::<Vm>("t").await.expect("the old vm goes");
+    let fresh = store
+        .create(&bound_to(None))
+        .await
+        .expect("a new vm under the same name");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    tear_down(&quiet_pass(&store, &registry, &connected), &listed, "")
+        .await
+        .expect("the old teardown");
+
+    let still: Vm = store.get("t").await.expect("the new vm");
+    assert_eq!(still.metadata.uid, fresh.metadata.uid);
+}
+
+/// The listed VM itself still goes: the guard is a guard, not a wall. (NL2-6)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_torn_down_as_listed_is_deleted() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    let listed = store.create(&deleting_vm()).await.expect("a deleting vm");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    tear_down(&quiet_pass(&store, &registry, &connected), &listed, "")
+        .await
+        .expect("the teardown");
+
+    assert!(matches!(
+        store.get::<Vm>("t").await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
 /// A guest of 2 vCPUs and `mem_mib`, bound to `on` or to nobody.
 fn sized_guest(name: &str, on: Option<&str>, mem_mib: u64) -> Vm {
     let mut vm = bound_to(on);
