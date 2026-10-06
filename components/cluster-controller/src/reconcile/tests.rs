@@ -2989,6 +2989,31 @@ async fn a_vm_torn_down_as_listed_is_deleted() {
     ));
 }
 
+/// A VM bound and started since the listing is not deleted on the old judgement, which sent
+/// no Destroy: the next pass judges it again and tells its node. (NL3-2)
+#[tokio::test]
+#[ignore = "needs an etcd; see crate::test_etcd"]
+async fn a_vm_bound_since_the_listing_is_judged_again_not_deleted() {
+    let store = crate::test_etcd::fresh_store("reconcile-test").await;
+    let listed = store.create(&deleting_vm()).await.expect("a deleting vm");
+    store
+        .mutate::<Vm, _>("t", |v| {
+            v.spec.node_name = Some("agent-1".into());
+            reported_as(v, "agent-1", VmPhaseKind::Running);
+        })
+        .await
+        .expect("bound and running on agent-1");
+    let registry = SessionRegistry::new();
+    let connected = sessions(&[]);
+
+    tear_down(&quiet_pass(&store, &registry, &connected), &listed, "")
+        .await
+        .expect("the old teardown");
+
+    let still: Vm = store.get("t").await.expect("the vm, until agent-1 is told");
+    assert_eq!(still.metadata.uid, listed.metadata.uid);
+}
+
 /// A guest of 2 vCPUs and `mem_mib`, bound to `on` or to nobody.
 fn sized_guest(name: &str, on: Option<&str>, mem_mib: u64) -> Vm {
     let mut vm = bound_to(on);

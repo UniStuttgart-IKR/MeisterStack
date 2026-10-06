@@ -444,9 +444,7 @@ pub(super) const REFUSAL_TTL: std::time::Duration = std::time::Duration::from_se
 /// Finalizer flow: tear down on the bound node (idempotent at the agent),
 /// then the object really goes away.
 pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> {
-    if let Some(node) = vm.spec.node_name.as_deref()
-        && vm.status.phase().kind() != VmPhaseKind::Pending
-    {
+    if let Some(node) = destroy_target(vm) {
         p.registry
             .send_command(
                 node,
@@ -457,9 +455,12 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
             )
             .await?;
     }
-    // The VM that was judged, on the revision it was judged at: one recreated under the same
-    // name since the listing is a new VM and is left alone (NL2-6).
-    if !deletion::finish_delete(p.store, vm, |v: &Vm| v.is_deleting()).await? {
+    // The VM that was judged, under the judgement it was given: still deleting, and the Destroy
+    // above went where the revision being deleted would send it. One recreated under the same
+    // name since the listing is a new VM and is left alone (NL2-6); one rebound, or no longer
+    // Pending or newly so, is judged again by the next pass (NL3-2).
+    let judged = |v: &Vm| v.is_deleting() && destroy_target(v) == destroy_target(vm);
+    if !deletion::finish_delete(p.store, vm, judged).await? {
         return Ok(());
     }
     info!("vm deleted");
@@ -476,6 +477,15 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
     // arriving in the window is answered and retried rather than obeyed.
     release_volumes(p, vm).await;
     Ok(())
+}
+
+/// The node a teardown tells to destroy the instance: the bound one, unless the VM is still
+/// Pending, which the teardown takes as nothing started there to destroy.
+fn destroy_target(vm: &Vm) -> Option<&str> {
+    vm.spec
+        .node_name
+        .as_deref()
+        .filter(|_| vm.status.phase().kind() != VmPhaseKind::Pending)
 }
 
 /// Compare desired referenced disks with node-reported attachments.
