@@ -1628,3 +1628,171 @@ async fn a_pool_widened_onto_a_network_declared_after_its_check_is_put_back() {
     let stands: FloatingPool = st.store.get(&pool).await.expect("the pool");
     assert_eq!(stands.spec.cidrs, ["10.40.0.0/24"]);
 }
+
+// --- NL6-4: what a lost claim takes back ------------------------------------
+
+/// An update of a tenant whose network lost its claim to a pool written between the update's
+/// check and its write is put back whole: its network, its quota and its labels are what they
+/// were before the request. (NL6-4)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_tenant_update_whose_network_lost_its_claim_is_put_back_whole() {
+    let st = cloud_with_routers("nl6-4-whole").await;
+    let tenant = unique("t");
+    let before = st
+        .store
+        .create(&tenant_with_network(&tenant, &[]))
+        .await
+        .expect("the tenant");
+    let mut edit = before.clone();
+    edit.spec.network_prefixes = vec!["10.30.0.0/24".into()];
+    edit.spec.quota.max_vms = Some(3);
+    edit.metadata.labels.insert("owner".into(), "ops".into());
+    let checked = pause(&tenant);
+
+    let (answer, ()) = tokio::join!(
+        update_tenant(
+            State(st.clone()),
+            Path(tenant.clone()),
+            DryRun::default(),
+            Json(edit),
+        ),
+        async {
+            checked.arrived().await;
+            st.store
+                .create(&pool_on_10_30(&unique("p")))
+                .await
+                .expect("a pool between the check and the write");
+            checked.release().await;
+        },
+    );
+
+    let refused = answer
+        .err()
+        .expect("the network lost to the pool before it");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let back: Tenant = st.store.get(&tenant).await.expect("the tenant");
+    assert_eq!(
+        (
+            back.spec.network_prefixes,
+            back.spec.quota.max_vms,
+            back.metadata.labels
+        ),
+        (Vec::<String>::new(), None, before.metadata.labels)
+    );
+}
+
+/// A put back writes over the revision the request wrote and over nothing written since: a
+/// later write of somebody else stays, and the put back fails. (NL6-4)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_put_back_does_not_write_over_a_later_write() {
+    let st = cloud_with_routers("nl6-4-cas").await;
+    let tenant = unique("t");
+    let before = st
+        .store
+        .create(&tenant_with_network(&tenant, &[]))
+        .await
+        .expect("the tenant");
+    let written = declare_network(&st, &tenant, &["10.30.0.0/24"]).await;
+    let theirs = relabel(&st, &tenant).await;
+
+    let failed = put_back(&st, &before, &written)
+        .await
+        .expect_err("their write came after ours");
+    assert_eq!(
+        failed.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        failed.message()
+    );
+    let stands: Tenant = st.store.get(&tenant).await.expect("the tenant");
+    assert_eq!(
+        stands.metadata.resource_version,
+        theirs.metadata.resource_version
+    );
+}
+
+/// A store with a tenant `a` and nothing else, and the prefix it lives under, for writing a
+/// record past it.
+async fn bare_cloud(what: &str) -> (ApiState, String) {
+    let prefix = fresh_prefix(what);
+    let st = replica(&prefix).await;
+    st.store
+        .create(&tenant_with_network("a", &[]))
+        .await
+        .expect("tenant a");
+    (st, prefix)
+}
+
+/// A floating pool whose question after its write cannot be answered (a tenant written between
+/// its check and its write does not decode) is taken back, and the answer is why. (NL6-4)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_pool_whose_question_after_its_write_has_no_answer_is_taken_back() {
+    let (st, prefix) = bare_cloud("nl6-4-pool-unanswered").await;
+    let pool = unique("p");
+    let checked = pause(&pool);
+
+    let (answer, ()) = tokio::join!(
+        create_floating_pool(
+            State(st.clone()),
+            DryRun::default(),
+            Json(pool_on_10_30(&pool)),
+        ),
+        async {
+            checked.arrived().await;
+            crate::reconcile::tests::unparsable::<Tenant>(&prefix, "broken").await;
+            checked.release().await;
+        },
+    );
+
+    let refused = answer.err().expect("not known to have won");
+    assert!(
+        refused.message().contains("did not decode"),
+        "{}",
+        refused.message()
+    );
+    assert!(matches!(
+        st.store.get::<FloatingPool>(&pool).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A routed subnet whose question after its write cannot be answered is taken back, and the
+/// answer is why, rather than a second block being cut. (NL6-4)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_routed_subnet_whose_question_after_its_write_has_no_answer_is_taken_back() {
+    let (st, prefix) = bare_cloud("nl6-4-subnet-unanswered").await;
+    let subnet = unique("s");
+    let checked = pause(&subnet);
+    let body = RoutedSubnet::declare(
+        &subnet,
+        controller_api::RoutedSubnetSpec {
+            tenant: "a".into(),
+            cidr: "10.7.1.0/24".into(),
+            ..Default::default()
+        },
+    );
+
+    let (answer, ()) = tokio::join!(
+        create_routed_subnet(State(st.clone()), DryRun::default(), Json(body)),
+        async {
+            checked.arrived().await;
+            crate::reconcile::tests::unparsable::<Tenant>(&prefix, "broken").await;
+            checked.release().await;
+        },
+    );
+
+    let refused = answer.err().expect("not known to have won");
+    assert!(
+        refused.message().contains("did not decode"),
+        "{}",
+        refused.message()
+    );
+    assert!(matches!(
+        st.store.get::<RoutedSubnet>(&subnet).await,
+        Err(StoreError::NotFound(_))
+    ));
+}

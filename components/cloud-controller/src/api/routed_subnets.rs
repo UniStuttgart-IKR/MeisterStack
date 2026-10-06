@@ -122,6 +122,8 @@ pub(super) async fn create_routed_subnet(
             },
         );
         subnet.metadata.labels = body.metadata.labels.clone();
+        #[cfg(test)]
+        super::admission_tests::admission_gate(&subnet.metadata.name).await;
         let created = match dry.preview(&subnet) {
             Some(preview) => preview,
             None => st.store.create(&subnet).await?,
