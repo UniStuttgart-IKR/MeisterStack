@@ -243,7 +243,8 @@ in
           "the cloud-controller on this host names no authenticator: no [auth] chain in "
           + "meisterstack.cloud.settings, none baked by nix/store-host.nix and no boot renderer "
           + "to append one. Name it, e.g. meisterstack.cloud.settings.auth.chain = [ \"mtls\" ] "
-          + "(certificates only), or import nixosModules.store-host.";
+          + "(certificates only), or import nixosModules.store-host AND turn it on "
+          + "(meisterstack.storeHost.enable = true): importing it alone bakes nothing.";
       }];
       meisterstack.cloud.effective = lib.recursiveUpdate
         (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
