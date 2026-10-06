@@ -650,26 +650,34 @@ impl NodeDemand<'_> {
     pub fn debit_each(&self, rooms: &mut [NodeRoom]) {
         for room in rooms
             .iter_mut()
-            .filter(|r| r.takes(self.size) && self.wants(r))
+            .filter(|r| r.takes(self.size) && self.wants(&r.node))
         {
             room.room = room.room.minus(self.size);
         }
     }
 
-    /// Of the nodes that take this VM, the one with the most room.
-    fn node_for(&self, rooms: &[NodeRoom]) -> Option<usize> {
-        roomiest(rooms, self.size, |r| self.wants(r))
+    /// Whether ONE usable node of `nodes` may run this VM, room aside: all
+    /// that can be asked of a cluster whose room is not known, and enough to
+    /// tell a VM that waits for that room from one none of its nodes would
+    /// ever take.
+    pub fn allowed_on_a_node(&self, nodes: &[NodeSummary]) -> bool {
+        nodes.iter().any(|n| n.usable() && self.wants(n))
     }
 
-    /// Whether this VM may run on `r`, room aside: its selector, the
+    /// Of the nodes that take this VM, the one with the most room.
+    fn node_for(&self, rooms: &[NodeRoom]) -> Option<usize> {
+        roomiest(rooms, self.size, |r| self.wants(&r.node))
+    }
+
+    /// Whether this VM may run on `node`, room aside: its selector, the
     /// locality of its volumes and its class.
-    fn wants(&self, r: &NodeRoom) -> bool {
-        selects(self.selector, &r.node.labels)
+    fn wants(&self, node: &NodeSummary) -> bool {
+        selects(self.selector, &node.labels)
             && self
                 .allowed
                 .as_ref()
-                .is_none_or(|allowed| allowed.iter().any(|a| a == &r.node.name))
-            && crate::resources::accepts_class(&r.node.accepts, self.class)
+                .is_none_or(|allowed| allowed.iter().any(|a| a == &node.name))
+            && crate::resources::accepts_class(&node.accepts, self.class)
     }
 }
 
@@ -699,21 +707,10 @@ impl NodeRoom {
         }
     }
 
-    /// Up, willing and without a vetoing condition: a node a VM can land on.
-    fn usable(&self) -> bool {
-        self.node.ready
-            && self.node.schedulable
-            // Apply the node-health veto before cloud placement, matching node scheduling.
-            && !self
-                .node
-                .conditions
-                .iter()
-                .any(crate::NodeCondition::vetoes_placement)
-    }
-
-    /// Usable, and with room for `size` left.
+    /// Usable, and with room for `size` left. The health veto applies before
+    /// cloud placement, as it does to node scheduling.
     fn takes(&self, size: Capacity) -> bool {
-        self.usable() && size.fits_in(self.room)
+        self.node.usable() && size.fits_in(self.room)
     }
 }
 
@@ -3421,6 +3418,34 @@ mod tests {
             wedged_summary("a", &[("disk", "nvme")]),
             summary("b", true, true, &[("disk", "nvme")]),
         ])));
+    }
+
+    /// Room aside, a node is still asked for its labels, its health and the
+    /// disk it holds: a full node may take the VM once room is known, a node
+    /// without the labels never will.
+    #[test]
+    fn a_node_room_aside_is_asked_everything_but_its_room() {
+        let want: BTreeMap<String, String> = [("disk".to_string(), "nvme".to_string())]
+            .into_iter()
+            .collect();
+        let demand = NodeDemand {
+            selector: &want,
+            allowed: Some(vec!["a".to_string()]),
+            size: Capacity {
+                vcpus: 1,
+                mem_mib: 1024,
+            },
+            class: crate::resources::CLASS_VM,
+        };
+        let mut full = summary("a", true, true, &[("disk", "nvme")]);
+        full.bound_mem_mib = full.mem_mib;
+        assert!(!demand.met_by_a_node(&rooms(std::slice::from_ref(&full))));
+        assert!(demand.allowed_on_a_node(&[full]));
+
+        assert!(!demand.allowed_on_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
+        assert!(!demand.allowed_on_a_node(&[summary("b", true, true, &[("disk", "nvme")])]));
+        assert!(!demand.allowed_on_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
+        assert!(!demand.allowed_on_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
     }
 
     /// And the volume half: a node-local disk pins the VM to one machine, so

@@ -149,4 +149,14 @@ pub struct NodeSummary {
     pub accepts: Vec<String>,
 }
 
+impl NodeSummary {
+    /// Up, willing and without a vetoing condition: a node a VM can land on,
+    /// whatever room it has left.
+    pub fn usable(&self) -> bool {
+        self.ready
+            && self.schedulable
+            && !self.conditions.iter().any(NodeCondition::vetoes_placement)
+    }
+}
+
 pub type Cluster = Object<ClusterSpec, ClusterStatus>;

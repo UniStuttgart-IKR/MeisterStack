@@ -1166,18 +1166,7 @@ fn a_cluster_whose_unplaced_list_was_cut_short_offers_no_room() {
 /// short — not its own asks, none of which is what is missing.
 #[test]
 fn a_vm_waiting_on_a_cluster_whose_room_is_not_known_is_told_so() {
-    let mut cluster = netlab(4096);
-    cluster.status.unplaced_omitted = 3;
-    let ledger = ledger_of(&cluster, &[]);
-    let small = asking(512);
-
-    let (_, (category, sentence)) = pick_cluster(
-        &controller_api::FirstFit,
-        &ledger,
-        &small,
-        &Wanted::of(&small, None, None),
-    )
-    .expect_err("no room is known");
+    let (category, sentence) = told(&ledger_of_unknown_room(), &asking(512));
 
     assert_eq!(category, controller_api::PendingReason::RoomUnknown);
     assert!(
@@ -1185,6 +1174,53 @@ fn a_vm_waiting_on_a_cluster_whose_room_is_not_known_is_told_so() {
         "{sentence}"
     );
     assert!(sentence.contains("cut short"), "{sentence}");
+}
+
+/// `netlab(4096)` with three more VMs waiting there for a node than its
+/// status lists, as the pass's ledger.
+fn ledger_of_unknown_room() -> std::sync::Mutex<Ledger> {
+    let mut cluster = netlab(4096);
+    cluster.status.unplaced_omitted = 3;
+    ledger_of(&cluster, &[])
+}
+
+/// What `pick_cluster` says of `vm` over `ledger`, which places it nowhere.
+fn told(ledger: &std::sync::Mutex<Ledger>, vm: &Vm) -> (controller_api::PendingReason, String) {
+    pick_cluster(
+        &controller_api::FirstFit,
+        ledger,
+        vm,
+        &Wanted::of(vm, None, None),
+    )
+    .expect_err("placed nowhere")
+    .1
+}
+
+/// A VM whose selector no node of a cluster carries is not waiting for that
+/// cluster's room, known or not: it is told its selector, which is what will
+/// keep it waiting once the room is known.
+#[test]
+fn a_vm_no_node_of_a_cluster_of_unknown_room_selects_is_told_its_selector() {
+    let mut picky = asking(512);
+    picky.spec.node_selector.insert("gpu".into(), "a100".into());
+
+    let (category, sentence) = told(&ledger_of_unknown_room(), &picky);
+
+    assert_eq!(category, controller_api::PendingReason::SelectorUnmatched);
+    assert!(sentence.contains("gpu=a100"), "{sentence}");
+}
+
+/// A cluster whose room is not known but whose catalogue lacks what the VM
+/// asks for would not take it with any room: the VM is told what is lacking.
+#[test]
+fn a_vm_a_cluster_of_unknown_room_would_not_serve_is_told_what_it_lacks() {
+    let ledger = ledger_of_unknown_room();
+    ledger.lock().unwrap().clusters[0].catalogue.clear();
+
+    let (category, sentence) = told(&ledger, &asking(512));
+
+    assert_eq!(category, controller_api::PendingReason::Unserved);
+    assert!(sentence.contains("hypervisor"), "{sentence}");
 }
 
 /// A VM bound but not reported yet whose volumes cannot be read right now

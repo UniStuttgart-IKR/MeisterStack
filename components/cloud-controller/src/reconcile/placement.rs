@@ -178,15 +178,19 @@ impl Ledger {
         self.nodes.get(cluster).map_or(&[], Rooms::nodes)
     }
 
-    /// The clusters that could take `wanted` but for their room, which is not
-    /// known: usable, allowed by its volumes, and with more VMs waiting for a
-    /// node than their status lists. Each with how many more.
-    fn room_unknown_for(&self, wanted: &Wanted) -> Vec<(&str, u32)> {
+    /// The clusters whose room is not known and whose nodes could take
+    /// `wanted` if they had room: allowed by its volumes, and with a usable
+    /// node its node-level asks allow. Each with how many more VMs wait there
+    /// for a node than its status lists.
+    fn served_but_for_room(&self, wanted: &Wanted) -> Vec<(&Candidate, u32)> {
         self.clusters
             .iter()
-            .filter(|c| controller_api::scheduler::is_usable(c) && wanted.allows_cluster(&c.name))
             .filter_map(|c| match self.nodes.get(&c.name) {
-                Some(Rooms::Unknown { omitted }) => Some((c.name.as_str(), *omitted)),
+                Some(Rooms::Unknown { omitted, nodes })
+                    if wanted.served_room_aside(&c.name, nodes) =>
+                {
+                    Some((c, *omitted))
+                }
                 _ => None,
             })
             .collect()
@@ -198,8 +202,14 @@ pub(super) enum Rooms {
     /// What each node has left, as this cloud measures it.
     Measured(Vec<NodeRoom>),
     /// Not known: `omitted` more VMs wait there for a node than its status
-    /// lists, and what they ask is counted nowhere. Unknown is no room.
-    Unknown { omitted: u32 },
+    /// lists, and what they ask is counted nowhere. Unknown is no room. The
+    /// `nodes` as reported still say what the cluster could take but for
+    /// room, which is what tells a VM waiting for that room from one this
+    /// cluster would never take.
+    Unknown {
+        omitted: u32,
+        nodes: Vec<controller_api::NodeSummary>,
+    },
 }
 
 impl Rooms {
@@ -224,6 +234,7 @@ pub(super) fn rooms_of(cluster: &Cluster, unreported: &[Booking], overcommit: Ov
     if cluster.status.unplaced_omitted > 0 {
         return Rooms::Unknown {
             omitted: cluster.status.unplaced_omitted,
+            nodes: cluster.status.nodes.clone(),
         };
     }
     let mut rooms =
@@ -352,6 +363,12 @@ impl<'a> Wanted<'a> {
         self.allows_cluster(cluster) && self.node.met_by_a_node(rooms)
     }
 
+    /// Whether `cluster`, whose `nodes` have room not known, could take the
+    /// VM if they had room for it.
+    fn served_room_aside(&self, cluster: &str, nodes: &[controller_api::NodeSummary]) -> bool {
+        self.allows_cluster(cluster) && self.node.allowed_on_a_node(nodes)
+    }
+
     /// Whether the VM's volumes let it go to `cluster` at all.
     fn allows_cluster(&self, cluster: &str) -> bool {
         self.clusters
@@ -420,7 +437,6 @@ pub(super) fn pick_cluster(
         .filter(|c| wanted.served_by(&c.name, ledger.rooms(&c.name)))
         .cloned()
         .collect();
-    let listed = ledger.clusters.len();
     match scheduler.assign(vm, &allowed) {
         Some(pick) => {
             controller_api::spend(&mut ledger.clusters, &pick, vm);
@@ -429,22 +445,46 @@ pub(super) fn pick_cluster(
             }
             Ok(pick)
         }
-        // The sentence is measured against what was actually
-        // offered. A cluster cut away for having no suitable node is
-        // not a cluster that "had no room", and saying so would send
-        // an operator to look at the wrong thing — and one cut away
-        // because its room is not known is neither, so it is asked
-        // about first.
-        None if allowed.is_empty() && listed > 0 => Err((
-            listed,
-            room_unknown_reason(&ledger.room_unknown_for(wanted))
-                .unwrap_or_else(|| node_level_reason(vm, listed)),
-        )),
-        None => Err((
-            allowed.len(),
-            controller_api::pending_reason_of(vm, &allowed),
-        )),
+        None => Err(why_none(scheduler, &ledger, vm, wanted, allowed)),
     }
+}
+
+/// Why no cluster of `ledger` took `vm`, and how many clusters that was
+/// measured against.
+///
+/// Measured against what was actually offered: a cluster cut away for having
+/// no suitable node is not a cluster that "had no room", and saying so would
+/// send an operator to look at the wrong thing. A cluster whose room is not
+/// known is offered as if its nodes had room. Where the scheduler would take
+/// one of those, that room is all the VM waits for and the sentence says so;
+/// one it would refuse whatever its room is weighed with the rest, so the
+/// sentence names what it lacks and not a room nobody can see. (IKR-B78)
+fn why_none(
+    scheduler: &dyn Scheduler,
+    ledger: &Ledger,
+    vm: &Vm,
+    wanted: &Wanted,
+    allowed: Vec<Candidate>,
+) -> (usize, (controller_api::PendingReason, String)) {
+    let unknown = ledger.served_but_for_room(wanted);
+    let waited_on: Vec<(&str, u32)> = unknown
+        .iter()
+        .filter(|(c, _)| scheduler.assign(vm, std::slice::from_ref(*c)).is_some())
+        .map(|(c, omitted)| (c.name.as_str(), *omitted))
+        .collect();
+    let mut weighed = allowed;
+    weighed.extend(unknown.iter().map(|(c, _)| (*c).clone()));
+    if let Some(reason) = room_unknown_reason(&waited_on) {
+        return (weighed.len(), reason);
+    }
+    let listed = ledger.clusters.len();
+    if weighed.is_empty() && listed > 0 {
+        return (listed, node_level_reason(vm, listed));
+    }
+    (
+        weighed.len(),
+        controller_api::pending_reason_of(vm, &weighed),
+    )
 }
 
 /// An answer, or the sentence that says why there is none yet. The outer
