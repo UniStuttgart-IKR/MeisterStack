@@ -1023,12 +1023,24 @@ async fn delete_cloud_record<T: controller_api::Resource>(
     if deletion::finish_delete(store, checked, the_clouds).await? {
         return Ok(());
     }
-    let name = &checked.metadata().name;
+    let done = |obj: &T| !the_clouds(obj);
+    answer_unwritten(store, &checked.metadata().name, done, "deleted").await
+}
+
+/// The answer to a cloud command whose guarded write did not land: done when the name names
+/// nothing any more or an object `done` holds for, otherwise an error the cloud retries, never
+/// an ack for an object of the cloud's that still waits on the command.
+async fn answer_unwritten<T: controller_api::Resource>(
+    store: &EtcdStore,
+    name: &str,
+    done: impl Fn(&T) -> bool,
+    doing: &str,
+) -> anyhow::Result<()> {
     match store.get::<T>(name).await {
         Err(StoreError::NotFound(_)) => Ok(()),
-        Ok(current) if !the_clouds(&current) => Ok(()),
+        Ok(current) if done(&current) => Ok(()),
         Ok(_) => bail!(
-            "{}/{name} changed while it was deleted; not deleted yet",
+            "{}/{name} changed while it was {doing}; not {doing} yet",
             T::RESOURCE
         ),
         Err(e) => Err(e.into()),
@@ -1439,15 +1451,36 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
     if current.is_deleting() {
         return Ok(());
     }
-    store
-        .mutate::<Vm, _>(&d.name, |v| {
-            if v.metadata.deletion_timestamp.is_none() {
+    mark_for_teardown(store, &current, &d.uid).await?;
+    info!(vm = %d.name, "marked for teardown by the cloud");
+    Ok(())
+}
+
+/// Mark the VM a cloud destroy was judged against for teardown, under the uid it was judged at,
+/// never whatever its name names by the time of the write (NL3-3).
+///
+/// A VM that went, became another cloud object's or was marked by someone else in between
+/// leaves the destroy nothing to do. One that is still the cloud's and unmarked is an error the
+/// cloud retries.
+async fn mark_for_teardown(store: &EtcdStore, checked: &Vm, cloud_uid: &str) -> anyhow::Result<()> {
+    let the_clouds = |v: &Vm| v.metadata.cloud_uid() == Some(cloud_uid);
+    let mut marked = false;
+    let written = store
+        .mutate_if::<Vm, _>(&checked.metadata.name, &checked.metadata.uid, |v| {
+            marked = the_clouds(v);
+            if marked && v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
         })
-        .await?;
-    info!(vm = %d.name, "marked for teardown by the cloud");
-    Ok(())
+        .await;
+    match written {
+        Ok(_) if marked => Ok(()),
+        Ok(_) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => {
+            let done = |v: &Vm| !the_clouds(v) || v.is_deleting();
+            answer_unwritten(store, &checked.metadata.name, done, "marked for teardown").await
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Build one status and put it on the stream. False means the session is gone.
@@ -3070,5 +3103,68 @@ mod tests {
             store.get::<Router>("out").await,
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    /// The running VM `t`, stored as the cloud's object `cloud_uid`.
+    async fn stored_vm(store: &EtcdStore, cloud_uid: &str) -> Vm {
+        store
+            .create(&vm("t", Some(cloud_uid), VmPhaseKind::Running))
+            .await
+            .expect("the cloud's vm")
+    }
+
+    /// A destroy judged on a VM that was replaced under the same name before the write leaves
+    /// the new VM unmarked. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_judged_on_an_old_vm_leaves_the_recreated_one_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+        store.delete::<Vm>("t").await.expect("it goes");
+        stored_vm(&store, "u-2").await;
+
+        mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect("nothing of u-1 is left here, which is a destroy done");
+
+        let still: Vm = store.get("t").await.expect("the new vm");
+        assert_eq!(still.metadata.cloud_uid(), Some("u-2"));
+        assert!(!still.is_deleting());
+    }
+
+    /// A destroy whose VM was recreated for the same cloud object is not acked while that VM is
+    /// unmarked: the cloud retries and marks it. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_is_not_acked_while_the_clouds_vm_is_unmarked() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        let checked = stored_vm(&store, "u-1").await;
+        store.delete::<Vm>("t").await.expect("it goes");
+        let fresh = stored_vm(&store, "u-1").await;
+
+        mark_for_teardown(&store, &checked, "u-1")
+            .await
+            .expect_err("the vm judged is gone, the cloud's vm is not");
+
+        let still: Vm = store.get("t").await.expect("the new vm");
+        assert_eq!(still.metadata.uid, fresh.metadata.uid);
+        assert!(!still.is_deleting());
+    }
+
+    /// The VM the destroy names is marked for teardown: the guard is not a wall. (NL3-3)
+    #[tokio::test]
+    #[ignore = "needs an etcd; see crate::test_etcd"]
+    async fn a_destroy_of_the_current_vm_marks_it_for_teardown() {
+        let store = crate::test_etcd::fresh_store("cloud-destroy-test").await;
+        stored_vm(&store, "u-1").await;
+        let destroy = proto::DestroyVm {
+            name: "t".into(),
+            uid: "u-1".into(),
+        };
+
+        handle_destroy(&store, destroy).await.expect("marked");
+
+        let marked: Vm = store.get("t").await.expect("the vm, until its teardown");
+        assert!(marked.is_deleting());
     }
 }
