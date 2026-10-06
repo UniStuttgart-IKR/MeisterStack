@@ -60,17 +60,65 @@ pub async fn finish_delete<T: Resource>(
 /// standing after [`finish_delete`] gave up is an error and never a quiet `false`. Gone, or
 /// another object under the name by now, is a rollback done.
 pub async fn take_back_created<T: Resource>(store: &EtcdStore, created: &T) -> Result<()> {
-    if finish_delete(store, created, |_| true).await? {
+    if finish_delete(store, created, |_| true).await? || is_gone(store, created).await? {
         return Ok(());
     }
-    let name = &created.metadata().name;
-    match store.get::<T>(name).await {
-        Err(StoreError::NotFound(_)) => Ok(()),
-        Ok(current) if current.metadata().uid != created.metadata().uid => Ok(()),
-        Ok(_) => Err(StoreError::Conflict(format!(
-            "{}/{name} kept changing while it was taken back and is still there",
-            T::RESOURCE
-        ))),
+    Err(StoreError::Conflict(format!(
+        "{}/{} kept changing while it was taken back and is still there",
+        T::RESOURCE,
+        created.metadata().name
+    )))
+}
+
+/// How the rollback of a create ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakenBack {
+    /// The object is gone, or another object stands under its name.
+    Gone,
+    /// The object had been handed on before the rollback and is marked for deletion: the
+    /// teardown that its own delete would have started finishes the rollback.
+    Marked,
+}
+
+/// [`take_back_created`] for an object a pass may hand on between the create and its rollback,
+/// as a router is placed on a cluster: deleted while `deletable` holds, as its own delete would
+/// delete it, and once it does not, marked for deletion (`deletionTimestamp`), so that the pass
+/// takes it down where it was handed first, as its own delete would have it. Deleted past that,
+/// it would leave behind out there what nothing names any more. Gone, or another object under
+/// the name by now, is a rollback done; an object neither deleted nor marked is an error.
+pub async fn take_back_or_mark<T: Resource>(
+    store: &EtcdStore,
+    created: &T,
+    deletable: impl Fn(&T) -> bool,
+) -> Result<TakenBack> {
+    if finish_delete(store, created, &deletable).await? {
+        return Ok(TakenBack::Gone);
+    }
+    let meta = created.metadata();
+    let marked = store
+        .mutate_if::<T, _>(&meta.name, &meta.uid, |obj| {
+            obj.metadata_mut()
+                .deletion_timestamp
+                .get_or_insert_with(chrono::Utc::now);
+        })
+        .await;
+    match marked {
+        Ok(_) => Ok(TakenBack::Marked),
+        Err(e) => {
+            if is_gone(store, created).await? {
+                Ok(TakenBack::Gone)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Whether the object `created` names is gone: deleted, or another object under its name.
+async fn is_gone<T: Resource>(store: &EtcdStore, created: &T) -> Result<bool> {
+    match store.get::<T>(&created.metadata().name).await {
+        Ok(current) => Ok(current.metadata().uid != created.metadata().uid),
+        Err(StoreError::NotFound(_)) => Ok(true),
         Err(e) => Err(e),
     }
 }

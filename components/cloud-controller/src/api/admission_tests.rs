@@ -1975,6 +1975,43 @@ async fn a_router_created_onto_a_pool_written_after_its_check_is_taken_back() {
     ));
 }
 
+/// A router the pass places between the create's write and its undo is marked for the teardown
+/// its own delete would start, not deleted past the cluster that holds it. (RR6-1)
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_router_placed_before_its_lost_claim_is_undone_is_marked_for_teardown() {
+    let (st, tenant) = cloud_for_a_router("rr6-1-placed", &[]).await;
+    let name = unique("r");
+    let checked = pause(&name);
+    let undoing = pause_undo(&name);
+
+    let (answer, ()) = tokio::join!(
+        create_router_as_member(&st, router_of(&name, &tenant, "10.60.0.1/24")),
+        async {
+            checked.arrived().await;
+            pool_on(&st, "between", "10.60.0.0/25").await;
+            checked.release().await;
+            undoing.arrived().await;
+            st.store
+                .mutate::<controller_api::Router, _>(&name, |r| r.status.cluster = "c1".into())
+                .await
+                .expect("placed");
+            undoing.release().await;
+        },
+    );
+
+    let refused = answer.expect_err("the prefix lies on the pool");
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.message()
+    );
+    let marked: controller_api::Router = st.store.get(&name).await.expect("left to its teardown");
+    assert!(marked.is_deleting());
+    assert_eq!(marked.status.cluster, "c1");
+}
+
 /// An update that moves a router's inside address onto a floating pool is refused.
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]

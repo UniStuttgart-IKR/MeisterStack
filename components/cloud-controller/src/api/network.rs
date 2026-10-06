@@ -283,7 +283,7 @@ pub(super) async fn create_router(
         &created.metadata.name,
         "router",
         inside_prefix_lost(&st, &created).await,
-        take_back(&st, &created),
+        take_back_router(&st, &created),
     )
     .await?;
     info!(router = %created.metadata.name, tenant = %owner,
@@ -434,6 +434,25 @@ pub(super) async fn update_router(
     Ok(Json(updated))
 }
 
+/// Whether no cluster holds `router`: then deleting the object is all its delete takes. A
+/// placed router is torn down on its cluster first (`reconcile::routers::teardown`).
+fn never_placed(router: &controller_api::Router) -> bool {
+    router.status.cluster.is_empty()
+}
+
+/// Undo a router create the way `delete_router` deletes: the object itself while no cluster
+/// holds it, and once the pass has placed it, marked for the teardown that takes it off its
+/// cluster first. Deleted past that, the netns out there would be named by nothing. (RR6-1)
+async fn take_back_router(st: &ApiState, created: &controller_api::Router) -> Result<(), ApiError> {
+    let taken =
+        controller_api::deletion::take_back_or_mark(&st.store, created, never_placed).await?;
+    if taken == controller_api::deletion::TakenBack::Marked {
+        info!(router = %created.metadata.name, tenant = %created.spec.tenant,
+              "router placed before its create was taken back; marked for teardown");
+    }
+    Ok(())
+}
+
 /// Mark a bound router for asynchronous cluster teardown. Floating reservations
 /// remain allocated and can be reassigned. An unbound router is removed immediately.
 pub(super) async fn delete_router(
@@ -450,7 +469,7 @@ pub(super) async fn delete_router(
     // so there is nothing to wait for and the object goes now. It is also the
     // answer that keeps a router whose cluster never existed from becoming
     // undeletable.
-    if current.status.cluster.is_empty() {
+    if never_placed(&current) {
         // The router that was judged, not one made under the name since. (IKR-B81)
         st.store
             .delete_if::<controller_api::Router>(&name, &current.metadata.resource_version)
