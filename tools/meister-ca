@@ -13,6 +13,7 @@
 # left exactly as it is, and re-running with more --node/--user adds only
 # what is missing. Nothing here ever overwrites a private key without
 # --force, because the certificate that key belongs to is deployed somewhere.
+# The CA itself is made only by --init: every other call needs one to exist.
 #
 # The identity model is Kubernetes': CN is the name, O is the group.
 #
@@ -32,6 +33,7 @@
 set -euo pipefail
 
 DIR="pki"
+INIT=0
 CA_DAYS=3650
 DAYS=90
 FORCE=0
@@ -54,6 +56,9 @@ usage() {
 usage: meister-ca [options]
 
   --dir DIR              where the CA and the certificates live (default: pki)
+  --init                 create the CA in DIR if there is none. Without it,
+                         every call refuses a DIR that holds no CA rather
+                         than start a new one there.
   --days N               lifetime of issued certificates (default: 90)
   --ca-days N            lifetime of the CA itself (default: 3650)
   --force                reissue identities that already exist
@@ -123,7 +128,7 @@ bundle at <dir>/bundle/<name>.md holding the TOML fragment and the NixOS
 snippet for it.
 
 examples:
-  meister-ca --cloud meister-cloud:10.128.1.103 \
+  meister-ca --init --cloud meister-cloud:10.128.1.103 \
              --cluster cluster-1:10.128.1.104 \
              --node manacor --admin root --user alice:member
 USAGE
@@ -135,6 +140,7 @@ note() { printf '  %s\n' "$*" >&2; }
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--dir)     DIR="$2"; shift 2 ;;
+		--init)    INIT=1; shift ;;
 		--days)    DAYS="$2"; shift 2 ;;
 		--ca-days) CA_DAYS="$2"; shift 2 ;;
 		--curve)   CURVE="$2"; shift 2 ;;
@@ -164,7 +170,6 @@ done
 
 command -v openssl >/dev/null || die "openssl is not on PATH (try: nix shell nixpkgs#openssl)"
 
-mkdir -p "$DIR" "$DIR/bundle"
 CA_KEY="$DIR/ca.key"
 CA_CRT="$DIR/ca.crt"
 
@@ -173,12 +178,14 @@ CA_CRT="$DIR/ca.crt"
 # Reused if it is there. This is the half of "idempotent" that matters: every
 # certificate already deployed chains to this key, and replacing it would
 # quietly invalidate all of them.
-if [ -f "$CA_KEY" ] && [ -f "$CA_CRT" ]; then
-	note "ca: reusing $CA_CRT"
-elif [ -f "$CA_KEY" ] || [ -f "$CA_CRT" ]; then
-	die "half a CA in $DIR (one of ca.key/ca.crt is missing); refusing to guess"
-else
+#
+# Made only when --init asks for it. A --dir that names the wrong directory
+# must not quietly become a second CA that signs a request or issues an
+# identity nobody else trusts. Signing a request and editing the index are
+# about a CA's history, so they need one that existed before this call.
+create_ca() {
 	note "ca: creating $CA_CRT"
+	mkdir -p "$DIR"
 	( umask 077; openssl genpkey -quiet -algorithm EC \
 		-pkeyopt "ec_paramgen_curve:$CURVE" -out "$CA_KEY" )
 	openssl req -x509 -new -key "$CA_KEY" -sha256 -days "$CA_DAYS" -out "$CA_CRT" \
@@ -186,7 +193,22 @@ else
 		-addext "basicConstraints=critical,CA:TRUE" \
 		-addext "keyUsage=critical,keyCertSign,cRLSign" \
 		-addext "subjectKeyIdentifier=hash"
+}
+
+if [ "$INIT" -eq 1 ] && { [ -n "$SIGN_CSR" ] || [ "$INDEX_REBUILD" -eq 1 ] \
+		|| [ -n "$REVOKE" ] || [ "$GENCRL" -eq 1 ]; }; then
+	die "--init makes a CA; signing a request or editing the index needs one that already exists. Run --init on its own first."
 fi
+if [ -f "$CA_KEY" ] && [ -f "$CA_CRT" ]; then
+	note "ca: reusing $CA_CRT"
+elif [ -f "$CA_KEY" ] || [ -f "$CA_CRT" ]; then
+	die "half a CA in $DIR (one of ca.key/ca.crt is missing); refusing to guess"
+elif [ "$INIT" -eq 1 ]; then
+	create_ca
+else
+	die "no CA in $DIR (neither ca.key nor ca.crt). Create one with \`meister-ca --dir $DIR --init\`, or point --dir at the CA you meant."
+fi
+mkdir -p "$DIR/bundle"
 
 # issue <file-stem> <subject> <extensions-block>
 issue() {

@@ -4,7 +4,8 @@
 
 # Compare a bare host with role-free and agent-role imports. Runtime modules
 # must preserve host-global boot and network policy; role-free imports also
-# leave optional daemons, kernel modules, and mounts unchanged.
+# leave optional daemons, kernel modules, mounts, accounts, units and /etc
+# unchanged.
 { nixpkgs, lib, pkgs, system, self }:
 
   let
@@ -41,6 +42,11 @@
       "services.frr.bgpd.enable" = c.services.frr.bgpd.enable;
       "boot.kernelModules" = c.boot.kernelModules;
       "fileSystems" = lib.attrNames c.fileSystems;
+      "users.users" = lib.attrNames c.users.users;
+      "users.groups" = lib.attrNames c.users.groups;
+      "systemd.services" = lib.attrNames c.systemd.services;
+      "systemd.tmpfiles.rules" = c.systemd.tmpfiles.rules;
+      "environment.etc" = lib.attrNames c.environment.etc;
     };
 
     differing = f: a: b:

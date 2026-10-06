@@ -38,7 +38,7 @@ let
   };
 
   cloudDefaults = serving // {
-    metrics_listen = "0.0.0.0:${toString cfg.ports.cloud.metrics}";
+    metrics_listen = cfg.metrics.listen.cloud;
     # Cloud replicas need a client identity to forward requests to the replica
     # holding a cluster session. This identity is distinct from the serving certificate.
     identity_cert = "${pki}/identity.crt";
@@ -46,18 +46,25 @@ let
   };
 
   clusterDefaults = serving // clusterAuth // {
-    metrics_listen = "0.0.0.0:${toString cfg.ports.cluster.metrics}";
+    metrics_listen = cfg.metrics.listen.cluster;
     # Use a separate client credential for the cluster-to-cloud session.
     cloud_ca = "${pki}/ca.crt";
     cloud_cert = "${pki}/identity.crt";
     cloud_key = "${pki}/identity.key";
   };
 
+  # A controller's file has to name its authenticators: the binary refuses
+  # an empty chain, and an evaluation that knew it would be empty says so first.
+  namesAuthChain = effective: (effective.auth.chain or [ ]) != [ ];
+
+  networkOnline = lib.optional cfg.metrics.waitsForNetwork "network-online.target";
+
   controller = name: {
     description = "MeisterStack ${name}-controller";
+    wantedBy = lib.mkIf cfg.autostart [ "multi-user.target" ];
     # Order after the context renderer only when that renderer is enabled.
-    after = [ "etcd.service" "meister-context.service" ];
-    wants = [ "etcd.service" ];
+    after = [ "etcd.service" "meister-context.service" ] ++ networkOnline;
+    wants = [ "etcd.service" ] ++ networkOnline;
     # Gate startup on the configuration and credential files the service needs.
     unitConfig.ConditionPathExists =
       lib.optional (!cfg.binariesInStore) "${cfg.binDir}/meister-${name}-controller"
@@ -138,12 +145,12 @@ in
         so config/examples/hardened/cloud.toml is worth reading before any
         deployment that is reachable from outside the lab.
 
-        NOT `auth`: this tier's whole [auth] table is appended by the context
-        renderer (nix/context.nix) at boot (see cloudAuthMtls/cloudAuthOidc above and the reason it has
-        to be one owner). A key here would be a duplicate [auth] table and a
-        parse error on the VM. The values live in cloudAuthOidc; the issuer
-        comes from MEISTER_OIDC_ISSUER — and on a managed host, where there is
-        no renderer, by `meisterstack.cloud.generated` at build time.
+        `auth` depends on who writes this file. A boot renderer appends the
+        whole [auth] table at boot, so a key here would be a duplicate table
+        and a parse error on the VM; a managed host bakes it through
+        `meisterstack.cloud.generated`. A host with neither has to name its
+        chain here, e.g. `auth.chain = [ "mtls" ];` — the evaluation refuses a
+        cloud without one rather than leave the choice to the binary.
       '';
     };
 
@@ -201,6 +208,13 @@ in
   # Enable only the role selected for this host.
   config = lib.mkMerge [
     (lib.mkIf (builtins.elem "cluster" cfg.unitsFor) {
+      assertions = [{
+        assertion = namesAuthChain cfg.cluster.effective;
+        message =
+          "meisterstack.cluster.settings.auth.chain is empty, so the cluster-controller "
+          + "would have no authenticator and would refuse to start. Machines and "
+          + "break-glass operators authenticate here with certificates: [ \"mtls\" ].";
+      }];
       meisterstack.cluster.effective = lib.recursiveUpdate
         (lib.recursiveUpdate clusterDefaults cfg.cluster.generated)
         cfg.cluster.settings;
@@ -222,6 +236,15 @@ in
 
 
     (lib.mkIf (builtins.elem "cloud" cfg.unitsFor) {
+      assertions = [{
+        # A boot renderer appends the [auth] table after evaluation.
+        assertion = cfg.context.enable || namesAuthChain cfg.cloud.effective;
+        message =
+          "the cloud-controller on this host names no authenticator: no [auth] chain in "
+          + "meisterstack.cloud.settings, none baked by nix/managed.nix and no boot renderer "
+          + "to append one. Name it, e.g. meisterstack.cloud.settings.auth.chain = [ \"mtls\" ] "
+          + "(certificates only), or import nixosModules.managed.";
+      }];
       meisterstack.cloud.effective = lib.recursiveUpdate
         (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
         cfg.cloud.settings;

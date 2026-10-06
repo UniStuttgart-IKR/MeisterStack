@@ -8,6 +8,10 @@
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
+  inherit (import ./lib/net.nix { inherit lib; }) hostPort wildcard;
+
+  metricsAddress = cfg.metrics.listenAddress;
+  bindsOneAddress = !(builtins.elem metricsAddress [ "127.0.0.1" "::1" "0.0.0.0" "::" ]);
 in
 {
   imports = [
@@ -15,6 +19,7 @@ in
     ./etcd.nix
     ./controllers.nix
     ./agent.nix
+    ./guest-guard.nix
     ./single-node.nix
     # Import optional RDMA tools.
     ./rdma.nix
@@ -86,6 +91,24 @@ in
         packages have to be joined into one path. A host without that role
         gets the workspace package alone rather than a hypervisor it never
         starts.
+      '';
+    };
+
+    autostart = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = lib.literalExpression "config.my.host.holdsItsCertificates";
+      description = ''
+        Whether the role units of this host (`meister-agent`,
+        `meister-cloud-controller`, `meister-cluster-controller`) start at
+        boot, i.e. are wanted by `multi-user.target`.
+
+        Off by default: importing `nixosModules.services` into an existing
+        configuration defines the units and starts none of them, so a host
+        decides when it is ready — typically once its certificates are in
+        place. `nix/managed.nix` turns it on, because there the deployed
+        closure is the decision. Either way a unit still waits for its key
+        material (`ConditionPathExists`), and the agent for its guest guard.
       '';
     };
 
@@ -171,6 +194,55 @@ in
       '';
     };
 
+    metrics.listenAddress = lib.mkOption {
+      type = lib.types.str;
+      # A boot-rendered image is generic and learns its address, and its
+      # family, only at boot, but the fleet's Prometheus scrapes it there.
+      default = if cfg.context.enable then wildcard config else "127.0.0.1";
+      defaultText = lib.literalExpression
+        ''if config.meisterstack.context.enable then "::" else "127.0.0.1"'';
+      example = "10.0.0.10";
+      description = ''
+        The address the three metrics listeners (`metrics_listen` of the
+        cloud, the cluster and the agent, ports in `meisterstack.ports`)
+        bind. They are unauthenticated, and their series name objects across
+        every tenant.
+
+        Loopback by default, so a host that does not say otherwise exposes
+        them to nobody. A fleet built with `lib.mkFleet` binds the host's
+        management address, which is what its Prometheus scrapes, and refuses
+        a host that binds neither that address nor a wildcard covering it; a unit that
+        binds one address waits for `network-online.target`. A host that
+        renders its config at boot (`meisterstack.context.enable`) binds every
+        address of either family (`::`), because its image does not know the
+        address it is scraped at; where the kernel keeps IPv6 sockets to IPv6
+        (`net.ipv6.bindv6only = 1`) or has no IPv6, that is `0.0.0.0`. A
+        wildcard binds every address, and then only the host's firewall
+        decides who reads them; `0.0.0.0` takes IPv4 only. A role's
+        `settings.metrics_listen` still wins over this.
+      '';
+    };
+
+    metrics.listen = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      internal = true;
+      readOnly = true;
+      default = lib.mapAttrs (_: role: hostPort metricsAddress role.metrics)
+        { inherit (cfg.ports) cloud cluster agent; };
+      description = "The `metrics_listen` value of each role, from `metrics.listenAddress`.";
+    };
+
+    metrics.waitsForNetwork = lib.mkOption {
+      type = lib.types.bool;
+      internal = true;
+      readOnly = true;
+      default = bindsOneAddress;
+      description = ''
+        Whether the role units order after `network-online.target`: a
+        listener bound to one address cannot bind before the address exists.
+      '';
+    };
+
     ports = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf (lib.types.either lib.types.int lib.types.str));
       readOnly = true;
@@ -183,10 +255,12 @@ in
       description = ''
         The ports this stack listens on, per role — to be READ, not set.
 
-        No firewall rule is written by these modules, and that is the point:
-        a host's firewall belongs to the host, and a service module that
-        opens a port decides something host-global behind its owner's back.
-        So the numbers are published here instead, and an operator's own
+        These modules open no port, and that is the point: a host's firewall
+        belongs to the host, and a service module that opens a port decides
+        something host-global behind its owner's back. The only rule they
+        write is the guest guard's drop table on an agent host
+        (nix/guest-guard.nix, `meisterstack.agent.guestGuard`), and it opens
+        nothing. So the numbers are published here instead, and an operator's own
         `networking.firewall` can name them:
 
           networking.firewall.allowedTCPPorts = with config.meisterstack.ports;
@@ -212,8 +286,9 @@ in
     # Controllers share the meister service account. The meister group also grants
     # access to the agent socket; membership permits local VM administration.
     # Keep supplementary device groups on the agent unit, not the shared account.
-    users.groups.meister = { };
-    users.users.meister = {
+    # A host without a role gets neither, so importing the module changes nothing.
+    users.groups.meister = lib.mkIf (cfg.unitsFor != [ ]) { };
+    users.users.meister = lib.mkIf (cfg.unitsFor != [ ]) {
       isSystemUser = true;
       group = "meister";
       description = "MeisterStack control plane";

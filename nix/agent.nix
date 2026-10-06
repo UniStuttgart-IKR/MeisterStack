@@ -32,8 +32,8 @@ let
     # remain top-level in context-based rendering.
     stop_grace_secs = 30;
 
-    # Metrics bind to a configured address and expose no authentication.
-    metrics_listen = "0.0.0.0:${toString cfg.ports.agent.metrics}";
+    # Metrics expose no authentication; see meisterstack.metrics.listenAddress.
+    metrics_listen = cfg.metrics.listen.agent;
 
     # Use ordinary PEM files so the shared key loader can enforce private-key modes.
   } // lib.optionalAttrs (!cfg.singleNode.enable) {
@@ -71,10 +71,10 @@ let
     network = {
       # Required default bridge.
       default_bridge = "meister_br0";
-      # Give the default bridge a gateway address for standalone or lab guests.
-      bridge_addr = "10.42.0.1/24";
       # Sweep orphaned driver-owned overlays once at startup.
       sweep_orphans = true;
+    } // lib.optionalAttrs (cfg.agent.bridgeAddress != null) {
+      bridge_addr = cfg.agent.bridgeAddress;
     };
 
     # Register backends only when their host support is enabled. NVMe/TCP settings
@@ -179,6 +179,25 @@ in
         stopping for.
       '';
     };
+  };
+
+  options.meisterstack.agent.bridgeAddress = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    example = "10.42.0.1/24";
+    description = ''
+      The address this host holds on the default guest bridge `meister_br0`,
+      in CIDR notation; `null` (the default) is none.
+
+      An address there lets the host reach guests on that bridge directly,
+      and it is the same on every host, so it is a host-local segment and
+      not a network. It is not needed for anything this stack does: there
+      is no NAT, DHCP or metadata service behind it. On a host that was not
+      built for this stack it can also collide with a network the site
+      already uses. `nix/managed.nix` keeps the fleet's historical
+      `10.42.0.1/24`. Whatever is set here, `meisterstack.agent.guestGuard`
+      keeps guests from opening connections to the host.
+    '';
   };
 
   # Runtime helper options.
@@ -433,6 +452,7 @@ in
 
       systemd.services.meister-agent = {
         description = "MeisterStack agent";
+        wantedBy = lib.mkIf cfg.autostart [ "multi-user.target" ];
         # Order the agent after its volume mount. Require the mount only when
         # volumes.required is set; optional mounts permit root-filesystem fallback.
         after = [
@@ -440,6 +460,7 @@ in
           "network-online.target"
           "var-lib-meisterstack-volumes.mount"
         ];
+        wants = lib.optional cfg.metrics.waitsForNetwork "network-online.target";
         # Populate the service PATH explicitly with networking, storage, image, and
         # process helpers used by drivers. A systemd unit does not inherit an operator
         # shell PATH, and helpers launched by other helpers also need these entries.

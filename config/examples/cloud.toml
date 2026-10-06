@@ -79,9 +79,15 @@ etcd_prefix = "/cloud"
 #memory = 1.0
 
 # Authenticators are ordered and stop on rejection. Explicit chains require their
-# credentials; session-serving controllers require mTLS in the chain. Without
-# configured authenticators the controller accepts anonymous unrestricted access.
+# credentials; session-serving controllers require mTLS in the chain. Without a
+# configured authenticator the controller refuses to start unless `anonymous`
+# asks for anonymous, unrestricted access.
 [auth]
+
+# This example configures no authenticator, so it asks for the anonymous mode:
+# every request is served without credentials and with every permission. Only
+# for a throwaway local controller; remove it once client_ca or a token is set.
+anonymous = true
 
 # Put OIDC before a static bearer authenticator because both read Authorization.
 #chain = ["mtls", "oidc", "bearer"]

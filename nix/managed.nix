@@ -157,6 +157,8 @@ in
 
     # Keep guest image assets in managed persistent storage.
     meisterstack.agent.imageDir = lib.mkDefault "/var/lib/meisterstack/images";
+    # The fleet's host-local gateway on the default guest bridge, as before.
+    meisterstack.agent.bridgeAddress = lib.mkDefault "10.42.0.1/24";
     # Render role TOML from module defaults and inventory settings.
     meisterstack.cloud.generated = rendered.cloud;
     meisterstack.cluster.generated = rendered.cluster;
@@ -177,21 +179,12 @@ in
     # to prevent competing writers during activation and rollback.
     networking.resolvconf.enable =
       lib.mkIf (ms.context.providerScript != "") (lib.mkDefault false);
-    # Start the provider unit when configured, without enabling a boot renderer.
-    meisterstack.observability.enable = lib.mkDefault false;
-
     # Include deployment helpers used remotely over SSH, in addition to the
     # role daemons named by service units.
     environment.systemPackages = [ ms.package ];
 
-    # Enable selected role units at boot; credentials can still gate their startup.
-    systemd.services = lib.mkMerge (map
-      (role:
-        lib.mkIf (builtins.elem role ms.unitsFor) {
-          ${if role == "agent" then "meister-agent" else "meister-${role}-controller"}
-            .wantedBy = [ "multi-user.target" ];
-        })
-      [ "cloud" "cluster" "agent" ]);
+    # Start the role units at boot; credentials can still gate their startup.
+    meisterstack.autostart = lib.mkDefault true;
 
     # Signed closure transport and local deployment support.
     nix.enable = true;

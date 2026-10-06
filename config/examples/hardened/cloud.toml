@@ -56,8 +56,9 @@ cert_ttl_days = 90
 # ["mtls", "bearer"], where "bearer" contributes nothing unless a token file
 
 # Authenticators are ordered and stop on rejection. Explicit chains require their
-# credentials; session-serving controllers require mTLS in the chain. Without
-# configured authenticators the controller accepts anonymous unrestricted access.
+# credentials; session-serving controllers require mTLS in the chain. Without a
+# configured authenticator the controller refuses to start unless `anonymous`
+# asks for anonymous, unrestricted access.
 [auth]
 
 # Put OIDC before a static bearer authenticator because both read Authorization.

@@ -1664,6 +1664,7 @@ pub const STACK_UNITS: &[&str] = &[
     "meister-cloud-controller.service",
     "meister-cluster-controller.service",
     "meister-context.service",
+    "meister-guest-guard.service",
     "prometheus.service",
     "tempo.service",
 ];
@@ -6080,8 +6081,22 @@ mod tests {
                 "{unit} is what a MeisterStack role adds and STACK_UNITS does not name it"
             );
         }
-        // And the one unit both shapes share from this stack is named too.
-        assert!(STACK_UNITS.contains(&"meister-agent.service"));
+        // And the units both shapes share from this stack are named too.
+        let shared: Vec<&str> = agent_units
+            .iter()
+            .copied()
+            .filter(|unit| unit.starts_with("meister-"))
+            .collect();
+        assert!(
+            shared.contains(&"meister-guest-guard.service"),
+            "{shared:?}"
+        );
+        for unit in &shared {
+            assert!(
+                STACK_UNITS.contains(unit),
+                "{unit} is what the agent role adds and STACK_UNITS does not name it"
+            );
+        }
     }
 
     #[test]

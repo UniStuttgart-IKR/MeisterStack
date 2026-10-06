@@ -74,6 +74,23 @@ fn an_auth_chain_that_cannot_stand_is_refused_without_reading_a_single_key() {
 }
 
 #[test]
+fn a_config_that_names_no_authenticator_is_refused() {
+    // No client CA, no token, no provider: the default chain would build
+    // nothing, and an empty chain serves every caller as an administrator.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.toml");
+    std::fs::write(&path, "listen_api = \"127.0.0.1:1\"\n").unwrap();
+
+    let out = check(&path, None);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("anonymous = true"),
+        "and it says how to ask: {said}"
+    );
+}
+
+#[test]
 fn checking_a_config_binds_nothing_dials_nothing_and_writes_nothing() {
     // The two addresses the config names are already taken by this test. A
     // check that bound them would fail; it passes, so it did not bind.
@@ -85,7 +102,8 @@ fn checking_a_config_binds_nothing_dials_nothing_and_writes_nothing() {
         &path,
         format!(
             "listen_api = \"{}\"\nlisten_session = \"{}\"\n\
-             etcd_endpoints = \"http://127.0.0.1:1\"\n",
+             etcd_endpoints = \"http://127.0.0.1:1\"\n\
+             [auth]\nanonymous = true\n",
             api.local_addr().unwrap(),
             session.local_addr().unwrap()
         ),
@@ -126,7 +144,9 @@ fn a_revocation_list_is_read_by_the_check_and_named_when_it_cannot_be() {
     let path = dir.path().join("cloud.toml");
 
     // Named and not there.
-    std::fs::write(&path, "[auth]\ncrl = \"crl.pem\"\n").unwrap();
+    // Revocation is checked by the mtls link, so the config names a client CA.
+    // The check reads the list and not the CA.
+    std::fs::write(&path, "client_ca = \"ca.crt\"\n[auth]\ncrl = \"crl.pem\"\n").unwrap();
     let out = check(&path, None);
     assert_eq!(out.status.code(), Some(1));
     let said = String::from_utf8_lossy(&out.stderr);
@@ -145,7 +165,7 @@ fn a_revocation_list_is_read_by_the_check_and_named_when_it_cannot_be() {
     let meister_ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/meister-ca");
     let made = Command::new("bash")
         .arg(&meister_ca)
-        .args(["--dir", ca.to_str().unwrap(), "--node", "n1"])
+        .args(["--dir", ca.to_str().unwrap(), "--init", "--node", "n1"])
         .output()
         .expect("bash");
     if !made.status.success() {

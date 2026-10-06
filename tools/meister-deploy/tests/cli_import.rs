@@ -70,6 +70,7 @@ impl Scratch {
             .args([
                 "--dir",
                 &ca.path().display().to_string(),
+                "--init",
                 "--node",
                 "n1",
                 "--cluster-identity",

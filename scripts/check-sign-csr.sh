@@ -23,7 +23,7 @@ command -v openssl >/dev/null || { printf 'openssl is not on PATH\n' >&2; exit 1
 DIR="$T/ca"
 
 # Create an isolated CA.
-"$CA" --dir "$DIR" >/dev/null 2>&1
+"$CA" --dir "$DIR" --init >/dev/null 2>&1
 if [ -f "$DIR/ca.crt" ] && [ -f "$DIR/ca.key" ]; then
 	ok "eine CA ohne Identitaeten ist nur eine CA"
 else
@@ -40,6 +40,31 @@ mkcsr() {
 }
 
 mkcsr node "was-auch-immer-der-client-behauptet"
+
+# A directory without a CA is a wrong --dir, not an invitation to start one.
+EMPTY="$T/keine-ca"
+if "$CA" --dir "$EMPTY" --sign-csr "$T/node.csr" --kind node --name n1 >/dev/null 2>&1; then
+	bad "--sign-csr hat ohne CA signiert"
+else
+	ok "--sign-csr gegen ein Verzeichnis ohne CA wird abgelehnt"
+fi
+if [ -e "$EMPTY" ]; then
+	bad "und hat dabei etwas angelegt" "$(find "$EMPTY")"
+else
+	ok "und legt dabei nichts an, auch keine CA"
+fi
+if "$CA" --dir "$EMPTY" --node n1 >/dev/null 2>&1 || [ -e "$EMPTY" ]; then
+	bad "ein Aufruf ohne --init hat eine CA angelegt"
+else
+	ok "ohne --init entsteht keine CA"
+fi
+if "$CA" --dir "$EMPTY" --init --sign-csr "$T/node.csr" --kind node --name n1 >/dev/null 2>&1 \
+		|| [ -e "$EMPTY" ]; then
+	bad "--init zusammen mit --sign-csr wurde angenommen"
+else
+	ok "--init zusammen mit --sign-csr wird abgelehnt"
+fi
+
 out="$("$CA" --dir "$DIR" --sign-csr "$T/node.csr" --kind node --name n1 2>/dev/null)"
 crt="$DIR/issued/n1-node.crt"
 

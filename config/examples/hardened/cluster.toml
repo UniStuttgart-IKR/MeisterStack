@@ -56,8 +56,9 @@ cloud_key = "pki/system-cluster-cluster-1.key"
 #log_format = "json"
 
 # Authenticators are ordered and stop on rejection. Explicit chains require their
-# credentials; session-serving controllers require mTLS in the chain. Without
-# configured authenticators the controller accepts anonymous unrestricted access.
+# credentials; session-serving controllers require mTLS in the chain. Without a
+# configured authenticator the controller refuses to start unless `anonymous`
+# asks for anonymous, unrestricted access.
 [auth]
 
 # mTLS authenticates sessions and operator calls; OIDC is not supported at this tier.

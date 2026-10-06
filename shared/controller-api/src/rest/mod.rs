@@ -6,8 +6,8 @@
 //!
 //! The TLS listener attaches peer certificates to requests for authentication.
 //! Authorization policy lives in `auth`; directory resolution lives in `guard`.
-//! TLS and authentication are configured independently. With no authenticators,
-//! requests are anonymous and unrestricted.
+//! TLS and authentication are configured independently. Anonymous, unrestricted
+//! access exists only where `auth.anonymous` asks for it.
 
 use std::sync::Arc;
 use std::time::Duration;

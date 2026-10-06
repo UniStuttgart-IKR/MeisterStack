@@ -158,6 +158,16 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # A host without nix/managed.nix gets defaults that fail closed.
+          standalone-host = import ./nix/tests/standalone-host.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
+          # Every host binds its metrics where the fleet's Prometheus scrapes them.
+          scrape-targets = import ./nix/tests/scrape-targets.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # A managed host's units name the store, never /opt.
           managed-uses-the-package = import ./nix/tests/managed-uses-the-package.nix {
             inherit nixpkgs lib pkgs system self;
@@ -186,6 +196,16 @@
           # Validate installer output in a scratch root.
           install-script = import ./nix/tests/install-script.nix {
             inherit nixpkgs lib pkgs system self;
+          };
+
+          # Keep guests from opening connections to their host.
+          vm-guest-guard = import ./nix/tests/guest-guard.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # The same beside a NixOS nftables firewall that flushes the ruleset.
+          vm-guest-guard-nftables = import ./nix/tests/guest-guard.nix {
+            inherit nixpkgs lib pkgs system self;
+            hostRunsNftables = true;
           };
 
           # Exercise standalone socket access and a nested guest.

@@ -471,8 +471,8 @@ pub fn service(
 pub struct ClusterPlaneService {
     registry: std::sync::Arc<SessionRegistry>,
     store: std::sync::Arc<EtcdStore>,
-    /// The same chain the REST API runs. Empty = anonymous, which is how
-    /// every session in M1 through M4 was opened and still is by default.
+    /// The same chain the REST API runs. Empty = anonymous, which happens
+    /// only where `[auth] anonymous = true` asks for it, never by default.
     chain: controller_api::grpc::SessionAuth,
     /// Where this replica's REST API can be reached by its siblings, if it
     /// can name an address at all. Written into the cluster's status at

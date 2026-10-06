@@ -26,7 +26,7 @@ state_of() { awk -F'\t' -v s="$1" '$4 == s { print $1 }' "$DIR/index.txt"; }
 serial_of() { openssl x509 -in "$1" -noout -serial | cut -d= -f2; }
 
 # Create four initial identities.
-"$CA" --dir "$DIR" --node a --node b --admin root --serving box >/dev/null 2>&1
+"$CA" --dir "$DIR" --init --node a --node b --admin root --serving box >/dev/null 2>&1
 if [ -f "$DIR/ca.crt" ] && [ -f "$DIR/system-node-a.crt" ]; then
 	ok "die Wegwerf-CA steht"
 else

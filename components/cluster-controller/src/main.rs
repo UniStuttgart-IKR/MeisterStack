@@ -433,10 +433,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let chain = Arc::new(chain);
     // --- end lane 5A ---------------------------------------------------
     if chain.is_empty() {
-        // Warn, as `csr_auto_approve` and the static bearer token are: a
-        // deliberate configuration that leaves the API wide open should not
-        // be the quietest of the three lines that say so.
-        warn!("no authenticators configured, every request is anonymous");
+        // Only reachable through `auth.anonymous`. Warn, as `csr_auto_approve`
+        // and the static bearer token are: a deliberate configuration that
+        // leaves the API wide open should not be the quietest of the three
+        // lines that say so.
+        warn!("auth.anonymous is set, every request is anonymous");
     }
 
     let endpoints: Vec<String> = cfg
