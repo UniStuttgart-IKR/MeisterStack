@@ -20,14 +20,6 @@ enum KeyVerb {
 }
 
 impl KeyVerb {
-    /// The host each verb starts from in a rotation.
-    fn host(self) -> MemFiles {
-        match self {
-            KeyVerb::Switch => rotating(),
-            KeyVerb::Revert | KeyVerb::Remove => switched(),
-        }
-    }
-
     fn run(self, files: &dyn Files, pid: u32) -> Result<KeysRecord> {
         let (runner, clock, me) = (StrictFake::new(), clock(), FakeProcesses(pid));
         let helper = helper(&runner, files, &clock, &me);
@@ -144,8 +136,22 @@ fn remove_takes_the_last_pair(files: &MemFiles) -> Option<String> {
     }
 }
 
-/// One key verb, from the host it starts from in a rotation.
-struct KeyRotation(KeyVerb);
+/// One key verb, and the host it starts from.
+struct KeyRotation {
+    verb: KeyVerb,
+    from: fn() -> MemFiles,
+}
+
+impl KeyRotation {
+    /// The verb, from the host it starts from in a rotation.
+    fn of(verb: KeyVerb) -> KeyRotation {
+        let from = match verb {
+            KeyVerb::Switch => rotating,
+            KeyVerb::Revert | KeyVerb::Remove => switched,
+        };
+        KeyRotation { verb, from }
+    }
+}
 
 /// What comes after a crash in a key verb.
 #[derive(Debug, Clone, Copy)]
@@ -163,11 +169,11 @@ impl Scenario for KeyRotation {
     type Snapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
 
     fn world(&self) -> MemFiles {
-        self.0.host()
+        (self.from)()
     }
 
-    fn run(&self, files: &MemFiles, cut: &Arc<CutPoint>) {
-        let _ = self.0.run(&CutFiles(files, cut.clone()), 1);
+    fn run(&self, files: &MemFiles, cut: &Arc<CutPoint>) -> Result<()> {
+        self.verb.run(&CutFiles(files, cut.clone()), 1).map(drop)
     }
 
     fn frozen(&self, files: &MemFiles) -> (Vec<Breach>, ()) {
@@ -180,7 +186,7 @@ impl Scenario for KeyRotation {
     }
 
     fn successors(&self) -> Vec<KeySuccessor> {
-        match self.0 {
+        match self.verb {
             KeyVerb::Switch => vec![KeySuccessor::RunAgain, KeySuccessor::TakeBack],
             KeyVerb::Revert | KeyVerb::Remove => vec![KeySuccessor::RunAgain],
         }
@@ -188,7 +194,7 @@ impl Scenario for KeyRotation {
 
     fn recover(&self, files: &MemFiles, by: KeySuccessor, cut: &Arc<CutPoint>, first_pid: u32) {
         let verb = match by {
-            KeySuccessor::RunAgain => self.0,
+            KeySuccessor::RunAgain => self.verb,
             KeySuccessor::TakeBack => KeyVerb::Revert,
         };
         let _ = verb.run(&CutFiles(files, cut.clone()), first_pid);
@@ -224,17 +230,17 @@ impl Scenario for KeyRotation {
 
 #[test]
 fn every_crash_in_a_key_switch_is_finished_by_running_it_again_or_taken_back() {
-    assert_no_breach(&every_crash(&KeyRotation(KeyVerb::Switch)));
+    assert_no_breach(&every_crash(&KeyRotation::of(KeyVerb::Switch)));
 }
 
 #[test]
 fn every_crash_in_a_key_revert_is_finished_by_running_it_again() {
-    assert_no_breach(&every_crash(&KeyRotation(KeyVerb::Revert)));
+    assert_no_breach(&every_crash(&KeyRotation::of(KeyVerb::Revert)));
 }
 
 #[test]
 fn every_crash_in_a_key_removal_is_finished_by_running_it_again() {
-    assert_no_breach(&every_crash(&KeyRotation(KeyVerb::Remove)));
+    assert_no_breach(&every_crash(&KeyRotation::of(KeyVerb::Remove)));
 }
 
 /// The record is written first by a switch and last by a revert or a
@@ -243,7 +249,7 @@ fn every_crash_in_a_key_removal_is_finished_by_running_it_again() {
 #[test]
 fn a_crash_while_recovering_a_key_rotation_is_recovered_too() {
     for verb in [KeyVerb::Switch, KeyVerb::Revert, KeyVerb::Remove] {
-        assert_no_breach(&every_crash_during_recovery(&KeyRotation(verb)));
+        assert_no_breach(&every_crash_during_recovery(&KeyRotation::of(verb)));
     }
 }
 
@@ -251,6 +257,18 @@ fn a_crash_while_recovering_a_key_rotation_is_recovered_too() {
 #[should_panic(expected = "VACUOUS")]
 fn an_armed_cut_that_never_fires_fails() {
     // Armed with the count of a longer verb, a shorter one never reaches the cut.
-    let n = trace_of(&KeyRotation(KeyVerb::Switch)).len();
-    crashed_at(&KeyRotation(KeyVerb::Remove), n - 1, n);
+    let n = trace_of(&KeyRotation::of(KeyVerb::Switch)).len();
+    crashed_at(&KeyRotation::of(KeyVerb::Remove), n - 1, n);
+}
+
+#[test]
+#[should_panic(expected = "VACUOUS")]
+fn a_verb_that_refuses_the_host_it_starts_from_fails() {
+    // Nothing has switched yet, so there is nothing to remove: every cut
+    // would be judged on a host the verb never touched.
+    let refusing = KeyRotation {
+        verb: KeyVerb::Remove,
+        from: rotating,
+    };
+    trace_of(&refusing);
 }

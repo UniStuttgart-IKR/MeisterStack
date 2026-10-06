@@ -324,10 +324,10 @@ impl Scenario for Confirm {
         Host::waiting_for_confirm()
     }
 
-    fn run(&self, host: &Host, cut: &Arc<CutPoint>) {
+    fn run(&self, host: &Host, cut: &Arc<CutPoint>) -> Result<()> {
         host.through(cut, &FakeProcesses(1), |helper| {
-            let _ = helper.confirm(ID);
-        });
+            helper.confirm(ID).map(drop)
+        })
     }
 
     fn frozen(&self, host: &Host) -> (Vec<Breach>, bool) {

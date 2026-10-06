@@ -135,8 +135,8 @@ trait Scenario {
     type Snapshot: PartialEq + Debug;
 
     fn world(&self) -> Self::World;
-    /// The verb, as the process that dies.
-    fn run(&self, world: &Self::World, cut: &Arc<CutPoint>);
+    /// The verb, as the process that dies, and what it answered.
+    fn run(&self, world: &Self::World, cut: &Arc<CutPoint>) -> Result<()>;
     /// O0, on the frozen host.
     fn frozen(&self, world: &Self::World) -> (Vec<Breach>, Self::Seen);
     fn successors(&self) -> Vec<Self::Successor>;
@@ -154,11 +154,17 @@ trait Scenario {
     fn snapshot(&self, world: &Self::World) -> Self::Snapshot;
 }
 
-/// The effects one uncut run of the verb makes.
+/// The effects one uncut run of the verb makes. A verb that refuses the
+/// host it starts from, or finishes without an effect, leaves only the cut
+/// at the end, and every end state would be judged on a host nothing moved.
 fn trace_of<S: Scenario>(scenario: &S) -> Vec<Op> {
     let cut = CutPoint::new();
-    scenario.run(&scenario.world(), &cut);
-    cut.trace()
+    if let Err(e) = scenario.run(&scenario.world(), &cut) {
+        panic!("VACUOUS: the uncut verb failed on the host it starts from: {e:#}");
+    }
+    let trace = cut.trace();
+    assert!(!trace.is_empty(), "VACUOUS: the uncut verb made no effect");
+    trace
 }
 
 /// A cut armed inside the run must fire exactly there; one armed at `n` is
@@ -176,7 +182,9 @@ fn assert_fired(cut: &CutPoint, k: usize, n: usize) {
 fn crashed_at<S: Scenario>(scenario: &S, k: usize, n: usize) -> S::World {
     let (world, cut) = (scenario.world(), CutPoint::new());
     cut.arm_after(k);
-    scenario.run(&world, &cut);
+    // Nobody hears what a process that died answered; `trace_of` judged
+    // the answer of the run that finishes.
+    let _ = scenario.run(&world, &cut);
     assert_fired(&cut, k, n);
     world
 }
