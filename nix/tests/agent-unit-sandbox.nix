@@ -20,20 +20,23 @@ let
     ];
   }).config.systemd.services.meister-agent.serviceConfig;
 
-  # Every setting that gives a unit a mount namespace of its own (systemd.exec(5)).
-  # systemd makes that namespace a slave of the host's whatever MountFlags says,
-  # so a mount made inside it never reaches the host.
-  namespacing = [
-    "ProtectHome" "ProtectSystem" "PrivateTmp" "PrivateDevices" "PrivateMounts"
-    "PrivateNetwork" "ProtectKernelTunables" "ProtectKernelModules"
-    "ProtectKernelLogs" "ProtectControlGroups" "ProtectProc" "ProcSubset"
-    "ProtectHostname" "ReadWritePaths" "ReadOnlyPaths" "InaccessiblePaths"
-    "ExecPaths" "NoExecPaths" "BindPaths" "BindReadOnlyPaths"
-    "TemporaryFileSystem" "MountAPIVFS" "RootDirectory" "RootImage" "MountFlags"
+  # The settings an agent that mounts may carry, each read in systemd.exec(5) and
+  # known to leave the unit in the host's mount namespace. Any other setting counts
+  # as one of its own until somebody has read it up and added it here: a list of the
+  # settings that do namespace (ProtectHome, PrivateTmp, ReadOnlyPaths, DynamicUser,
+  # LogNamespace, PrivatePIDs, MountImages, ...) missed some, and systemd adds more.
+  # systemd makes such a namespace a slave of the host's whatever MountFlags says, so
+  # a mount made inside it never reaches the host.
+  hostMountNamespace = [
+    "ExecStart" "ExecStartPre" "Restart" "RestartSec" "Environment"
+    "RestrictAddressFamilies" "User" "Group" "SupplementaryGroups"
+    "AmbientCapabilities" "CapabilityBoundingSet" "Delegate" "DelegateSubgroup"
+    "DevicePolicy" "DeviceAllow"
   ];
   unset = v: v == false || v == "" || v == [ ] || v == "no";
   ownMountNamespace = unit:
-    lib.any (key: unit ? ${key} && !(unset unit.${key})) namespacing;
+    lib.any (key: !(lib.elem key hostMountNamespace) && !(unset unit.${key}))
+      (lib.attrNames unit);
 
   families = unit:
     lib.sort lib.lessThan (lib.filter (f: f != "") (lib.splitString " " unit.RestrictAddressFamilies));
@@ -52,6 +55,15 @@ let
       !(ownMountNamespace unprivilegedMounting);
     "an agent that cannot mount keeps the home directories closed" =
       computeOnly.ProtectHome or false;
+    "a setting nobody has read up counts as a mount namespace of its own" =
+      lib.all (setting: ownMountNamespace (root // setting)) [
+        { DynamicUser = true; }
+        { LogNamespace = "meister"; }
+        { PrivatePIDs = true; }
+        { MountImages = [ "/img.raw:/mnt" ]; }
+        { ExtensionDirectories = [ "/ext" ]; }
+        { RootEphemeral = true; }
+      ];
 
     # IKR-B75: arping opens an AF_PACKET socket, and nothing beyond it is opened.
     "the agent may open packet sockets for gratuitous ARP and no other new family" =
