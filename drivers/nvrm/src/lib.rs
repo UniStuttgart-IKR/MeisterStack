@@ -56,6 +56,12 @@ const BACKEND_DEFAULT_RESERVE_MIB: u64 = 256;
 /// this is stuck in a driver that will not answer the backend either.
 const VGPUPROFILE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long after a `vgpuprofile` run was killed at its deadline no other is
+/// started. Each admission naming a type not resolved yet would otherwise
+/// wait out a whole deadline under the agent's operations lock, against a
+/// card that has just failed to answer.
+const VGPUPROFILE_BACKOFF: Duration = Duration::from_secs(60);
+
 /// `vgpuprofile`'s host reserve, written from `vgpu_host_reserve_mib`.
 const HOST_RESERVE_ENV: &str = "LEA_VGPU_HOST_RESERVE_MIB";
 
@@ -247,7 +253,7 @@ pub struct NvrmDriver {
     process: BackendKind,
     vgpu_cache: Mutex<HashMap<String, VgpuType>>,
     /// Runs `vgpuprofile` one at a time, and not at all while one killed at
-    /// its deadline still lives; see [`bounded`].
+    /// its deadline still lives or for a backoff after; see [`bounded`].
     vgpuprofile: Arc<bounded::Runner>,
     /// The backends this instance started. Admission counts the agent's
     /// records first; see [`ledger`]. Held for no await, so a reservation
@@ -291,7 +297,7 @@ impl NvrmDriver {
             process,
             config,
             vgpu_cache: Mutex::new(cache),
-            vgpuprofile: Arc::default(),
+            vgpuprofile: Arc::new(bounded::Runner::new(VGPUPROFILE_BACKOFF)),
             ledger: std::sync::Mutex::new(Ledger::default()),
         }
     }
@@ -339,7 +345,7 @@ impl NvrmDriverConfig {
     /// type. A helper that hangs here fails the driver's construction, and
     /// nothing of this run is kept for the driver.
     fn resolve_profile_types(&self) -> device::Result<HashMap<String, VgpuType>> {
-        let runner = bounded::Runner::default();
+        let runner = bounded::Runner::new(VGPUPROFILE_BACKOFF);
         let mut cache = HashMap::new();
         for (name, params) in &self.profiles {
             let Some(vtype) = self.defaults.overlay(params).vgpu_type else {
