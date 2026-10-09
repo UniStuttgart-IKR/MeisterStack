@@ -584,6 +584,66 @@ fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there()
     );
 }
 
+/// A URL image no node has fetched yet is waiting, not missing: complete
+/// inventories without it add no line, so it settles Pending (AwaitingNode)
+/// and a VM may still be created for it — the VM is what makes a node fetch
+/// it. The same silence about a path image is NotFound, and a node's own
+/// FetchFailed still fails a URL image. IKR-B85.
+#[test]
+fn a_url_image_nobody_fetched_yet_awaits_a_node_and_is_not_missing() {
+    let complete = ["agent-1a", "agent-1b"];
+    let settle = |spec: &controller_api::ImageSpec, said: &[&proto::ImageStateReport]| {
+        let mut status = controller_api::ImageStatus::default();
+        status.nodes = super::inventory::lines_of(
+            "cluster-1",
+            "debian.qcow2",
+            said,
+            super::inventory::absence_witnesses(spec, &complete),
+        );
+        controller_api::settle_image(spec, &status)
+    };
+    let url_image = controller_api::ImageSpec {
+        source: "debian.qcow2".into(),
+        url: Some("https://images.example/debian.qcow2".into()),
+        sha256: Some("a".repeat(64)),
+        ..Default::default()
+    };
+    let path_image = controller_api::ImageSpec {
+        source: "debian.qcow2".into(),
+        ..Default::default()
+    };
+
+    let waiting = settle(&url_image, &[]);
+    assert_eq!(waiting.kind(), controller_api::ImagePhaseKind::Pending);
+    assert_eq!(
+        waiting.reason(),
+        Some(controller_api::ImageReason::AwaitingNode)
+    );
+    assert_eq!(waiting.message(), Some("not fetched by any node yet"));
+
+    let missing = settle(&path_image, &[]);
+    assert_eq!(missing.kind(), controller_api::ImagePhaseKind::Failed);
+    assert_eq!(
+        missing.reason(),
+        Some(controller_api::ImageReason::NotFound)
+    );
+
+    let fetch_failed = proto::ImageStateReport {
+        name: "debian.qcow2".into(),
+        phase: "Failed".into(),
+        reason: "FetchFailed".into(),
+        message: "connection refused".into(),
+        node: "agent-1a".into(),
+        digest: String::new(),
+    };
+    let refused = settle(&url_image, &[&fetch_failed]);
+    assert_eq!(refused.kind(), controller_api::ImagePhaseKind::Failed);
+    assert_eq!(
+        refused.reason(),
+        Some(controller_api::ImageReason::FetchFailed)
+    );
+}
+
 /// A node's reported digest reaches `ImageNodeState` unchanged, and an empty
 /// one — a url image, or a node older than the field — arrives as `None`
 /// rather than as an empty claim.

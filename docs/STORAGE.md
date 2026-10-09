@@ -112,5 +112,7 @@ Deletion remains asynchronous:
 
 Images use a separate [cloud catalogue](../components/cloud-controller/src/api/images.rs):
 privileged path registration adopts node files; URL images require HTTP(S) and
-SHA-256; node reports determine readiness. Deletion checks VM references but omits
+SHA-256; node reports determine readiness. A URL image stays Pending
+(`AwaitingNode`) until a node fetches it for its first VM; a node's complete
+inventory without the file fails only a path image. Deletion checks VM references but omits
 Volume base-image references. Cache removal is best effort on reachable peers.

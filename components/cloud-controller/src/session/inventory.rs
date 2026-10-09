@@ -10,8 +10,9 @@
 use super::*;
 
 /// Merge cluster evidence into registered catalogue images.
-/// Complete node inventories contribute missing-file evidence. Unknown image
-/// names do not create catalogue entries; unchanged evidence avoids a store write.
+/// Complete node inventories contribute missing-file evidence for path images
+/// (`absence_witnesses`). Unknown image names do not create catalogue entries;
+/// unchanged evidence avoids a store write.
 pub(super) async fn ingest_images(
     store: &EtcdStore,
     cluster: &str,
@@ -43,7 +44,12 @@ pub(super) async fn ingest_images(
         let name = current.metadata.name.clone();
         let lines: Vec<&proto::ImageStateReport> =
             by_image.get(name.as_str()).cloned().unwrap_or_default();
-        let mine = lines_of(cluster, &name, &lines, &complete);
+        let mine = lines_of(
+            cluster,
+            &name,
+            &lines,
+            absence_witnesses(&current.spec, &complete),
+        );
         let merged = merged_lines(&current, cluster, mine.clone());
         if same_node_states(&current.status.nodes, &merged) {
             continue;
@@ -79,6 +85,20 @@ pub(super) async fn ingest_images(
                             "writing image status failed"),
         }
     }
+}
+
+/// The complete inventories whose silence about an image says its file is not
+/// there. A path image's bytes are put in place by hand, so a complete
+/// inventory without it proves them missing. A URL image's bytes arrive when a
+/// node first needs them, so its absence only means "not fetched yet" and
+/// claims nothing: counted as NotFound, it failed every new URL image before a
+/// VM could use it — and a VM is what makes a node fetch it (IKR-B85). Its
+/// fetch failures still come in the node's own words.
+pub(super) fn absence_witnesses<'a, 'n>(
+    spec: &controller_api::ImageSpec,
+    complete: &'a [&'n str],
+) -> &'a [&'n str] {
+    if spec.url.is_some() { &[] } else { complete }
 }
 
 /// Collect this cluster's image evidence, including absence from complete node
